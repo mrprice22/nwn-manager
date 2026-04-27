@@ -1,0 +1,855 @@
+{
+  "blarg": [
+    {
+      "name": "blarg",
+      "version": {
+        "version": "0.1.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.6.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "blarg",
+      "version": {
+        "version": "0.1.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.6.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "neverwinter": [
+    {
+      "name": "neverwinter",
+      "version": {
+        "version": "2.0.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 2.0.0",
+        "checksums >= 0.2.1",
+        "https://github.com/docopt/docopt.nim#head",
+        "db_connector >= 0.1.0"
+      ],
+      "isRoot": false,
+      "url": "https://github.com/niv/neverwinter.nim"
+    },
+    {
+      "name": "neverwinter",
+      "version": {
+        "version": "2.1.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 2.0.0",
+        "checksums >= 0.2.1",
+        "docopt >= 0.7.1",
+        "db_connector >= 0.1.0"
+      ],
+      "isRoot": false,
+      "url": "https://github.com/niv/neverwinter.nim"
+    },
+    {
+      "name": "neverwinter",
+      "version": {
+        "version": "2.1.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 2.0.0",
+        "checksums >= 0.2.1",
+        "docopt >= 0.7.1",
+        "db_connector >= 0.1.0"
+      ],
+      "isRoot": false,
+      "url": "https://github.com/niv/neverwinter.nim"
+    },
+    {
+      "name": "neverwinter",
+      "version": {
+        "version": "2.1.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 2.0.0",
+        "checksums >= 0.2.1",
+        "docopt >= 0.7.1",
+        "db_connector >= 0.1.0"
+      ],
+      "isRoot": false,
+      "url": "https://github.com/niv/neverwinter.nim"
+    },
+    {
+      "name": "neverwinter",
+      "version": {
+        "version": "2.0.3",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 2.0.0",
+        "checksums >= 0.2.1",
+        "https://github.com/docopt/docopt.nim#head",
+        "db_connector >= 0.1.0"
+      ],
+      "isRoot": false,
+      "url": "https://github.com/niv/neverwinter.nim"
+    },
+    {
+      "name": "neverwinter",
+      "version": {
+        "version": "2.0.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 2.0.0",
+        "checksums >= 0.2.1",
+        "https://github.com/docopt/docopt.nim#head",
+        "db_connector >= 0.1.0"
+      ],
+      "isRoot": false,
+      "url": "https://github.com/niv/neverwinter.nim"
+    },
+    {
+      "name": "neverwinter",
+      "version": {
+        "version": "1.8.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.6.4",
+        "checksums",
+        "https://github.com/docopt/docopt.nim#head",
+        "db_connector >= 0.1.0"
+      ],
+      "isRoot": false,
+      "url": "https://github.com/niv/neverwinter.nim"
+    }
+  ],
+  "unicodedb": [
+    {
+      "name": "unicodedb",
+      "version": {
+        "version": "0.13.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "regex": [
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.26.3",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.6.0",
+        "unicodedb >= 0.13.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.26.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.6.0",
+        "unicodedb >= 0.13.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.26.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.6.0",
+        "unicodedb >= 0.13.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.26.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.6.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.25.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.6.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.24.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.24.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.23.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.22.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.21.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.20.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.20.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.20.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.19.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.18.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.17.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.17.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.16.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.16.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.16.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.15.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.14.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.14.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.6",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.13.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.0",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.13.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.0",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.12.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.18.0",
+        "unicodedb >= 0.7.2",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.11.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.18.0",
+        "unicodedb >= 0.7.0",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "regex",
+      "version": {
+        "version": "0.11.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.18.0",
+        "unicodedb >= 0.7.0",
+        "unicodeplus >= 0.5.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "graphemes": [
+    {
+      "name": "graphemes",
+      "version": {
+        "version": "0.12.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "checksums": [
+    {
+      "name": "checksums",
+      "version": {
+        "version": "0.2.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 2.0.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "checksums",
+      "version": {
+        "version": "0.2.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 2.0.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "db_connector": [
+    {
+      "name": "db_connector",
+      "version": {
+        "version": "0.1.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.7.3"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "unicodeplus": [
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.14.2",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1",
+        "graphemes >= 0.12"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.14.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1",
+        "graphemes >= 0.12"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.14.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1",
+        "graphemes >= 0.12"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.13.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.12.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.11.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.11.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.10.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.9.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.9.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.8.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.6.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.0",
+        "unicodedb >= 0.8",
+        "segmentation >= 0.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.5.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.18.0",
+        "unicodedb >= 0.7"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "unicodeplus",
+      "version": {
+        "version": "0.5.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.18.0",
+        "unicodedb >= 0.7"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "docopt": [
+    {
+      "name": "docopt",
+      "version": {
+        "version": "0.7.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.20.0",
+        "regex >= 0.11.1"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "nwnt": [
+    {
+      "name": "nwnt",
+      "version": {
+        "version": "1.4.1",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.4.0",
+        "neverwinter >= 1.4.1",
+        "docopt >= 0.6.8"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "nwnt",
+      "version": {
+        "version": "1.4.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.4.0",
+        "neverwinter >= 1.4.1",
+        "docopt >= 0.6.8"
+      ],
+      "isRoot": false,
+      "url": ""
+    },
+    {
+      "name": "nwnt",
+      "version": {
+        "version": "1.3.3",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 1.4.0",
+        "neverwinter >= 1.4.1",
+        "docopt >= 0.6.8"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ],
+  "segmentation": [
+    {
+      "name": "segmentation",
+      "version": {
+        "version": "0.1.0",
+        "speSemanticVersion": null
+      },
+      "requires": [
+        "nim >= 0.19.0",
+        "unicodedb >= 0.8.0"
+      ],
+      "isRoot": false,
+      "url": ""
+    }
+  ]
+}

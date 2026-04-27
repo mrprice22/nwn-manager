@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# nwn-manager — unpack/repack Neverwinter Nights 1 modules for git-friendly,
+# LLM-editable workflows. Thin wrapper around `nasher` (squattingmonk/nasher)
+# and the neverwinter.nim CLIs (niv/neverwinter.nim).
+
+PROG=$(basename "$0")
+PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+usage() {
+  cat <<EOF
+$PROG — unpack/repack NWN1 .mod files for git.
+
+Usage:
+  $PROG unpack <module.mod>     Extract a .mod into ./src/ (creates nasher.cfg
+                                on first run via 'nasher init'; subsequent
+                                runs delegate to 'nasher unpack').
+  $PROG repack [args...]        Build .mod from ./src/ via 'nasher pack'.
+                                Extra args are passed through to nasher.
+  $PROG -h | --help             Show this help.
+
+Layout (managed by nasher, not this wrapper):
+  nasher.cfg     project + target config — edit to rename output, change
+                 install dest, add HAK/TLK targets, etc.
+  src/           source tree (areas/, creatures/, dialogs/, scripts/, ...)
+                 GFFs are stored as JSON; scripts as .nss source only.
+  dist/          packed .mod output (gitignored)
+  .nasher/       nasher's working cache (gitignored)
+
+Prerequisites (must be on PATH):
+  nasher              — nimble install nasher
+  nwn_gff             — nimble install neverwinter
+  nwn_script_comp     — nimble install neverwinter
+EOF
+}
+
+# Verify required external CLIs are available; print install hints if not.
+preflight() {
+  local missing=0
+  declare -A HINT=(
+    [nasher]="nimble install nasher"
+    [nwn_gff]="nimble install neverwinter"
+    [nwn_script_comp]="nimble install neverwinter"
+  )
+  for bin in nasher nwn_gff nwn_script_comp; do
+    if ! command -v "$bin" >/dev/null 2>&1; then
+      echo "error: required tool '$bin' not on PATH" >&2
+      echo "       install with: ${HINT[$bin]}" >&2
+      missing=1
+    fi
+  done
+  [[ $missing -eq 0 ]] || exit 1
+}
+
+cmd_unpack() {
+  if [[ $# -lt 1 ]]; then
+    echo "error: unpack requires a path to a .mod file" >&2
+    echo "usage: $PROG unpack <module.mod>" >&2
+    exit 2
+  fi
+  local mod=$1
+  if [[ ! -f $mod ]]; then
+    echo "error: $mod not found" >&2
+    exit 1
+  fi
+  cd "$PROJECT_ROOT"
+  if [[ ! -f nasher.cfg ]]; then
+    echo "[$PROG] initializing project from $mod"
+    # --default + --skipPkgInfo + --yes runs non-interactively, accepting
+    # nasher's defaults for project metadata. Edit nasher.cfg afterwards
+    # to customize name, version, author, output filename, etc.
+    nasher init --default --skipPkgInfo --yes . "$mod"
+  else
+    echo "[$PROG] nasher.cfg present — re-unpacking $mod"
+    # Subsequent unpacks: pass the mod through. nasher will pick the default
+    # target from nasher.cfg.
+    nasher unpack --yes "$mod"
+  fi
+  if [[ -d src ]]; then
+    echo "[$PROG] src/ summary:"
+    local total
+    total=$(find src -type f | wc -l)
+    echo "  total files: $total"
+    find src -type f \
+      | sed -n 's/.*\.\([^./]*\)$/\1/p' \
+      | sort | uniq -c | sort -rn \
+      | sed 's/^/  /'
+  fi
+}
+
+cmd_repack() {
+  cd "$PROJECT_ROOT"
+  if [[ ! -f nasher.cfg ]]; then
+    echo "error: no nasher.cfg in $PROJECT_ROOT — run '$PROG unpack' first" >&2
+    exit 1
+  fi
+  nasher pack "$@"
+  if [[ -d dist ]]; then
+    echo "[$PROG] dist/ contents:"
+    ls -lh dist/ | tail -n +2 | sed 's/^/  /'
+  fi
+}
+
+main() {
+  case "${1:-}" in
+    unpack)        shift; preflight; cmd_unpack "$@" ;;
+    repack)        shift; preflight; cmd_repack "$@" ;;
+    -h|--help|"")  usage ;;
+    *)
+      echo "error: unknown subcommand: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
