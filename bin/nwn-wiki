@@ -1,0 +1,1215 @@
+#!/usr/bin/env python3
+"""nwn-wiki — generate a static HTML wiki from an unpacked NWN1 module.
+
+Usage:
+  nwn-wiki --src <unpacked-dir> --out <wiki-dir> [--module-name NAME] [--seed N]
+
+Reads the unpacked GFF-as-JSON tree, builds derived indexes (waypoint→area
+map, transitions, per-area NPCs/loot/encounters/stores), and writes a static
+multi-page wiki including a force-directed SVG map of all areas.
+
+Pure stdlib. No third-party deps.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import math
+import random
+import shutil
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Iterable
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = SCRIPT_DIR / "wiki_data"
+ASSETS_DIR = SCRIPT_DIR / "wiki_assets"
+
+
+# ---------------------------------------------------------------------------
+# GFF helpers
+# ---------------------------------------------------------------------------
+
+def gff(node: Any, default: Any = None) -> Any:
+    """Unwrap a {'type': ..., 'value': ...} cell to its value."""
+    if isinstance(node, dict) and "value" in node:
+        return node["value"]
+    return default if node is None else node
+
+
+def fld(struct: dict | None, name: str, default: Any = None) -> Any:
+    """Look up a named field's *value* in a GFF struct/dict."""
+    if not struct or name not in struct:
+        return default
+    return gff(struct[name], default)
+
+
+def loc(node: Any, lang: int = 0) -> str:
+    """Resolve a cexolocstring to a string. TLK-only refs become a placeholder."""
+    val = gff(node)
+    if not isinstance(val, dict) or not val:
+        return ""
+    key = str(lang)
+    if key in val and isinstance(val[key], str):
+        return val[key]
+    if "id" in val:
+        return f"[TLK#{val['id']}]"
+    for v in val.values():
+        if isinstance(v, str):
+            return v
+    return ""
+
+
+def list_items(node: Any) -> list[dict]:
+    val = gff(node)
+    if isinstance(val, list):
+        return val
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Bundled 2DA-ish lookups (row → human name).
+# ---------------------------------------------------------------------------
+
+def _load_lookup(name: str) -> dict[int, str]:
+    p = DATA_DIR / f"{name}.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    return {int(k): str(v) for k, v in raw.items()}
+
+
+BASEITEMS = _load_lookup("baseitems")
+CLASSES = _load_lookup("classes")
+RACES = _load_lookup("racialtypes")
+APPEARANCE = _load_lookup("appearance")
+
+
+def baseitem_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    return BASEITEMS.get(int(row), f"BaseItem #{row}")
+
+
+def class_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    return CLASSES.get(int(row), f"Class #{row}")
+
+
+def race_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    return RACES.get(int(row), f"Race #{row}")
+
+
+def appearance_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    return APPEARANCE.get(int(row), f"Appearance #{row}")
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+class Db:
+    def __init__(self, src: Path):
+        self.src = src
+        self.areas: dict[str, dict] = {}
+        self.gits: dict[str, dict] = {}
+        self.gics: dict[str, dict] = {}
+        self.creatures: dict[str, dict] = {}
+        self.items: dict[str, dict] = {}
+        self.doors: dict[str, dict] = {}
+        self.triggers: dict[str, dict] = {}
+        self.encounters: dict[str, dict] = {}
+        self.placeables: dict[str, dict] = {}
+        self.stores: dict[str, dict] = {}
+        self.waypoints: dict[str, dict] = {}
+        self.dialogs: dict[str, dict] = {}
+        self.ifo: dict | None = None
+        self.jrl: dict | None = None
+        self.fac: dict | None = None
+
+        # Derived
+        self.waypoint_area: dict[str, str] = {}
+        # Transitions: list of {src_area, dst_area, dst_tag, kind, label, src_resref}
+        self.transitions: list[dict] = []
+        self.area_npcs: dict[str, list[dict]] = defaultdict(list)
+        self.area_encounters: dict[str, list[dict]] = defaultdict(list)
+        self.area_placeables: dict[str, list[dict]] = defaultdict(list)
+        self.area_stores: dict[str, list[dict]] = defaultdict(list)
+        self.area_triggers: dict[str, list[dict]] = defaultdict(list)
+        self.area_doors: dict[str, list[dict]] = defaultdict(list)
+        self.area_waypoints: dict[str, list[dict]] = defaultdict(list)
+        self.faction_friendly: dict[int, bool] = {}  # FactionID → friendly to PC?
+
+        # nss script index (resref → relative path) — used for "this script
+        # exists" checks; not deep parsed.
+        self.scripts: set[str] = set()
+
+    # ---- Loading ----
+
+    def load(self) -> None:
+        t0 = time.time()
+        files = sorted(self.src.iterdir())
+        n_loaded = 0
+        for path in files:
+            if path.is_dir():
+                continue
+            name = path.name
+            if name.endswith(".nss"):
+                self.scripts.add(name[:-4])
+                continue
+            if not name.endswith(".json"):
+                continue
+            # Examples: bree.are.json, 001.uti.json, module.ifo.json
+            stem = name[:-5]  # strip ".json"
+            # parts[-1] is the gff type tag (lowercase)
+            parts = stem.split(".")
+            if len(parts) < 2:
+                continue
+            kind = parts[-1].lower()
+            resref = ".".join(parts[:-1])
+            try:
+                obj = json.loads(path.read_text())
+            except Exception as e:
+                print(f"  warn: failed to parse {name}: {e}", file=sys.stderr)
+                continue
+            n_loaded += 1
+            if kind == "are":
+                self.areas[resref] = obj
+            elif kind == "git":
+                self.gits[resref] = obj
+            elif kind == "gic":
+                self.gics[resref] = obj
+            elif kind == "utc":
+                self.creatures[resref] = obj
+            elif kind == "uti":
+                self.items[resref] = obj
+            elif kind == "utd":
+                self.doors[resref] = obj
+            elif kind == "utt":
+                self.triggers[resref] = obj
+            elif kind == "ute":
+                self.encounters[resref] = obj
+            elif kind == "utp":
+                self.placeables[resref] = obj
+            elif kind == "utm":
+                self.stores[resref] = obj
+            elif kind == "utw":
+                self.waypoints[resref] = obj
+            elif kind == "dlg":
+                self.dialogs[resref] = obj
+            elif kind == "ifo" and resref == "module":
+                self.ifo = obj
+            elif kind == "jrl" and resref == "module":
+                self.jrl = obj
+            elif kind == "fac" and resref == "repute":
+                self.fac = obj
+            # everything else (palettes, etc.) ignored
+        print(f"  loaded {n_loaded} json files + {len(self.scripts)} scripts in {time.time()-t0:.1f}s")
+
+    # ---- Indexing ----
+
+    def index(self) -> None:
+        t0 = time.time()
+        # Faction friendliness: faction is "friendly" if its rep with PC
+        # (faction id 0) is >= 50 in repute.fac.json's RepList. Default
+        # friendly for ids 0/2/3/4 (PC, Commoner, Merchant, Defender by
+        # engine convention). FactionList struct ids correspond to the
+        # FactionID referenced from creatures.
+        self.faction_friendly = {0: True, 2: True, 3: True, 4: True, 1: False}
+        if self.fac:
+            replist = list_items(self.fac.get("RepList"))
+            for rep in replist:
+                f1 = fld(rep, "FactionID1")
+                f2 = fld(rep, "FactionID2")
+                v = fld(rep, "FactionRep", 0) or 0
+                # Reps are pairwise; consult vs faction 0 (PC)
+                if f1 == 0 and isinstance(f2, int):
+                    self.faction_friendly[f2] = (v >= 50)
+                elif f2 == 0 and isinstance(f1, int):
+                    self.faction_friendly[f1] = (v >= 50)
+
+        # Waypoint tag → area resref. Walk every git's WaypointList.
+        for area_resref, git in self.gits.items():
+            for wp in list_items(git.get("WaypointList")):
+                tag = fld(wp, "Tag")
+                if tag and tag not in self.waypoint_area:
+                    self.waypoint_area[tag] = area_resref
+                self.area_waypoints[area_resref].append(wp)
+
+        # Per-area lists for the rest.
+        for area_resref, git in self.gits.items():
+            for c in list_items(git.get("Creature List")):
+                self.area_npcs[area_resref].append(c)
+            for e in list_items(git.get("Encounter List")):
+                self.area_encounters[area_resref].append(e)
+            for p in list_items(git.get("Placeable List")):
+                self.area_placeables[area_resref].append(p)
+            for s in list_items(git.get("StoreList")):
+                self.area_stores[area_resref].append(s)
+            for t in list_items(git.get("TriggerList")):
+                self.area_triggers[area_resref].append(t)
+            for d in list_items(git.get("Door List")):
+                self.area_doors[area_resref].append(d)
+
+        # Build transitions from triggers + doors.
+        for area_resref, triggers in self.area_triggers.items():
+            for t in triggers:
+                linked = fld(t, "LinkedTo")
+                if not linked:
+                    continue
+                dst = self.waypoint_area.get(linked)
+                self.transitions.append({
+                    "src_area": area_resref,
+                    "dst_area": dst,
+                    "dst_tag": linked,
+                    "kind": "trigger",
+                    "label": fld(t, "Tag", "") or fld(t, "TemplateResRef", "") or "",
+                    "src_resref": fld(t, "TemplateResRef", ""),
+                })
+        for area_resref, doors in self.area_doors.items():
+            for d in doors:
+                linked = fld(d, "LinkedTo")
+                if not linked:
+                    continue
+                dst = self.waypoint_area.get(linked)
+                self.transitions.append({
+                    "src_area": area_resref,
+                    "dst_area": dst,
+                    "dst_tag": linked,
+                    "kind": "door",
+                    "label": fld(d, "Tag", "") or fld(d, "TemplateResRef", "") or "",
+                    "src_resref": fld(d, "TemplateResRef", ""),
+                })
+        print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
+              f"{len(self.transitions)} transitions, "
+              f"{len(self.creatures)} creatures, {len(self.items)} items")
+
+    # ---- Convenience getters ----
+
+    def area_name(self, resref: str) -> str:
+        a = self.areas.get(resref)
+        if not a:
+            return resref
+        return loc(a.get("Name")) or resref
+
+    def creature_name(self, resref: str) -> str:
+        c = self.creatures.get(resref)
+        if not c:
+            return resref
+        first = loc(c.get("FirstName"))
+        last = loc(c.get("LastName"))
+        full = (first + " " + last).strip()
+        return full or resref
+
+    def item_name(self, resref: str) -> str:
+        i = self.items.get(resref)
+        if not i:
+            return resref
+        return loc(i.get("LocalizedName")) or resref
+
+    def store_name(self, resref: str) -> str:
+        s = self.stores.get(resref)
+        if not s:
+            return resref
+        return loc(s.get("LocName")) or resref
+
+    def is_friendly(self, faction_id: int | None) -> bool:
+        if faction_id is None:
+            return True
+        return self.faction_friendly.get(int(faction_id), True)
+
+
+# ---------------------------------------------------------------------------
+# Force-directed area layout (Fruchterman-Reingold).
+# ---------------------------------------------------------------------------
+
+def layout_areas(
+    node_ids: list[str],
+    edges: list[tuple[str, str]],
+    *,
+    width: float = 4000.0,
+    height: float = 3000.0,
+    iterations: int = 250,
+    seed: int = 1,
+) -> dict[str, tuple[float, float]]:
+    """Return {node_id → (x, y)} for area-graph layout."""
+    if not node_ids:
+        return {}
+    rng = random.Random(seed)
+    n = len(node_ids)
+    pos = {nid: [rng.uniform(0, width), rng.uniform(0, height)] for nid in node_ids}
+
+    # Build adjacency as id pairs for speed.
+    edge_pairs = [(a, b) for a, b in edges if a in pos and b in pos and a != b]
+
+    area = width * height
+    k = math.sqrt(area / max(n, 1))
+    t = max(width, height) / 8.0  # initial temperature
+    cooling = t / iterations
+
+    for it in range(iterations):
+        disp = {nid: [0.0, 0.0] for nid in pos}
+        # Repulsive forces (O(n^2))
+        ids = list(pos.keys())
+        for i, u in enumerate(ids):
+            ux, uy = pos[u]
+            for v in ids[i + 1:]:
+                vx, vy = pos[v]
+                dx = ux - vx
+                dy = uy - vy
+                d2 = dx * dx + dy * dy
+                if d2 < 1e-3:
+                    dx = rng.uniform(-0.5, 0.5)
+                    dy = rng.uniform(-0.5, 0.5)
+                    d2 = dx * dx + dy * dy + 1e-3
+                d = math.sqrt(d2)
+                f = k * k / d
+                fx, fy = dx / d * f, dy / d * f
+                disp[u][0] += fx
+                disp[u][1] += fy
+                disp[v][0] -= fx
+                disp[v][1] -= fy
+
+        # Attractive forces (edges).
+        for a, b in edge_pairs:
+            ax, ay = pos[a]
+            bx, by = pos[b]
+            dx = ax - bx
+            dy = ay - by
+            d = math.sqrt(dx * dx + dy * dy) + 1e-3
+            f = d * d / k
+            fx, fy = dx / d * f, dy / d * f
+            disp[a][0] -= fx
+            disp[a][1] -= fy
+            disp[b][0] += fx
+            disp[b][1] += fy
+
+        # Apply with temperature limit.
+        for nid in ids:
+            dx, dy = disp[nid]
+            d = math.sqrt(dx * dx + dy * dy) + 1e-9
+            scale = min(d, t) / d
+            pos[nid][0] += dx * scale
+            pos[nid][1] += dy * scale
+            # Keep inside bounds
+            pos[nid][0] = min(width - 10, max(10, pos[nid][0]))
+            pos[nid][1] = min(height - 10, max(10, pos[nid][1]))
+
+        t = max(0.1, t - cooling)
+
+    return {nid: (pos[nid][0], pos[nid][1]) for nid in pos}
+
+
+# ---------------------------------------------------------------------------
+# HTML helpers
+# ---------------------------------------------------------------------------
+
+def E(s: Any) -> str:
+    """HTML-escape a value, treating None as ''."""
+    if s is None:
+        return ""
+    return html.escape(str(s), quote=True)
+
+
+def link(href: str, text: str) -> str:
+    return f'<a href="{E(href)}">{E(text)}</a>'
+
+
+def page(title: str, body: str, root_rel: str = ".") -> str:
+    """Wrap body in the standard wiki page shell."""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{E(title)}</title>
+  <link rel="stylesheet" href="{E(root_rel)}/assets/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="{E(root_rel)}/index.html">Module Wiki</a>
+    <nav>
+      <a href="{E(root_rel)}/index.html">Map</a>
+      <a href="{E(root_rel)}/areas/index.html">Areas</a>
+      <a href="{E(root_rel)}/creatures/index.html">Creatures</a>
+      <a href="{E(root_rel)}/items/index.html">Items</a>
+      <a href="{E(root_rel)}/stores/index.html">Stores</a>
+      <a href="{E(root_rel)}/factions.html">Factions</a>
+      <a href="{E(root_rel)}/journal.html">Journal</a>
+    </nav>
+  </header>
+  <main>
+{body}
+  </main>
+  <footer>generated by nwn-wiki</footer>
+</body>
+</html>
+"""
+
+
+def write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+# ---------------------------------------------------------------------------
+# Renderers
+# ---------------------------------------------------------------------------
+
+def render_index(db: Db, out: Path, module_title: str, positions: dict[str, tuple[float, float]]) -> None:
+    # Module overview block
+    ifo = db.ifo or {}
+    start_area = fld(ifo, "Mod_Entry_Area", "")
+    haks = list_items(ifo.get("Mod_HakList"))
+    hak_names = [fld(h, "Mod_Hak", "") for h in haks]
+    tlk = fld(ifo, "Mod_CustomTlk", "")
+    xp = fld(ifo, "Mod_XPScale")
+    desc = loc(ifo.get("Mod_Description")) if ifo else ""
+
+    overview = [
+        f'<h1>{E(module_title)}</h1>',
+        '<dl class="meta">',
+        f'<dt>Areas</dt><dd>{len(db.areas)}</dd>',
+        f'<dt>Creatures</dt><dd>{len(db.creatures)}</dd>',
+        f'<dt>Items</dt><dd>{len(db.items)}</dd>',
+        f'<dt>Stores</dt><dd>{len(db.stores)}</dd>',
+        f'<dt>Dialogues</dt><dd>{len(db.dialogs)}</dd>',
+        f'<dt>Scripts</dt><dd>{len(db.scripts)}</dd>',
+    ]
+    if start_area:
+        overview.append(f'<dt>Entry area</dt><dd>{link(f"areas/{start_area}.html", db.area_name(start_area))}</dd>')
+    if tlk:
+        overview.append(f'<dt>Custom TLK</dt><dd>{E(tlk)}</dd>')
+    if xp is not None:
+        overview.append(f'<dt>XP scale</dt><dd>{E(xp)}%</dd>')
+    if hak_names:
+        overview.append(f'<dt>HAKs</dt><dd>{E(", ".join(hak_names))}</dd>')
+    overview.append('</dl>')
+    if desc:
+        overview.append(f'<p class="desc">{E(desc)}</p>')
+
+    overview.append('<h2>Area map</h2>')
+    overview.append('<p class="map-hint">Click an area to open its page. Lines: '
+                    '<span class="legend trigger">trigger</span> '
+                    '<span class="legend door">door</span>.</p>')
+    overview.append(render_map_svg(db, positions))
+
+    body = "\n".join(overview)
+    write(out / "index.html", page(module_title, body, root_rel="."))
+
+
+def render_map_svg(db: Db, positions: dict[str, tuple[float, float]]) -> str:
+    if not positions:
+        return "<p>(no areas)</p>"
+    xs = [p[0] for p in positions.values()]
+    ys = [p[1] for p in positions.values()]
+    pad = 60
+    min_x, max_x = min(xs) - pad, max(xs) + pad
+    min_y, max_y = min(ys) - pad, max(ys) + pad
+    width = max_x - min_x
+    height = max_y - min_y
+
+    # Edges first (so they're under nodes).
+    edge_lines = []
+    drawn = set()
+    for tr in db.transitions:
+        a = tr["src_area"]
+        b = tr["dst_area"]
+        if a not in positions or not b or b not in positions:
+            continue
+        # Dedupe undirected edge for visual cleanliness; keep first kind seen.
+        key = (min(a, b), max(a, b), tr["kind"])
+        if key in drawn:
+            continue
+        drawn.add(key)
+        x1, y1 = positions[a]
+        x2, y2 = positions[b]
+        cls = "edge-trigger" if tr["kind"] == "trigger" else "edge-door"
+        edge_lines.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" class="{cls}"/>')
+
+    # Nodes: rect sized by tile area (Width × Height of the area).
+    node_g = []
+    for resref, (x, y) in positions.items():
+        a = db.areas.get(resref, {})
+        tw = fld(a, "Width", 4) or 4
+        th = fld(a, "Height", 4) or 4
+        size = max(18.0, min(60.0, math.sqrt(tw * th) * 4.5))
+        name = db.area_name(resref)
+        # Truncate long names for the visual.
+        label = name if len(name) <= 18 else name[:17] + "…"
+        href = f"areas/{resref}.html"
+        node_g.append(
+            f'<a href="{E(href)}"><g class="area-node">'
+            f'<rect x="{x - size/2:.1f}" y="{y - size/2:.1f}" '
+            f'width="{size:.1f}" height="{size:.1f}" rx="4"/>'
+            f'<text x="{x:.1f}" y="{y + size/2 + 12:.1f}" '
+            f'text-anchor="middle">{E(label)}</text>'
+            f'<title>{E(name)} ({E(resref)})</title>'
+            f'</g></a>'
+        )
+
+    return (
+        f'<div class="map-wrap">'
+        f'<svg class="area-map" viewBox="{min_x:.1f} {min_y:.1f} {width:.1f} {height:.1f}" '
+        f'preserveAspectRatio="xMidYMid meet">'
+        + "\n".join(edge_lines)
+        + "\n"
+        + "\n".join(node_g)
+        + '</svg></div>'
+    )
+
+
+def render_areas_index(db: Db, out: Path) -> None:
+    rows = []
+    for resref in sorted(db.areas.keys(), key=lambda r: db.area_name(r).lower()):
+        a = db.areas[resref]
+        npc_count = len(db.area_npcs.get(resref, []))
+        enc_count = len(db.area_encounters.get(resref, []))
+        store_count = len(db.area_stores.get(resref, []))
+        rows.append(
+            f'<tr>'
+            f'<td>{link(f"{resref}.html", db.area_name(resref))}</td>'
+            f'<td>{E(resref)}</td>'
+            f'<td>{E(fld(a, "Tileset", ""))}</td>'
+            f'<td>{E(fld(a, "Width", ""))}×{E(fld(a, "Height", ""))}</td>'
+            f'<td>{npc_count}</td>'
+            f'<td>{enc_count}</td>'
+            f'<td>{store_count}</td>'
+            f'</tr>'
+        )
+    body = (
+        "<h1>Areas</h1>"
+        f"<p>{len(db.areas)} areas total.</p>"
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>ResRef</th><th>Tileset</th><th>Size</th>"
+        "<th>NPCs</th><th>Encounters</th><th>Stores</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "areas" / "index.html", page("Areas", body, root_rel=".."))
+
+
+def render_area_page(db: Db, resref: str, out: Path) -> None:
+    a = db.areas.get(resref)
+    if not a:
+        return
+    name = db.area_name(resref)
+    sections: list[str] = []
+
+    # Header dl
+    width = fld(a, "Width", "")
+    height = fld(a, "Height", "")
+    tileset = fld(a, "Tileset", "")
+    tag = fld(a, "Tag", "")
+    on_enter = fld(a, "OnEnter", "")
+    on_exit = fld(a, "OnExit", "")
+    on_hb = fld(a, "OnHeartbeat", "")
+    on_user = fld(a, "OnUserDefined", "")
+
+    sections.append(f"<h1>{E(name)}</h1>")
+    sections.append(
+        '<dl class="meta">'
+        f'<dt>ResRef</dt><dd>{E(resref)}</dd>'
+        f'<dt>Tag</dt><dd>{E(tag)}</dd>'
+        f'<dt>Tileset</dt><dd>{E(tileset)}</dd>'
+        f'<dt>Size</dt><dd>{E(width)}×{E(height)} tiles</dd>'
+        f'<dt>OnEnter</dt><dd>{E(on_enter)}</dd>'
+        f'<dt>OnExit</dt><dd>{E(on_exit)}</dd>'
+        f'<dt>OnHeartbeat</dt><dd>{E(on_hb)}</dd>'
+        f'<dt>OnUserDefined</dt><dd>{E(on_user)}</dd>'
+        '</dl>'
+    )
+
+    # Transitions (out)
+    out_trans = [t for t in db.transitions if t["src_area"] == resref]
+    if out_trans:
+        sections.append("<h2>Outgoing transitions</h2>")
+        rows = []
+        for t in out_trans:
+            dst = t["dst_area"]
+            dst_link = (link(f"{dst}.html", db.area_name(dst))
+                        if dst else f'<em>(unresolved waypoint <code>{E(t["dst_tag"])}</code>)</em>')
+            rows.append(
+                f"<tr><td>{E(t['kind'])}</td>"
+                f"<td>{E(t['label'])}</td>"
+                f"<td>{dst_link}</td>"
+                f"<td><code>{E(t['dst_tag'])}</code></td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Kind</th><th>Label</th><th>Destination</th><th>Waypoint tag</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Transitions (in)
+    in_trans = [t for t in db.transitions if t["dst_area"] == resref]
+    if in_trans:
+        sections.append("<h2>Incoming transitions</h2>")
+        rows = []
+        for t in in_trans:
+            src = t["src_area"]
+            rows.append(
+                f"<tr><td>{E(t['kind'])}</td>"
+                f"<td>{link(f'{src}.html', db.area_name(src))}</td>"
+                f"<td>{E(t['label'])}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Kind</th><th>From</th><th>Label</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # NPCs / hostile residents — split by friendliness
+    npcs = db.area_npcs.get(resref, [])
+    friendly, hostile = [], []
+    for c in npcs:
+        fid = fld(c, "FactionID")
+        (friendly if db.is_friendly(fid) else hostile).append(c)
+
+    def npc_table(rows_data: list[dict], heading: str) -> None:
+        if not rows_data:
+            return
+        sections.append(f"<h2>{heading}</h2>")
+        rows = []
+        for c in rows_data:
+            rr = fld(c, "TemplateResRef", "") or ""
+            first = loc(c.get("FirstName"))
+            last = loc(c.get("LastName"))
+            disp = (first + " " + last).strip() or rr or "(unnamed)"
+            classes = list_items(c.get("ClassList"))
+            cls_str = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes
+            )
+            hp = fld(c, "MaxHitPoints", fld(c, "HitPoints", ""))
+            cr = fld(c, "ChallengeRating", "")
+            conv = fld(c, "Conversation", "")
+            name_cell = (link(f"../creatures/{rr}.html", disp)
+                         if rr in db.creatures else E(disp))
+            rows.append(
+                f"<tr><td>{name_cell}</td>"
+                f"<td>{E(rr)}</td>"
+                f"<td>{E(race_name(fld(c, 'Race')))}</td>"
+                f"<td>{E(cls_str)}</td>"
+                f"<td>{E(hp)}</td>"
+                f"<td>{E(cr)}</td>"
+                f"<td>{E(conv)}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th>"
+            "<th>HP</th><th>CR</th><th>Conversation</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    npc_table(friendly, "NPCs")
+    npc_table(hostile, "Hostile residents")
+
+    # Encounters
+    encs = db.area_encounters.get(resref, [])
+    if encs:
+        sections.append("<h2>Encounters</h2>")
+        rows = []
+        for e in encs:
+            tag = fld(e, "Tag", "")
+            rr = fld(e, "TemplateResRef", "")
+            blueprint = db.encounters.get(rr, {})
+            ename = loc(blueprint.get("LocalizedName")) or loc(e.get("LocalizedName")) or rr
+            max_c = fld(blueprint, "MaxCreatures", fld(e, "MaxCreatures", ""))
+            diff = fld(blueprint, "DifficultyIndex", fld(e, "DifficultyIndex", ""))
+            spawns = list_items(blueprint.get("CreatureList")) or list_items(e.get("CreatureList"))
+            spawn_cells = []
+            for s in spawns:
+                srr = fld(s, "ResRef", "")
+                cr = fld(s, "CR", "")
+                disp = db.creature_name(srr) if srr in db.creatures else srr
+                cell = (link(f"../creatures/{srr}.html", disp)
+                        if srr in db.creatures else E(disp))
+                spawn_cells.append(f"{cell}<small> CR {E(cr)}</small>")
+            rows.append(
+                f"<tr><td>{E(ename)}</td>"
+                f"<td>{E(rr)}</td>"
+                f"<td>{E(tag)}</td>"
+                f"<td>{E(max_c)}</td>"
+                f"<td>{E(diff)}</td>"
+                f"<td>{', '.join(spawn_cells) if spawn_cells else '—'}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>ResRef</th><th>Tag</th><th>Max</th><th>Diff</th><th>Spawn pool</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Placeables / chests with loot
+    placeables = db.area_placeables.get(resref, [])
+    chests = []
+    for p in placeables:
+        items = list_items(p.get("ItemList"))
+        if items:
+            chests.append((p, items))
+    if chests:
+        sections.append("<h2>Containers / loot</h2>")
+        rows = []
+        for p, items in chests:
+            tag = fld(p, "Tag", "")
+            rr = fld(p, "TemplateResRef", "")
+            pname = loc(p.get("LocName")) or tag or rr or "(unnamed)"
+            item_cells = []
+            for it in items:
+                irr = fld(it, "InventoryRes")
+                if not irr and "EquippedRes" in it:
+                    irr = fld(it, "EquippedRes")
+                disp = db.item_name(irr) if irr in db.items else (irr or "(unknown)")
+                cell = (link(f"../items/{irr}.html", disp)
+                        if irr in db.items else E(disp))
+                item_cells.append(cell)
+            rows.append(
+                f"<tr><td>{E(pname)}</td>"
+                f"<td>{E(tag)}</td>"
+                f"<td>{E(rr)}</td>"
+                f"<td>{', '.join(item_cells)}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Container</th><th>Tag</th><th>ResRef</th><th>Loot</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Stores in the area
+    stores = db.area_stores.get(resref, [])
+    if stores:
+        sections.append("<h2>Stores</h2>")
+        rows = []
+        for s in stores:
+            rr = fld(s, "ResRef", "") or fld(s, "TemplateResRef", "")
+            sname = db.store_name(rr) or fld(s, "Tag", "") or rr
+            cell = (link(f"../stores/{rr}.html", sname)
+                    if rr in db.stores else E(sname))
+            rows.append(f"<tr><td>{cell}</td><td>{E(rr)}</td></tr>")
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Store</th><th>ResRef</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Waypoints (just for completeness — useful for checking spawn-walk paths
+    # and trigger destinations)
+    wps = db.area_waypoints.get(resref, [])
+    if wps:
+        sections.append("<h2>Waypoints</h2>")
+        rows = []
+        for w in wps:
+            tag = fld(w, "Tag", "")
+            rr = fld(w, "TemplateResRef", "")
+            rows.append(f"<tr><td><code>{E(tag)}</code></td><td>{E(rr)}</td></tr>")
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Tag</th><th>ResRef</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    write(out / "areas" / f"{resref}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_creatures_index(db: Db, out: Path) -> None:
+    rows = []
+    for rr in sorted(db.creatures.keys(), key=lambda r: db.creature_name(r).lower()):
+        c = db.creatures[rr]
+        classes = list_items(c.get("ClassList"))
+        cls_str = "/".join(
+            f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+            for cl in classes
+        )
+        rows.append(
+            f"<tr><td>{link(f'{rr}.html', db.creature_name(rr))}</td>"
+            f"<td>{E(rr)}</td>"
+            f"<td>{E(race_name(fld(c, 'Race')))}</td>"
+            f"<td>{E(cls_str)}</td>"
+            f"<td>{E(fld(c, 'MaxHitPoints', ''))}</td>"
+            f"<td>{E(fld(c, 'ChallengeRating', ''))}</td></tr>"
+        )
+    body = (
+        "<h1>Creatures</h1>"
+        f"<p>{len(db.creatures)} creature blueprints.</p>"
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th><th>HP</th><th>CR</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "creatures" / "index.html", page("Creatures", body, root_rel=".."))
+
+
+def render_creature_page(db: Db, resref: str, out: Path) -> None:
+    c = db.creatures.get(resref)
+    if not c:
+        return
+    name = db.creature_name(resref)
+    classes = list_items(c.get("ClassList"))
+    cls_str = "/".join(
+        f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+        for cl in classes
+    )
+    feats = list_items(c.get("FeatList"))
+    skills = list_items(c.get("SkillList"))
+    equip = list_items(c.get("Equip_ItemList"))
+    inv = list_items(c.get("ItemList"))
+
+    sections = [
+        f"<h1>{E(name)}</h1>",
+        '<dl class="meta">',
+        f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
+        f"<dt>Tag</dt><dd>{E(fld(c, 'Tag', ''))}</dd>",
+        f"<dt>Race</dt><dd>{E(race_name(fld(c, 'Race')))}</dd>",
+        f"<dt>Appearance</dt><dd>{E(appearance_name(fld(c, 'Appearance_Type')))}</dd>",
+        f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
+        f"<dt>HP</dt><dd>{E(fld(c, 'MaxHitPoints', fld(c, 'HitPoints', '')))}</dd>",
+        f"<dt>CR</dt><dd>{E(fld(c, 'ChallengeRating', ''))}</dd>",
+        f"<dt>Faction</dt><dd>{E(fld(c, 'FactionID', ''))}</dd>",
+        f"<dt>Conversation</dt><dd>{E(fld(c, 'Conversation', ''))}</dd>",
+        '</dl>',
+        '<h2>Abilities</h2>',
+        '<table class="data"><tr>'
+        f"<th>Str</th><td>{E(fld(c, 'Str', ''))}</td>"
+        f"<th>Dex</th><td>{E(fld(c, 'Dex', ''))}</td>"
+        f"<th>Con</th><td>{E(fld(c, 'Con', ''))}</td>"
+        f"<th>Int</th><td>{E(fld(c, 'Int', ''))}</td>"
+        f"<th>Wis</th><td>{E(fld(c, 'Wis', ''))}</td>"
+        f"<th>Cha</th><td>{E(fld(c, 'Cha', ''))}</td>"
+        "</tr></table>",
+    ]
+
+    desc = loc(c.get("Description"))
+    if desc:
+        sections.append(f'<p class="desc">{E(desc)}</p>')
+
+    # Equipment
+    if equip:
+        sections.append("<h2>Equipment</h2>")
+        rows = []
+        for e in equip:
+            irr = fld(e, "EquippedRes", "")
+            cell = (link(f"../items/{irr}.html", db.item_name(irr))
+                    if irr in db.items else E(irr or "(empty)"))
+            slot = fld(e, "__struct_id", "")
+            rows.append(f"<tr><td>{E(slot)}</td><td>{cell}</td></tr>")
+        sections.append(
+            '<table class="data"><thead><tr><th>Slot</th><th>Item</th></tr></thead>'
+            "<tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Inventory
+    if inv:
+        sections.append("<h2>Inventory</h2>")
+        rows = []
+        for it in inv:
+            irr = fld(it, "InventoryRes", "")
+            cell = (link(f"../items/{irr}.html", db.item_name(irr))
+                    if irr in db.items else E(irr or "(unknown)"))
+            rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
+        sections.append(
+            '<table class="data"><thead><tr><th>Item</th><th>ResRef</th></tr></thead>'
+            "<tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Scripts
+    sections.append("<h2>Scripts</h2>")
+    script_fields = [
+        "ScriptHeartbeat", "ScriptOnNotice", "ScriptEndRound", "ScriptDialogue",
+        "ScriptAttacked", "ScriptDamaged", "ScriptDeath", "ScriptDisturbed",
+        "ScriptSpawn", "ScriptRested", "ScriptSpellAt", "ScriptUserDefine",
+        "ScriptOnBlocked",
+    ]
+    rows = []
+    for sf in script_fields:
+        v = fld(c, sf, "")
+        rows.append(f"<tr><td>{E(sf)}</td><td>{E(v)}</td></tr>")
+    sections.append(
+        '<table class="data"><thead><tr><th>Event</th><th>Script</th></tr></thead>'
+        "<tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+
+    # Counts of feats/skills (full lists are noisy)
+    if feats:
+        sections.append(f"<p>{len(feats)} feats.</p>")
+    if skills:
+        sections.append(f"<p>{len(skills)} skill entries.</p>")
+
+    # "Appears in" — areas that place this creature
+    appears = sorted({a for a, lst in db.area_npcs.items()
+                      for c2 in lst if fld(c2, "TemplateResRef") == resref})
+    if appears:
+        sections.append("<h2>Appears in</h2><ul>")
+        for a in appears:
+            sections.append(f"<li>{link(f'../areas/{a}.html', db.area_name(a))}</li>")
+        sections.append("</ul>")
+
+    write(out / "creatures" / f"{resref}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_items_index(db: Db, out: Path) -> None:
+    rows = []
+    for rr in sorted(db.items.keys(), key=lambda r: db.item_name(r).lower()):
+        i = db.items[rr]
+        rows.append(
+            f"<tr><td>{link(f'{rr}.html', db.item_name(rr))}</td>"
+            f"<td>{E(rr)}</td>"
+            f"<td>{E(baseitem_name(fld(i, 'BaseItem')))}</td>"
+            f"<td>{E(fld(i, 'Cost', ''))}</td>"
+            f"<td>{E(fld(i, 'StackSize', ''))}</td></tr>"
+        )
+    body = (
+        "<h1>Items</h1>"
+        f"<p>{len(db.items)} item blueprints.</p>"
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>ResRef</th><th>Base item</th><th>Cost</th><th>Stack</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "items" / "index.html", page("Items", body, root_rel=".."))
+
+
+def render_item_page(db: Db, resref: str, out: Path) -> None:
+    i = db.items.get(resref)
+    if not i:
+        return
+    name = db.item_name(resref)
+    props = list_items(i.get("PropertiesList"))
+    sections = [
+        f"<h1>{E(name)}</h1>",
+        '<dl class="meta">',
+        f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
+        f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
+        f"<dt>Base item</dt><dd>{E(baseitem_name(fld(i, 'BaseItem')))}</dd>",
+        f"<dt>Cost</dt><dd>{E(fld(i, 'Cost', ''))}</dd>",
+        f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
+        f"<dt>Cursed</dt><dd>{E(fld(i, 'Cursed', ''))}</dd>",
+        f"<dt>Plot</dt><dd>{E(fld(i, 'Plot', ''))}</dd>",
+        '</dl>',
+    ]
+    desc = loc(i.get("Description"))
+    if desc:
+        sections.append(f'<p class="desc">{E(desc)}</p>')
+
+    if props:
+        sections.append("<h2>Properties</h2>")
+        rows = []
+        for p in props:
+            rows.append(
+                f"<tr><td>{E(fld(p, 'PropertyName', ''))}</td>"
+                f"<td>{E(fld(p, 'Subtype', ''))}</td>"
+                f"<td>{E(fld(p, 'CostTable', ''))}</td>"
+                f"<td>{E(fld(p, 'CostValue', ''))}</td>"
+                f"<td>{E(fld(p, 'Param1', ''))}/{E(fld(p, 'Param1Value', ''))}</td>"
+                f"<td>{E(fld(p, 'ChanceAppear', ''))}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Property</th><th>Subtype</th><th>CostTable</th><th>CostValue</th>"
+            "<th>Param1/Val</th><th>Chance</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    write(out / "items" / f"{resref}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_stores_index(db: Db, out: Path) -> None:
+    rows = []
+    for rr in sorted(db.stores.keys(), key=lambda r: db.store_name(r).lower()):
+        s = db.stores[rr]
+        pages = list_items(s.get("StoreList"))
+        n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+        rows.append(
+            f"<tr><td>{link(f'{rr}.html', db.store_name(rr))}</td>"
+            f"<td>{E(rr)}</td>"
+            f"<td>{E(fld(s, 'Tag', ''))}</td>"
+            f"<td>{n_items}</td></tr>"
+        )
+    body = (
+        "<h1>Stores</h1>"
+        f"<p>{len(db.stores)} store blueprints.</p>"
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>ResRef</th><th>Tag</th><th>Items</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "stores" / "index.html", page("Stores", body, root_rel=".."))
+
+
+def render_store_page(db: Db, resref: str, out: Path) -> None:
+    s = db.stores.get(resref)
+    if not s:
+        return
+    name = db.store_name(resref)
+    pages = list_items(s.get("StoreList"))
+    page_names = ["Armor", "Misc", "Potions", "Rings", "Weapons"]
+    sections = [
+        f"<h1>{E(name)}</h1>",
+        '<dl class="meta">',
+        f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
+        f"<dt>Tag</dt><dd>{E(fld(s, 'Tag', ''))}</dd>",
+        f"<dt>MarkUp / MarkDown</dt><dd>{E(fld(s, 'MarkUp', ''))} / {E(fld(s, 'MarkDown', ''))}</dd>",
+        f"<dt>StoreGold</dt><dd>{E(fld(s, 'StoreGold', ''))}</dd>",
+        f"<dt>BlackMarket</dt><dd>{E(fld(s, 'BlackMarket', ''))}</dd>",
+        '</dl>',
+    ]
+    for idx, p in enumerate(pages):
+        page_label = page_names[idx] if idx < len(page_names) else f"Page {idx}"
+        items = list_items(p.get("ItemList"))
+        if not items:
+            continue
+        sections.append(f"<h2>{E(page_label)}</h2>")
+        rows = []
+        for it in items:
+            irr = fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
+            disp = db.item_name(irr) if irr in db.items else irr
+            cell = (link(f"../items/{irr}.html", disp)
+                    if irr in db.items else E(disp))
+            rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
+        sections.append(
+            '<table class="data"><thead><tr><th>Item</th><th>ResRef</th></tr></thead>'
+            "<tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    write(out / "stores" / f"{resref}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_factions(db: Db, out: Path) -> None:
+    if not db.fac:
+        write(out / "factions.html", page("Factions", "<h1>Factions</h1><p>(none)</p>"))
+        return
+    flist = list_items(db.fac.get("FactionList"))
+    rows = []
+    for i, f in enumerate(flist):
+        rows.append(
+            f"<tr><td>{i}</td>"
+            f"<td>{E(fld(f, 'FactionName', ''))}</td>"
+            f"<td>{E(fld(f, 'FactionParentID', ''))}</td>"
+            f"<td>{E(fld(f, 'FactionGlobal', ''))}</td></tr>"
+        )
+    body = (
+        "<h1>Factions</h1>"
+        '<table class="data"><thead><tr>'
+        "<th>ID</th><th>Name</th><th>Parent</th><th>Global</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "factions.html", page("Factions", body))
+
+
+def render_journal(db: Db, out: Path) -> None:
+    if not db.jrl:
+        write(out / "journal.html", page("Journal", "<h1>Journal</h1><p>(empty)</p>"))
+        return
+    cats = list_items(db.jrl.get("Categories"))
+    sections = [f"<h1>Journal</h1><p>{len(cats)} quests.</p>"]
+    for c in cats:
+        tag = fld(c, "Tag", "")
+        qname = loc(c.get("Name")) or tag
+        prio = fld(c, "Priority", "")
+        xp = fld(c, "XP", "")
+        sections.append(f"<h2>{E(qname)} <small>({E(tag)})</small></h2>")
+        sections.append(f"<p>Priority: {E(prio)} · XP: {E(xp)}</p>")
+        entries = list_items(c.get("EntryList"))
+        if entries:
+            rows = []
+            for e in entries:
+                eid = fld(e, "ID", "")
+                end = fld(e, "End", "")
+                txt = loc(e.get("Text"))
+                rows.append(
+                    f"<tr><td>{E(eid)}</td><td>{E('end' if end else '')}</td><td>{E(txt)}</td></tr>"
+                )
+            sections.append(
+                '<table class="data"><thead><tr><th>ID</th><th>End</th><th>Text</th></tr></thead>'
+                "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+    write(out / "journal.html", page("Journal", "\n".join(sections)))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--src", required=True, help="path to unpacked/ tree")
+    ap.add_argument("--out", required=True, help="path to output wiki/ dir")
+    ap.add_argument("--module-name", default=None,
+                    help="override module title (default: from module.ifo)")
+    ap.add_argument("--seed", type=int, default=1, help="layout RNG seed")
+    args = ap.parse_args()
+
+    src = Path(args.src).resolve()
+    out = Path(args.out).resolve()
+    if not src.is_dir():
+        print(f"error: --src not a directory: {src}", file=sys.stderr)
+        return 1
+
+    print(f"[nwn-wiki] reading {src}")
+    db = Db(src)
+    db.load()
+    db.index()
+
+    out.mkdir(parents=True, exist_ok=True)
+    # Disable Jekyll on GitHub Pages so files starting with _ etc. are served verbatim.
+    (out / ".nojekyll").touch()
+    # Copy bundled stylesheet (idempotent)
+    if ASSETS_DIR.is_dir():
+        (out / "assets").mkdir(parents=True, exist_ok=True)
+        for f in ASSETS_DIR.iterdir():
+            if f.is_file():
+                shutil.copy2(f, out / "assets" / f.name)
+
+    # Module title
+    title = args.module_name
+    if not title and db.ifo:
+        title = loc(db.ifo.get("Mod_Name")) or "NWN Module"
+    title = title or "NWN Module"
+
+    # Layout
+    print("[nwn-wiki] computing area layout")
+    t0 = time.time()
+    edges = []
+    for tr in db.transitions:
+        a, b = tr["src_area"], tr["dst_area"]
+        if a in db.areas and b in db.areas:
+            edges.append((a, b))
+    positions = layout_areas(
+        sorted(db.areas.keys()),
+        edges,
+        seed=args.seed,
+    )
+    print(f"  layout in {time.time() - t0:.1f}s")
+
+    print("[nwn-wiki] rendering pages")
+    t0 = time.time()
+    render_index(db, out, title, positions)
+    render_areas_index(db, out)
+    for resref in db.areas:
+        render_area_page(db, resref, out)
+    render_creatures_index(db, out)
+    for resref in db.creatures:
+        render_creature_page(db, resref, out)
+    render_items_index(db, out)
+    for resref in db.items:
+        render_item_page(db, resref, out)
+    render_stores_index(db, out)
+    for resref in db.stores:
+        render_store_page(db, resref, out)
+    render_factions(db, out)
+    render_journal(db, out)
+    print(f"  rendered in {time.time() - t0:.1f}s")
+
+    print(f"[nwn-wiki] done — {out}/index.html")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

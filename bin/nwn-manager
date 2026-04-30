@@ -1,112 +1,312 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# nwn-manager — unpack/repack Neverwinter Nights 1 modules for git-friendly,
-# LLM-editable workflows. Thin wrapper around `nasher` (squattingmonk/nasher)
+# nwn-manager — multi-module manager for NWN1 .mod files (git-friendly,
+# LLM-editable workflow). Thin wrapper around nasher (squattingmonk/nasher)
 # and the neverwinter.nim CLIs (niv/neverwinter.nim).
 
 PROG=$(basename "$0")
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 usage() {
   cat <<EOF
-$PROG — unpack/repack NWN1 .mod files for git.
+$PROG — multi-module manager for NWN1 .mod files.
 
 Usage:
-  $PROG unpack <module.mod>     Extract a .mod into ./src/ (creates nasher.cfg
-                                on first run via 'nasher init'; subsequent
-                                runs delegate to 'nasher unpack').
-  $PROG repack [args...]        Build .mod from ./src/ via 'nasher pack'.
-                                Extra args are passed through to nasher.
-  $PROG -h | --help             Show this help.
+  $PROG init <project-dir> <module.mod>
+                          Create a new module project. Initializes
+                          nasher.cfg, populates <dir>/unpacked/ from
+                          <module.mod>, writes .gitignore and a stub
+                          README.md.
 
-Layout (managed by nasher, not this wrapper):
-  nasher.cfg     project + target config — edit to rename output, change
-                 install dest, add HAK/TLK targets, etc.
-  src/           source tree (areas/, creatures/, dialogs/, scripts/, ...)
-                 GFFs are stored as JSON; scripts as .nss source only.
+  $PROG unpack [<module.mod>]
+                          Refresh ./unpacked/ from the .mod. With no
+                          argument, re-unpacks the path stored in
+                          .nasher/source. Run from inside a project
+                          (or any subdir).
+
+  $PROG repack [args...]  Build .mod from ./unpacked/ via 'nasher
+                          pack'. If a path is recorded in
+                          .nasher/source, copy the built .mod there.
+                          Extra args pass through to nasher.
+
+  $PROG wiki [--out <dir>] [args...]
+                          Generate a static HTML wiki from
+                          ./unpacked/ into <project>/docs/ (or --out).
+                          docs/ is the folder GitHub Pages publishes
+                          from. Extra args pass through to nwn-wiki.
+
+  $PROG -h | --help       Show this help.
+
+Per-project layout (created by 'init'):
+  nasher.cfg     project + target config (committed)
+  unpacked/      source tree of GFF JSON + .nss scripts (committed)
   dist/          packed .mod output (gitignored)
-  .nasher/       nasher's working cache (gitignored)
+  docs/          generated wiki — committed; GitHub Pages serves from here
+  .nasher/       nasher cache + last-used source path (gitignored)
 
 Prerequisites (must be on PATH):
   nasher              — nimble install nasher
   nwn_gff             — nimble install neverwinter
   nwn_script_comp     — nimble install neverwinter
+  python3             — for 'wiki' subcommand
 EOF
 }
 
 # Verify required external CLIs are available; print install hints if not.
 preflight() {
-  local missing=0
   declare -A HINT=(
     [nasher]="nimble install nasher"
     [nwn_gff]="nimble install neverwinter"
     [nwn_script_comp]="nimble install neverwinter"
+    [python3]="install Python 3 (system package)"
   )
-  for bin in nasher nwn_gff nwn_script_comp; do
+  local missing=0
+  for bin in "$@"; do
     if ! command -v "$bin" >/dev/null 2>&1; then
       echo "error: required tool '$bin' not on PATH" >&2
-      echo "       install with: ${HINT[$bin]}" >&2
+      [[ -n "${HINT[$bin]:-}" ]] && echo "       install with: ${HINT[$bin]}" >&2
       missing=1
     fi
   done
   [[ $missing -eq 0 ]] || exit 1
 }
 
-cmd_unpack() {
-  if [[ $# -lt 1 ]]; then
-    echo "error: unpack requires a path to a .mod file" >&2
-    echo "usage: $PROG unpack <module.mod>" >&2
+# Walk up from cwd to find a directory containing nasher.cfg.
+# Echoes the directory on success, returns 1 if not found.
+find_project_root() {
+  local d=$PWD
+  while [[ $d != "/" ]]; do
+    if [[ -f "$d/nasher.cfg" ]]; then
+      echo "$d"
+      return 0
+    fi
+    d=$(dirname "$d")
+  done
+  return 1
+}
+
+# nwn_erf chokes on apostrophes (and is fragile around spaces) in input
+# paths. Always invoke nasher against a sanitized symlink in /tmp.
+# Echoes the safe path.
+sanitize_mod_path() {
+  local src=$1
+  if [[ ! -f $src ]]; then
+    echo "error: $src not found" >&2
+    return 1
+  fi
+  local abs base clean link
+  abs=$(realpath "$src")
+  base=$(basename "$abs")
+  clean=$(printf '%s' "$base" | tr -c '[:alnum:]._-' '_')
+  link="/tmp/nwnmgr_${clean}"
+  ln -sfn "$abs" "$link"
+  printf '%s\n' "$link"
+}
+
+# Print a one-line summary of unpacked/ contents.
+print_unpacked_summary() {
+  [[ -d unpacked ]] || return 0
+  local total
+  total=$(find unpacked -type f | wc -l)
+  echo "[$PROG] unpacked/ summary:"
+  echo "  total files: $total"
+  find unpacked -type f \
+    | sed -n 's/.*\.\([^./]*\)$/\1/p' \
+    | sort | uniq -c | sort -rn \
+    | sed 's/^/  /'
+}
+
+cmd_init() {
+  if [[ $# -lt 2 ]]; then
+    echo "error: init requires <project-dir> <module.mod>" >&2
+    echo "usage: $PROG init <project-dir> <module.mod>" >&2
     exit 2
   fi
-  local mod=$1
-  if [[ ! -f $mod ]]; then
-    echo "error: $mod not found" >&2
+  local project=$1 mod=$2
+  if [[ -e $project && -n "$(ls -A "$project" 2>/dev/null)" ]]; then
+    echo "error: $project exists and is not empty" >&2
     exit 1
   fi
-  cd "$PROJECT_ROOT"
-  if [[ ! -f nasher.cfg ]]; then
-    echo "[$PROG] initializing project from $mod"
-    # --default + --skipPkgInfo + --yes runs non-interactively, accepting
-    # nasher's defaults for project metadata. Edit nasher.cfg afterwards
-    # to customize name, version, author, output filename, etc.
-    nasher init --default --skipPkgInfo --yes . "$mod"
-  else
-    echo "[$PROG] nasher.cfg present — re-unpacking $mod"
-    # Subsequent unpacks: pass the mod through. nasher will pick the default
-    # target from nasher.cfg.
-    nasher unpack --yes "$mod"
+  if [[ ! -f $mod ]]; then
+    echo "error: module not found: $mod" >&2
+    exit 1
   fi
+
+  local mod_abs
+  mod_abs=$(realpath "$mod")
+  mkdir -p "$project"
+  project=$(realpath "$project")
+  cd "$project"
+
+  local clean_mod
+  clean_mod=$(sanitize_mod_path "$mod_abs")
+
+  echo "[$PROG] initializing $project from $mod_abs"
+  # nasher init creates nasher.cfg and a src/ tree from the .mod.
+  # --default + --skipPkgInfo + --yes keeps it non-interactive. We
+  # post-rewrite src → unpacked below.
+  nasher init --default --skipPkgInfo --yes . "$clean_mod"
+
   if [[ -d src ]]; then
-    echo "[$PROG] src/ summary:"
-    local total
-    total=$(find src -type f | wc -l)
-    echo "  total files: $total"
-    find src -type f \
-      | sed -n 's/.*\.\([^./]*\)$/\1/p' \
-      | sort | uniq -c | sort -rn \
-      | sed 's/^/  /'
+    mv src unpacked
   fi
+  # Patch nasher.cfg: src → unpacked in include + rules.
+  sed -i \
+    -e 's|"src/\*\*|"unpacked/**|g' \
+    -e 's|"\*" = "src"|"*" = "unpacked"|g' \
+    nasher.cfg
+
+  mkdir -p .nasher
+  printf '%s\n' "$mod_abs" > .nasher/source
+
+  # Per-project .gitignore.
+  cat > .gitignore <<'EOF'
+/.nasher/
+/dist/
+*.mod
+*.ncs
+*.erf
+*.hak
+EOF
+
+  # Stub README (don't overwrite if the user-or-nasher already wrote one).
+  if [[ ! -f README.md ]]; then
+    local mod_basename
+    mod_basename=$(basename "$mod_abs")
+    cat > README.md <<EOF
+# $(basename "$project")
+
+NWN1 module project unpacked from \`$mod_basename\` for git-friendly,
+LLM-editable editing.
+
+## Workflow
+
+\`\`\`
+nwn-manager unpack       # refresh unpacked/ from the .mod
+# edit JSON / .nss in unpacked/
+nwn-manager repack       # build .mod and copy back to install location
+nwn-manager wiki         # regenerate docs/ (committed; published by GitHub Pages)
+\`\`\`
+
+The source/install path is recorded in \`.nasher/source\` (per-machine,
+gitignored). Pass an explicit path to \`unpack\` to point at a different
+.mod.
+EOF
+  fi
+
+  print_unpacked_summary
+  echo "[$PROG] project ready at: $project"
+}
+
+cmd_unpack() {
+  local root
+  root=$(find_project_root) || {
+    echo "error: not inside an nwn-manager project (no nasher.cfg found above $PWD)" >&2
+    echo "       run '$PROG init <dir> <module.mod>' to create one" >&2
+    exit 1
+  }
+  cd "$root"
+
+  local mod=""
+  if [[ $# -ge 1 ]]; then
+    mod=$(realpath "$1")
+    [[ -f $mod ]] || { echo "error: $mod not found" >&2; exit 1; }
+    mkdir -p .nasher
+    printf '%s\n' "$mod" > .nasher/source
+  elif [[ -f .nasher/source ]]; then
+    mod=$(cat .nasher/source)
+    [[ -f $mod ]] || {
+      echo "error: stored source $mod no longer exists" >&2
+      echo "       pass an explicit path: $PROG unpack <module.mod>" >&2
+      exit 1
+    }
+  else
+    echo "error: no .nasher/source recorded; pass <module.mod> explicitly" >&2
+    exit 1
+  fi
+
+  local clean_mod
+  clean_mod=$(sanitize_mod_path "$mod")
+  echo "[$PROG] unpacking $mod → $root/unpacked/"
+  nasher unpack --yes --file:"$clean_mod"
+
+  print_unpacked_summary
 }
 
 cmd_repack() {
-  cd "$PROJECT_ROOT"
-  if [[ ! -f nasher.cfg ]]; then
-    echo "error: no nasher.cfg in $PROJECT_ROOT — run '$PROG unpack' first" >&2
+  local root
+  root=$(find_project_root) || {
+    echo "error: not inside an nwn-manager project (no nasher.cfg found above $PWD)" >&2
     exit 1
-  fi
-  nasher pack "$@"
+  }
+  cd "$root"
+
+  nasher pack --yes "$@"
+
   if [[ -d dist ]]; then
     echo "[$PROG] dist/ contents:"
     ls -lh dist/ | tail -n +2 | sed 's/^/  /'
   fi
+
+  if [[ -f .nasher/source ]]; then
+    local install built
+    install=$(cat .nasher/source)
+    built=$(ls -t dist/*.mod 2>/dev/null | head -1 || true)
+    if [[ -z $built ]]; then
+      echo "[$PROG] no .mod in dist/ — skipping install copy" >&2
+      return 0
+    fi
+    if [[ ! -d $(dirname "$install") ]]; then
+      echo "[$PROG] install dir $(dirname "$install") does not exist — skipping copy" >&2
+      return 0
+    fi
+    cp -v "$built" "$install"
+    echo "[$PROG] installed to: $install"
+  fi
+}
+
+cmd_wiki() {
+  local root
+  root=$(find_project_root) || {
+    echo "error: not inside an nwn-manager project (no nasher.cfg found above $PWD)" >&2
+    exit 1
+  }
+  cd "$root"
+  local out=docs
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out)
+        [[ -n ${2:-} ]] || { echo "error: --out requires a directory" >&2; exit 2; }
+        out=$2; shift 2
+        ;;
+      *) break ;;
+    esac
+  done
+  exec "$SCRIPT_DIR/nwn-wiki" --src unpacked --out "$out" "$@"
 }
 
 main() {
   case "${1:-}" in
-    unpack)        shift; preflight; cmd_unpack "$@" ;;
-    repack)        shift; preflight; cmd_repack "$@" ;;
-    -h|--help|"")  usage ;;
+    init)
+      shift; preflight nasher nwn_gff nwn_script_comp
+      cmd_init "$@"
+      ;;
+    unpack)
+      shift; preflight nasher nwn_gff nwn_script_comp
+      cmd_unpack "$@"
+      ;;
+    repack)
+      shift; preflight nasher nwn_gff nwn_script_comp
+      cmd_repack "$@"
+      ;;
+    wiki)
+      shift; preflight python3
+      cmd_wiki "$@"
+      ;;
+    -h|--help|"")
+      usage
+      ;;
     *)
       echo "error: unknown subcommand: $1" >&2
       usage >&2

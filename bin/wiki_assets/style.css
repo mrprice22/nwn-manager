@@ -1,0 +1,168 @@
+/* nwn-wiki — base stylesheet for generated module wikis. */
+
+:root {
+  --fg: #1f1f1f;
+  --bg: #fafaf6;
+  --muted: #6b6b6b;
+  --accent: #6b3a1c;
+  --accent-soft: #c8a577;
+  --border: #d6d2c4;
+  --card: #fff;
+  --hostile: #a13a2c;
+  --friendly: #2d6a3a;
+  --link: #5a3210;
+  --link-hover: #a05a1c;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Iowan Old Style", Georgia, "Times New Roman", serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+body { padding: 0; }
+
+a { color: var(--link); text-decoration: none; }
+a:hover { color: var(--link-hover); text-decoration: underline; }
+
+header.site {
+  background: var(--accent);
+  color: #fff;
+  padding: 0.75em 1.5em;
+  border-bottom: 4px solid var(--accent-soft);
+}
+header.site a { color: #fff; }
+header.site h1 {
+  margin: 0;
+  font-size: 1.4em;
+  font-weight: normal;
+  letter-spacing: 0.02em;
+}
+header.site nav {
+  margin-top: 0.4em;
+  font-size: 0.9em;
+}
+header.site nav a { margin-right: 1.2em; }
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5em;
+}
+
+h1, h2, h3 {
+  font-family: "Iowan Old Style", Georgia, serif;
+  color: var(--accent);
+  font-weight: normal;
+}
+h1 { font-size: 1.8em; margin-top: 0; }
+h2 {
+  font-size: 1.3em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.2em;
+  margin-top: 1.6em;
+}
+h3 { font-size: 1.1em; margin-top: 1.2em; }
+
+.muted { color: var(--muted); }
+.tag {
+  display: inline-block;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.85em;
+  background: rgba(0,0,0,0.05);
+  padding: 0.05em 0.4em;
+  border-radius: 3px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2em 1em;
+  margin: 0.5em 0 1em;
+}
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5em 0 1em;
+  background: var(--card);
+}
+th, td {
+  text-align: left;
+  padding: 0.4em 0.6em;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th {
+  background: rgba(107, 58, 28, 0.08);
+  font-weight: normal;
+  color: var(--accent);
+}
+tr:hover td { background: rgba(0,0,0,0.02); }
+
+.hostile  { color: var(--hostile);  }
+.friendly { color: var(--friendly); }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  padding: 1em 1.2em;
+  margin: 0.8em 0;
+  border-radius: 4px;
+}
+
+footer.site {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85em;
+  padding: 1.5em 0 2em;
+}
+
+/* The giant area map */
+.map-wrap {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin: 1em 0;
+  overflow: auto;
+}
+.map-wrap svg { display: block; max-width: 100%; height: auto; }
+.map-legend {
+  font-size: 0.85em;
+  color: var(--muted);
+  padding: 0.5em 1em;
+  border-top: 1px solid var(--border);
+}
+.map-legend .swatch {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.4em;
+  vertical-align: middle;
+  margin-right: 0.3em;
+}
+
+/* SVG node defaults (overridable inline) */
+svg .area-node rect {
+  fill: #fff;
+  stroke: var(--accent);
+  stroke-width: 1.2;
+}
+svg .area-node:hover rect {
+  fill: var(--accent-soft);
+}
+svg .area-node text {
+  fill: var(--fg);
+  font-size: 11px;
+  pointer-events: none;
+}
+svg .edge-trigger { stroke: #6b3a1c; stroke-width: 1; opacity: 0.6; fill: none; }
+svg .edge-door    { stroke: #2d6a3a; stroke-width: 1; opacity: 0.6; fill: none; }
+svg .external-node rect { fill: #ddd; stroke: #999; stroke-dasharray: 3,3; }
