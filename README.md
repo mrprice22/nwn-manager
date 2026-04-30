@@ -26,7 +26,8 @@ CLI:
 nwn_manager/
   bin/nwn-manager        the wrapper CLI
   bin/nwn-wiki           the wiki generator (Python 3, stdlib only)
-  bin/wiki_data/         bundled 2DA → name lookups (classes, baseitems, …)
+  bin/wiki_data/         bundled 2DA → name lookups (classes, baseitems,
+                         item properties, …)
   bin/wiki_assets/       bundled wiki stylesheet
 ```
 
@@ -151,17 +152,30 @@ and open `http://localhost:8000/` in that case.
 
 Builds a static, multi-page HTML wiki from `unpacked/`:
 
-- `index.html` — module overview and a giant force-directed SVG map of
-  every area, linked by the trigger and door transitions between them.
-  Click an area on the map to jump to its page.
+- `index.html` — module overview and a directional SVG map of every
+  area. Box dimensions are scaled to each area's tile size (Width ×
+  Height); transition X/Y is used to bias each connected area to the
+  correct N/E/S/W of its neighbour, so the resulting map respects
+  in-game orientation rather than producing a force-directed blob. Click
+  any area to open its page.
 - `areas/<resref>.html` — per-area page listing NPCs (friendly /
-  hostile), encounter spawn pools, chest loot, store inventories, and
-  the in/out transitions.
+  hostile), encounter spawn pools, store inventories, in/out
+  transitions, and a **Containers** table (placeables with non-empty
+  inventory) showing item count, X/Y/Z position, locked state, and open
+  DC. Each container name links to a per-container detail page.
+- `containers/<area>-<idx>.html` — full detail per container:
+  appearance, HP / hardness, plot/static/useable flags, lock + key
+  state, trap fields, and the contents table with base item and cost.
 - `creatures/`, `items/`, `stores/` — sortable tables and per-resref
-  detail pages for every creature, item, and store in the module.
+  detail pages. Item pages render `PropertiesList` in human terms
+  (e.g. `PropertyName 6, CostValue 4` → "Enhancement Bonus +4") with the
+  raw values preserved in a collapsible panel for cases where a custom
+  HAK overrides the stock 2DA. Base item names always show the raw
+  baseitems.2da row alongside the stock label, since CEP and similar
+  HAKs frequently override rows — the row number is authoritative when
+  the label disagrees with the in-game item.
 - `factions.html`, `journal.html` — module-level data.
-- `assets/style.css`, `assets/data.json` — bundled stylesheet and the
-  raw graph for any future client-side enhancements.
+- `assets/style.css` — bundled stylesheet.
 
 The wiki is **never** rebuilt automatically. `repack` does not trigger
 it; run `nwn-manager wiki` explicitly when you want fresh output.

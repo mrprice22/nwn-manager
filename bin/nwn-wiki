@@ -89,10 +89,40 @@ RACES = _load_lookup("racialtypes")
 APPEARANCE = _load_lookup("appearance")
 
 
+def _load_itemprops() -> dict:
+    p = DATA_DIR / "itemprops.json"
+    if not p.exists():
+        return {"properties": {}, "tables": {}}
+    return json.loads(p.read_text())
+
+
+ITEMPROPS = _load_itemprops()
+IPROP_DEFS: dict[int, dict] = {int(k): v for k, v in ITEMPROPS.get("properties", {}).items()}
+IPROP_TABLES: dict[str, dict] = ITEMPROPS.get("tables", {})
+
+
 def baseitem_name(row: int | None) -> str:
+    """Stock baseitems.2da lookup. Custom HAKs (CEP, etc.) often add rows
+    beyond stock; for those we surface the row number explicitly so the
+    reader knows the label is a guess."""
     if row is None:
         return ""
-    return BASEITEMS.get(int(row), f"BaseItem #{row}")
+    r = int(row)
+    if r in BASEITEMS:
+        return BASEITEMS[r]
+    return f"BaseItem #{r}"
+
+
+def baseitem_label(row: int | None) -> str:
+    """Human label for an item's base type, with the row number always
+    preserved (CEP/custom HAKs override many rows so the stock name is a hint
+    rather than ground truth)."""
+    if row is None:
+        return ""
+    r = int(row)
+    if r in BASEITEMS:
+        return f"{BASEITEMS[r]} <small class=\"muted\">(row {r})</small>"
+    return f"BaseItem #{r}"
 
 
 def class_name(row: int | None) -> str:
@@ -111,6 +141,103 @@ def appearance_name(row: int | None) -> str:
     if row is None:
         return ""
     return APPEARANCE.get(int(row), f"Appearance #{row}")
+
+
+# ---------------------------------------------------------------------------
+# Item property formatting
+# ---------------------------------------------------------------------------
+
+# Subtype lookups whose values come from non-iprp tables we already loaded.
+_NON_IPRP_SUBTYPES = {
+    "racialtypes": lambda i: race_name(i),
+    "classes": lambda i: class_name(i),
+}
+
+
+def _table_lookup(table_name: str | None, idx: int | None) -> str | None:
+    """Resolve a per-property numeric index to a label.
+
+    Order of resolution:
+      1. Non-iprp tables (classes, races) handled directly.
+      2. Explicit row entry in the JSON (e.g. "0": "+1").
+      3. Format string fallback ("_format": "+{}") — used when a table is a
+         simple identity progression and we don't want to hand-list every row.
+
+    Empirically the engine often stores the numeric *value* directly in
+    CostValue rather than a row index (e.g. CostValue=4 ⇒ "+4"), so the
+    format-string path matters more than per-row lookups for the common
+    "+N" tables.
+    """
+    if not table_name or idx is None:
+        return None
+    if table_name in _NON_IPRP_SUBTYPES:
+        return _NON_IPRP_SUBTYPES[table_name](idx)
+    tbl = IPROP_TABLES.get(table_name)
+    if not tbl:
+        return None
+    key = str(int(idx))
+    if key in tbl:
+        return tbl[key]
+    fmt = tbl.get("_format")
+    if isinstance(fmt, str):
+        return fmt.format(int(idx))
+    return None
+
+
+def itemprop_format(prop: dict) -> dict[str, str]:
+    """Translate one PropertiesList entry to display fields.
+
+    Returns: {property, subtype, cost, param, chance}
+    Falls back to raw numbers when a lookup is missing.
+    """
+    pname_id = fld(prop, "PropertyName")
+    subtype_id = fld(prop, "Subtype")
+    cost_table_id = fld(prop, "CostTable")
+    cost_value = fld(prop, "CostValue")
+    param1 = fld(prop, "Param1")
+    param1_value = fld(prop, "Param1Value")
+    chance = fld(prop, "ChanceAppear", 100)
+
+    pdef = IPROP_DEFS.get(int(pname_id), {}) if pname_id is not None else {}
+    pname = pdef.get("name") or (f"Property #{pname_id}" if pname_id is not None else "")
+
+    # Subtype: per-property table (e.g. Damage Bonus → damage type name)
+    subtype_str = ""
+    if subtype_id is not None:
+        st_tbl = pdef.get("subtype")
+        sval = _table_lookup(st_tbl, subtype_id) if st_tbl else None
+        subtype_str = sval if sval is not None else (str(subtype_id) if subtype_id != 0 else "")
+
+    # Cost: indexes a per-property cost table (e.g. +1..+20). Fall back to raw.
+    cost_str = ""
+    if cost_value is not None:
+        ct_tbl = pdef.get("cost_table")
+        cval = _table_lookup(ct_tbl, cost_value) if ct_tbl else None
+        cost_str = cval if cval is not None else str(cost_value)
+
+    # Param1: 255 is the engine "no param" sentinel.
+    param_str = ""
+    if param1 is not None and int(param1) != 255:
+        param_str = f"{param1}/{param1_value if param1_value is not None else 0}"
+
+    return {
+        "property": pname,
+        "subtype": subtype_str,
+        "cost": cost_str,
+        "param": param_str,
+        "chance": "" if chance == 100 else str(chance),
+    }
+
+
+def itemprop_oneliner(prop: dict) -> str:
+    """Compact single-line summary (used in tooltips / loot lists)."""
+    f = itemprop_format(prop)
+    bits = [f["property"]]
+    if f["subtype"]:
+        bits.append(f["subtype"])
+    if f["cost"]:
+        bits.append(f["cost"])
+    return " ".join(b for b in bits if b)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +274,9 @@ class Db:
         self.area_triggers: dict[str, list[dict]] = defaultdict(list)
         self.area_doors: dict[str, list[dict]] = defaultdict(list)
         self.area_waypoints: dict[str, list[dict]] = defaultdict(list)
+        # Containers = placeables with a non-empty ItemList. Stored as a
+        # parallel list keyed by area resref + ordinal for stable URLs.
+        self.area_containers: dict[str, list[dict]] = defaultdict(list)
         self.faction_friendly: dict[int, bool] = {}  # FactionID → friendly to PC?
 
         # nss script index (resref → relative path) — used for "this script
@@ -261,6 +391,8 @@ class Db:
                 self.area_doors[area_resref].append(d)
 
         # Build transitions from triggers + doors.
+        # Transition X/Y is captured in *area metres* (10 m per tile) so the
+        # map layout can tell which edge each transition exits from.
         for area_resref, triggers in self.area_triggers.items():
             for t in triggers:
                 linked = fld(t, "LinkedTo")
@@ -274,6 +406,8 @@ class Db:
                     "kind": "trigger",
                     "label": fld(t, "Tag", "") or fld(t, "TemplateResRef", "") or "",
                     "src_resref": fld(t, "TemplateResRef", ""),
+                    "src_x": fld(t, "XPosition"),
+                    "src_y": fld(t, "YPosition"),
                 })
         for area_resref, doors in self.area_doors.items():
             for d in doors:
@@ -288,7 +422,16 @@ class Db:
                     "kind": "door",
                     "label": fld(d, "Tag", "") or fld(d, "TemplateResRef", "") or "",
                     "src_resref": fld(d, "TemplateResRef", ""),
+                    "src_x": fld(d, "X"),
+                    "src_y": fld(d, "Y"),
                 })
+
+        # Containers: placeables that hold an inventory.
+        for area_resref, placeables in self.area_placeables.items():
+            for idx, p in enumerate(placeables):
+                items = list_items(p.get("ItemList"))
+                if items:
+                    self.area_containers[area_resref].append({"idx": idx, "p": p})
         print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
               f"{len(self.transitions)} transitions, "
               f"{len(self.creatures)} creatures, {len(self.items)} items")
@@ -329,84 +472,193 @@ class Db:
 
 
 # ---------------------------------------------------------------------------
-# Force-directed area layout (Fruchterman-Reingold).
+# Directional area layout
 # ---------------------------------------------------------------------------
+#
+# NWN areas are tile grids: the in-game X axis runs east, the Y axis runs
+# north. A trigger or door at X≈Width*10 sits on the east edge of its area —
+# meaning the area it links to "is to the east" in the player's mental map.
+# We exploit that to place adjacent areas on the correct side of each other,
+# so the resulting overview map looks like a real overworld instead of a
+# random force-directed blob.
+
+def _transition_dir(tr: dict, src_w: float, src_h: float) -> tuple[float, float] | None:
+    """Unit vector pointing out of the source area in the direction the
+    transition exits. Returns None if the transition has no usable position
+    or is well inside the area (we don't want noise near the centre to push
+    nodes around)."""
+    x, y = tr.get("src_x"), tr.get("src_y")
+    if x is None or y is None or src_w <= 0 or src_h <= 0:
+        return None
+    # Distance from each edge (in metres).
+    d_w = x                  # west
+    d_e = src_w - x          # east
+    d_s = y                  # south
+    d_n = src_h - y          # north
+    # Closest edge wins; ignore transitions deep inside the area.
+    edges = [("w", d_w, (-1.0, 0.0)),
+             ("e", d_e, (1.0, 0.0)),
+             ("s", d_s, (0.0, -1.0)),
+             ("n", d_n, (0.0, 1.0))]
+    edges.sort(key=lambda e: e[1])
+    name, dist, vec = edges[0]
+    # Threshold = 25% of the smaller dimension. Anything further from any
+    # edge is ambiguous (e.g. internal door inside a building).
+    thresh = 0.25 * min(src_w, src_h)
+    if dist > thresh:
+        return None
+    return vec
+
 
 def layout_areas(
     node_ids: list[str],
     edges: list[tuple[str, str]],
     *,
-    width: float = 4000.0,
-    height: float = 3000.0,
-    iterations: int = 250,
+    db: "Db | None" = None,
+    iterations: int = 600,
     seed: int = 1,
-) -> dict[str, tuple[float, float]]:
-    """Return {node_id → (x, y)} for area-graph layout."""
+) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]]]:
+    """Place areas on a 2D canvas, biased toward each transition's edge
+    direction so the resulting map respects in-game orientation.
+
+    Returns (positions, sizes). Sizes are in the same units as positions
+    (one unit ≈ one tile, so a 16×10 area becomes a 16×10 box). Positions
+    are box centres.
+    """
     if not node_ids:
-        return {}
+        return {}, {}
     rng = random.Random(seed)
-    n = len(node_ids)
-    pos = {nid: [rng.uniform(0, width), rng.uniform(0, height)] for nid in node_ids}
 
-    # Build adjacency as id pairs for speed.
-    edge_pairs = [(a, b) for a, b in edges if a in pos and b in pos and a != b]
+    # Box size in tile units, padded so adjacent boxes have visual breathing
+    # room on the rendered map.
+    sizes: dict[str, tuple[float, float]] = {}
+    for nid in node_ids:
+        a = db.areas.get(nid, {}) if db else {}
+        w = float(fld(a, "Width", 8) or 8)
+        h = float(fld(a, "Height", 8) or 8)
+        sizes[nid] = (max(w, 4.0), max(h, 4.0))
 
-    area = width * height
-    k = math.sqrt(area / max(n, 1))
-    t = max(width, height) / 8.0  # initial temperature
+    # Initial spread: scatter on a wide canvas so attractive forces have
+    # room to pull connected components together.
+    avg_dim = sum(w + h for w, h in sizes.values()) / max(1, 2 * len(sizes))
+    spread = avg_dim * math.sqrt(len(node_ids)) * 1.2
+    pos = {nid: [rng.uniform(-spread, spread), rng.uniform(-spread, spread)]
+           for nid in node_ids}
+
+    # Per-edge desired direction (averaged over both endpoints' transitions).
+    edge_dirs: dict[tuple[str, str], tuple[float, float]] = {}
+    if db is not None:
+        for tr in db.transitions:
+            a, b = tr["src_area"], tr["dst_area"]
+            if a not in pos or not b or b not in pos or a == b:
+                continue
+            sw, sh = sizes[a]
+            v = _transition_dir(tr, sw * 10.0, sh * 10.0)  # tile→metres
+            if v is None:
+                continue
+            cur = edge_dirs.get((a, b), (0.0, 0.0))
+            edge_dirs[(a, b)] = (cur[0] + v[0], cur[1] + v[1])
+    # Normalise.
+    for k, v in list(edge_dirs.items()):
+        m = math.hypot(*v)
+        if m > 1e-6:
+            edge_dirs[k] = (v[0] / m, v[1] / m)
+
+    # Adjacency for attractive forces.
+    edge_pairs = [(a, b) for a, b in edges
+                  if a in pos and b in pos and a != b]
+
+    # "Ideal" edge length: enough that two boxes don't overlap, plus margin.
+    def ideal_len(a: str, b: str) -> float:
+        wa, ha = sizes[a]
+        wb, hb = sizes[b]
+        return 0.5 * (max(wa, ha) + max(wb, hb)) + avg_dim * 1.2
+
+    t = spread / 4.0
     cooling = t / iterations
 
-    for it in range(iterations):
+    for _ in range(iterations):
         disp = {nid: [0.0, 0.0] for nid in pos}
-        # Repulsive forces (O(n^2))
+
+        # Repulsion — only between boxes whose AABBs are close enough to
+        # potentially overlap, with a soft falloff.
         ids = list(pos.keys())
         for i, u in enumerate(ids):
             ux, uy = pos[u]
+            uw, uh = sizes[u]
             for v in ids[i + 1:]:
                 vx, vy = pos[v]
+                vw, vh = sizes[v]
+                # AABB overlap distance in each axis (negative = overlap).
+                gap_x = abs(ux - vx) - 0.5 * (uw + vw) - avg_dim * 0.4
+                gap_y = abs(uy - vy) - 0.5 * (uh + vh) - avg_dim * 0.4
+                gap = max(gap_x, gap_y)
+                if gap > avg_dim * 4:
+                    continue  # far apart; no force
                 dx = ux - vx
                 dy = uy - vy
-                d2 = dx * dx + dy * dy
-                if d2 < 1e-3:
+                d = math.hypot(dx, dy)
+                if d < 1e-3:
                     dx = rng.uniform(-0.5, 0.5)
                     dy = rng.uniform(-0.5, 0.5)
-                    d2 = dx * dx + dy * dy + 1e-3
-                d = math.sqrt(d2)
-                f = k * k / d
-                fx, fy = dx / d * f, dy / d * f
+                    d = math.hypot(dx, dy) + 1e-3
+                # Strong push when overlapping, gentle nudge when close.
+                strength = (avg_dim * 6.0) ** 2 / max(d, 1.0)
+                if gap < 0:
+                    strength *= 6.0
+                fx, fy = dx / d * strength, dy / d * strength
                 disp[u][0] += fx
                 disp[u][1] += fy
                 disp[v][0] -= fx
                 disp[v][1] -= fy
 
-        # Attractive forces (edges).
+        # Attractive forces toward an ideal length, with directional bias.
         for a, b in edge_pairs:
             ax, ay = pos[a]
             bx, by = pos[b]
-            dx = ax - bx
-            dy = ay - by
-            d = math.sqrt(dx * dx + dy * dy) + 1e-3
-            f = d * d / k
+            dx = bx - ax
+            dy = by - ay
+            d = math.hypot(dx, dy) + 1e-6
+            L = ideal_len(a, b)
+            # Spring toward L
+            f = (d - L) * 0.04
             fx, fy = dx / d * f, dy / d * f
-            disp[a][0] -= fx
-            disp[a][1] -= fy
-            disp[b][0] += fx
-            disp[b][1] += fy
+            disp[a][0] += fx
+            disp[a][1] += fy
+            disp[b][0] -= fx
+            disp[b][1] -= fy
 
-        # Apply with temperature limit.
+            # Directional bias: dst should be at src + L*dir (and vice versa
+            # for dst→src direction if recorded).
+            for s, t_id, sign in [(a, b, 1.0), (b, a, -1.0)]:
+                v = edge_dirs.get((s, t_id))
+                if v is None:
+                    continue
+                # Target offset of t_id from s.
+                target_dx = v[0] * L
+                target_dy = v[1] * L
+                cur_dx = pos[t_id][0] - pos[s][0]
+                cur_dy = pos[t_id][1] - pos[s][1]
+                err_x = target_dx - cur_dx
+                err_y = target_dy - cur_dy
+                bias = 0.06
+                disp[t_id][0] += err_x * bias
+                disp[t_id][1] += err_y * bias
+                disp[s][0]    -= err_x * bias * 0.5
+                disp[s][1]    -= err_y * bias * 0.5
+
+        # Apply, capped by current temperature.
         for nid in ids:
             dx, dy = disp[nid]
-            d = math.sqrt(dx * dx + dy * dy) + 1e-9
+            d = math.hypot(dx, dy) + 1e-9
             scale = min(d, t) / d
             pos[nid][0] += dx * scale
             pos[nid][1] += dy * scale
-            # Keep inside bounds
-            pos[nid][0] = min(width - 10, max(10, pos[nid][0]))
-            pos[nid][1] = min(height - 10, max(10, pos[nid][1]))
 
-        t = max(0.1, t - cooling)
+        t = max(0.5, t - cooling)
 
-    return {nid: (pos[nid][0], pos[nid][1]) for nid in pos}
+    # Flip Y to screen coords (NWN +Y = north; SVG +Y = down).
+    return ({nid: (pos[nid][0], -pos[nid][1]) for nid in pos}, sizes)
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +716,9 @@ def write(path: Path, content: str) -> None:
 # Renderers
 # ---------------------------------------------------------------------------
 
-def render_index(db: Db, out: Path, module_title: str, positions: dict[str, tuple[float, float]]) -> None:
+def render_index(db: Db, out: Path, module_title: str,
+                 positions: dict[str, tuple[float, float]],
+                 sizes: dict[str, tuple[float, float]]) -> None:
     # Module overview block
     ifo = db.ifo or {}
     start_area = fld(ifo, "Mod_Entry_Area", "")
@@ -500,24 +754,53 @@ def render_index(db: Db, out: Path, module_title: str, positions: dict[str, tupl
     overview.append('<p class="map-hint">Click an area to open its page. Lines: '
                     '<span class="legend trigger">trigger</span> '
                     '<span class="legend door">door</span>.</p>')
-    overview.append(render_map_svg(db, positions))
+    overview.append(render_map_svg(db, positions, sizes))
 
     body = "\n".join(overview)
     write(out / "index.html", page(module_title, body, root_rel="."))
 
 
-def render_map_svg(db: Db, positions: dict[str, tuple[float, float]]) -> str:
+def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
+                   sizes: dict[str, tuple[float, float]]) -> str:
     if not positions:
         return "<p>(no areas)</p>"
-    xs = [p[0] for p in positions.values()]
-    ys = [p[1] for p in positions.values()]
-    pad = 60
-    min_x, max_x = min(xs) - pad, max(xs) + pad
-    min_y, max_y = min(ys) - pad, max(ys) + pad
-    width = max_x - min_x
-    height = max_y - min_y
 
-    # Edges first (so they're under nodes).
+    # Box sizes are in "tile units"; positions share those units. We scale
+    # everything up to give text room — bigger labels, bigger boxes — so the
+    # map is readable instead of cramming tiny rects on the borders.
+    scale = 8.0  # px per tile unit
+    inset = 0.5  # leave a small visual gap inside each AABB
+
+    # Compute extents from rect bounds (not just centres) so labels never
+    # get clipped at the edge.
+    min_x = min(x - sizes[r][0] / 2 for r, (x, y) in positions.items())
+    max_x = max(x + sizes[r][0] / 2 for r, (x, y) in positions.items())
+    min_y = min(y - sizes[r][1] / 2 for r, (x, y) in positions.items())
+    max_y = max(y + sizes[r][1] / 2 for r, (x, y) in positions.items())
+    pad = 6.0
+    min_x -= pad; max_x += pad
+    min_y -= pad; max_y += pad
+
+    vx = min_x * scale
+    vy = min_y * scale
+    vw = (max_x - min_x) * scale
+    vh = (max_y - min_y) * scale
+
+    # Edges connect rect *boundaries* — not centres — so lines visibly
+    # terminate at the nearest edge of each box.
+    def rect_edge_point(r: str, towards: tuple[float, float]) -> tuple[float, float]:
+        cx, cy = positions[r]
+        w, h = sizes[r]
+        dx = towards[0] - cx
+        dy = towards[1] - cy
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return cx, cy
+        # Scale to land on rect boundary.
+        sx = (w / 2 - inset) / abs(dx) if dx else float('inf')
+        sy = (h / 2 - inset) / abs(dy) if dy else float('inf')
+        s = min(sx, sy)
+        return cx + dx * s, cy + dy * s
+
     edge_lines = []
     drawn = set()
     for tr in db.transitions:
@@ -525,40 +808,50 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]]) -> str:
         b = tr["dst_area"]
         if a not in positions or not b or b not in positions:
             continue
-        # Dedupe undirected edge for visual cleanliness; keep first kind seen.
         key = (min(a, b), max(a, b), tr["kind"])
         if key in drawn:
             continue
         drawn.add(key)
-        x1, y1 = positions[a]
-        x2, y2 = positions[b]
+        ax, ay = rect_edge_point(a, positions[b])
+        bx, by = rect_edge_point(b, positions[a])
         cls = "edge-trigger" if tr["kind"] == "trigger" else "edge-door"
-        edge_lines.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" class="{cls}"/>')
+        edge_lines.append(
+            f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}"/>'
+        )
 
-    # Nodes: rect sized by tile area (Width × Height of the area).
+    # Nodes — boxes sized by area's tile dimensions, with labels at ~2.5x
+    # the previous font size.
+    font_size = 28.0  # ~2.5x the prior 11px label
     node_g = []
     for resref, (x, y) in positions.items():
-        a = db.areas.get(resref, {})
-        tw = fld(a, "Width", 4) or 4
-        th = fld(a, "Height", 4) or 4
-        size = max(18.0, min(60.0, math.sqrt(tw * th) * 4.5))
+        w, h = sizes[resref]
+        px = (x - w / 2) * scale
+        py = (y - h / 2) * scale
+        pw = w * scale
+        ph = h * scale
+        cx = x * scale
+        cy = y * scale
         name = db.area_name(resref)
-        # Truncate long names for the visual.
-        label = name if len(name) <= 18 else name[:17] + "…"
+        # Use the box width to decide truncation: roughly font_size*0.55 px
+        # per character at this font.
+        max_chars = max(6, int(pw / (font_size * 0.55)))
+        label = name if len(name) <= max_chars else name[: max_chars - 1] + "…"
         href = f"areas/{resref}.html"
         node_g.append(
             f'<a href="{E(href)}"><g class="area-node">'
-            f'<rect x="{x - size/2:.1f}" y="{y - size/2:.1f}" '
-            f'width="{size:.1f}" height="{size:.1f}" rx="4"/>'
-            f'<text x="{x:.1f}" y="{y + size/2 + 12:.1f}" '
-            f'text-anchor="middle">{E(label)}</text>'
-            f'<title>{E(name)} ({E(resref)})</title>'
+            f'<rect x="{px:.1f}" y="{py:.1f}" '
+            f'width="{pw:.1f}" height="{ph:.1f}" rx="6"/>'
+            f'<text x="{cx:.1f}" y="{cy:.1f}" '
+            f'text-anchor="middle" dominant-baseline="middle" '
+            f'font-size="{font_size:.0f}">{E(label)}</text>'
+            f'<title>{E(name)} ({E(resref)}, {int(w)}×{int(h)})</title>'
             f'</g></a>'
         )
 
     return (
         f'<div class="map-wrap">'
-        f'<svg class="area-map" viewBox="{min_x:.1f} {min_y:.1f} {width:.1f} {height:.1f}" '
+        f'<svg class="area-map" viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
         f'preserveAspectRatio="xMidYMid meet">'
         + "\n".join(edge_lines)
         + "\n"
@@ -574,6 +867,7 @@ def render_areas_index(db: Db, out: Path) -> None:
         npc_count = len(db.area_npcs.get(resref, []))
         enc_count = len(db.area_encounters.get(resref, []))
         store_count = len(db.area_stores.get(resref, []))
+        cont_count = len(db.area_containers.get(resref, []))
         rows.append(
             f'<tr>'
             f'<td>{link(f"{resref}.html", db.area_name(resref))}</td>'
@@ -583,6 +877,7 @@ def render_areas_index(db: Db, out: Path) -> None:
             f'<td>{npc_count}</td>'
             f'<td>{enc_count}</td>'
             f'<td>{store_count}</td>'
+            f'<td>{cont_count}</td>'
             f'</tr>'
         )
     body = (
@@ -590,7 +885,7 @@ def render_areas_index(db: Db, out: Path) -> None:
         f"<p>{len(db.areas)} areas total.</p>"
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>ResRef</th><th>Tileset</th><th>Size</th>"
-        "<th>NPCs</th><th>Encounters</th><th>Stores</th>"
+        "<th>NPCs</th><th>Encounters</th><th>Stores</th><th>Containers</th>"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
     write(out / "areas" / "index.html", page("Areas", body, root_rel=".."))
@@ -747,38 +1042,40 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
-    # Placeables / chests with loot
-    placeables = db.area_placeables.get(resref, [])
-    chests = []
-    for p in placeables:
-        items = list_items(p.get("ItemList"))
-        if items:
-            chests.append((p, items))
-    if chests:
-        sections.append("<h2>Containers / loot</h2>")
+    # Containers (placeables with non-empty inventory). Detail lives on a
+    # per-container page so this row can stay scannable.
+    containers = db.area_containers.get(resref, [])
+    if containers:
+        sections.append(
+            f"<h2>Containers <small class=\"muted\">({len(containers)})</small></h2>"
+        )
         rows = []
-        for p, items in chests:
+        for c in containers:
+            p = c["p"]
+            idx = c["idx"]
             tag = fld(p, "Tag", "")
             rr = fld(p, "TemplateResRef", "")
             pname = loc(p.get("LocName")) or tag or rr or "(unnamed)"
-            item_cells = []
-            for it in items:
-                irr = fld(it, "InventoryRes")
-                if not irr and "EquippedRes" in it:
-                    irr = fld(it, "EquippedRes")
-                disp = db.item_name(irr) if irr in db.items else (irr or "(unknown)")
-                cell = (link(f"../items/{irr}.html", disp)
-                        if irr in db.items else E(disp))
-                item_cells.append(cell)
+            n_items = len(list_items(p.get("ItemList")))
+            x = fld(p, "X", 0.0) or 0.0
+            y = fld(p, "Y", 0.0) or 0.0
+            z = fld(p, "Z", 0.0) or 0.0
+            locked = "yes" if int(fld(p, "Locked", 0) or 0) else "no"
+            dc = fld(p, "OpenLockDC", "")
+            href = f"../containers/{resref}-{idx:03d}.html"
             rows.append(
-                f"<tr><td>{E(pname)}</td>"
-                f"<td>{E(tag)}</td>"
+                f"<tr><td>{link(href, pname)}</td>"
+                f"<td>{n_items}</td>"
+                f"<td><code>{E(tag)}</code></td>"
                 f"<td>{E(rr)}</td>"
-                f"<td>{', '.join(item_cells)}</td></tr>"
+                f"<td>{x:.1f}, {y:.1f}, {z:.1f}</td>"
+                f"<td>{E(locked)}</td>"
+                f"<td>{E(dc)}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Container</th><th>Tag</th><th>ResRef</th><th>Loot</th>"
+            "<th>Container</th><th>Items</th><th>Tag</th><th>ResRef</th>"
+            "<th>X, Y, Z</th><th>Locked</th><th>Open DC</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
@@ -817,6 +1114,104 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
 
     write(out / "areas" / f"{resref}.html",
           page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
+    """One page per container (a placeable with a non-empty inventory).
+    Surfaces the in-area position, lock state, and items it holds — useful
+    for tracing the player's loot path through an area without having to
+    open the placeable in the toolset."""
+    p = c["p"]
+    idx = c["idx"]
+    tag = fld(p, "Tag", "")
+    rr = fld(p, "TemplateResRef", "")
+    pname = loc(p.get("LocName")) or tag or rr or "(unnamed container)"
+    items = list_items(p.get("ItemList"))
+
+    x = fld(p, "X", 0.0) or 0.0
+    y = fld(p, "Y", 0.0) or 0.0
+    z = fld(p, "Z", 0.0) or 0.0
+    bearing = fld(p, "Bearing", "")
+    appearance = fld(p, "Appearance")
+    hp = fld(p, "HP", "")
+    cur_hp = fld(p, "CurrentHP", "")
+    hardness = fld(p, "Hardness", "")
+    plot = "yes" if int(fld(p, "Plot", 0) or 0) else "no"
+    static = "yes" if int(fld(p, "Static", 0) or 0) else "no"
+    useable = "yes" if int(fld(p, "Useable", 0) or 0) else "no"
+    lockable = "yes" if int(fld(p, "Lockable", 0) or 0) else "no"
+    locked = "yes" if int(fld(p, "Locked", 0) or 0) else "no"
+    open_dc = fld(p, "OpenLockDC", "")
+    close_dc = fld(p, "CloseLockDC", "")
+    key_required = "yes" if int(fld(p, "KeyRequired", 0) or 0) else "no"
+    key_name = fld(p, "KeyName", "")
+    auto_key = "yes" if int(fld(p, "AutoRemoveKey", 0) or 0) else "no"
+    trap_flag = "yes" if int(fld(p, "TrapFlag", 0) or 0) else "no"
+    trap_dc = fld(p, "TrapDetectDC", "")
+    disarm_dc = fld(p, "DisarmDC", "")
+    conv = fld(p, "Conversation", "")
+    faction = fld(p, "Faction", "")
+
+    sections = [
+        f"<h1>{E(pname)}</h1>",
+        '<dl class="meta">',
+        f"<dt>Area</dt><dd>{link(f'../areas/{area_resref}.html', db.area_name(area_resref))}</dd>",
+        f"<dt>Tag</dt><dd><code>{E(tag)}</code></dd>",
+        f"<dt>ResRef</dt><dd>{E(rr)}</dd>",
+        f"<dt>Position (X, Y, Z)</dt><dd>{x:.2f}, {y:.2f}, {z:.2f}</dd>",
+        f"<dt>Bearing</dt><dd>{E(bearing)}</dd>",
+        f"<dt>Appearance</dt><dd>{E(appearance) if appearance is not None else ''} "
+        f"<small class=\"muted\">(placeables.2da row)</small></dd>",
+        f"<dt>HP</dt><dd>{E(cur_hp)} / {E(hp)} (hardness {E(hardness)})</dd>",
+        f"<dt>Plot / Static / Useable</dt><dd>{plot} / {static} / {useable}</dd>",
+        f"<dt>Lockable</dt><dd>{lockable}</dd>",
+        f"<dt>Locked</dt><dd>{locked}</dd>",
+        f"<dt>Open lock DC</dt><dd>{E(open_dc)}</dd>",
+        f"<dt>Close lock DC</dt><dd>{E(close_dc)}</dd>",
+        f"<dt>Key required</dt><dd>{key_required}</dd>",
+        f"<dt>Key name</dt><dd>{E(key_name)}</dd>",
+        f"<dt>Auto-remove key</dt><dd>{auto_key}</dd>",
+        f"<dt>Trap</dt><dd>{trap_flag} (detect DC {E(trap_dc)}, disarm DC {E(disarm_dc)})</dd>",
+        f"<dt>Conversation</dt><dd>{E(conv)}</dd>",
+        f"<dt>Faction ID</dt><dd>{E(faction)}</dd>",
+        '</dl>',
+    ]
+
+    desc = loc(p.get("Description"))
+    if desc:
+        sections.append(f'<p class="desc">{E(desc)}</p>')
+
+    if items:
+        sections.append(f"<h2>Contents ({len(items)})</h2>")
+        rows = []
+        for it in items:
+            irr = fld(it, "TemplateResRef") or fld(it, "InventoryRes") or fld(it, "EquippedRes") or ""
+            iname = loc(it.get("LocalizedName"))
+            if not iname and irr in db.items:
+                iname = db.item_name(irr)
+            if not iname:
+                iname = irr or "(unknown)"
+            stack = fld(it, "StackSize", 1)
+            base = baseitem_label(fld(it, "BaseItem"))
+            cost = fld(it, "Cost", "")
+            cell = (link(f"../items/{irr}.html", iname)
+                    if irr in db.items else E(iname))
+            rows.append(
+                f"<tr><td>{cell}</td>"
+                f"<td>{E(irr)}</td>"
+                f"<td>{base}</td>"
+                f"<td>{E(stack)}</td>"
+                f"<td>{E(cost)}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>Cost</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    title = f"{pname} — {db.area_name(area_resref)}"
+    write(out / "containers" / f"{area_resref}-{idx:03d}.html",
+          page(title, "\n".join(sections), root_rel=".."))
 
 
 def render_creatures_index(db: Db, out: Path) -> None:
@@ -961,13 +1356,16 @@ def render_items_index(db: Db, out: Path) -> None:
         rows.append(
             f"<tr><td>{link(f'{rr}.html', db.item_name(rr))}</td>"
             f"<td>{E(rr)}</td>"
-            f"<td>{E(baseitem_name(fld(i, 'BaseItem')))}</td>"
+            f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>"
             f"<td>{E(fld(i, 'Cost', ''))}</td>"
             f"<td>{E(fld(i, 'StackSize', ''))}</td></tr>"
         )
     body = (
         "<h1>Items</h1>"
-        f"<p>{len(db.items)} item blueprints.</p>"
+        f"<p>{len(db.items)} item blueprints. "
+        '<small class="muted">Base item names use the stock NWN '
+        "baseitems.2da; CEP and other HAKs frequently override or extend "
+        "rows, so the <em>row number</em> shown alongside is authoritative.</small></p>"
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>ResRef</th><th>Base item</th><th>Cost</th><th>Stack</th>"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
@@ -986,7 +1384,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
-        f"<dt>Base item</dt><dd>{E(baseitem_name(fld(i, 'BaseItem')))}</dd>",
+        f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
         f"<dt>Cost</dt><dd>{E(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
         f"<dt>Cursed</dt><dd>{E(fld(i, 'Cursed', ''))}</dd>",
@@ -1000,8 +1398,17 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     if props:
         sections.append("<h2>Properties</h2>")
         rows = []
+        debug_rows = []
         for p in props:
+            f = itemprop_format(p)
             rows.append(
+                f"<tr><td>{E(f['property'])}</td>"
+                f"<td>{E(f['subtype'])}</td>"
+                f"<td>{E(f['cost'])}</td>"
+                f"<td>{E(f['param'])}</td>"
+                f"<td>{E(f['chance'])}</td></tr>"
+            )
+            debug_rows.append(
                 f"<tr><td>{E(fld(p, 'PropertyName', ''))}</td>"
                 f"<td>{E(fld(p, 'Subtype', ''))}</td>"
                 f"<td>{E(fld(p, 'CostTable', ''))}</td>"
@@ -1011,9 +1418,19 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Property</th><th>Subtype</th><th>CostTable</th><th>CostValue</th>"
-            "<th>Param1/Val</th><th>Chance</th>"
+            "<th>Property</th><th>Subtype</th><th>Value</th>"
+            "<th>Param</th><th>Chance %</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+        # Raw values, collapsed by default — handy when the human label is
+        # missing or wrong because of a custom 2DA.
+        sections.append(
+            "<details><summary>Raw values</summary>"
+            '<table class="data"><thead><tr>'
+            "<th>PropertyName</th><th>Subtype</th><th>CostTable</th><th>CostValue</th>"
+            "<th>Param1/Val</th><th>Chance</th>"
+            "</tr></thead><tbody>" + "\n".join(debug_rows) + "</tbody></table>"
+            "</details>"
         )
 
     write(out / "items" / f"{resref}.html",
@@ -1181,19 +1598,23 @@ def main() -> int:
         a, b = tr["src_area"], tr["dst_area"]
         if a in db.areas and b in db.areas:
             edges.append((a, b))
-    positions = layout_areas(
+    positions, sizes = layout_areas(
         sorted(db.areas.keys()),
         edges,
+        db=db,
         seed=args.seed,
     )
     print(f"  layout in {time.time() - t0:.1f}s")
 
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
-    render_index(db, out, title, positions)
+    render_index(db, out, title, positions, sizes)
     render_areas_index(db, out)
     for resref in db.areas:
         render_area_page(db, resref, out)
+    for resref, conts in db.area_containers.items():
+        for c in conts:
+            render_container_page(db, resref, c, out)
     render_creatures_index(db, out)
     for resref in db.creatures:
         render_creature_page(db, resref, out)

@@ -31,24 +31,53 @@ body { padding: 0; }
 a { color: var(--link); text-decoration: none; }
 a:hover { color: var(--link-hover); text-decoration: underline; }
 
-header.site {
+header.site, header.site-header {
   background: var(--accent);
   color: #fff;
   padding: 0.75em 1.5em;
   border-bottom: 4px solid var(--accent-soft);
 }
-header.site a { color: #fff; }
+header.site a, header.site-header a { color: #fff; }
+header.site-header .brand {
+  font-size: 1.3em;
+  margin-right: 1.5em;
+}
 header.site h1 {
   margin: 0;
   font-size: 1.4em;
   font-weight: normal;
   letter-spacing: 0.02em;
 }
-header.site nav {
-  margin-top: 0.4em;
-  font-size: 0.9em;
+header.site nav, header.site-header nav {
+  display: inline;
+  font-size: 0.95em;
 }
-header.site nav a { margin-right: 1.2em; }
+header.site nav a, header.site-header nav a { margin-right: 1.2em; }
+
+dl.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2em 1.2em;
+  margin: 0.5em 0 1em;
+}
+dl.meta dt { color: var(--muted); }
+dl.meta dd { margin: 0; }
+
+table.data {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5em 0 1em;
+  background: var(--card);
+}
+.map-hint { color: var(--muted); font-size: 0.9em; margin-bottom: 0.3em; }
+.map-hint .legend.trigger::before,
+.map-hint .legend.door::before {
+  content: "—"; display: inline-block; margin-right: 0.25em;
+}
+.map-hint .legend.trigger { color: #6b3a1c; }
+.map-hint .legend.door    { color: #2d6a3a; }
+footer { text-align: center; color: var(--muted); font-size: 0.85em; padding: 1.5em 0 2em; }
+.muted { color: var(--muted); font-size: 0.85em; }
 
 main {
   max-width: 1100px;
@@ -150,19 +179,20 @@ footer.site {
 }
 
 /* SVG node defaults (overridable inline) */
+svg.area-map { width: 100%; height: auto; min-height: 600px; }
 svg .area-node rect {
   fill: #fff;
   stroke: var(--accent);
-  stroke-width: 1.2;
+  stroke-width: 2.4;
 }
 svg .area-node:hover rect {
   fill: var(--accent-soft);
 }
 svg .area-node text {
   fill: var(--fg);
-  font-size: 11px;
   pointer-events: none;
+  font-family: "Iowan Old Style", Georgia, serif;
 }
-svg .edge-trigger { stroke: #6b3a1c; stroke-width: 1; opacity: 0.6; fill: none; }
-svg .edge-door    { stroke: #2d6a3a; stroke-width: 1; opacity: 0.6; fill: none; }
+svg .edge-trigger { stroke: #6b3a1c; stroke-width: 2.5; opacity: 0.55; fill: none; }
+svg .edge-door    { stroke: #2d6a3a; stroke-width: 2.5; opacity: 0.55; fill: none; }
 svg .external-node rect { fill: #ddd; stroke: #999; stroke-dasharray: 3,3; }
