@@ -187,6 +187,35 @@ finer control:
 nwn-wiki --src ./unpacked --out ./docs --module-name "My Module" --seed 42
 ```
 
+#### Custom HAKs (CEP, etc.) — overriding the 2DA lookups
+
+The wiki ships stock NWN1 lookups for `baseitems.2da`, `iprp_feats.2da`,
+`classes.2da`, `racialtypes.2da`, and `placeables.2da`. Modules that
+depend on CEP or any other custom HAK frequently override or extend
+these tables, which is why a "Club +4" item can show up under base item
+"Rapier" — the HAK has reseated row 28 to a custom Club entry that the
+stock lookup doesn't know about.
+
+To get accurate labels, extract the relevant 2DAs from the HAK and
+point the wiki at them:
+
+```sh
+mkdir -p hak_2da
+nwn_erf -x -f /path/to/cepbaseitem.hak -d hak_2da
+nwn_erf -x -f /path/to/cep2da.hak       -d hak_2da   # iprp_*.2da etc.
+
+nwn-manager wiki -- --2da-dir hak_2da
+# or equivalently:
+nwn-wiki --src unpacked --out docs --2da-dir hak_2da
+```
+
+`--2da-dir` parses any of `baseitems.2da`, `iprp_feats.2da`,
+`racialtypes.2da`, `classes.2da`, and `placeables.2da` it finds and
+patches the in-memory lookups by row number; rows the HAK doesn't touch
+keep their stock labels. If you put the extracted files at
+`<project>/hak_2da/` (sibling to `unpacked/`), the wiki picks them up
+automatically without needing the flag.
+
 ### Help
 
 ```sh

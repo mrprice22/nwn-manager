@@ -80,13 +80,14 @@ def _load_lookup(name: str) -> dict[int, str]:
     if not p.exists():
         return {}
     raw = json.loads(p.read_text())
-    return {int(k): str(v) for k, v in raw.items()}
+    return {int(k): str(v) for k, v in raw.items() if not k.startswith("_")}
 
 
 BASEITEMS = _load_lookup("baseitems")
 CLASSES = _load_lookup("classes")
 RACES = _load_lookup("racialtypes")
 APPEARANCE = _load_lookup("appearance")
+IPRP_FEATS = _load_lookup("iprp_feats")
 
 
 def _load_itemprops() -> dict:
@@ -99,6 +100,126 @@ def _load_itemprops() -> dict:
 ITEMPROPS = _load_itemprops()
 IPROP_DEFS: dict[int, dict] = {int(k): v for k, v in ITEMPROPS.get("properties", {}).items()}
 IPROP_TABLES: dict[str, dict] = ITEMPROPS.get("tables", {})
+
+
+# ---------------------------------------------------------------------------
+# 2DA override loader
+# ---------------------------------------------------------------------------
+#
+# CEP and other HAKs ship custom baseitems.2da / iprp_*.2da files that
+# override or extend the stock tables. The bundled JSON lookups can't know
+# what's in those HAKs, so we let the user point us at a directory of
+# extracted 2DAs (`--2da-dir`) and override the relevant lookups in place.
+#
+# Extracting from a HAK with the neverwinter.nim toolchain:
+#
+#     mkdir -p hak_2da
+#     nwn_erf -x -f /path/to/cepbaseitem.hak -d hak_2da
+#
+# Then point the wiki at it:
+#
+#     nwn-wiki --src unpacked --out docs --2da-dir hak_2da
+
+def parse_2da(path: Path) -> tuple[list[str], list[list[str]]]:
+    """Parse an NWN 2DA (V2.0) file. Returns (column_headers, rows).
+    Each row's first cell is the row index as text. Quoted strings (with
+    embedded spaces) are honoured. `****` cells are returned as empty
+    strings."""
+    text = path.read_text(encoding="cp1252", errors="replace")
+    lines = [ln for ln in text.splitlines()]
+    # Skip blank/header lines until we find the first whitespace-delimited
+    # row. The first non-blank line after the magic is normally the
+    # column-header row; some files include a `DEFAULT: ""` directive.
+    i = 0
+    while i < len(lines) and not lines[i].strip().startswith("2DA"):
+        i += 1
+    i += 1  # past "2DA V2.0"
+    # Optional DEFAULT line
+    while i < len(lines) and (not lines[i].strip() or
+                              lines[i].lstrip().upper().startswith("DEFAULT")):
+        i += 1
+    # Column headers
+    if i >= len(lines):
+        return [], []
+    headers = _2da_split(lines[i])
+    i += 1
+    rows: list[list[str]] = []
+    for ln in lines[i:]:
+        if not ln.strip():
+            continue
+        cells = _2da_split(ln)
+        if not cells:
+            continue
+        rows.append(cells)
+    return headers, rows
+
+
+def _2da_split(line: str) -> list[str]:
+    """Split a 2DA line on whitespace, keeping double-quoted spans together
+    and decoding `****` as the empty string."""
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        while i < n and line[i] in (" ", "\t"):
+            i += 1
+        if i >= n:
+            break
+        if line[i] == '"':
+            j = i + 1
+            while j < n and line[j] != '"':
+                j += 1
+            out.append(line[i + 1:j])
+            i = j + 1
+        else:
+            j = i
+            while j < n and line[j] not in (" ", "\t"):
+                j += 1
+            tok = line[i:j]
+            out.append("" if tok == "****" else tok)
+            i = j
+    return out
+
+
+def load_2da_overrides(d: Path) -> None:
+    """Patch the in-memory lookup dicts from extracted 2DA files in `d`.
+    Updates BASEITEMS, IPRP_FEATS, RACES, CLASSES, APPEARANCE in place;
+    keys that aren't present in the override are left at their stock
+    values."""
+    files = {
+        "baseitems.2da":     ("Label", BASEITEMS),
+        "iprp_feats.2da":    ("Label", IPRP_FEATS),
+        "racialtypes.2da":   ("Label", RACES),
+        "classes.2da":       ("Label", CLASSES),
+        "placeables.2da":    ("Label", APPEARANCE),
+    }
+    for fname, (col, target) in files.items():
+        p = d / fname
+        if not p.is_file():
+            continue
+        try:
+            headers, rows = parse_2da(p)
+        except Exception as e:
+            print(f"  warn: could not parse {p}: {e}", file=sys.stderr)
+            continue
+        try:
+            col_idx = [h.lower() for h in headers].index(col.lower()) + 1
+        except ValueError:
+            print(f"  warn: {p} has no '{col}' column; skipping", file=sys.stderr)
+            continue
+        n_loaded = 0
+        for row in rows:
+            if not row:
+                continue
+            try:
+                ridx = int(row[0])
+            except ValueError:
+                continue
+            label = row[col_idx] if col_idx < len(row) else ""
+            if label:
+                target[ridx] = label
+                n_loaded += 1
+        print(f"  override: {fname} → {n_loaded} rows")
 
 
 def baseitem_name(row: int | None) -> str:
@@ -148,9 +269,12 @@ def appearance_name(row: int | None) -> str:
 # ---------------------------------------------------------------------------
 
 # Subtype lookups whose values come from non-iprp tables we already loaded.
+# These point at top-level lookup dicts so 2DA overrides made through
+# load_2da_overrides() remain visible (closing over the dict, not the value).
 _NON_IPRP_SUBTYPES = {
     "racialtypes": lambda i: race_name(i),
-    "classes": lambda i: class_name(i),
+    "classes":     lambda i: class_name(i),
+    "iprp_feats":  lambda i: IPRP_FEATS.get(int(i)) if i is not None else None,
 }
 
 
@@ -201,12 +325,25 @@ def itemprop_format(prop: dict) -> dict[str, str]:
     pdef = IPROP_DEFS.get(int(pname_id), {}) if pname_id is not None else {}
     pname = pdef.get("name") or (f"Property #{pname_id}" if pname_id is not None else "")
 
-    # Subtype: per-property table (e.g. Damage Bonus → damage type name)
+    # Subtype: per-property table (e.g. Damage Bonus → damage type name).
+    # When the lookup misses (custom HAK row or table we don't ship), surface
+    # the table name alongside the raw index so the reader can extract that
+    # 2DA and rerun with --2da-dir, instead of staring at a bare integer.
+    # Properties without a subtype table drop a subtype of 0 (the engine's
+    # "no subtype" sentinel for those props); properties that *do* have a
+    # subtype table treat 0 as a real value (e.g. Bonus Feat 0 = Alertness).
     subtype_str = ""
     if subtype_id is not None:
         st_tbl = pdef.get("subtype")
-        sval = _table_lookup(st_tbl, subtype_id) if st_tbl else None
-        subtype_str = sval if sval is not None else (str(subtype_id) if subtype_id != 0 else "")
+        if st_tbl:
+            sval = _table_lookup(st_tbl, subtype_id)
+            if sval is not None:
+                subtype_str = sval
+            else:
+                short = st_tbl.replace("iprp_", "")
+                subtype_str = f"{short} #{subtype_id}"
+        elif subtype_id != 0:
+            subtype_str = str(subtype_id)
 
     # Cost: indexes a per-property cost table (e.g. +1..+20). Fall back to raw.
     cost_str = ""
@@ -1561,6 +1698,10 @@ def main() -> int:
     ap.add_argument("--module-name", default=None,
                     help="override module title (default: from module.ifo)")
     ap.add_argument("--seed", type=int, default=1, help="layout RNG seed")
+    ap.add_argument("--2da-dir", dest="twoda_dir", default=None,
+                    help="directory of extracted 2DA files (e.g. baseitems.2da, "
+                         "iprp_feats.2da) to override the bundled stock lookups. "
+                         "Use this when the module relies on CEP / custom HAKs.")
     args = ap.parse_args()
 
     src = Path(args.src).resolve()
@@ -1568,6 +1709,24 @@ def main() -> int:
     if not src.is_dir():
         print(f"error: --src not a directory: {src}", file=sys.stderr)
         return 1
+
+    # 2DA overrides — explicit flag wins, otherwise auto-pick a sibling
+    # `<src>/../hak_2da` or `<src>/2da` if present.
+    twoda_dir: Path | None = None
+    if args.twoda_dir:
+        twoda_dir = Path(args.twoda_dir).resolve()
+    else:
+        for candidate in (src.parent / "hak_2da", src / "2da"):
+            if candidate.is_dir():
+                twoda_dir = candidate
+                break
+    if twoda_dir is not None:
+        if twoda_dir.is_dir():
+            print(f"[nwn-wiki] applying 2DA overrides from {twoda_dir}")
+            load_2da_overrides(twoda_dir)
+        else:
+            print(f"warn: --2da-dir {twoda_dir} is not a directory; ignoring",
+                  file=sys.stderr)
 
     print(f"[nwn-wiki] reading {src}")
     db = Db(src)
