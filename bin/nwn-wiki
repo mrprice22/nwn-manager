@@ -527,6 +527,30 @@ class Db:
             for d in list_items(git.get("Door List")):
                 self.area_doors[area_resref].append(d)
 
+        # Door/trigger tag → area indexes. NWN's `LinkedTo` is a tag
+        # reference, not specifically a waypoint tag — door-to-door pairs
+        # (each door's LinkedTo holds the *other door's* tag) are common, and
+        # so are trigger-to-trigger pairs. Resolving against only waypoints
+        # makes those transitions render as "(unresolved waypoint)" and
+        # silently disappear from the overview map.
+        door_tag_area: dict[str, str] = {}
+        trigger_tag_area: dict[str, str] = {}
+        for area_resref, doors in self.area_doors.items():
+            for d in doors:
+                tag = fld(d, "Tag")
+                if tag and tag not in door_tag_area:
+                    door_tag_area[tag] = area_resref
+        for area_resref, triggers in self.area_triggers.items():
+            for t in triggers:
+                tag = fld(t, "Tag")
+                if tag and tag not in trigger_tag_area:
+                    trigger_tag_area[tag] = area_resref
+
+        def resolve_link(linked: str) -> str | None:
+            return (self.waypoint_area.get(linked)
+                    or door_tag_area.get(linked)
+                    or trigger_tag_area.get(linked))
+
         # Build transitions from triggers + doors.
         # Transition X/Y is captured in *area metres* (10 m per tile) so the
         # map layout can tell which edge each transition exits from.
@@ -535,7 +559,7 @@ class Db:
                 linked = fld(t, "LinkedTo")
                 if not linked:
                     continue
-                dst = self.waypoint_area.get(linked)
+                dst = resolve_link(linked)
                 self.transitions.append({
                     "src_area": area_resref,
                     "dst_area": dst,
@@ -551,7 +575,7 @@ class Db:
                 linked = fld(d, "LinkedTo")
                 if not linked:
                     continue
-                dst = self.waypoint_area.get(linked)
+                dst = resolve_link(linked)
                 self.transitions.append({
                     "src_area": area_resref,
                     "dst_area": dst,
@@ -905,7 +929,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
     # Box sizes are in "tile units"; positions share those units. We scale
     # everything up to give text room — bigger labels, bigger boxes — so the
     # map is readable instead of cramming tiny rects on the borders.
-    scale = 8.0  # px per tile unit
+    scale = 14.0  # px per tile unit
     inset = 0.5  # leave a small visual gap inside each AABB
 
     # Compute extents from rect bounds (not just centres) so labels never
@@ -957,9 +981,9 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}"/>'
         )
 
-    # Nodes — boxes sized by area's tile dimensions, with labels at ~2.5x
-    # the previous font size.
-    font_size = 28.0  # ~2.5x the prior 11px label
+    # Nodes — boxes sized by area's tile dimensions. Label sizing trades off
+    # against legibility at default zoom and the page's natural width.
+    font_size = 44.0
     node_g = []
     for resref, (x, y) in positions.items():
         w, h = sizes[resref]
@@ -986,9 +1010,15 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             f'</g></a>'
         )
 
+    # Render the SVG at its native viewBox size (CSS pixels). Browser zoom
+    # scales CSS pixels uniformly, so the map gets larger with the rest of
+    # the page; the wrap's overflow:auto adds scrollbars when the map is
+    # wider than the viewport.
     return (
         f'<div class="map-wrap">'
-        f'<svg class="area-map" viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
+        f'<svg class="area-map" '
+        f'width="{vw:.0f}" height="{vh:.0f}" '
+        f'viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
         f'preserveAspectRatio="xMidYMid meet">'
         + "\n".join(edge_lines)
         + "\n"
@@ -1732,6 +1762,21 @@ def main() -> int:
     db = Db(src)
     db.load()
     db.index()
+
+    # Wipe stale generated content so deleted resources don't linger in the
+    # wiki. We only nuke the contents — keeping the directory itself preserves
+    # any user-created tooling (CNAME, custom workflow files) co-located in
+    # docs/. CNAME is the one well-known file we explicitly preserve.
+    if out.is_dir():
+        cname = out / "CNAME"
+        keep_cname = cname.read_bytes() if cname.is_file() else None
+        for child in out.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        if keep_cname is not None:
+            cname.write_bytes(keep_cname)
 
     out.mkdir(parents=True, exist_ok=True)
     # Disable Jekyll on GitHub Pages so files starting with _ etc. are served verbatim.

@@ -228,6 +228,12 @@ cmd_unpack() {
 
   local clean_mod
   clean_mod=$(sanitize_mod_path "$mod")
+  # Wipe unpacked/ first so resources deleted in the toolset don't linger
+  # in the source tree (and silently sneak back into the next repack).
+  if [[ -d unpacked ]]; then
+    echo "[$PROG] clearing $root/unpacked/"
+    rm -rf unpacked
+  fi
   echo "[$PROG] unpacking $mod → $root/unpacked/"
   nasher unpack --yes --file:"$clean_mod"
 

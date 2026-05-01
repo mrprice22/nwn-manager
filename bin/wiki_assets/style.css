@@ -155,9 +155,12 @@ footer.site {
   padding: 1.5em 0 2em;
 }
 
-/* The giant area map. Breaks out of the centred main column to use almost
- * the full viewport, since labels become unreadable when 287 areas are
- * crammed into 1100 px. The SVG keeps its viewBox aspect ratio. */
+/* The giant area map. Breaks out of the centred main column so it can use
+ * almost the full viewport, since labels become unreadable when hundreds of
+ * areas are crammed into 1100 px. The SVG inside renders at its native
+ * pixel size (set by width/height attributes) so browser zoom enlarges the
+ * map proportionally with the rest of the page; the wrap scrolls when the
+ * map is wider than the viewport. */
 .map-wrap {
   background: var(--card);
   border: 1px solid var(--border);
@@ -167,7 +170,7 @@ footer.site {
   max-width: 96vw;
   overflow: auto;
 }
-.map-wrap svg { display: block; width: 100%; height: auto; }
+.map-wrap svg { display: block; }
 .map-legend {
   font-size: 0.85em;
   color: var(--muted);
@@ -183,7 +186,6 @@ footer.site {
 }
 
 /* SVG node defaults (overridable inline) */
-svg.area-map { width: 100%; height: auto; min-height: 1500px; }
 svg .area-node rect {
   fill: #fff;
   stroke: var(--accent);

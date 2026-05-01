@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Desktop-launcher target: refresh the Homer's LotR module unpacked tree
+# and regenerate its static wiki. Pauses at the end so failure output stays
+# visible when launched from the GNOME app grid (no parent shell to read).
+
+set -o pipefail
+
+PROJECT=/var/home/james/GIT/nwn_homers_lotr
+NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
+
+export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
+
+cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
+
+nwn-manager unpack && nwn-manager wiki
+status=$?
+
+echo
+if [[ $status -eq 0 ]]; then
+  echo "[done] wiki regenerated → $PROJECT/docs/index.html"
+else
+  echo "[FAILED] exit $status"
+fi
+echo
+read -rp "Press Enter to close..."
