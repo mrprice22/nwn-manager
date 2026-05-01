@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Desktop-launcher target: regenerate the Homer's LotR static wiki only
+# (skips the slow .mod unpack step). Use this when only wiki-generation
+# code or templates have changed and the unpacked tree is already current.
+# Pauses at the end so failure output stays visible when launched from the
+# GNOME app grid (no parent shell to read).
+
+set -o pipefail
+
+PROJECT=/var/home/james/GIT/nwn_homers_lotr
+NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
+
+export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
+
+cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
+
+nwn-manager wiki
+status=$?
+
+echo
+if [[ $status -eq 0 ]]; then
+  echo "[done] wiki regenerated → $PROJECT/docs/index.html"
+else
+  echo "[FAILED] exit $status"
+fi
+echo
+read -rp "Press Enter to close..."
