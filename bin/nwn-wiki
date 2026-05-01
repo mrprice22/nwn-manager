@@ -690,14 +690,16 @@ def layout_areas(
         return {}, {}
     rng = random.Random(seed)
 
-    # Box size in tile units, padded so adjacent boxes have visual breathing
-    # room on the rendered map.
+    # Box size in tile units. We deliberately oversize boxes (2× the area's
+    # tile dims) so labels have room to breathe; the layout below packs them
+    # tightly enough that the extra size doesn't waste map area.
+    box_scale = 2.0
     sizes: dict[str, tuple[float, float]] = {}
     for nid in node_ids:
         a = db.areas.get(nid, {}) if db else {}
         w = float(fld(a, "Width", 8) or 8)
         h = float(fld(a, "Height", 8) or 8)
-        sizes[nid] = (max(w, 4.0), max(h, 4.0))
+        sizes[nid] = (max(w, 4.0) * box_scale, max(h, 4.0) * box_scale)
 
     # Initial spread: scatter on a wide canvas so attractive forces have
     # room to pull connected components together.
@@ -730,10 +732,13 @@ def layout_areas(
                   if a in pos and b in pos and a != b]
 
     # "Ideal" edge length: enough that two boxes don't overlap, plus margin.
+    # Padding is intentionally small (relative to avg_dim) so the doubled box
+    # sizes above aren't pushed further apart proportionally — boxes end up
+    # bigger relative to gaps, leaving more room to fit text labels.
     def ideal_len(a: str, b: str) -> float:
         wa, ha = sizes[a]
         wb, hb = sizes[b]
-        return 0.5 * (max(wa, ha) + max(wb, hb)) + avg_dim * 1.2
+        return 0.5 * (max(wa, ha) + max(wb, hb)) + avg_dim * 0.4
 
     t = spread / 4.0
     cooling = t / iterations
@@ -751,8 +756,8 @@ def layout_areas(
                 vx, vy = pos[v]
                 vw, vh = sizes[v]
                 # AABB overlap distance in each axis (negative = overlap).
-                gap_x = abs(ux - vx) - 0.5 * (uw + vw) - avg_dim * 0.4
-                gap_y = abs(uy - vy) - 0.5 * (uh + vh) - avg_dim * 0.4
+                gap_x = abs(ux - vx) - 0.5 * (uw + vw) - avg_dim * 0.15
+                gap_y = abs(uy - vy) - 0.5 * (uh + vh) - avg_dim * 0.15
                 gap = max(gap_x, gap_y)
                 if gap > avg_dim * 4:
                     continue  # far apart; no force
@@ -1010,14 +1015,21 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             f'</g></a>'
         )
 
-    # Render the SVG at its native viewBox size (CSS pixels). Browser zoom
-    # scales CSS pixels uniformly, so the map gets larger with the rest of
-    # the page; the wrap's overflow:auto adds scrollbars when the map is
-    # wider than the viewport.
+    # Cap the rendered display size so the map fits on a normal-sized screen
+    # at default browser zoom. The viewBox keeps full SVG coordinates so the
+    # internal layout is preserved — the SVG just downscales to display_w ×
+    # display_h CSS pixels. Browser zoom (Ctrl-+) magnifies these CSS pixels,
+    # at which point the SVG exceeds .map-wrap and overflow:auto scrollbars
+    # let the user pan around.
+    target_w = 1400.0
+    target_h = 900.0
+    fit = min(target_w / vw, target_h / vh, 1.0) if vw > 0 and vh > 0 else 1.0
+    display_w = vw * fit
+    display_h = vh * fit
     return (
         f'<div class="map-wrap">'
         f'<svg class="area-map" '
-        f'width="{vw:.0f}" height="{vh:.0f}" '
+        f'width="{display_w:.0f}" height="{display_h:.0f}" '
         f'viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
         f'preserveAspectRatio="xMidYMid meet">'
         + "\n".join(edge_lines)
