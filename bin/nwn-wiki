@@ -20,6 +20,7 @@ import math
 import random
 import re
 import shutil
+import struct
 import sys
 import time
 from collections import Counter, defaultdict
@@ -49,8 +50,37 @@ def fld(struct: dict | None, name: str, default: Any = None) -> Any:
     return gff(struct[name], default)
 
 
+# TLK lookup tables, populated from --dialog-tlk / --custom-tlk if given.
+# StrRefs >= CUSTOM_TLK_BASE are custom-TLK rows (id - CUSTOM_TLK_BASE);
+# anything below resolves against the base game's dialog.tlk.
+CUSTOM_TLK_BASE = 0x01000000  # 16777216
+BASE_TLK: dict[int, str] = {}
+CUSTOM_TLK: dict[int, str] = {}
+
+
+def read_tlk(path: Path) -> dict[int, str]:
+    """Parse an NWN TLK V3.0 file into {strref: text}.
+    Empty entries (no TextPresent flag) are omitted."""
+    data = path.read_bytes()
+    if len(data) < 20 or data[:4] != b"TLK " or data[4:8] != b"V3.0":
+        raise ValueError(f"not a TLK V3.0 file: {path}")
+    _lang_id, count, str_off = struct.unpack_from("<III", data, 8)
+    out: dict[int, str] = {}
+    base = 20
+    for i in range(count):
+        off = base + i * 40
+        flags = struct.unpack_from("<I", data, off)[0]
+        if not (flags & 0x1):  # TextPresent
+            continue
+        soff, ssize = struct.unpack_from("<II", data, off + 28)
+        start = str_off + soff
+        out[i] = data[start:start + ssize].decode("cp1252", errors="replace")
+    return out
+
+
 def loc(node: Any, lang: int = 0) -> str:
-    """Resolve a cexolocstring to a string. TLK-only refs become a placeholder."""
+    """Resolve a cexolocstring. Falls back to TLK tables for ID-only refs;
+    if the StrRef can't be resolved, yields a `[TLK#N]` placeholder."""
     val = gff(node)
     if not isinstance(val, dict) or not val:
         return ""
@@ -58,7 +88,15 @@ def loc(node: Any, lang: int = 0) -> str:
     if key in val and isinstance(val[key], str):
         return val[key]
     if "id" in val:
-        return f"[TLK#{val['id']}]"
+        sid = val["id"]
+        if isinstance(sid, int) and sid >= 0:
+            if sid >= CUSTOM_TLK_BASE:
+                t = CUSTOM_TLK.get(sid - CUSTOM_TLK_BASE)
+            else:
+                t = BASE_TLK.get(sid)
+            if t is not None:
+                return t
+        return f"[TLK#{sid}]"
     for v in val.values():
         if isinstance(v, str):
             return v
@@ -3687,6 +3725,12 @@ def main() -> int:
                     help="directory of extracted 2DA files (e.g. baseitems.2da, "
                          "iprp_feats.2da) to override the bundled stock lookups. "
                          "Use this when the module relies on CEP / custom HAKs.")
+    ap.add_argument("--dialog-tlk", default=None,
+                    help="path to base-game dialog.tlk for resolving "
+                         "StrRef references (id < 16777216).")
+    ap.add_argument("--custom-tlk", default=None,
+                    help="path to the module's custom TLK (named in module.ifo "
+                         "Mod_CustomTlk) for resolving StrRefs >= 16777216.")
     args = ap.parse_args()
 
     src = Path(args.src).resolve()
@@ -3694,6 +3738,23 @@ def main() -> int:
     if not src.is_dir():
         print(f"error: --src not a directory: {src}", file=sys.stderr)
         return 1
+
+    if args.dialog_tlk:
+        p = Path(args.dialog_tlk).resolve()
+        if p.is_file():
+            BASE_TLK.update(read_tlk(p))
+            print(f"[nwn-wiki] loaded base TLK ({len(BASE_TLK)} entries) from {p}")
+        else:
+            print(f"warn: --dialog-tlk {p} not found; StrRefs will show as [TLK#N]",
+                  file=sys.stderr)
+    if args.custom_tlk:
+        p = Path(args.custom_tlk).resolve()
+        if p.is_file():
+            CUSTOM_TLK.update(read_tlk(p))
+            print(f"[nwn-wiki] loaded custom TLK ({len(CUSTOM_TLK)} entries) from {p}")
+        else:
+            print(f"warn: --custom-tlk {p} not found; custom StrRefs will show as [TLK#N]",
+                  file=sys.stderr)
 
     print(f"[nwn-wiki] reading {src}")
     db = Db(src)

@@ -104,6 +104,84 @@ sanitize_mod_path() {
   printf '%s\n' "$link"
 }
 
+# Detect the NWN install root from $NWN_INSTALL or by walking up from
+# .nasher/source (.mod is conventionally at <install>/data/mod/<name>.mod).
+# Echoes the detected path or empty if none found.
+detect_nwn_install() {
+  if [[ -n "${NWN_INSTALL:-}" && -d "$NWN_INSTALL" ]]; then
+    printf '%s\n' "$NWN_INSTALL"; return 0
+  fi
+  [[ -f .nasher/source ]] || return 0
+  local mod_path mod_dir parent
+  mod_path=$(cat .nasher/source)
+  mod_dir=$(dirname "$mod_path")
+  parent=$(dirname "$mod_dir")
+  if [[ "$(basename "$mod_dir")" == "mod" && "$(basename "$parent")" == "data" ]]; then
+    printf '%s\n' "$(dirname "$parent")"
+  fi
+}
+
+# Extract the base dialog.tlk and the custom TLK (named in module.ifo's
+# Mod_CustomTlk, if any) from the NWN install into ./tlk/. Non-fatal: if
+# the install can't be located, the wiki still renders but TLK refs stay
+# as [TLK#N] placeholders.
+extract_tlks() {
+  rm -rf tlk
+  mkdir -p tlk
+
+  local install
+  install=$(detect_nwn_install)
+  if [[ -z $install ]]; then
+    echo "[$PROG] NWN install not detected (set NWN_INSTALL=...) — skipping TLK extract" >&2
+    return 0
+  fi
+
+  local dialog=""
+  for cand in "$install/lang/en/data/dialog.tlk" "$install/data/tlk/dialog.tlk"; do
+    [[ -f $cand ]] && { dialog=$cand; break; }
+  done
+  if [[ -n $dialog ]]; then
+    cp "$dialog" tlk/dialog.tlk
+    echo "[$PROG] copied $dialog → tlk/dialog.tlk"
+  else
+    echo "warn: dialog.tlk not found under $install" >&2
+  fi
+
+  local custom_name=""
+  if [[ -f unpacked/module.ifo.json ]]; then
+    custom_name=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open("unpacked/module.ifo.json"))
+    v = d.get("Mod_CustomTlk", {}).get("value", "")
+    print(str(v).strip())
+except Exception:
+    pass' 2>/dev/null || true)
+  fi
+  if [[ -n $custom_name ]]; then
+    local custom=""
+    for cand in "$install/data/tlk/${custom_name}.tlk" "$install/lang/en/data/${custom_name}.tlk"; do
+      [[ -f $cand ]] && { custom=$cand; break; }
+    done
+    if [[ -n $custom ]]; then
+      cp "$custom" "tlk/${custom_name}.tlk"
+      echo "[$PROG] copied $custom → tlk/${custom_name}.tlk"
+    else
+      echo "warn: custom TLK '${custom_name}.tlk' not found under $install" >&2
+    fi
+  fi
+}
+
+# Append a literal entry to .gitignore if missing. Idempotent so existing
+# projects pick up the /tlk/ rule the first time they re-unpack.
+ensure_gitignore_entry() {
+  local entry=$1
+  [[ -f .gitignore ]] || return 0
+  grep -qxF "$entry" .gitignore && return 0
+  printf '%s\n' "$entry" >> .gitignore
+  echo "[$PROG] added '$entry' to .gitignore"
+}
+
 # Print a one-line summary of unpacked/ contents.
 print_unpacked_summary() {
   [[ -d unpacked ]] || return 0
@@ -160,10 +238,11 @@ cmd_init() {
   mkdir -p .nasher
   printf '%s\n' "$mod_abs" > .nasher/source
 
-  # Per-project .gitignore.
+  # Per-project .gitignore. tlk/ is sourced from the NWN install at unpack time.
   cat > .gitignore <<'EOF'
 /.nasher/
 /dist/
+/tlk/
 *.mod
 *.ncs
 *.erf
@@ -237,6 +316,9 @@ cmd_unpack() {
   echo "[$PROG] unpacking $mod → $root/unpacked/"
   nasher unpack --yes --file:"$clean_mod"
 
+  ensure_gitignore_entry "/tlk/"
+  extract_tlks
+
   print_unpacked_summary
 }
 
@@ -289,7 +371,23 @@ cmd_wiki() {
       *) break ;;
     esac
   done
-  exec "$SCRIPT_DIR/nwn-wiki" --src unpacked --out "$out" "$@"
+
+  local tlk_args=()
+  if [[ -f tlk/dialog.tlk ]]; then
+    tlk_args+=(--dialog-tlk tlk/dialog.tlk)
+  fi
+  local custom=""
+  for f in tlk/*.tlk; do
+    [[ -f $f ]] || continue
+    [[ "$(basename "$f")" == "dialog.tlk" ]] && continue
+    custom=$f
+    break
+  done
+  if [[ -n $custom ]]; then
+    tlk_args+=(--custom-tlk "$custom")
+  fi
+
+  exec "$SCRIPT_DIR/nwn-wiki" --src unpacked --out "$out" "${tlk_args[@]}" "$@"
 }
 
 main() {
