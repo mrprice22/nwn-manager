@@ -369,6 +369,53 @@ def spell_name(row: int | None) -> str:
     return SPELLS.get(int(row), f"Spell #{row}")
 
 
+# Stock NWN1 tileset resrefs → human-readable names. The Aurora Toolset
+# stores the resref in the area's `Tileset` field; the friendly name is
+# kept in the corresponding .set file (which we don't read here).
+TILESETS: dict[str, str] = {
+    "tcn01": "City Exterior 1",
+    "tcn02": "City Exterior 2",
+    "tdc01": "Castle Interior 1",
+    "tdc02": "Castle Interior 2",
+    "tde01": "Castle Interior, Illuminated",
+    "tdm01": "Mines and Caverns",
+    "tdr01": "Rural",
+    "tds01": "Sewers",
+    "tib01": "Beholder Caves",
+    "tic01": "City Interior",
+    "til01": "Lizardfolk Interior",
+    "tin01": "Crypt",
+    "tni01": "Mines, Lower",
+    "tno01": "Forest",
+    "ttd01": "Desert",
+    "tte01": "Forest, Drow",
+    "ttf01": "Frozen Wastes",
+    "ttp01": "Microset",
+    "ttr01": "Rural Winter",
+    "tts01": "Snow",
+    "ttu01": "Underdark",
+    "ttz01": "Mountains",
+    "twc01": "Castle Exterior, Rural",
+}
+
+
+def tileset_name(resref: str) -> str:
+    """Friendly tileset name, falling back to the raw resref for unknowns."""
+    if not resref:
+        return ""
+    return TILESETS.get(resref.lower(), resref)
+
+
+def tileset_label(resref: str) -> str:
+    """Friendly tileset name with the resref preserved as a muted suffix."""
+    if not resref:
+        return ""
+    pretty = TILESETS.get(resref.lower())
+    if pretty:
+        return f'{E(pretty)} <small class="muted">({E(resref)})</small>'
+    return E(resref)
+
+
 # ---------------------------------------------------------------------------
 # Item property formatting
 # ---------------------------------------------------------------------------
@@ -1387,7 +1434,7 @@ def render_areas_index(db: Db, out: Path) -> None:
             f'<tr>'
             f'<td>{link(f"{resref}.html", db.area_name(resref))}</td>'
             f'<td>{E(resref)}</td>'
-            f'<td>{E(fld(a, "Tileset", ""))}</td>'
+            f'<td>{E(tileset_name(fld(a, "Tileset", "")))}</td>'
             f'<td>{E(fld(a, "Width", ""))}×{E(fld(a, "Height", ""))}</td>'
             f'<td>{npc_count}</td>'
             f'<td>{enc_count}</td>'
@@ -1428,7 +1475,7 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
         '<dl class="meta">'
         f'<dt>ResRef</dt><dd>{E(resref)}</dd>'
         f'<dt>Tag</dt><dd>{E(tag)}</dd>'
-        f'<dt>Tileset</dt><dd>{E(tileset)}</dd>'
+        f'<dt>Tileset</dt><dd>{tileset_label(tileset)}</dd>'
         f'<dt>Size</dt><dd>{E(width)}×{E(height)} tiles</dd>'
         f'<dt>OnEnter</dt><dd>{E(on_enter)}</dd>'
         f'<dt>OnExit</dt><dd>{E(on_exit)}</dd>'
