@@ -18,6 +18,7 @@ import html
 import json
 import math
 import random
+import re
 import shutil
 import sys
 import time
@@ -1213,8 +1214,131 @@ def E(s: Any) -> str:
     return html.escape(str(s), quote=True)
 
 
+# ---------------------------------------------------------------------------
+# NWN colour token rendering
+# ---------------------------------------------------------------------------
+#
+# NWN strings can embed colour codes in two related forms:
+#   <cRGB>...</c>      – the normal in-game form (R,G,B are raw bytes 0–255).
+#   <<cRGB>...<</c>    – the doubled-bracket form used inside conversation,
+#                        journal, and description fields so the toolset
+#                        editors don't strip the angle brackets.
+# The byte values arrive here as Unicode code points after JSON decoding,
+# usually 1:1 (Latin-1 style); a few values in 0x80–0x9F may have been
+# remapped through CP-1252 (e.g. 0x80 → U+20AC '€'), which we reverse so
+# the original byte can be recovered.
+#
+# Module text is loaded straight from GFF and may contain unbalanced tokens
+# (e.g. <c…> with no </c>); we auto-close any open spans at the end.
+
+def _colour_byte(ch: str) -> int:
+    """Recover the 0–255 NWN channel byte from a single decoded character."""
+    o = ord(ch)
+    if o <= 0xFF:
+        return o
+    try:
+        return ch.encode("cp1252")[0]
+    except (UnicodeEncodeError, IndexError):
+        return min(o, 0xFF)
+
+
+def nwn_html(s: Any) -> str:
+    """Render an NWN string with <cRGB>/</c> tokens to HTML-safe markup.
+
+    Plain text is HTML-escaped; colour tokens become <span style="color:#rrggbb">
+    so the intended colour is shown and the raw bytes are hidden."""
+    if s is None:
+        return ""
+    s = str(s)
+    if not s:
+        return ""
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+
+    def flush() -> None:
+        if buf:
+            out.append(html.escape("".join(buf), quote=True))
+            buf.clear()
+
+    i = 0
+    n = len(s)
+    while i < n:
+        # Doubled-bracket open: <<cRGB>
+        if (i + 7 <= n and s[i] == "<" and s[i + 1] == "<"
+                and s[i + 2] == "c" and s[i + 6] == ">"):
+            flush()
+            r, g, b = (_colour_byte(s[i + 3]), _colour_byte(s[i + 4]),
+                       _colour_byte(s[i + 5]))
+            out.append(f'<span style="color:#{r:02x}{g:02x}{b:02x}">')
+            depth += 1
+            i += 7
+            continue
+        # Doubled-bracket close: <</c>
+        if i + 5 <= n and s[i:i + 5] == "<</c>":
+            flush()
+            if depth > 0:
+                out.append("</span>")
+                depth -= 1
+            i += 5
+            continue
+        # Standard open: <cRGB>
+        if (i + 6 <= n and s[i] == "<" and s[i + 1] == "c"
+                and s[i + 5] == ">"):
+            flush()
+            r, g, b = (_colour_byte(s[i + 2]), _colour_byte(s[i + 3]),
+                       _colour_byte(s[i + 4]))
+            out.append(f'<span style="color:#{r:02x}{g:02x}{b:02x}">')
+            depth += 1
+            i += 6
+            continue
+        # Standard close: </c>
+        if i + 4 <= n and s[i:i + 4] == "</c>":
+            flush()
+            if depth > 0:
+                out.append("</span>")
+                depth -= 1
+            i += 4
+            continue
+        buf.append(s[i])
+        i += 1
+
+    flush()
+    out.extend(["</span>"] * depth)
+    return "".join(out)
+
+
+_C_TOKEN_RE = re.compile(r"<<?/c>|<<?c.{3}>", re.DOTALL)
+_C_OPEN_RE = re.compile(r"<<?c(.)(.)(.)>", re.DOTALL)
+
+
+def nwn_text(s: Any) -> str:
+    """Strip NWN colour tokens, returning plain text (no HTML escaping).
+
+    Use for places that can't render markup: HTML <title>, alt attributes,
+    sort keys."""
+    if s is None:
+        return ""
+    return _C_TOKEN_RE.sub("", str(s))
+
+
+def nwn_first_color(s: Any) -> str | None:
+    """Return '#rrggbb' for the first <cRGB>/<<cRGB> token in s, or None.
+
+    Useful for elements that can carry a single colour (SVG <text> fill)
+    but not inline runs."""
+    if s is None:
+        return None
+    m = _C_OPEN_RE.search(str(s))
+    if not m:
+        return None
+    r, g, b = (_colour_byte(m.group(1)), _colour_byte(m.group(2)),
+               _colour_byte(m.group(3)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def link(href: str, text: str) -> str:
-    return f'<a href="{E(href)}">{E(text)}</a>'
+    return f'<a href="{E(href)}">{nwn_html(text)}</a>'
 
 
 def page(title: str, body: str, root_rel: str = ".") -> str:
@@ -1223,7 +1347,7 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>{E(title)}</title>
+  <title>{E(nwn_text(title))}</title>
   <link rel="stylesheet" href="{E(root_rel)}/assets/style.css">
 </head>
 <body>
@@ -1270,7 +1394,7 @@ def render_index(db: Db, out: Path, module_title: str,
     desc = loc(ifo.get("Mod_Description")) if ifo else ""
 
     overview = [
-        f'<h1>{E(module_title)}</h1>',
+        f'<h1>{nwn_html(module_title)}</h1>',
         '<dl class="meta">',
         f'<dt>Areas</dt><dd>{len(db.areas)}</dd>',
         f'<dt>Creatures</dt><dd>{len(db.creatures)}</dd>',
@@ -1289,7 +1413,7 @@ def render_index(db: Db, out: Path, module_title: str,
         overview.append(f'<dt>HAKs</dt><dd>{E(", ".join(hak_names))}</dd>')
     overview.append('</dl>')
     if desc:
-        overview.append(f'<p class="desc">{E(desc)}</p>')
+        overview.append(f'<p class="desc">{nwn_html(desc)}</p>')
 
     overview.append('<h2>Area map</h2>')
     overview.append('<p class="map-hint">Click an area to open its page. Lines: '
@@ -1373,7 +1497,13 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         ph = h * scale
         cx = x * scale
         cy = y * scale
-        name = db.area_name(resref)
+        # SVG <text> can't render mid-string colour changes without <tspan>s,
+        # so collapse to the first colour token (good enough for area names
+        # that almost always use a single uniform colour) and strip the rest.
+        raw = db.area_name(resref)
+        name = nwn_text(raw)
+        fill = nwn_first_color(raw)
+        fill_attr = f' fill="{fill}"' if fill else ""
         # Use the box width to decide truncation: roughly font_size*0.55 px
         # per character at this font.
         max_chars = max(6, int(pw / (font_size * 0.55)))
@@ -1385,7 +1515,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             f'width="{pw:.1f}" height="{ph:.1f}" rx="6"/>'
             f'<text x="{cx:.1f}" y="{cy:.1f}" '
             f'text-anchor="middle" dominant-baseline="middle" '
-            f'font-size="{font_size:.0f}">{E(label)}</text>'
+            f'font-size="{font_size:.0f}"{fill_attr}>{E(label)}</text>'
             f'<title>{E(name)} ({E(resref)}, {int(w)}×{int(h)})</title>'
             f'</g></a>'
         )
@@ -1424,7 +1554,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
 
 def render_areas_index(db: Db, out: Path) -> None:
     rows = []
-    for resref in sorted(db.areas.keys(), key=lambda r: db.area_name(r).lower()):
+    for resref in sorted(db.areas.keys(), key=lambda r: nwn_text(db.area_name(r)).lower()):
         a = db.areas[resref]
         npc_count = len(db.area_npcs.get(resref, []))
         enc_count = len(db.area_encounters.get(resref, []))
@@ -1470,7 +1600,7 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
     on_hb = fld(a, "OnHeartbeat", "")
     on_user = fld(a, "OnUserDefined", "")
 
-    sections.append(f"<h1>{E(name)}</h1>")
+    sections.append(f"<h1>{nwn_html(name)}</h1>")
     sections.append(
         '<dl class="meta">'
         f'<dt>ResRef</dt><dd>{E(resref)}</dd>'
@@ -1549,7 +1679,7 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
             cr = fld(c, "ChallengeRating", "")
             conv = fld(c, "Conversation", "")
             name_cell = (link(f"../creatures/{rr}.html", disp)
-                         if rr in db.creatures else E(disp))
+                         if rr in db.creatures else nwn_html(disp))
             rows.append(
                 f"<tr><td>{name_cell}</td>"
                 f"<td>{E(rr)}</td>"
@@ -1588,10 +1718,10 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
                 cr = fld(s, "CR", "")
                 disp = db.creature_name(srr) if srr in db.creatures else srr
                 cell = (link(f"../creatures/{srr}.html", disp)
-                        if srr in db.creatures else E(disp))
+                        if srr in db.creatures else nwn_html(disp))
                 spawn_cells.append(f"{cell}<small> CR {E(cr)}</small>")
             rows.append(
-                f"<tr><td>{E(ename)}</td>"
+                f"<tr><td>{nwn_html(ename)}</td>"
                 f"<td>{E(rr)}</td>"
                 f"<td>{E(tag)}</td>"
                 f"<td>{E(max_c)}</td>"
@@ -1650,7 +1780,7 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
             rr = fld(s, "ResRef", "") or fld(s, "TemplateResRef", "")
             sname = db.store_name(rr) or fld(s, "Tag", "") or rr
             cell = (link(f"../stores/{rr}.html", sname)
-                    if rr in db.stores else E(sname))
+                    if rr in db.stores else nwn_html(sname))
             rows.append(f"<tr><td>{cell}</td><td>{E(rr)}</td></tr>")
         sections.append(
             '<table class="data"><thead><tr>'
@@ -1715,7 +1845,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
     faction = fld(p, "Faction", "")
 
     sections = [
-        f"<h1>{E(pname)}</h1>",
+        f"<h1>{nwn_html(pname)}</h1>",
         '<dl class="meta">',
         f"<dt>Area</dt><dd>{link(f'../areas/{area_resref}.html', db.area_name(area_resref))}</dd>",
         f"<dt>Tag</dt><dd><code>{E(tag)}</code></dd>",
@@ -1741,7 +1871,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
 
     desc = loc(p.get("Description"))
     if desc:
-        sections.append(f'<p class="desc">{E(desc)}</p>')
+        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
 
     if items:
         sections.append(f"<h2>Contents ({len(items)})</h2>")
@@ -1757,7 +1887,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
             base = baseitem_label(fld(it, "BaseItem"))
             cost = fld(it, "Cost", "")
             cell = (link(f"../items/{irr}.html", iname)
-                    if irr in db.items else E(iname))
+                    if irr in db.items else nwn_html(iname))
             rows.append(
                 f"<tr><td>{cell}</td>"
                 f"<td>{E(irr)}</td>"
@@ -1778,7 +1908,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
 
 def render_creatures_index(db: Db, out: Path) -> None:
     rows = []
-    for rr in sorted(db.creatures.keys(), key=lambda r: db.creature_name(r).lower()):
+    for rr in sorted(db.creatures.keys(), key=lambda r: nwn_text(db.creature_name(r)).lower()):
         c = db.creatures[rr]
         classes = list_items(c.get("ClassList"))
         cls_str = "/".join(
@@ -1819,7 +1949,7 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
     inv = list_items(c.get("ItemList"))
 
     sections = [
-        f"<h1>{E(name)}</h1>",
+        f"<h1>{nwn_html(name)}</h1>",
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(c, 'Tag', ''))}</dd>",
@@ -1844,7 +1974,7 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
 
     desc = loc(c.get("Description"))
     if desc:
-        sections.append(f'<p class="desc">{E(desc)}</p>')
+        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
 
     # ----- Combat: saves / AC / BAB / attacks -------------------------------
     str_score = fld(c, "Str", 10) or 10
@@ -1987,7 +2117,7 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
         crit_str = weapon_crit_string(base_row)
         wname = db.item_name(irr) if irr in db.items else (irr or "(empty)")
         wlink = (link(f"../items/{irr}.html", wname)
-                 if irr in db.items else E(wname))
+                 if irr in db.items else nwn_html(wname))
         bname = baseitem_name(base_row) if base_row is not None else ""
         rng_str = ""
         stats = WEAPONS.get(int(base_row)) if base_row is not None else None
@@ -2186,7 +2316,7 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
 
 def render_items_index(db: Db, out: Path) -> None:
     rows = []
-    for rr in sorted(db.items.keys(), key=lambda r: db.item_name(r).lower()):
+    for rr in sorted(db.items.keys(), key=lambda r: nwn_text(db.item_name(r)).lower()):
         i = db.items[rr]
         rows.append(
             f"<tr><td>{link(f'{rr}.html', db.item_name(rr))}</td>"
@@ -2215,7 +2345,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     name = db.item_name(resref)
     props = list_items(i.get("PropertiesList"))
     sections = [
-        f"<h1>{E(name)}</h1>",
+        f"<h1>{nwn_html(name)}</h1>",
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
@@ -2228,7 +2358,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     ]
     desc = loc(i.get("Description"))
     if desc:
-        sections.append(f'<p class="desc">{E(desc)}</p>')
+        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
 
     if props:
         sections.append("<h2>Properties</h2>")
@@ -2274,7 +2404,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
 
 def render_stores_index(db: Db, out: Path) -> None:
     rows = []
-    for rr in sorted(db.stores.keys(), key=lambda r: db.store_name(r).lower()):
+    for rr in sorted(db.stores.keys(), key=lambda r: nwn_text(db.store_name(r)).lower()):
         s = db.stores[rr]
         pages = list_items(s.get("StoreList"))
         n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
@@ -2302,7 +2432,7 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
     pages = list_items(s.get("StoreList"))
     page_names = ["Armor", "Misc", "Potions", "Rings", "Weapons"]
     sections = [
-        f"<h1>{E(name)}</h1>",
+        f"<h1>{nwn_html(name)}</h1>",
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(s, 'Tag', ''))}</dd>",
@@ -2322,7 +2452,7 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
             irr = fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
             disp = db.item_name(irr) if irr in db.items else irr
             cell = (link(f"../items/{irr}.html", disp)
-                    if irr in db.items else E(disp))
+                    if irr in db.items else nwn_html(disp))
             rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
         sections.append(
             '<table class="data"><thead><tr><th>Item</th><th>ResRef</th></tr></thead>'
@@ -2342,7 +2472,7 @@ def render_factions(db: Db, out: Path) -> None:
     for i, f in enumerate(flist):
         rows.append(
             f"<tr><td>{i}</td>"
-            f"<td>{E(fld(f, 'FactionName', ''))}</td>"
+            f"<td>{nwn_html(fld(f, 'FactionName', ''))}</td>"
             f"<td>{E(fld(f, 'FactionParentID', ''))}</td>"
             f"<td>{E(fld(f, 'FactionGlobal', ''))}</td></tr>"
         )
@@ -2366,7 +2496,7 @@ def render_journal(db: Db, out: Path) -> None:
         qname = loc(c.get("Name")) or tag
         prio = fld(c, "Priority", "")
         xp = fld(c, "XP", "")
-        sections.append(f"<h2>{E(qname)} <small>({E(tag)})</small></h2>")
+        sections.append(f"<h2>{nwn_html(qname)} <small>({E(tag)})</small></h2>")
         sections.append(f"<p>Priority: {E(prio)} · XP: {E(xp)}</p>")
         entries = list_items(c.get("EntryList"))
         if entries:
@@ -2376,7 +2506,7 @@ def render_journal(db: Db, out: Path) -> None:
                 end = fld(e, "End", "")
                 txt = loc(e.get("Text"))
                 rows.append(
-                    f"<tr><td>{E(eid)}</td><td>{E('end' if end else '')}</td><td>{E(txt)}</td></tr>"
+                    f"<tr><td>{E(eid)}</td><td>{E('end' if end else '')}</td><td>{nwn_html(txt)}</td></tr>"
                 )
             sections.append(
                 '<table class="data"><thead><tr><th>ID</th><th>End</th><th>Text</th></tr></thead>'
