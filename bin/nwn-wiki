@@ -790,6 +790,12 @@ class Db:
         # Containers = placeables with a non-empty ItemList. Stored as a
         # parallel list keyed by area resref + ordinal for stable URLs.
         self.area_containers: dict[str, list[dict]] = defaultdict(list)
+        # Creature instances: actual placements of creatures inside areas, as
+        # opposed to the blueprint definitions in `creatures`. Each instance
+        # is {"area": area_resref, "idx": ord_in_area, "c": git_creature}.
+        # Keyed by area + ordinal for stable URLs.
+        self.creature_instances: list[dict] = []
+        self.area_creature_instances: dict[str, list[dict]] = defaultdict(list)
         self.faction_friendly: dict[int, bool] = {}  # FactionID → friendly to PC?
 
         # nss script index (resref → relative path) — used for "this script
@@ -925,8 +931,11 @@ class Db:
 
         # Per-area lists for the rest.
         for area_resref, git in self.gits.items():
-            for c in list_items(git.get("Creature List")):
+            for idx, c in enumerate(list_items(git.get("Creature List"))):
                 self.area_npcs[area_resref].append(c)
+                inst = {"area": area_resref, "idx": idx, "c": c}
+                self.creature_instances.append(inst)
+                self.area_creature_instances[area_resref].append(inst)
             for e in list_items(git.get("Encounter List")):
                 self.area_encounters[area_resref].append(e)
             for p in list_items(git.get("Placeable List")):
@@ -1225,6 +1234,22 @@ class Db:
                     "kind": "creature", "resref": rr,
                     "areas": sorted(creature_areas.get(rr, set())),
                 })
+
+        # 1a. Per-instance Conversation override on placed creatures. The
+        # toolset lets a builder swap the conversation on a single placement
+        # (Crazy Maggie in Bree uses `maggie.dlg` even though her blueprint
+        # `nw_oldwoman` points at the default commoner dialog), so we walk
+        # every placement and capture its effective conversation.
+        for inst in self.creature_instances:
+            c = inst["c"]
+            dlg = (fld(c, "Conversation", "") or "").lower()
+            if dlg and dlg in self.dialogs:
+                _add_caller(dlg, {
+                    "kind": "creature-instance",
+                    "area": inst["area"], "idx": inst["idx"],
+                    "resref": fld(c, "TemplateResRef", "") or "",
+                    "areas": [inst["area"]],
+                })
         for rr, p in self.placeables.items():
             dlg = (fld(p, "Conversation", "") or "").lower()
             if dlg and dlg in self.dialogs:
@@ -1310,7 +1335,8 @@ class Db:
             uniq = []
             for c in callers:
                 key = (c.get("kind"), c.get("resref"), c.get("event"),
-                       c.get("script"), tuple(c.get("areas", [])))
+                       c.get("script"), tuple(c.get("areas", [])),
+                       c.get("area"), c.get("idx"))
                 if key in seen:
                     continue
                 seen.add(key)
@@ -1416,6 +1442,38 @@ class Db:
         if faction_id is None:
             return True
         return self.faction_friendly.get(int(faction_id), True)
+
+    def faction_name(self, faction_id) -> str:
+        """Human-readable faction name from repute.fac.json's FactionList.
+        Falls back to the numeric id if the faction can't be resolved."""
+        if faction_id is None or faction_id == "":
+            return ""
+        try:
+            i = int(faction_id)
+        except (TypeError, ValueError):
+            return str(faction_id)
+        if not self.fac:
+            return str(i)
+        flist = list_items(self.fac.get("FactionList"))
+        if 0 <= i < len(flist):
+            name = fld(flist[i], "FactionName", "") or ""
+            return nwn_text(name) if name else str(i)
+        return str(i)
+
+    def creature_instance_name(self, area: str, idx: int) -> str:
+        """Display name for a creature INSTANCE (uses overridden FirstName/
+        LastName on the placement, falling back to the blueprint's name)."""
+        insts = self.area_creature_instances.get(area, [])
+        if not (0 <= idx < len(insts)):
+            return ""
+        c = insts[idx]["c"]
+        first = loc(c.get("FirstName"))
+        last = loc(c.get("LastName"))
+        full = (first + " " + last).strip()
+        if full:
+            return full
+        rr = fld(c, "TemplateResRef", "") or ""
+        return self.creature_name(rr) if rr else "(unnamed)"
 
     def dialog_label(self, resref: str) -> str:
         """A short human label for a dialog: the first line of its first
@@ -1786,6 +1844,18 @@ def _conv_link(db: "Db", resref: str | None, root_rel: str = "..") -> str:
     return f"<code>{E(resref)}</code>"
 
 
+def _faction_dd(db: Db, faction_id, root_rel: str = ".") -> str:
+    """Render a faction id as <name> (<id>) linking to the factions page,
+    falling back to just the raw id when no name is resolvable."""
+    if faction_id is None or faction_id == "":
+        return ""
+    name = db.faction_name(faction_id)
+    if name and str(name) != str(faction_id):
+        return (f'<a href="{E(root_rel)}/factions.html">{nwn_html(name)}</a>'
+                f' <small class="muted">(id {E(faction_id)})</small>')
+    return (f'<a href="{E(root_rel)}/factions.html">{E(faction_id)}</a>')
+
+
 def page(title: str, body: str, root_rel: str = ".") -> str:
     """Wrap body in the standard wiki page shell."""
     return f"""<!doctype html>
@@ -1801,7 +1871,8 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
     <nav>
       <a href="{E(root_rel)}/index.html">Map</a>
       <a href="{E(root_rel)}/areas/index.html">Areas</a>
-      <a href="{E(root_rel)}/creatures/index.html">Creatures</a>
+      <a href="{E(root_rel)}/creatures/index.html">Creature Blueprints</a>
+      <a href="{E(root_rel)}/creatures/instances/index.html">Creature Instances</a>
       <a href="{E(root_rel)}/items/index.html">Items</a>
       <a href="{E(root_rel)}/stores/index.html">Stores</a>
       <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
@@ -2198,23 +2269,26 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
-    # NPCs / hostile residents — split by friendliness
-    npcs = db.area_npcs.get(resref, [])
+    # NPCs / hostile residents — split by friendliness. Each row is one
+    # placement (instance), so we link the name to the per-instance page and
+    # separately surface the blueprint it was spawned from.
+    insts = db.area_creature_instances.get(resref, [])
     friendly, hostile = [], []
-    for c in npcs:
+    for inst in insts:
+        c = inst["c"]
         fid = fld(c, "FactionID")
-        (friendly if db.is_friendly(fid) else hostile).append(c)
+        (friendly if db.is_friendly(fid) else hostile).append(inst)
 
     def npc_table(rows_data: list[dict], heading: str) -> None:
         if not rows_data:
             return
         sections.append(f"<h2>{heading}</h2>")
         rows = []
-        for c in rows_data:
+        for inst in rows_data:
+            c = inst["c"]
+            idx = inst["idx"]
             rr = fld(c, "TemplateResRef", "") or ""
-            first = loc(c.get("FirstName"))
-            last = loc(c.get("LastName"))
-            disp = (first + " " + last).strip() or rr or "(unnamed)"
+            disp = db.creature_instance_name(resref, idx) or rr or "(unnamed)"
             classes = list_items(c.get("ClassList"))
             cls_str = "/".join(
                 f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
@@ -2223,21 +2297,27 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
             hp = fld(c, "MaxHitPoints", fld(c, "HitPoints", ""))
             cr = fld(c, "ChallengeRating", "")
             conv = fld(c, "Conversation", "")
-            name_cell = (link(f"../creatures/{rr}.html", disp)
-                         if rr in db.creatures else nwn_html(disp))
+            inst_url = f"../creatures/instances/{resref}-{idx:03d}.html"
+            name_cell = f'<a href="{E(inst_url)}">{nwn_html(disp)}</a>'
+            bp_cell = (link(f"../creatures/{rr}.html", db.creature_name(rr))
+                       if rr in db.creatures else
+                       (f"<code>{E(rr)}</code>" if rr else ""))
             rows.append(
                 f"<tr><td>{name_cell}</td>"
+                f"<td>{bp_cell}</td>"
                 f"<td>{E(rr)}</td>"
                 f"<td>{E(race_name(fld(c, 'Race')))}</td>"
                 f"<td>{E(cls_str)}</td>"
                 f"<td>{E(hp)}</td>"
                 f"<td>{E(cr)}</td>"
+                f"<td>{E(db.faction_name(fld(c, 'FactionID', '')))}</td>"
                 f"<td>{_conv_link(db, conv, root_rel='..')}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th>"
-            "<th>HP</th><th>CR</th><th>Conversation</th>"
+            "<th>Name</th><th>Blueprint</th><th>ResRef</th>"
+            "<th>Race</th><th>Class</th><th>HP</th><th>CR</th>"
+            "<th>Faction</th><th>Conversation</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
@@ -2353,15 +2433,25 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
                 dests = sorted({t["area"] for t in tps if t.get("area")})
                 tp_str = ", ".join(
                     link(f"{a}.html", db.area_name(a)) for a in dests if a in db.areas)
-            via = "; ".join(
-                (c["kind"] == "creature" and f"NPC <code>{E(c['resref'])}</code>") or
-                (c["kind"] == "placeable" and f"placeable <code>{E(c['resref'])}</code>") or
-                (c["kind"] == "door" and f"door <code>{E(c['resref'])}</code>") or
-                (c["kind"].endswith("-event")
-                 and f"<code>{E(c.get('event',''))}</code> on <code>{E(c['resref'])}</code>")
-                or c["kind"]
-                for c in callers
-            )
+            def _via_one(c: dict) -> str:
+                k = c["kind"]
+                if k == "creature":
+                    return f"NPC blueprint <code>{E(c['resref'])}</code>"
+                if k == "creature-instance":
+                    a = c.get("area", "")
+                    idx = c.get("idx", 0)
+                    nm = db.creature_instance_name(a, idx) or c.get("resref", "")
+                    href = f"../creatures/instances/{a}-{idx:03d}.html"
+                    return f'NPC <a href="{E(href)}">{nwn_html(nm)}</a>'
+                if k == "placeable":
+                    return f"placeable <code>{E(c['resref'])}</code>"
+                if k == "door":
+                    return f"door <code>{E(c['resref'])}</code>"
+                if k.endswith("-event"):
+                    return (f"<code>{E(c.get('event',''))}</code> on "
+                            f"<code>{E(c['resref'])}</code>")
+                return k
+            via = "; ".join(_via_one(c) for c in callers)
             rows.append(
                 f"<tr><td>{link(f'../conversations/{dlg_resref}.html', db.dialog_label(dlg_resref))}</td>"
                 f"<td><code>{E(dlg_resref)}</code></td>"
@@ -2508,16 +2598,21 @@ def render_creatures_index(db: Db, out: Path) -> None:
             f"<td>{E(race_name(fld(c, 'Race')))}</td>"
             f"<td>{E(cls_str)}</td>"
             f"<td>{E(fld(c, 'MaxHitPoints', ''))}</td>"
-            f"<td>{E(fld(c, 'ChallengeRating', ''))}</td></tr>"
+            f"<td>{E(fld(c, 'ChallengeRating', ''))}</td>"
+            f"<td>{E(db.faction_name(fld(c, 'FactionID', '')))}</td></tr>"
         )
     body = (
-        "<h1>Creatures</h1>"
-        f"<p>{len(db.creatures)} creature blueprints.</p>"
+        "<h1>Creature Blueprints</h1>"
+        f"<p>{len(db.creatures)} blueprints. Each may be placed zero, one, "
+        f'or many times across areas — see '
+        f'<a href="instances/index.html">Creature Instances</a> for placements.</p>'
         '<table class="data"><thead><tr>'
-        "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th><th>HP</th><th>CR</th>"
+        "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th>"
+        "<th>HP</th><th>CR</th><th>Faction</th>"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
-    write(out / "creatures" / "index.html", page("Creatures", body, root_rel=".."))
+    write(out / "creatures" / "index.html",
+          page("Creature Blueprints", body, root_rel=".."))
 
 
 def render_creature_page(db: Db, resref: str, out: Path) -> None:
@@ -2545,7 +2640,7 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
         f"<dt>HP</dt><dd>{E(fld(c, 'MaxHitPoints', fld(c, 'HitPoints', '')))}</dd>",
         f"<dt>CR</dt><dd>{E(fld(c, 'ChallengeRating', ''))}</dd>",
-        f"<dt>Faction</dt><dd>{E(fld(c, 'FactionID', ''))}</dd>",
+        f"<dt>Faction</dt><dd>{_faction_dd(db, fld(c, 'FactionID', ''), root_rel='..')}</dd>",
         f"<dt>Conversation</dt><dd>{_conv_link(db, fld(c, 'Conversation', ''), root_rel='..')}</dd>",
         '</dl>',
         '<h2>Abilities</h2>',
@@ -2888,17 +2983,174 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
         "<tbody>" + "\n".join(rows) + "</tbody></table>"
     )
 
-    # "Appears in" — areas that place this creature
-    appears = sorted({a for a, lst in db.area_npcs.items()
-                      for c2 in lst if fld(c2, "TemplateResRef") == resref})
-    if appears:
-        sections.append("<h2>Appears in</h2><ul>")
-        for a in appears:
-            sections.append(f"<li>{link(f'../areas/{a}.html', db.area_name(a))}</li>")
-        sections.append("</ul>")
+    # "Instances" — each placement of this blueprint, with overrides.
+    inst_rows = []
+    for area_rr in sorted(db.area_creature_instances.keys(),
+                          key=lambda r: db.area_name(r).lower()):
+        for inst in db.area_creature_instances[area_rr]:
+            ic = inst["c"]
+            if fld(ic, "TemplateResRef", "") != resref:
+                continue
+            idx = inst["idx"]
+            disp = db.creature_instance_name(area_rr, idx) or "(unnamed)"
+            url = f"instances/{area_rr}-{idx:03d}.html"
+            inst_conv = (fld(ic, "Conversation", "") or "").lower()
+            blueprint_conv = (fld(c, "Conversation", "") or "").lower()
+            conv_note = ""
+            if inst_conv and inst_conv != blueprint_conv:
+                conv_note = (' <small class="muted">(conv override: '
+                             f'{_conv_link(db, inst_conv, root_rel="..")})</small>')
+            inst_rows.append(
+                f"<tr><td><a href=\"{E(url)}\">{nwn_html(disp)}</a></td>"
+                f"<td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                f"<td>{E(db.faction_name(fld(ic, 'FactionID', '')))}</td>"
+                f"<td>{conv_note or '—'}</td></tr>"
+            )
+    if inst_rows:
+        sections.append(
+            f"<h2>Instances <small class=\"muted\">({len(inst_rows)})</small></h2>"
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Area</th><th>Faction</th><th>Notes</th>"
+            "</tr></thead><tbody>" + "\n".join(inst_rows) + "</tbody></table>"
+        )
 
     write(out / "creatures" / f"{resref}.html",
           page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_creature_instances_index(db: Db, out: Path) -> None:
+    """One row per placed creature, grouped by area. Instances may or may not
+    track their blueprint exactly — the toolset lets a builder rename a
+    placement, swap its conversation, or change its faction without editing
+    the underlying utc."""
+    sections = ["<h1>Creature Instances</h1>"]
+    n_total = len(db.creature_instances)
+    n_areas = sum(1 for v in db.area_creature_instances.values() if v)
+    sections.append(
+        f"<p>{n_total} placed creatures across {n_areas} areas. "
+        f'See <a href="../index.html">Creature Blueprints</a> for the '
+        f"underlying templates.</p>"
+    )
+    for area_rr in sorted(db.area_creature_instances.keys(),
+                          key=lambda r: db.area_name(r).lower()):
+        insts = db.area_creature_instances[area_rr]
+        if not insts:
+            continue
+        sections.append(
+            f'<h2>{link(f"../../areas/{area_rr}.html", db.area_name(area_rr))} '
+            f'<small class="muted">({len(insts)})</small></h2>'
+        )
+        rows = []
+        for inst in insts:
+            c = inst["c"]
+            idx = inst["idx"]
+            rr = fld(c, "TemplateResRef", "") or ""
+            disp = db.creature_instance_name(area_rr, idx) or rr or "(unnamed)"
+            url = f"{area_rr}-{idx:03d}.html"
+            bp_cell = (link(f"../{rr}.html", db.creature_name(rr))
+                       if rr in db.creatures else
+                       (f"<code>{E(rr)}</code>" if rr else "—"))
+            inst_conv = (fld(c, "Conversation", "") or "")
+            conv_cell = _conv_link(db, inst_conv, root_rel="../..") if inst_conv else "—"
+            rows.append(
+                f"<tr><td><a href=\"{E(url)}\">{nwn_html(disp)}</a></td>"
+                f"<td>{bp_cell}</td>"
+                f"<td>{E(rr)}</td>"
+                f"<td><code>{E(fld(c, 'Tag', ''))}</code></td>"
+                f"<td>{E(db.faction_name(fld(c, 'FactionID', '')))}</td>"
+                f"<td>{conv_cell}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Blueprint</th><th>ResRef</th>"
+            "<th>Tag</th><th>Faction</th><th>Conversation</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+    write(out / "creatures" / "instances" / "index.html",
+          page("Creature Instances", "\n".join(sections), root_rel="../.."))
+
+
+def render_creature_instance_page(db: Db, area_rr: str, idx: int, out: Path) -> None:
+    """One page per creature placement. Surfaces instance-specific overrides
+    (name, faction, conversation, position) alongside a back-link to the
+    blueprint, so the reader can see at a glance whether this placement is a
+    plain spawn or a customised NPC like Crazy Maggie."""
+    insts = db.area_creature_instances.get(area_rr, [])
+    if not (0 <= idx < len(insts)):
+        return
+    c = insts[idx]["c"]
+    rr = fld(c, "TemplateResRef", "") or ""
+    bp = db.creatures.get(rr)
+    name = db.creature_instance_name(area_rr, idx) or rr or "(unnamed)"
+
+    inst_conv = (fld(c, "Conversation", "") or "")
+    bp_conv = (fld(bp, "Conversation", "") or "") if bp else ""
+
+    classes = list_items(c.get("ClassList"))
+    cls_str = "/".join(
+        f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+        for cl in classes
+    )
+
+    x = fld(c, "XPosition", fld(c, "X", 0.0)) or 0.0
+    y = fld(c, "YPosition", fld(c, "Y", 0.0)) or 0.0
+    z = fld(c, "ZPosition", fld(c, "Z", 0.0)) or 0.0
+
+    bp_link = (link(f"../{rr}.html", db.creature_name(rr))
+               if rr in db.creatures else
+               (f"<code>{E(rr)}</code>" if rr else "—"))
+
+    sections = [
+        f"<h1>{nwn_html(name)}</h1>",
+        '<dl class="meta">',
+        f"<dt>Area</dt><dd>{link(f'../../areas/{area_rr}.html', db.area_name(area_rr))}</dd>",
+        f"<dt>Blueprint</dt><dd>{bp_link}</dd>",
+        f"<dt>ResRef</dt><dd>{E(rr)}</dd>",
+        f"<dt>Tag</dt><dd><code>{E(fld(c, 'Tag', ''))}</code></dd>",
+        f"<dt>Position (X, Y, Z)</dt><dd>"
+        f"{(float(x) if isinstance(x, (int, float)) else 0.0):.2f}, "
+        f"{(float(y) if isinstance(y, (int, float)) else 0.0):.2f}, "
+        f"{(float(z) if isinstance(z, (int, float)) else 0.0):.2f}</dd>",
+        f"<dt>Race</dt><dd>{E(race_name(fld(c, 'Race')))}</dd>",
+        f"<dt>Appearance</dt><dd>{E(appearance_name(fld(c, 'Appearance_Type')))}</dd>",
+        f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
+        f"<dt>HP</dt><dd>{E(fld(c, 'MaxHitPoints', fld(c, 'HitPoints', '')))}</dd>",
+        f"<dt>CR</dt><dd>{E(fld(c, 'ChallengeRating', ''))}</dd>",
+        f"<dt>Faction</dt><dd>{_faction_dd(db, fld(c, 'FactionID', ''), root_rel='../..')}</dd>",
+        f"<dt>Conversation</dt><dd>{_conv_link(db, inst_conv, root_rel='../..') if inst_conv else '—'}</dd>",
+    ]
+    if inst_conv and bp_conv and inst_conv.lower() != bp_conv.lower():
+        sections.append(
+            f'<dt>Blueprint conversation</dt><dd>'
+            f'{_conv_link(db, bp_conv, root_rel="../..")} '
+            f'<small class="muted">(overridden on this placement)</small></dd>'
+        )
+    sections.append('</dl>')
+
+    desc = loc(c.get("Description"))
+    if desc:
+        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
+
+    # Inventory specific to this placement (instance ItemList).
+    inv = list_items(c.get("ItemList"))
+    if inv:
+        sections.append(f"<h2>Inventory <small class=\"muted\">({len(inv)})</small></h2>")
+        rows = []
+        for it in inv:
+            irr = (fld(it, "InventoryRes", "") or
+                   fld(it, "TemplateResRef", "") or
+                   fld(it, "EquippedRes", ""))
+            iname = db.item_name(irr) if irr in db.items else (irr or "(unknown)")
+            cell = (link(f"../../items/{irr}.html", iname)
+                    if irr in db.items else nwn_html(iname))
+            rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
+        sections.append(
+            '<table class="data"><thead><tr><th>Item</th><th>ResRef</th></tr></thead>'
+            "<tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    write(out / "creatures" / "instances" / f"{area_rr}-{idx:03d}.html",
+          page(name, "\n".join(sections), root_rel="../.."))
 
 
 def render_items_index(db: Db, out: Path) -> None:
@@ -3141,7 +3393,22 @@ def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
                 if rr in db.creatures else nwn_html(rr))
         areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
                           for a in c.get("areas", []) if a in db.areas)
-        return f"NPC {cell} <code>{E(rr)}</code>" + (f" — in {areas}" if areas else "")
+        return (f'<span class="badge">blueprint</span> NPC {cell} '
+                f"<code>{E(rr)}</code>" + (f" — in {areas}" if areas else ""))
+    if kind == "creature-instance":
+        area_rr = c.get("area", "")
+        idx = c.get("idx", 0)
+        inst_label = db.creature_instance_name(area_rr, idx) or rr or "(unnamed)"
+        inst_url = f"{root_rel}/creatures/instances/{area_rr}-{idx:03d}.html"
+        bp_link = (link(f"{root_rel}/creatures/{rr}.html", db.creature_name(rr))
+                   if rr in db.creatures else
+                   (f"<code>{E(rr)}</code>" if rr else ""))
+        area_link = (link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
+                     if area_rr in db.areas else nwn_html(area_rr))
+        bp_part = f" <small class=\"muted\">(blueprint {bp_link})</small>" if bp_link else ""
+        return (f'<span class="badge">instance</span> NPC '
+                f'<a href="{E(inst_url)}">{nwn_html(inst_label)}</a>'
+                f"{bp_part} — in {area_link}")
     if kind == "placeable":
         # Placeables don't have their own page; we'll link to one of their
         # area pages instead, which is where the placement lives.
@@ -3539,6 +3806,10 @@ def main() -> int:
     render_creatures_index(db, out)
     for resref in db.creatures:
         render_creature_page(db, resref, out)
+    render_creature_instances_index(db, out)
+    for area_rr, insts in db.area_creature_instances.items():
+        for inst in insts:
+            render_creature_instance_page(db, area_rr, inst["idx"], out)
     render_items_index(db, out)
     for resref in db.items:
         render_item_page(db, resref, out)
