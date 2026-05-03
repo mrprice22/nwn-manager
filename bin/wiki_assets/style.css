@@ -76,6 +76,8 @@ table.data {
 }
 .map-hint .legend.trigger { color: #6b3a1c; }
 .map-hint .legend.door    { color: #2d6a3a; }
+.map-hint .legend.convo   { color: #9b4dca; }
+.map-hint .legend.pseudo  { color: #9b4dca; font-size: 1.1em; }
 footer { text-align: center; color: var(--muted); font-size: 0.85em; padding: 1.5em 0 2em; }
 .muted { color: var(--muted); font-size: 0.85em; }
 
@@ -202,4 +204,72 @@ svg .area-node text {
 }
 svg .edge-trigger { stroke: #6b3a1c; stroke-width: 2.5; opacity: 0.55; fill: none; }
 svg .edge-door    { stroke: #2d6a3a; stroke-width: 2.5; opacity: 0.55; fill: none; }
+svg .edge-convo   {
+  stroke: #9b4dca; stroke-width: 2.5; opacity: 0.7; fill: none;
+  stroke-dasharray: 6, 4;
+}
 svg .external-node rect { fill: #ddd; stroke: #999; stroke-dasharray: 3,3; }
+
+svg .convo-node polygon {
+  fill: #f3e8ff;
+  stroke: #9b4dca;
+  stroke-width: 2.4;
+}
+svg .convo-node:hover polygon { fill: #e3c9ff; }
+svg .convo-node text {
+  fill: #5a2b78;
+  pointer-events: none;
+  font-family: "Iowan Old Style", Georgia, serif;
+}
+
+/* Conversations index + per-dialog page styling. Goal: scannable
+ * outline, with NPC entries and PC replies visually distinct so a
+ * branching tree is readable as a flat list. */
+.badge {
+  display: inline-block;
+  padding: 0.05em 0.45em;
+  border-radius: 3px;
+  font-size: 0.75em;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  vertical-align: middle;
+}
+.badge.global   { background: #f3e8ff; color: #5a2b78; }
+.badge.teleport { background: #fff0c2; color: #6b4a00; }
+
+.dlg-callers { margin: 0.5em 0 1em; padding-left: 1.2em; }
+.dlg-callers li { margin-bottom: 0.25em; }
+
+.dlg-node {
+  margin: 0.4em 0;
+  padding: 0.5em 0.75em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--card);
+}
+.dlg-node.entry {
+  border-left: 4px solid var(--accent);
+}
+.dlg-node.reply {
+  border-left: 4px solid #2d6a3a;
+  margin-left: 1.5em;
+  background: #f7faf6;
+}
+.dlg-head {
+  font-size: 0.85em;
+  color: var(--muted);
+  margin-bottom: 0.3em;
+}
+.dlg-id { font-family: "SFMono-Regular", Consolas, monospace; }
+.dlg-speaker { color: var(--accent); }
+.dlg-action  { color: #5a2b78; }
+.dlg-text { white-space: pre-wrap; }
+.dlg-links {
+  font-size: 0.85em;
+  margin-top: 0.4em;
+  color: var(--muted);
+}
+.dlg-links a { color: var(--link); }
+.dlg-node:target {
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 2px;
+}

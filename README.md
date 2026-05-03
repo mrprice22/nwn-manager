@@ -212,6 +212,26 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
   - Spell resistance is inferred from feats only; SR granted by scripts
     or items is not summed into the AC/SR display.
 - `factions.html`, `journal.html` — module-level data.
+- `conversations/index.html` — every `.dlg` in the module, with per-dialog
+  pages that render the entry/reply outline plus the static cross-reference
+  graph: which NPCs / placeables / doors host the conversation, which
+  module- or area-level event scripts trigger it (e.g. `OnPlayerRest`
+  firing `on_mod_rest` → `ActionStartConversation("emotewand")`), and
+  which action scripts run on each entry/reply. Conversations whose action
+  scripts call `JumpToLocation` / `JumpToObject` are flagged as
+  *teleports* and listed with their resolved destination area.
+
+  The area map gains two extras from this analysis:
+  - **Dashed purple edges** from each area whose NPCs / placeables host
+    a teleport-capable conversation, pointing to that conversation's
+    destination area(s).
+  - **Octagonal nodes** for "global-trigger" teleport conversations
+    (rest menu, item activators, etc.) — they don't belong to a specific
+    area but the player can fire them anywhere, so they sit on the map
+    as their own pseudo-area linking to the conversation page.
+
+  Static analysis only: dialogs invoked through string-built resrefs or
+  pure runtime dispatch tables won't be picked up.
 - `assets/style.css` — bundled stylesheet.
 
 The wiki is **never** rebuilt automatically. `repack` does not trigger
@@ -403,5 +423,3 @@ nwn-wiki --src unpacked --out docs
 - TLK / HAK packing — supported by nasher via `nasher.cfg`, but no
   wrapper command in v1.
 - Git hooks and CI helpers.
-- Full dialog-tree rendering in the wiki (NPC pages link to their
-  `.dlg.json` resref but don't render the tree).

@@ -795,6 +795,39 @@ class Db:
         # nss script index (resref → relative path) — used for "this script
         # exists" checks; not deep parsed.
         self.scripts: set[str] = set()
+        self.script_paths: dict[str, Path] = {}
+
+        # ---- Dialog / script cross-references (index_scripts_and_dialogs) ----
+        # script resref → set of dialog resrefs the script calls
+        # ActionStartConversation against with a literal first arg.
+        self.script_dialogs: dict[str, set[str]] = defaultdict(set)
+        # script resref → set of waypoint/object tags the script jumps to.
+        self.script_teleport_tags: dict[str, set[str]] = defaultdict(set)
+        # tag (waypoint, door, trigger, placeable, creature) → area resref.
+        self.tag_to_area: dict[str, str] = {}
+        # dlg resref → list of caller descriptors:
+        #   {"kind": "creature"|"placeable"|"door", "resref": ..., "areas": [...]}
+        #   {"kind": "module-event", "event": "OnPlayerRest", "script": "..."}
+        #   {"kind": "creature-event", "resref": ..., "event": "ScriptDialogue", "script": ...}
+        #   {"kind": "placeable-event", "resref": ..., "event": "OnUsed", "script": ...}
+        #   {"kind": "trigger-event", "resref": ..., "event": "OnEnter", "script": ...}
+        #   {"kind": "area-event", "resref": ..., "event": "OnEnter", "script": ...}
+        #   {"kind": "item-script", "resref": ..., "script": ...}  (tag-based scripting)
+        self.dialog_callers: dict[str, list[dict]] = defaultdict(list)
+        # dlg resref → list of teleport destinations reachable from the dialog:
+        #   {"tag": <waypoint/object tag>, "area": <area resref or None>,
+        #    "via_script": <script resref>, "node_kind": "entry"|"reply",
+        #    "node_index": <int>}
+        self.dialog_teleports: dict[str, list[dict]] = defaultdict(list)
+        # dlg resref → list of {"resref": script, "kind": "active"|"action",
+        #                       "node_kind": "entry"|"reply", "node_index": int}
+        self.dialog_scripts: dict[str, list[dict]] = defaultdict(list)
+        # Pseudo-map nodes for conversations triggered "globally" (rest menu etc.)
+        # that contain teleports. id → {label, conv_resref, dests: [area resrefs]}
+        self.global_convo_pseudo: dict[str, dict] = {}
+        # Edges (area-or-pseudo-id → area resref) introduced by conversation
+        # teleports, drawn alongside trigger/door transitions on the map.
+        self.conv_transitions: list[dict] = []
 
     # ---- Loading ----
 
@@ -807,7 +840,9 @@ class Db:
                 continue
             name = path.name
             if name.endswith(".nss"):
-                self.scripts.add(name[:-4])
+                resref = name[:-4]
+                self.scripts.add(resref)
+                self.script_paths[resref] = path
                 continue
             if not name.endswith(".json"):
                 continue
@@ -973,6 +1008,381 @@ class Db:
               f"{len(self.transitions)} transitions, "
               f"{len(self.creatures)} creatures, {len(self.items)} items")
 
+    # ---- Dialog & script cross-referencing ----
+
+    # Module-event field → human label, used when a module-bound event
+    # script is the bridge between a player action (rest, level-up …) and
+    # an ActionStartConversation call.
+    MODULE_EVENT_FIELDS: dict[str, str] = {
+        "Mod_OnAcquirItem": "OnAcquireItem",
+        "Mod_OnActvtItem": "OnActivateItem",
+        "Mod_OnClientEntr": "OnClientEnter",
+        "Mod_OnClientLeav": "OnClientLeave",
+        "Mod_OnCutsnAbort": "OnCutsceneAbort",
+        "Mod_OnHeartbeat": "OnHeartbeat",
+        "Mod_OnModLoad": "OnModuleLoad",
+        "Mod_OnModStart": "OnModuleStart",
+        "Mod_OnPlrDeath": "OnPlayerDeath",
+        "Mod_OnPlrDying": "OnPlayerDying",
+        "Mod_OnPlrEqItm": "OnPlayerEquipItem",
+        "Mod_OnPlrLvlUp": "OnPlayerLevelUp",
+        "Mod_OnPlrRest": "OnPlayerRest",
+        "Mod_OnPlrUnEqItm": "OnPlayerUnequipItem",
+        "Mod_OnSpawnBtnDn": "OnSpawnButtonDown",
+        "Mod_OnUnAqreItem": "OnUnacquireItem",
+        "Mod_OnUsrDefined": "OnUserDefined",
+    }
+
+    # Per-blueprint event slots that we walk for ActionStartConversation
+    # calls. Names mirror the GFF field names on the blueprint.
+    CREATURE_EVENT_FIELDS: dict[str, str] = {
+        "ScriptDialogue": "OnConversation",
+        "ScriptSpawn": "OnSpawn",
+        "ScriptHeartbeat": "OnHeartbeat",
+        "ScriptOnNotice": "OnPerception",
+        "ScriptUserDefine": "OnUserDefined",
+    }
+    PLACEABLE_EVENT_FIELDS: dict[str, str] = {
+        "OnUsed": "OnUsed",
+        "OnDialog": "OnConversation",
+        "OnHeartbeat": "OnHeartbeat",
+        "OnUserDefined": "OnUserDefined",
+        "OnOpen": "OnOpen",
+        "OnClick": "OnClick",
+    }
+    DOOR_EVENT_FIELDS: dict[str, str] = {
+        "OnUsed": "OnUsed",
+        "OnDialog": "OnConversation",
+        "OnOpen": "OnOpen",
+        "OnClick": "OnClick",
+    }
+    TRIGGER_EVENT_FIELDS: dict[str, str] = {
+        "OnEnter": "OnEnter",
+        "OnExit": "OnExit",
+        "OnHeartbeat": "OnHeartbeat",
+        "OnUserDefined": "OnUserDefined",
+        "ScriptOnEnter": "OnEnter",
+        "ScriptOnExit": "OnExit",
+        "ScriptHeartbeat": "OnHeartbeat",
+        "ScriptUserDefine": "OnUserDefined",
+    }
+    AREA_EVENT_FIELDS: dict[str, str] = {
+        "OnEnter": "OnEnter",
+        "OnExit": "OnExit",
+        "OnHeartbeat": "OnHeartbeat",
+        "OnUserDefined": "OnUserDefined",
+    }
+
+    # Regex set used to scrape every .nss file once.
+    # Keep them line-oriented and forgiving on whitespace; the goal is
+    # "good enough to surface the obvious cross-references" not full
+    # NWScript parsing.
+    _RE_START_CONV = re.compile(
+        r"\bActionStartConversation\s*\(\s*[^,)]+,\s*\"([A-Za-z0-9_]+)\""
+    )
+    _RE_GET_TAG = re.compile(
+        r"\b(?:GetWaypointByTag|GetObjectByTag|GetNearestObjectByTag)"
+        r"\s*\(\s*\"([A-Za-z0-9_]+)\"\s*\)"
+    )
+    _RE_JUMP = re.compile(
+        r"\b(?:Action)?(?:JumpToLocation|JumpToObject)\s*\("
+    )
+
+    def _parse_scripts(self) -> None:
+        """One-shot scan of every .nss file. Populates script_dialogs and
+        script_teleport_tags. Cheap enough (~2300 files in well under 1s on
+        a hot disk) and avoids per-renderer file I/O."""
+        for resref, path in self.script_paths.items():
+            try:
+                text = path.read_text(errors="replace")
+            except Exception:
+                continue
+            # ActionStartConversation("dlgresref", ...)
+            for m in self._RE_START_CONV.finditer(text):
+                self.script_dialogs[resref].add(m.group(1).lower())
+            # Tag-based teleport heuristic: a script that resolves an object
+            # by tag *and* calls JumpTo[Location|Object] is treated as
+            # teleporting to that tag. Imperfect (a script may resolve a
+            # tag for some other reason), but the false-positive rate on
+            # real modules is low and the player-visible value is high.
+            if self._RE_JUMP.search(text):
+                for m in self._RE_GET_TAG.finditer(text):
+                    self.script_teleport_tags[resref].add(m.group(1))
+
+    def _build_tag_to_area(self) -> None:
+        """Tag → area resref index spanning every placement (waypoints,
+        doors, triggers, placeables, creatures). Used to resolve the
+        destination area of a teleport script's GetWaypointByTag call."""
+        for area_resref, git in self.gits.items():
+            for wp in list_items(git.get("WaypointList")):
+                tag = fld(wp, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+            for d in list_items(git.get("Door List")):
+                tag = fld(d, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+            for t in list_items(git.get("TriggerList")):
+                tag = fld(t, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+            for p in list_items(git.get("Placeable List")):
+                tag = fld(p, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+            for c in list_items(git.get("Creature List")):
+                tag = fld(c, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+
+    def _walk_dialog_nodes(self, dlg: dict) -> Iterable[tuple[str, int, dict]]:
+        """Yield (kind, index, node) for every Entry and Reply in a dlg."""
+        for i, e in enumerate(list_items(dlg.get("EntryList"))):
+            yield ("entry", i, e)
+        for i, r in enumerate(list_items(dlg.get("ReplyList"))):
+            yield ("reply", i, r)
+
+    def index_dialogs(self) -> None:
+        """Build dialog_callers, dialog_teleports, dialog_scripts and the
+        pseudo-node + conv_transitions edges for the area map. Must run
+        after index() (relies on tag/transition state) and after
+        _parse_scripts (relies on script→dialog and script→teleport-tag
+        lookups)."""
+        t0 = time.time()
+        self._parse_scripts()
+        self._build_tag_to_area()
+
+        # Per-dialog: action / active scripts and teleport destinations.
+        for dlg_resref, dlg in self.dialogs.items():
+            for kind, idx, node in self._walk_dialog_nodes(dlg):
+                action = fld(node, "Script", "")
+                if action:
+                    self.dialog_scripts[dlg_resref].append({
+                        "resref": action, "kind": "action",
+                        "node_kind": kind, "node_index": idx,
+                    })
+                    for tag in self.script_teleport_tags.get(action, ()):
+                        self.dialog_teleports[dlg_resref].append({
+                            "tag": tag,
+                            "area": self.tag_to_area.get(tag),
+                            "via_script": action,
+                            "node_kind": kind,
+                            "node_index": idx,
+                        })
+                # Conditional / starting-list "Active" gates also have
+                # their own scripts, surfaced for completeness.
+                for cond in list_items(node.get("RepliesList")) + list_items(node.get("EntriesList")):
+                    a = fld(cond, "Active", "")
+                    if a:
+                        self.dialog_scripts[dlg_resref].append({
+                            "resref": a, "kind": "active",
+                            "node_kind": kind, "node_index": idx,
+                        })
+            for s in list_items(dlg.get("StartingList")):
+                a = fld(s, "Active", "")
+                if a:
+                    self.dialog_scripts[dlg_resref].append({
+                        "resref": a, "kind": "active",
+                        "node_kind": "start", "node_index": -1,
+                    })
+
+        # Caller bookkeeping helper.
+        def _add_caller(dlg_resref: str, caller: dict) -> None:
+            if dlg_resref in self.dialogs:
+                self.dialog_callers[dlg_resref].append(caller)
+
+        # Where each blueprint is placed (resref → set of area resrefs).
+        creature_areas: dict[str, set[str]] = defaultdict(set)
+        placeable_areas: dict[str, set[str]] = defaultdict(set)
+        door_areas: dict[str, set[str]] = defaultdict(set)
+        trigger_areas: dict[str, set[str]] = defaultdict(set)
+        for ar, npcs in self.area_npcs.items():
+            for c in npcs:
+                rr = fld(c, "TemplateResRef", "")
+                if rr:
+                    creature_areas[rr].add(ar)
+        for ar, ps in self.area_placeables.items():
+            for p in ps:
+                rr = fld(p, "TemplateResRef", "")
+                if rr:
+                    placeable_areas[rr].add(ar)
+        for ar, ds in self.area_doors.items():
+            for d in ds:
+                rr = fld(d, "TemplateResRef", "")
+                if rr:
+                    door_areas[rr].add(ar)
+        for ar, ts in self.area_triggers.items():
+            for t in ts:
+                rr = fld(t, "TemplateResRef", "")
+                if rr:
+                    trigger_areas[rr].add(ar)
+
+        # 1. Direct Conversation field on creature/placeable/door blueprints.
+        for rr, c in self.creatures.items():
+            dlg = (fld(c, "Conversation", "") or "").lower()
+            if dlg and dlg in self.dialogs:
+                _add_caller(dlg, {
+                    "kind": "creature", "resref": rr,
+                    "areas": sorted(creature_areas.get(rr, set())),
+                })
+        for rr, p in self.placeables.items():
+            dlg = (fld(p, "Conversation", "") or "").lower()
+            if dlg and dlg in self.dialogs:
+                _add_caller(dlg, {
+                    "kind": "placeable", "resref": rr,
+                    "areas": sorted(placeable_areas.get(rr, set())),
+                })
+        for rr, d in self.doors.items():
+            dlg = (fld(d, "Conversation", "") or "").lower()
+            if dlg and dlg in self.dialogs:
+                _add_caller(dlg, {
+                    "kind": "door", "resref": rr,
+                    "areas": sorted(door_areas.get(rr, set())),
+                })
+
+        # 2. Scripts bound to per-blueprint event slots that statically
+        #    call ActionStartConversation with a literal dlg resref.
+        def _add_blueprint_event_callers(blueprints: dict, fields: dict[str, str],
+                                         kind: str, areas_idx: dict[str, set[str]]):
+            for rr, bp in blueprints.items():
+                for fld_name, label in fields.items():
+                    s = (fld(bp, fld_name, "") or "").lower()
+                    if not s:
+                        continue
+                    for dlg in self.script_dialogs.get(s, ()):
+                        _add_caller(dlg, {
+                            "kind": kind, "resref": rr,
+                            "event": label, "script": s,
+                            "areas": sorted(areas_idx.get(rr, set())),
+                        })
+        _add_blueprint_event_callers(self.creatures, self.CREATURE_EVENT_FIELDS,
+                                     "creature-event", creature_areas)
+        _add_blueprint_event_callers(self.placeables, self.PLACEABLE_EVENT_FIELDS,
+                                     "placeable-event", placeable_areas)
+        _add_blueprint_event_callers(self.doors, self.DOOR_EVENT_FIELDS,
+                                     "door-event", door_areas)
+        _add_blueprint_event_callers(self.triggers, self.TRIGGER_EVENT_FIELDS,
+                                     "trigger-event", trigger_areas)
+
+        # 3. Per-area event scripts.
+        for rr, area in self.areas.items():
+            for fld_name, label in self.AREA_EVENT_FIELDS.items():
+                s = (fld(area, fld_name, "") or "").lower()
+                if not s:
+                    continue
+                for dlg in self.script_dialogs.get(s, ()):
+                    _add_caller(dlg, {
+                        "kind": "area-event", "resref": rr,
+                        "event": label, "script": s,
+                        "areas": [rr],
+                    })
+
+        # 4. Module-level event scripts.
+        if self.ifo:
+            for fld_name, label in self.MODULE_EVENT_FIELDS.items():
+                s = (fld(self.ifo, fld_name, "") or "").lower()
+                if not s:
+                    continue
+                for dlg in self.script_dialogs.get(s, ()):
+                    _add_caller(dlg, {
+                        "kind": "module-event", "event": label, "script": s,
+                    })
+
+        # 5. Item tag-based scripting: when a script's resref equals an item's
+        #    tag (or resref) and that script statically starts a conversation,
+        #    treat the item as a caller. This catches the common "wand /
+        #    activate-item" pattern without needing to parse the central
+        #    Mod_OnActvtItem dispatcher's tag table.
+        for rr, item in self.items.items():
+            tag = (fld(item, "Tag", "") or "").lower()
+            for candidate in {rr.lower(), tag}:
+                if candidate and candidate in self.script_dialogs:
+                    for dlg in self.script_dialogs[candidate]:
+                        _add_caller(dlg, {
+                            "kind": "item-script", "resref": rr,
+                            "script": candidate,
+                        })
+
+        # Dedupe caller lists (the same blueprint can match via several
+        # event scripts; collapse identical descriptors).
+        for dlg, callers in self.dialog_callers.items():
+            seen = set()
+            uniq = []
+            for c in callers:
+                key = (c.get("kind"), c.get("resref"), c.get("event"),
+                       c.get("script"), tuple(c.get("areas", [])))
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(c)
+            self.dialog_callers[dlg] = uniq
+
+        # Pseudo-nodes + conv_transitions for the area map.
+        # A conversation contributes to the map if it has at least one
+        # teleport destination resolvable to a real area.
+        for dlg_resref, teleports in self.dialog_teleports.items():
+            dest_areas = sorted({t["area"] for t in teleports
+                                 if t["area"] and t["area"] in self.areas})
+            if not dest_areas:
+                continue
+            callers = self.dialog_callers.get(dlg_resref, [])
+            # Source areas: every area that hosts an entity caller.
+            src_areas: set[str] = set()
+            global_kinds: list[dict] = []
+            for c in callers:
+                if c["kind"] in ("module-event",):
+                    global_kinds.append(c)
+                elif c["kind"] == "item-script":
+                    # Items can be carried anywhere; treat as global too,
+                    # unless we later add inventory→area cross-refs.
+                    global_kinds.append(c)
+                else:
+                    for a in c.get("areas", []):
+                        if a in self.areas:
+                            src_areas.add(a)
+            for src in sorted(src_areas):
+                for dst in dest_areas:
+                    if dst == src:
+                        continue
+                    self.conv_transitions.append({
+                        "src": src,
+                        "dst_area": dst,
+                        "conv_resref": dlg_resref,
+                        "kind": "convo",
+                        "label": dlg_resref,
+                    })
+            if global_kinds:
+                # Pick a short label: prefer a module-event name, else
+                # "Convo: <resref>".
+                label = None
+                for c in global_kinds:
+                    if c["kind"] == "module-event":
+                        label = c["event"]
+                        break
+                if label is None:
+                    label = "Item activation"
+                pseudo_id = f"__convo:{dlg_resref}"
+                self.global_convo_pseudo[pseudo_id] = {
+                    "label": label,
+                    "conv_resref": dlg_resref,
+                    "dests": dest_areas,
+                }
+                for dst in dest_areas:
+                    self.conv_transitions.append({
+                        "src": pseudo_id,
+                        "dst_area": dst,
+                        "conv_resref": dlg_resref,
+                        "kind": "convo",
+                        "label": label,
+                    })
+
+        n_glob = len(self.global_convo_pseudo)
+        n_conv_edges = len(self.conv_transitions)
+        n_callers = sum(len(v) for v in self.dialog_callers.values())
+        print(f"  dialog xref in {time.time()-t0:.1f}s — {len(self.dialogs)} dialogs, "
+              f"{n_callers} callers, {n_glob} global pseudo-nodes, "
+              f"{n_conv_edges} conv map edges")
+
     # ---- Convenience getters ----
 
     def area_name(self, resref: str) -> str:
@@ -1006,6 +1416,29 @@ class Db:
         if faction_id is None:
             return True
         return self.faction_friendly.get(int(faction_id), True)
+
+    def dialog_label(self, resref: str) -> str:
+        """A short human label for a dialog: the first line of its first
+        Starting entry, truncated. Falls back to the resref."""
+        dlg = self.dialogs.get(resref)
+        if not dlg:
+            return resref
+        starts = list_items(dlg.get("StartingList"))
+        entries = list_items(dlg.get("EntryList"))
+        for s in starts:
+            i = fld(s, "Index")
+            if isinstance(i, int) and 0 <= i < len(entries):
+                txt = nwn_text(loc(entries[i].get("Text")))
+                txt = txt.strip().splitlines()[0] if txt else ""
+                if txt:
+                    return (txt[:60] + "…") if len(txt) > 63 else txt
+        # Fall back to the first non-empty entry text.
+        for e in entries:
+            txt = nwn_text(loc(e.get("Text")))
+            txt = txt.strip().splitlines()[0] if txt else ""
+            if txt:
+                return (txt[:60] + "…") if len(txt) > 63 else txt
+        return resref
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1774,18 @@ def link(href: str, text: str) -> str:
     return f'<a href="{E(href)}">{nwn_html(text)}</a>'
 
 
+def _conv_link(db: "Db", resref: str | None, root_rel: str = "..") -> str:
+    """Render a dialog resref as a link to its conversation page when the
+    dialog is in the module; otherwise render it as plain code (lets the
+    user see resrefs that point at engine-default dialogs that don't ship
+    in the module's dlg files)."""
+    if not resref:
+        return ""
+    if resref.lower() in db.dialogs:
+        return link(f"{root_rel}/conversations/{resref.lower()}.html", resref)
+    return f"<code>{E(resref)}</code>"
+
+
 def page(title: str, body: str, root_rel: str = ".") -> str:
     """Wrap body in the standard wiki page shell."""
     return f"""<!doctype html>
@@ -1359,6 +1804,7 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
       <a href="{E(root_rel)}/creatures/index.html">Creatures</a>
       <a href="{E(root_rel)}/items/index.html">Items</a>
       <a href="{E(root_rel)}/stores/index.html">Stores</a>
+      <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
       <a href="{E(root_rel)}/factions.html">Factions</a>
       <a href="{E(root_rel)}/journal.html">Journal</a>
     </nav>
@@ -1415,10 +1861,54 @@ def render_index(db: Db, out: Path, module_title: str,
     if desc:
         overview.append(f'<p class="desc">{nwn_html(desc)}</p>')
 
+    # Global-triggered conversations (rest menu, item activators, …) get
+    # called out above the map: a player can fire them from anywhere, and
+    # they often hide teleport destinations the map otherwise can't show.
+    global_dlgs = sorted(
+        db.global_convo_pseudo.values(),
+        key=lambda info: info["conv_resref"],
+    )
+    if global_dlgs:
+        overview.append("<h2>Global-trigger conversations</h2>")
+        overview.append('<p class="muted">Reachable from anywhere via a '
+                        'module-level event (rest, level-up, etc.) or a '
+                        'tag-based item activator. Each contains at least '
+                        'one teleport.</p>')
+        rows = []
+        for info in global_dlgs:
+            rr = info["conv_resref"]
+            callers = db.dialog_callers.get(rr, [])
+            kinds = sorted({(c["kind"], c.get("event") or c.get("script", ""))
+                            for c in callers
+                            if c["kind"] in ("module-event", "item-script")})
+            via = ", ".join(
+                f"<code>{E(ev)}</code>" if k == "module-event"
+                else f"item <code>{E(ev)}</code>"
+                for k, ev in kinds
+            )
+            dests = ", ".join(
+                link(f"areas/{a}.html", db.area_name(a))
+                for a in info["dests"] if a in db.areas)
+            rows.append(
+                f"<tr><td>{link(f'conversations/{rr}.html', db.dialog_label(rr))}</td>"
+                f"<td><code>{E(rr)}</code></td>"
+                f"<td>{via}</td>"
+                f"<td>{dests}</td></tr>"
+            )
+        overview.append(
+            '<table class="data"><thead><tr>'
+            "<th>Conversation</th><th>ResRef</th><th>Triggered via</th>"
+            "<th>Teleports to</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
     overview.append('<h2>Area map</h2>')
     overview.append('<p class="map-hint">Click an area to open its page. Lines: '
                     '<span class="legend trigger">trigger</span> '
-                    '<span class="legend door">door</span>.</p>')
+                    '<span class="legend door">door</span> '
+                    '<span class="legend convo">conversation teleport</span>. '
+                    '<span class="legend pseudo">★</span> = a global-trigger '
+                    'conversation node (e.g. Rest Menu).</p>')
     overview.append(render_map_svg(db, positions, sizes))
 
     body = "\n".join(overview)
@@ -1485,22 +1975,68 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}"/>'
         )
 
+    # Conversation-teleport edges. Drawn as a separate, dashed style so a
+    # quest hub's "rest menu can teleport you to X" doesn't get confused
+    # with a real walkable transition. Use an arrowhead because these
+    # edges are directional (src → dst); regular transitions are drawn
+    # bidirectionally already.
+    conv_drawn = set()
+    for tr in db.conv_transitions:
+        s = tr["src"]
+        d = tr["dst_area"]
+        if s not in positions or d not in positions:
+            continue
+        key = (s, d)
+        if key in conv_drawn:
+            continue
+        conv_drawn.add(key)
+        ax, ay = rect_edge_point(s, positions[d])
+        bx, by = rect_edge_point(d, positions[s])
+        edge_lines.append(
+            f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" '
+            f'class="edge-convo" marker-end="url(#convo-arrow)"/>'
+        )
+
     # Nodes — boxes sized by area's tile dimensions. Label sizing trades off
     # against legibility at default zoom and the page's natural width.
     font_size = 44.0
     node_g = []
-    for resref, (x, y) in positions.items():
-        w, h = sizes[resref]
+    for nid, (x, y) in positions.items():
+        w, h = sizes[nid]
         px = (x - w / 2) * scale
         py = (y - h / 2) * scale
         pw = w * scale
         ph = h * scale
         cx = x * scale
         cy = y * scale
+        if nid in db.global_convo_pseudo:
+            # Pseudo-node: octagon, links to the conversation page. The
+            # shape itself is what tells the reader "this isn't an area".
+            info = db.global_convo_pseudo[nid]
+            label = info["label"]
+            href = f"conversations/{info['conv_resref']}.html"
+            r = min(pw, ph) * 0.45
+            # Regular octagon centred on (cx, cy).
+            pts = []
+            for k in range(8):
+                ang = math.pi / 8 + k * math.pi / 4
+                pts.append(f"{cx + r * math.cos(ang):.1f},{cy + r * math.sin(ang):.1f}")
+            node_g.append(
+                f'<a href="{E(href)}"><g class="convo-node">'
+                f'<polygon points="{" ".join(pts)}" />'
+                f'<text x="{cx:.1f}" y="{cy:.1f}" '
+                f'text-anchor="middle" dominant-baseline="middle" '
+                f'font-size="{font_size * 0.7:.0f}">{E(label)}</text>'
+                f'<title>Conversation: {E(info["conv_resref"])} '
+                f'({E(label)} — global trigger)</title>'
+                f'</g></a>'
+            )
+            continue
         # SVG <text> can't render mid-string colour changes without <tspan>s,
         # so collapse to the first colour token (good enough for area names
         # that almost always use a single uniform colour) and strip the rest.
-        raw = db.area_name(resref)
+        raw = db.area_name(nid)
         name = nwn_text(raw)
         fill = nwn_first_color(raw)
         fill_attr = f' fill="{fill}"' if fill else ""
@@ -1508,7 +2044,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         # per character at this font.
         max_chars = max(6, int(pw / (font_size * 0.55)))
         label = name if len(name) <= max_chars else name[: max_chars - 1] + "…"
-        href = f"areas/{resref}.html"
+        href = f"areas/{nid}.html"
         node_g.append(
             f'<a href="{E(href)}"><g class="area-node">'
             f'<rect x="{px:.1f}" y="{py:.1f}" '
@@ -1516,7 +2052,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             f'<text x="{cx:.1f}" y="{cy:.1f}" '
             f'text-anchor="middle" dominant-baseline="middle" '
             f'font-size="{font_size:.0f}"{fill_attr}>{E(label)}</text>'
-            f'<title>{E(name)} ({E(resref)}, {int(w)}×{int(h)})</title>'
+            f'<title>{E(name)} ({E(nid)}, {int(w)}×{int(h)})</title>'
             f'</g></a>'
         )
 
@@ -1536,12 +2072,21 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
     zoom = 4.0
     display_w = vw * fit * zoom
     display_h = vh * fit * zoom
+    defs = (
+        '<defs>'
+        '<marker id="convo-arrow" viewBox="0 0 12 12" refX="10" refY="6" '
+        'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
+        '<path d="M0,0 L12,6 L0,12 Z" fill="#9b4dca"/>'
+        '</marker>'
+        '</defs>'
+    )
     return (
         f'<div class="map-wrap" id="area-map-wrap">'
         f'<svg class="area-map" '
         f'width="{display_w:.0f}" height="{display_h:.0f}" '
         f'viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
         f'preserveAspectRatio="xMidYMid meet">'
+        + defs
         + "\n".join(edge_lines)
         + "\n"
         + "\n".join(node_g)
@@ -1687,7 +2232,7 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
                 f"<td>{E(cls_str)}</td>"
                 f"<td>{E(hp)}</td>"
                 f"<td>{E(cr)}</td>"
-                f"<td>{E(conv)}</td></tr>"
+                f"<td>{_conv_link(db, conv, root_rel='..')}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
@@ -1785,6 +2330,48 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
         sections.append(
             '<table class="data"><thead><tr>'
             "<th>Store</th><th>ResRef</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Conversations reachable from this area — every dlg whose callers
+    # include an entity (NPC, placeable, door, trigger, area-event) bound
+    # to this area. Useful as a jump-off point when chasing a quest hook.
+    area_dlgs: list[tuple[str, list[dict]]] = []
+    for dlg_resref in sorted(db.dialogs):
+        callers = [c for c in db.dialog_callers.get(dlg_resref, [])
+                   if resref in c.get("areas", []) or
+                   (c.get("kind") == "area-event" and c.get("resref") == resref)]
+        if callers:
+            area_dlgs.append((dlg_resref, callers))
+    if area_dlgs:
+        sections.append("<h2>Conversations triggered here</h2>")
+        rows = []
+        for dlg_resref, callers in area_dlgs:
+            tps = db.dialog_teleports.get(dlg_resref, [])
+            tp_str = ""
+            if tps:
+                dests = sorted({t["area"] for t in tps if t.get("area")})
+                tp_str = ", ".join(
+                    link(f"{a}.html", db.area_name(a)) for a in dests if a in db.areas)
+            via = "; ".join(
+                (c["kind"] == "creature" and f"NPC <code>{E(c['resref'])}</code>") or
+                (c["kind"] == "placeable" and f"placeable <code>{E(c['resref'])}</code>") or
+                (c["kind"] == "door" and f"door <code>{E(c['resref'])}</code>") or
+                (c["kind"].endswith("-event")
+                 and f"<code>{E(c.get('event',''))}</code> on <code>{E(c['resref'])}</code>")
+                or c["kind"]
+                for c in callers
+            )
+            rows.append(
+                f"<tr><td>{link(f'../conversations/{dlg_resref}.html', db.dialog_label(dlg_resref))}</td>"
+                f"<td><code>{E(dlg_resref)}</code></td>"
+                f"<td>{via}</td>"
+                f"<td>{tp_str or '—'}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Conversation</th><th>ResRef</th><th>Triggered via</th>"
+            "<th>Teleports to</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
@@ -1959,7 +2546,7 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>HP</dt><dd>{E(fld(c, 'MaxHitPoints', fld(c, 'HitPoints', '')))}</dd>",
         f"<dt>CR</dt><dd>{E(fld(c, 'ChallengeRating', ''))}</dd>",
         f"<dt>Faction</dt><dd>{E(fld(c, 'FactionID', ''))}</dd>",
-        f"<dt>Conversation</dt><dd>{E(fld(c, 'Conversation', ''))}</dd>",
+        f"<dt>Conversation</dt><dd>{_conv_link(db, fld(c, 'Conversation', ''), root_rel='..')}</dd>",
         '</dl>',
         '<h2>Abilities</h2>',
         '<table class="data"><tr>'
@@ -2360,6 +2947,32 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     if desc:
         sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
 
+    # Conversations this item triggers via tag-based scripting (a script
+    # whose resref equals this item's resref or tag, calling
+    # ActionStartConversation with a literal dlg resref).
+    item_tag = (fld(i, "Tag", "") or "").lower()
+    item_dlgs: list[tuple[str, str]] = []  # (script_resref, dlg_resref)
+    for cand in {resref.lower(), item_tag}:
+        if cand and cand in db.script_dialogs:
+            for d in sorted(db.script_dialogs[cand]):
+                item_dlgs.append((cand, d))
+    if item_dlgs:
+        sections.append("<h2>Triggers conversation</h2><ul>")
+        for s, d in item_dlgs:
+            tps = db.dialog_teleports.get(d, [])
+            tp_note = ""
+            if tps:
+                dests = sorted({t["area"] for t in tps if t.get("area")})
+                if dests:
+                    tp_note = " — teleports to " + ", ".join(
+                        link(f"../areas/{a}.html", db.area_name(a))
+                        for a in dests if a in db.areas)
+            sections.append(
+                f"<li>{link(f'../conversations/{d}.html', db.dialog_label(d))} "
+                f"<code>{E(d)}</code> via script <code>{E(s)}</code>{tp_note}</li>"
+            )
+        sections.append("</ul>")
+
     if props:
         sections.append("<h2>Properties</h2>")
         rows = []
@@ -2516,6 +3129,283 @@ def render_journal(db: Db, out: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Conversations
+# ---------------------------------------------------------------------------
+
+def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
+    """One-line description of a dialog caller, with cross-page links."""
+    kind = c.get("kind")
+    rr = c.get("resref", "")
+    if kind == "creature":
+        cell = (link(f"{root_rel}/creatures/{rr}.html", db.creature_name(rr))
+                if rr in db.creatures else nwn_html(rr))
+        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+                          for a in c.get("areas", []) if a in db.areas)
+        return f"NPC {cell} <code>{E(rr)}</code>" + (f" — in {areas}" if areas else "")
+    if kind == "placeable":
+        # Placeables don't have their own page; we'll link to one of their
+        # area pages instead, which is where the placement lives.
+        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+                          for a in c.get("areas", []) if a in db.areas)
+        return (f"Placeable <code>{E(rr)}</code>" +
+                (f" — in {areas}" if areas else ""))
+    if kind == "door":
+        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+                          for a in c.get("areas", []) if a in db.areas)
+        return (f"Door <code>{E(rr)}</code>" +
+                (f" — in {areas}" if areas else ""))
+    if kind in ("creature-event", "placeable-event", "door-event",
+                "trigger-event", "area-event"):
+        ev = c.get("event", "")
+        s = c.get("script", "")
+        if kind == "creature-event":
+            ent = (link(f"{root_rel}/creatures/{rr}.html", db.creature_name(rr))
+                   if rr in db.creatures else nwn_html(rr))
+            label = f"NPC {ent} <code>{E(rr)}</code>"
+        elif kind == "area-event":
+            ent = (link(f"{root_rel}/areas/{rr}.html", db.area_name(rr))
+                   if rr in db.areas else nwn_html(rr))
+            label = f"Area {ent} <code>{E(rr)}</code>"
+        else:
+            label = f"{kind.split('-')[0].title()} <code>{E(rr)}</code>"
+        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+                          for a in c.get("areas", []) if a in db.areas)
+        return (f"{label} via <code>{E(ev)}</code> script <code>{E(s)}</code>" +
+                (f" — in {areas}" if areas else ""))
+    if kind == "module-event":
+        ev = c.get("event", "")
+        s = c.get("script", "")
+        return (f'<span class="badge global">global</span> '
+                f"Module <code>{E(ev)}</code> via script <code>{E(s)}</code>")
+    if kind == "item-script":
+        ent = (link(f"{root_rel}/items/{rr}.html", db.item_name(rr))
+               if rr in db.items else nwn_html(rr))
+        s = c.get("script", "")
+        return f"Item {ent} <code>{E(rr)}</code> via tag-script <code>{E(s)}</code>"
+    return E(repr(c))
+
+
+def _dialog_node_anchor(kind: str, idx: int) -> str:
+    return f"{kind[0]}{idx}"   # e.g. "e3", "r12"
+
+
+def _render_dialog_node_refs(db: Db, refs_field: list[dict],
+                             tgt_kind: str) -> str:
+    """Render a node's child-pointer list ("RepliesList" inside an entry,
+    "EntriesList" inside a reply) as inline anchor links to other nodes
+    on the same page. tgt_kind is "reply" or "entry"."""
+    if not refs_field:
+        return ""
+    cells = []
+    for ref in refs_field:
+        idx = fld(ref, "Index")
+        active = fld(ref, "Active", "")
+        is_child = fld(ref, "IsChild", 0)
+        anchor = _dialog_node_anchor(tgt_kind, int(idx)) if isinstance(idx, int) else "?"
+        label = "→ child" if is_child else f"→ {tgt_kind} #{idx}"
+        bits = [f'<a href="#{E(anchor)}">{E(label)}</a>']
+        if active:
+            bits.append(f' <small class="muted">(if <code>{E(active)}</code>)</small>')
+        cells.append("".join(bits))
+    return '<div class="dlg-links">' + " · ".join(cells) + "</div>"
+
+
+def render_conversations_index(db: Db, out: Path) -> None:
+    if not db.dialogs:
+        write(out / "conversations" / "index.html",
+              page("Conversations", "<h1>Conversations</h1><p>(none)</p>",
+                   root_rel=".."))
+        return
+    rows = []
+    for rr in sorted(db.dialogs.keys(),
+                     key=lambda r: db.dialog_label(r).lower()):
+        dlg = db.dialogs[rr]
+        n_entries = len(list_items(dlg.get("EntryList")))
+        n_replies = len(list_items(dlg.get("ReplyList")))
+        n_callers = len(db.dialog_callers.get(rr, []))
+        n_teleports = len(db.dialog_teleports.get(rr, []))
+        global_ = any(c["kind"] in ("module-event", "item-script")
+                      for c in db.dialog_callers.get(rr, []))
+        flags = []
+        if global_:
+            flags.append('<span class="badge global">global</span>')
+        if n_teleports:
+            flags.append('<span class="badge teleport">teleport</span>')
+        rows.append(
+            f"<tr><td>{link(f'{rr}.html', db.dialog_label(rr))}</td>"
+            f"<td><code>{E(rr)}</code></td>"
+            f"<td>{n_entries}</td>"
+            f"<td>{n_replies}</td>"
+            f"<td>{n_callers}</td>"
+            f"<td>{n_teleports}</td>"
+            f"<td>{' '.join(flags)}</td></tr>"
+        )
+    body = (
+        "<h1>Conversations</h1>"
+        f"<p>{len(db.dialogs)} dialog files. "
+        '<small class="muted">"global" = also reachable from a module-level '
+        "event script (rest, level-up, etc.) or a tag-based item activator. "
+        '"teleport" = at least one entry/reply runs an action script that '
+        "calls JumpToLocation/JumpToObject.</small></p>"
+        '<table class="data"><thead><tr>'
+        "<th>Opening line</th><th>ResRef</th><th>NPC lines</th><th>PC lines</th>"
+        "<th>Callers</th><th>Teleports</th><th>Flags</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "conversations" / "index.html",
+          page("Conversations", body, root_rel=".."))
+
+
+def render_conversation_page(db: Db, resref: str, out: Path) -> None:
+    """Per-dialog page. Renders the dialog as a flat outline of Entry and
+    Reply nodes with anchor links between them, since real NWN dialog
+    graphs cycle and a tree expansion is impractical (and noisy)."""
+    dlg = db.dialogs.get(resref)
+    if not dlg:
+        return
+    entries = list_items(dlg.get("EntryList"))
+    replies = list_items(dlg.get("ReplyList"))
+    starts = list_items(dlg.get("StartingList"))
+
+    sections: list[str] = [
+        f"<h1>Conversation: <code>{E(resref)}</code></h1>",
+        '<dl class="meta">',
+        f"<dt>NPC lines</dt><dd>{len(entries)}</dd>",
+        f"<dt>PC replies</dt><dd>{len(replies)}</dd>",
+        f"<dt>NumWords</dt><dd>{E(fld(dlg, 'NumWords', ''))}</dd>",
+        f"<dt>OnEnd</dt><dd><code>{E(fld(dlg, 'EndConversation', ''))}</code></dd>",
+        f"<dt>OnAbort</dt><dd><code>{E(fld(dlg, 'EndConverAbort', ''))}</code></dd>",
+        '</dl>',
+    ]
+
+    # ---- Triggered by ----
+    callers = db.dialog_callers.get(resref, [])
+    if callers:
+        sections.append("<h2>Triggered by</h2><ul class=\"dlg-callers\">")
+        for c in callers:
+            sections.append("<li>" + _caller_html(db, c, root_rel="..") + "</li>")
+        sections.append("</ul>")
+    else:
+        sections.append("<h2>Triggered by</h2>"
+                        "<p class=\"muted\">No caller found in static analysis. "
+                        "May be invoked from runtime-only code paths "
+                        "(string-built resrefs, etc.).</p>")
+
+    # ---- Teleport destinations ----
+    teleports = db.dialog_teleports.get(resref, [])
+    if teleports:
+        sections.append("<h2>Teleport destinations</h2>")
+        rows = []
+        for t in teleports:
+            anchor = _dialog_node_anchor(t["node_kind"], t["node_index"])
+            dst_area = t.get("area")
+            dst_cell = (link(f"../areas/{dst_area}.html", db.area_name(dst_area))
+                        if dst_area else f'<em class="muted">unresolved</em>')
+            rows.append(
+                f"<tr><td><code>{E(t['tag'])}</code></td>"
+                f"<td>{dst_cell}</td>"
+                f"<td><code>{E(t['via_script'])}</code></td>"
+                f"<td><a href=\"#{E(anchor)}\">{E(t['node_kind'])} #{t['node_index']}</a></td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Waypoint / object tag</th><th>Destination area</th>"
+            "<th>Via script</th><th>From node</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # ---- Action / condition scripts ----
+    scripts = db.dialog_scripts.get(resref, [])
+    if scripts:
+        sections.append("<h2>Scripts referenced</h2>")
+        seen: set[tuple[str, str]] = set()
+        rows = []
+        for s in scripts:
+            key = (s["resref"], s["kind"])
+            if key in seen:
+                continue
+            seen.add(key)
+            existence = "✓" if s["resref"] in db.scripts else "?"
+            extras = []
+            if s["resref"] in db.script_dialogs:
+                outs = sorted(db.script_dialogs[s["resref"]])
+                extras.append("starts: " + ", ".join(
+                    link(f"{o}.html", o) if o in db.dialogs else E(o) for o in outs))
+            if s["resref"] in db.script_teleport_tags:
+                extras.append("teleports to: " + ", ".join(
+                    f"<code>{E(t)}</code>" for t in sorted(db.script_teleport_tags[s["resref"]])))
+            rows.append(
+                f"<tr><td><code>{E(s['resref'])}</code></td>"
+                f"<td>{E(s['kind'])}</td>"
+                f"<td>{existence}</td>"
+                f"<td>{' · '.join(extras)}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Script</th><th>Slot</th><th>In module</th><th>Notes</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # ---- Starting entries ----
+    if starts:
+        sections.append("<h2>Starting entries</h2><ul>")
+        for s in starts:
+            i = fld(s, "Index")
+            active = fld(s, "Active", "")
+            anchor = _dialog_node_anchor("entry", int(i)) if isinstance(i, int) else "?"
+            preview = ""
+            if isinstance(i, int) and 0 <= i < len(entries):
+                preview = nwn_text(loc(entries[i].get("Text"))).strip()
+                preview = preview.splitlines()[0] if preview else ""
+                if len(preview) > 80:
+                    preview = preview[:80] + "…"
+            cond = (f' <small class="muted">(if <code>{E(active)}</code>)</small>'
+                    if active else "")
+            sections.append(
+                f'<li><a href="#{E(anchor)}">entry #{E(i)}</a>{cond}'
+                + (f' — {nwn_html(preview)}' if preview else "") + '</li>'
+            )
+        sections.append("</ul>")
+
+    # ---- Entries ----
+    sections.append("<h2>NPC lines (entries)</h2>")
+    for i, e in enumerate(entries):
+        anchor = _dialog_node_anchor("entry", i)
+        text = loc(e.get("Text"))
+        speaker = fld(e, "Speaker", "")
+        action = fld(e, "Script", "")
+        sections.append(
+            f'<div class="dlg-node entry" id="{E(anchor)}">'
+            f'<div class="dlg-head"><span class="dlg-id">entry #{i}</span>'
+            + (f' <span class="dlg-speaker">[{E(speaker)}]</span>' if speaker else "")
+            + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
+            + '</div>'
+            f'<div class="dlg-text">{nwn_html(text) or "<em>(no text)</em>"}</div>'
+            + _render_dialog_node_refs(db, list_items(e.get("RepliesList")), "reply")
+            + '</div>'
+        )
+
+    # ---- Replies ----
+    sections.append("<h2>PC replies</h2>")
+    for i, r in enumerate(replies):
+        anchor = _dialog_node_anchor("reply", i)
+        text = loc(r.get("Text"))
+        action = fld(r, "Script", "")
+        sections.append(
+            f'<div class="dlg-node reply" id="{E(anchor)}">'
+            f'<div class="dlg-head"><span class="dlg-id">reply #{i}</span>'
+            + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
+            + '</div>'
+            f'<div class="dlg-text">{nwn_html(text) or "<em>(no text)</em>"}</div>'
+            + _render_dialog_node_refs(db, list_items(r.get("EntriesList")), "entry")
+            + '</div>'
+        )
+
+    write(out / "conversations" / f"{resref}.html",
+          page(f"Conversation {resref}", "\n".join(sections), root_rel=".."))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2542,6 +3432,7 @@ def main() -> int:
     db = Db(src)
     db.load()
     db.index()
+    db.index_dialogs()
 
     # Apply 2DA-derived label overrides on top of the bundled stock JSON.
     # The lookup dicts (BASEITEMS, RACES, …) are module-level and only
@@ -2616,8 +3507,20 @@ def main() -> int:
         a, b = tr["src_area"], tr["dst_area"]
         if a in db.areas and b in db.areas:
             edges.append((a, b))
+    # Conversation-teleport edges and the pseudo-nodes that sit at the
+    # source of "global" trigger conversations (rest menu, item activators).
+    pseudo_nodes = sorted(db.global_convo_pseudo.keys())
+    for tr in db.conv_transitions:
+        s = tr["src"]
+        d = tr["dst_area"]
+        # Either both endpoints are areas, or src is a pseudo-node we'll
+        # add to node_ids below.
+        if d not in db.areas:
+            continue
+        if s in db.areas or s in db.global_convo_pseudo:
+            edges.append((s, d))
     positions, sizes = layout_areas(
-        sorted(db.areas.keys()),
+        sorted(db.areas.keys()) + pseudo_nodes,
         edges,
         db=db,
         seed=args.seed,
@@ -2642,6 +3545,9 @@ def main() -> int:
     render_stores_index(db, out)
     for resref in db.stores:
         render_store_page(db, resref, out)
+    render_conversations_index(db, out)
+    for resref in db.dialogs:
+        render_conversation_page(db, resref, out)
     render_factions(db, out)
     render_journal(db, out)
     print(f"  rendered in {time.time() - t0:.1f}s")
