@@ -87,6 +87,8 @@ BASEITEMS = _load_lookup("baseitems")
 CLASSES = _load_lookup("classes")
 RACES = _load_lookup("racialtypes")
 APPEARANCE = _load_lookup("appearance")
+PLACEABLES: dict[int, str] = {}  # populated by overlays only — stock placeables.2da
+                                  # rows are rarely interesting and we don't bundle them.
 IPRP_FEATS = _load_lookup("iprp_feats")
 
 
@@ -181,6 +183,60 @@ def _2da_split(line: str) -> list[str]:
     return out
 
 
+_OVERLAY_TARGETS: dict[str, dict[int, str]] = {
+    "baseitems":   BASEITEMS,
+    "racialtypes": RACES,
+    "appearance":  APPEARANCE,
+    "placeables":  PLACEABLES,
+    "iprp_feats":  IPRP_FEATS,
+    "classes":     CLASSES,
+}
+
+
+def load_json_overlay(d: Path, label: str) -> int:
+    """Merge pre-built `<name>.json` files in `d` onto the in-memory lookup
+    dicts. JSON layout: {"<row>": "<pretty name>", "_source": "..."}.
+    Keys starting with "_" are metadata and ignored. Returns total rows merged."""
+    total = 0
+    if not d.is_dir():
+        return 0
+    for name, target in _OVERLAY_TARGETS.items():
+        p = d / f"{name}.json"
+        if not p.is_file():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"  warn: could not parse {p}: {e}", file=sys.stderr)
+            continue
+        n = 0
+        for k, v in data.items():
+            if k.startswith("_") or not isinstance(v, str):
+                continue
+            try:
+                target[int(k)] = v
+            except ValueError:
+                continue
+            n += 1
+        total += n
+        print(f"  {label}: {name}.json → {n} rows")
+    return total
+
+
+def detect_cep_haks(ifo: dict | None) -> list[str]:
+    """Return the subset of `Mod_HakList` entries that look like CEP haks.
+    Empty list when the module is vanilla. Used to decide whether to layer
+    the bundled CEP overlay onto the stock lookups."""
+    if not ifo:
+        return []
+    haks = []
+    for h in list_items(ifo.get("Mod_HakList")):
+        name = (fld(h, "Mod_Hak", "") or "").lower()
+        if name.startswith("cep"):
+            haks.append(name)
+    return haks
+
+
 def load_2da_overrides(d: Path) -> None:
     """Patch the in-memory lookup dicts from extracted 2DA files in `d`.
     Updates BASEITEMS, IPRP_FEATS, RACES, CLASSES, APPEARANCE in place;
@@ -191,7 +247,8 @@ def load_2da_overrides(d: Path) -> None:
         "iprp_feats.2da":    ("Label", IPRP_FEATS),
         "racialtypes.2da":   ("Label", RACES),
         "classes.2da":       ("Label", CLASSES),
-        "placeables.2da":    ("Label", APPEARANCE),
+        "appearance.2da":    ("Label", APPEARANCE),
+        "placeables.2da":    ("Label", PLACEABLES),
     }
     for fname, (col, target) in files.items():
         p = d / fname
@@ -262,6 +319,15 @@ def appearance_name(row: int | None) -> str:
     if row is None:
         return ""
     return APPEARANCE.get(int(row), f"Appearance #{row}")
+
+
+def placeable_name(row: int | None) -> str:
+    """Human label for a placeables.2da row. Falls back to a numeric stub when
+    the row isn't bundled — placeables.2da overlays must be loaded for this to
+    return real names (CEP modules get them via the auto-detected overlay)."""
+    if row is None:
+        return ""
+    return PLACEABLES.get(int(row), f"Placeable #{row}")
 
 
 # ---------------------------------------------------------------------------
@@ -1347,8 +1413,8 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
         f"<dt>ResRef</dt><dd>{E(rr)}</dd>",
         f"<dt>Position (X, Y, Z)</dt><dd>{x:.2f}, {y:.2f}, {z:.2f}</dd>",
         f"<dt>Bearing</dt><dd>{E(bearing)}</dd>",
-        f"<dt>Appearance</dt><dd>{E(appearance) if appearance is not None else ''} "
-        f"<small class=\"muted\">(placeables.2da row)</small></dd>",
+        f"<dt>Appearance</dt><dd>{E(placeable_name(appearance))} "
+        f"<small class=\"muted\">(placeables.2da row {E(appearance) if appearance is not None else ''})</small></dd>",
         f"<dt>HP</dt><dd>{E(cur_hp)} / {E(hp)} (hardness {E(hardness)})</dd>",
         f"<dt>Plot / Static / Useable</dt><dd>{plot} / {static} / {useable}</dd>",
         f"<dt>Lockable</dt><dd>{lockable}</dd>",
@@ -1760,8 +1826,29 @@ def main() -> int:
         print(f"error: --src not a directory: {src}", file=sys.stderr)
         return 1
 
-    # 2DA overrides — explicit flag wins, otherwise auto-pick a sibling
-    # `<src>/../hak_2da` or `<src>/2da` if present.
+    print(f"[nwn-wiki] reading {src}")
+    db = Db(src)
+    db.load()
+    db.index()
+
+    # Apply 2DA-derived label overrides on top of the bundled stock JSON.
+    # The lookup dicts (BASEITEMS, RACES, …) are module-level and only
+    # consulted during rendering, so it's safe to mutate them after db.load().
+    # Order matters — later writers win:
+    #   1. stock         (baked into wiki_data/*.json on import)
+    #   2. CEP overlay   (auto-loaded when the IFO references any cep* hak)
+    #   3. --2da-dir     (or auto-picked <src>/../hak_2da, <src>/2da)
+    cep_haks = detect_cep_haks(db.ifo)
+    if cep_haks:
+        cep_overlay = DATA_DIR / "cep"
+        if cep_overlay.is_dir():
+            print(f"[nwn-wiki] applying CEP overlay (haks: {', '.join(cep_haks)})")
+            load_json_overlay(cep_overlay, label="cep")
+        else:
+            print(f"warn: CEP haks present but {cep_overlay} not bundled; "
+                  f"run wiki_data/cep/_build.py to regenerate",
+                  file=sys.stderr)
+
     twoda_dir: Path | None = None
     if args.twoda_dir:
         twoda_dir = Path(args.twoda_dir).resolve()
@@ -1777,11 +1864,6 @@ def main() -> int:
         else:
             print(f"warn: --2da-dir {twoda_dir} is not a directory; ignoring",
                   file=sys.stderr)
-
-    print(f"[nwn-wiki] reading {src}")
-    db = Db(src)
-    db.load()
-    db.index()
 
     # Wipe stale generated content so deleted resources don't linger in the
     # wiki. We only nuke the contents — keeping the directory itself preserves

@@ -1,4 +1,5 @@
 {
+  "_source": "stock NWN :: classes.2da",
   "0": "Barbarian",
   "1": "Bard",
   "2": "Cleric",
@@ -31,16 +32,12 @@
   "29": "Arcane Archer",
   "30": "Assassin",
   "31": "Blackguard",
-  "32": "Divine Champion",
+  "32": "Champion of Torm",
   "33": "Weapon Master",
   "34": "Pale Master",
   "35": "Shifter",
   "36": "Dwarven Defender",
-  "37": "Dragon Disciple",
+  "37": "Red Dragon Disciple",
   "38": "Ooze",
-  "39": "Eye of Gruumsh",
-  "40": "Red Dragon Disciple",
-  "41": "Purple Dragon Knight",
-  "42": "Champion of Torm",
-  "43": "Shou Disciple"
+  "41": "Purple Dragon Knight"
 }

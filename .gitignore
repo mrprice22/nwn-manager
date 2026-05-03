@@ -4,3 +4,4 @@
 *.ncs
 *.erf
 *.hak
+__pycache__/

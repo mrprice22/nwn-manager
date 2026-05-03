@@ -196,13 +196,19 @@ these tables, which is why a "Club +4" item can show up under base item
 "Rapier" — the HAK has reseated row 28 to a custom Club entry that the
 stock lookup doesn't know about.
 
-To get accurate labels, extract the relevant 2DAs from the HAK and
-point the wiki at them:
+**CEP modules**: a pre-built CEP overlay is bundled in
+`bin/wiki_data/cep/`. The wiki auto-detects any HAK whose name starts
+with `cep` in the module's `Mod_HakList` and merges the overlay on top
+of the stock lookups — no flags needed. To regenerate the overlay (e.g.
+when bumping CEP versions), run `bin/wiki_data/cep/_build.py` against a
+local CEP install plus an English `dialog.tlk`.
+
+**Other custom HAKs**: extract the relevant 2DAs and point the wiki at
+them with `--2da-dir`:
 
 ```sh
 mkdir -p hak_2da
-nwn_erf -x -f /path/to/cepbaseitem.hak -d hak_2da
-nwn_erf -x -f /path/to/cep2da.hak       -d hak_2da   # iprp_*.2da etc.
+nwn_erf -x -f /path/to/your.hak -d hak_2da
 
 nwn-manager wiki -- --2da-dir hak_2da
 # or equivalently:
@@ -210,17 +216,114 @@ nwn-wiki --src unpacked --out docs --2da-dir hak_2da
 ```
 
 `--2da-dir` parses any of `baseitems.2da`, `iprp_feats.2da`,
-`racialtypes.2da`, `classes.2da`, and `placeables.2da` it finds and
-patches the in-memory lookups by row number; rows the HAK doesn't touch
-keep their stock labels. If you put the extracted files at
-`<project>/hak_2da/` (sibling to `unpacked/`), the wiki picks them up
-automatically without needing the flag.
+`racialtypes.2da`, `classes.2da`, `appearance.2da`, and `placeables.2da`
+it finds and patches the in-memory lookups by row number; rows the HAK
+doesn't touch keep their stock (or CEP-overlaid) labels. Override
+order: stock → bundled CEP overlay (auto) → `--2da-dir` (last write
+wins). If you put extracted files at `<project>/hak_2da/` (sibling to
+`unpacked/`), the wiki picks them up automatically without the flag.
+
+#### Bundling a permanent overlay for your custom HAK
+
+If a HAK ships with the same module repeatedly (your own world, a
+shared community pack), it's worth promoting it from per-run
+`--2da-dir` to a bundled overlay so the wiki "just works" everywhere
+the HAK is used. The CEP overlay in `bin/wiki_data/cep/` is the
+template. To add a new one (e.g. `mypack`):
+
+```sh
+mkdir bin/wiki_data/mypack
+cp bin/wiki_data/cep/_build.py bin/wiki_data/mypack/_build.py
+```
+
+Edit `mypack/_build.py`:
+
+1. Update the `TARGETS` list — name the source `.hak`, the `.2da`
+   inside it, the output JSON basename, and the column names for the
+   TLK ref (`Name`/`STRING_REF`/etc.) and the fallback Label cell.
+   Different 2DAs use different column header names; check with
+   `nwn_twoda print <file>.2da | head` if you're not sure.
+2. Repoint the `--cep` / `--nwn` defaults at your HAK pack root and
+   custom TLK file, and rename the `_source` tag in the JSON output.
+3. Run it once: `bin/wiki_data/mypack/_build.py`. Commit the
+   generated `*.json` alongside `_build.py`.
+
+Then teach `nwn-wiki` about your overlay by editing `bin/nwn-wiki`:
+
+1. In `detect_cep_haks(...)` (rename / generalise as you see fit), add
+   a sibling helper that returns the matching haks for your pack, e.g.
+   `haks startswith "mypack"`.
+2. In `main()`, after the CEP block, add a parallel block that calls
+   `load_json_overlay(DATA_DIR / "mypack", label="mypack")` when your
+   detector fires. Order matters — overlays applied later win, so put
+   stack-on-top packs (project-specific tweaks) after broader ones
+   (CEP).
+
+The override layering is `stock → CEP → your pack(s) → --2da-dir`,
+left to right; later writers always win. The bundled CEP overlay
+costs ~160 KB on disk, which is a useful ceiling for what's
+reasonable to ship in-repo.
+
+#### Refreshing the bundled stock JSONs
+
+The top-level `bin/wiki_data/*.json` files (no subdirectory) are
+generated from a local NWN install by `bin/wiki_data/_build_stock.py`.
+Re-run it after a Beamdog EE patch that touches labels, or to bootstrap
+a fresh checkout:
+
+```sh
+bin/wiki_data/_build_stock.py            # default --nwn = Steam path on Linux
+bin/wiki_data/_build_stock.py --nwn /path/to/nwn
+```
+
+It uses `nwn_resman_extract` (from the `neverwinter` package) to pull
+2DAs straight from the install, so it doesn't matter whether the files
+are loose, in a `.bif`, or inside a patch HAK.
 
 ### Help
 
 ```sh
 nwn-manager --help
 nwn-wiki --help
+```
+
+### Tuning the area map
+
+The index page renders a force-directed SVG of every area. The default
+layout fits most modules; tweak it in three places when it doesn't.
+
+**Viewport** — `bin/wiki_assets/style.css`, the `.map-wrap` rule
+(currently `width: 1000px; height: 1000px`). The SVG renders at its
+native pixel size, so the wrap scrolls when the map is wider than
+the viewport. Increase both for huge modules; decrease for tiny ones.
+The styling is regenerated each `wiki` run so editing this file is the
+permanent change.
+
+**Box size** — `bin/nwn-wiki`, `layout_areas(...)`, the `box_scale`
+constant (currently `2.0`). Each area's box is sized to its tile
+dimensions × `box_scale`. Bumping it gives labels more room but
+spreads the map out; dropping below `1.5` makes labels collide.
+
+**Layout iterations / seed** — also in `layout_areas(...)`,
+`iterations` (default `600`) controls how many force-relaxation passes
+run; double it (~1.5× wallclock) if the map looks tangled. The CLI
+flag `--seed N` (default `1`) reshuffles the initial random
+placement — try a few values when you don't like the default's
+component positioning, since the force model is stable but starts from
+a random scatter.
+
+**Edge bias / repulsion** — also in `layout_areas(...)`. The repulsion
+gap thresholds (`avg_dim * 0.15`, `avg_dim * 4`) and the ideal edge
+length (`avg_dim * 0.4`) are the knobs that decide how tightly boxes
+pack. Edits here are advanced — read the inline comments in
+`bin/nwn-wiki` before changing.
+
+After any code-side change, rebuild the wiki to see the effect:
+
+```sh
+nwn-manager wiki         # in a project dir
+# or, just regenerate the docs/ tree without re-unpacking the .mod:
+nwn-wiki --src unpacked --out docs
 ```
 
 ## Notes
