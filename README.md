@@ -174,6 +174,43 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
   baseitems.2da row alongside the stock label, since CEP and similar
   HAKs frequently override rows — the row number is authoritative when
   the label disagrees with the in-game item.
+
+  Creature pages render a full combat profile derived from the UTC plus
+  the bundled 2DAs:
+
+  - **Combat** block: HP, AC (with breakdown — `10 + Dex + natural +
+    armor + shield + iprops`), BAB, Fort/Ref/Will saves, and any feats
+    that grant spell resistance.
+  - **Weapons** table: every equipped weapon (right hand, left hand, and
+    the three creature-weapon slots) with base item, melee/ranged + max
+    range, the iterative attack schedule (e.g. `+58/+53/+48/+43`), the
+    damage range (`1d8+15 (16–23) + Damage Bonus Acid 7`), and crit
+    threat / multiplier. Falls back to an unarmed schedule when no
+    weapon is equipped.
+  - **Feats** — full named list, deduped with `×N` counts for stacking
+    epic feats.
+  - **Skills** — table of skill name + ranks, zero-rank rows hidden.
+  - **Spells** — per class, broken out by spell level (Cantrips → Level
+    9), separating Memorized from Known. Any `SpecAbilityList` entries
+    (innate spell-likes) are grouped by spell + caster level into an
+    `N/day` row.
+
+  **Caveats** for the combat numbers (also surfaced inline on the page):
+
+  - Saves shown = the UTC's stored bonus + ability mod. The good-save
+    class progression and feat bonuses (Great Fortitude, Lightning
+    Reflexes, etc.) are added by the engine at load time, so the wiki
+    can't reproduce them exactly.
+  - AC is best-effort: armor / shield base AC and AC-bonus iprops are
+    parsed, but scripted bumps, dodge stacking, Tumble, and shield-bash
+    interactions only resolve at runtime.
+  - BAB uses the standard stock-class progression (full / 3⁄4 / 1⁄2).
+    Custom-HAK prestige classes whose `AttackBonusTable` differs from
+    their assumed factor will be off — supply `--2da-dir` with the
+    matching `classes.2da` if it matters, or bundle a permanent overlay
+    (see below).
+  - Spell resistance is inferred from feats only; SR granted by scripts
+    or items is not summed into the AC/SR display.
 - `factions.html`, `journal.html` — module-level data.
 - `assets/style.css` — bundled stylesheet.
 
@@ -190,11 +227,15 @@ nwn-wiki --src ./unpacked --out ./docs --module-name "My Module" --seed 42
 #### Custom HAKs (CEP, etc.) — overriding the 2DA lookups
 
 The wiki ships stock NWN1 lookups for `baseitems.2da`, `iprp_feats.2da`,
-`classes.2da`, `racialtypes.2da`, and `placeables.2da`. Modules that
-depend on CEP or any other custom HAK frequently override or extend
-these tables, which is why a "Club +4" item can show up under base item
+`classes.2da`, `racialtypes.2da`, `appearance.2da`, `feat.2da`,
+`skills.2da`, `spells.2da`, and a weapon-stats slice of `baseitems.2da`
+(for damage / crit / range on the creature page). Modules that depend
+on CEP or any other custom HAK frequently override or extend these
+tables, which is why a "Club +4" item can show up under base item
 "Rapier" — the HAK has reseated row 28 to a custom Club entry that the
-stock lookup doesn't know about.
+stock lookup doesn't know about. The same kind of mismatch on
+`feat.2da` / `skills.2da` / `spells.2da` shows up on creature pages as
+labels like `Feat #1234` instead of the named feat.
 
 **CEP modules**: a pre-built CEP overlay is bundled in
 `bin/wiki_data/cep/`. The wiki auto-detects any HAK whose name starts
@@ -216,12 +257,19 @@ nwn-wiki --src unpacked --out docs --2da-dir hak_2da
 ```
 
 `--2da-dir` parses any of `baseitems.2da`, `iprp_feats.2da`,
-`racialtypes.2da`, `classes.2da`, `appearance.2da`, and `placeables.2da`
-it finds and patches the in-memory lookups by row number; rows the HAK
-doesn't touch keep their stock (or CEP-overlaid) labels. Override
-order: stock → bundled CEP overlay (auto) → `--2da-dir` (last write
-wins). If you put extracted files at `<project>/hak_2da/` (sibling to
-`unpacked/`), the wiki picks them up automatically without the flag.
+`racialtypes.2da`, `classes.2da`, `appearance.2da`, `placeables.2da`,
+`feat.2da`, `skills.2da`, and `spells.2da` it finds and patches the
+in-memory lookups by row number; rows the HAK doesn't touch keep their
+stock (or CEP-overlaid) labels. Override order: stock → bundled CEP
+overlay (auto) → `--2da-dir` (last write wins). If you put extracted
+files at `<project>/hak_2da/` (sibling to `unpacked/`), the wiki picks
+them up automatically without the flag.
+
+For modules that add custom feats / skills / spells via HAK, this is
+the fix that turns `Feat #1234 ×3` into `Whirlwind of Fury ×3` on the
+creature page. `nwn_erf -x -f mypack.hak feat.2da skills.2da spells.2da
+-d hak_2da/` is enough — only the 2DAs you have take effect, the rest
+fall through to stock.
 
 #### Bundling a permanent overlay for your custom HAK
 
@@ -278,7 +326,11 @@ bin/wiki_data/_build_stock.py --nwn /path/to/nwn
 
 It uses `nwn_resman_extract` (from the `neverwinter` package) to pull
 2DAs straight from the install, so it doesn't matter whether the files
-are loose, in a `.bif`, or inside a patch HAK.
+are loose, in a `.bif`, or inside a patch HAK. Adding a new lookup is
+two edits in `_build_stock.py`: append a row to `TARGETS` (2da name,
+output JSON name, TLK-name column, fallback Label column), then
+register the same JSON name in `nwn-wiki`'s `_OVERLAY_TARGETS` and
+`load_2da_overrides()` files map so `--2da-dir` can patch it.
 
 ### Help
 
