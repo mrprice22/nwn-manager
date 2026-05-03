@@ -49,6 +49,20 @@ TARGETS = [
     ("classes.2da",     "classes",     "Name", "Label"),
     ("iprp_feats.2da",  "iprp_feats",  "Name", "Label"),
     ("appearance.2da",  "appearance",  "STRING_REF", "LABEL"),
+    # feat.2da / skills.2da / spells.2da power the expanded creature page
+    # (named feats, skill ranks, memorized spell lists). The 2da basename
+    # is "feat" (singular) but the engine uses "Feat" id refs from FeatList.
+    ("feat.2da",        "feat",        "FEAT", "LABEL"),
+    ("skills.2da",      "skills",      "Name", "Label"),
+    ("spells.2da",      "spells",      "Name", "Label"),
+]
+
+# baseitems.2da columns we cache as raw numeric values for weapon damage /
+# range / crit display. Pure numbers — no TLK lookup needed.
+WEAPON_COLS = [
+    "WeaponType", "WeaponSize", "RangedWeapon", "MinRange", "MaxRange",
+    "NumDice", "DieToRoll", "CritThreat", "CritHitMult", "WeaponWield",
+    "AmmunitionType", "BaseAC", "ArmorCheckPen", "AC_Enchant",
 ]
 
 
@@ -119,6 +133,43 @@ def build(nwn_dir: Path, out_dir: Path) -> None:
                 encoding="utf-8",
             )
             print(f"    wrote {out_path.name}: {len(mapping)} rows")
+
+        # Weapon stats: parse baseitems.2da once more, this time keeping
+        # the numeric fields the wiki needs for the creature attack
+        # schedule. Keyed by row id, so it sits alongside `baseitems.json`.
+        try:
+            twoda = extract_stock_2da(nwn_dir, "baseitems.2da", tmp)
+        except Exception as e:
+            print(f"    warn: weapon stats: could not re-extract baseitems.2da: {e}",
+                  file=sys.stderr)
+        else:
+            headers, rows = parse_2da(twoda)
+            col_idxs = {c: col_index(headers, c) for c in WEAPON_COLS}
+            weapons: dict[str, dict[str, str]] = {}
+            for row in rows:
+                if not row:
+                    continue
+                try:
+                    ridx = int(row[0])
+                except ValueError:
+                    continue
+                stats: dict[str, str] = {}
+                for col, idx in col_idxs.items():
+                    if idx is None or idx >= len(row):
+                        continue
+                    val = row[idx]
+                    if val:
+                        stats[col] = val
+                if stats:
+                    weapons[str(ridx)] = stats
+            wpath = out_dir / "weapons.json"
+            wpath.write_text(
+                json.dumps({"_source": "stock NWN :: baseitems.2da (weapon cols)",
+                            **weapons},
+                           indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print(f"    wrote {wpath.name}: {len(weapons)} rows")
 
 
 def main() -> None:

@@ -21,7 +21,7 @@ import random
 import shutil
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -90,6 +90,21 @@ APPEARANCE = _load_lookup("appearance")
 PLACEABLES: dict[int, str] = {}  # populated by overlays only — stock placeables.2da
                                   # rows are rarely interesting and we don't bundle them.
 IPRP_FEATS = _load_lookup("iprp_feats")
+FEATS = _load_lookup("feat")
+SKILLS = _load_lookup("skills")
+SPELLS = _load_lookup("spells")
+
+
+def _load_weapons() -> dict[int, dict[str, str]]:
+    p = DATA_DIR / "weapons.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    return {int(k): v for k, v in raw.items()
+            if not k.startswith("_") and isinstance(v, dict)}
+
+
+WEAPONS = _load_weapons()
 
 
 def _load_itemprops() -> dict:
@@ -190,6 +205,9 @@ _OVERLAY_TARGETS: dict[str, dict[int, str]] = {
     "placeables":  PLACEABLES,
     "iprp_feats":  IPRP_FEATS,
     "classes":     CLASSES,
+    "feat":        FEATS,
+    "skills":      SKILLS,
+    "spells":      SPELLS,
 }
 
 
@@ -249,6 +267,9 @@ def load_2da_overrides(d: Path) -> None:
         "classes.2da":       ("Label", CLASSES),
         "appearance.2da":    ("Label", APPEARANCE),
         "placeables.2da":    ("Label", PLACEABLES),
+        "feat.2da":          ("LABEL", FEATS),
+        "skills.2da":        ("Label", SKILLS),
+        "spells.2da":        ("Label", SPELLS),
     }
     for fname, (col, target) in files.items():
         p = d / fname
@@ -328,6 +349,24 @@ def placeable_name(row: int | None) -> str:
     if row is None:
         return ""
     return PLACEABLES.get(int(row), f"Placeable #{row}")
+
+
+def feat_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    return FEATS.get(int(row), f"Feat #{row}")
+
+
+def skill_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    return SKILLS.get(int(row), f"Skill #{row}")
+
+
+def spell_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    return SPELLS.get(int(row), f"Spell #{row}")
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +480,229 @@ def itemprop_oneliner(prop: dict) -> str:
     if f["cost"]:
         bits.append(f["cost"])
     return " ".join(b for b in bits if b)
+
+
+# ---------------------------------------------------------------------------
+# Combat-stat helpers (creature page)
+# ---------------------------------------------------------------------------
+#
+# NWN computes BAB / iterative attacks / AC at runtime from class progression
+# and equipment. The wiki is static, so we approximate from the UTC + items.
+# Where information is missing (custom HAKs, scripted bonuses) we surface the
+# raw fields so the reader can spot it.
+
+# Stock NWN class id → BAB factor. Full BAB classes get +1 per level, 3/4
+# classes get floor(0.75 * level), 1/2 classes get floor(0.5 * level).
+# Falls back to 3/4 for unknown ids.
+_FULL_BAB_CLASSES = {0, 4, 6, 7, 29, 31, 32, 33, 36, 38}
+_HALF_BAB_CLASSES = {9, 10, 34, 37}
+
+
+def _class_bab(class_id: int, level: int) -> int:
+    if class_id in _FULL_BAB_CLASSES:
+        return level
+    if class_id in _HALF_BAB_CLASSES:
+        return level // 2
+    return (level * 3) // 4
+
+
+def creature_bab(classes: list[dict]) -> int:
+    """Sum BAB across all class entries on a creature."""
+    total = 0
+    for cl in classes:
+        cid = fld(cl, "Class")
+        lvl = fld(cl, "ClassLevel", 0) or 0
+        if cid is None:
+            continue
+        total += _class_bab(int(cid), int(lvl))
+    return total
+
+
+def attack_schedule(bab: int, ability_mod: int = 0,
+                    bonus: int = 0) -> list[int]:
+    """Iterative attack bonuses. NWN caps at 4 attacks/round from BAB; haste
+    and dual-wield add separate bonus attacks we don't try to model."""
+    if bab <= 0:
+        return [ability_mod + bonus]
+    n = min(4, 1 + (bab - 1) // 5)
+    return [bab - 5 * i + ability_mod + bonus for i in range(n)]
+
+
+def ability_mod(score: int | None) -> int:
+    if score is None:
+        return 0
+    return (int(score) - 10) // 2
+
+
+# Inventory slot bitmasks used on Equip_ItemList[*].__struct_id.
+SLOT_HEAD = 0x0001
+SLOT_CHEST = 0x0002
+SLOT_BOOTS = 0x0004
+SLOT_ARMS = 0x0008
+SLOT_RIGHT = 0x0010
+SLOT_LEFT = 0x0020
+SLOT_CLOAK = 0x0040
+SLOT_LRING = 0x0080
+SLOT_RRING = 0x0100
+SLOT_NECK = 0x0200
+SLOT_BELT = 0x0400
+SLOT_ARROWS = 0x0800
+SLOT_BULLETS = 0x1000
+SLOT_BOLTS = 0x2000
+SLOT_CWEAP_R = 0x4000
+SLOT_CWEAP_L = 0x8000
+SLOT_CWEAP_B = 0x10000
+SLOT_CHIDE = 0x20000
+
+SLOT_NAMES = {
+    SLOT_HEAD: "Head", SLOT_CHEST: "Chest", SLOT_BOOTS: "Boots",
+    SLOT_ARMS: "Arms", SLOT_RIGHT: "Right hand", SLOT_LEFT: "Left hand",
+    SLOT_CLOAK: "Cloak", SLOT_LRING: "Left ring", SLOT_RRING: "Right ring",
+    SLOT_NECK: "Neck", SLOT_BELT: "Belt", SLOT_ARROWS: "Arrows",
+    SLOT_BULLETS: "Bullets", SLOT_BOLTS: "Bolts",
+    SLOT_CWEAP_R: "Creature weapon (R)", SLOT_CWEAP_L: "Creature weapon (L)",
+    SLOT_CWEAP_B: "Creature weapon (bite)", SLOT_CHIDE: "Creature hide",
+}
+
+WEAPON_SLOTS = {SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B}
+ARMOR_SLOTS = {SLOT_CHEST, SLOT_LEFT}  # left can hold a shield
+SHIELD_BASEITEMS = {58, 59, 60}  # Small / Large / Tower shields (stock 2da rows)
+
+
+def is_ranged_weapon(base_row: int | None) -> bool:
+    if base_row is None:
+        return False
+    stats = WEAPONS.get(int(base_row))
+    if not stats:
+        return False
+    rw = stats.get("RangedWeapon")
+    return bool(rw and rw not in ("0", ""))
+
+
+def weapon_damage_string(base_row: int | None,
+                         str_mod: int = 0,
+                         is_ranged: bool = False,
+                         iprop_dmg_bonus: int = 0,
+                         iprop_extra: list[str] | None = None) -> str:
+    """Human-readable base damage. Doesn't model two-handed (1.5x Str) or
+    weapon-finesse — those are runtime decisions."""
+    stats = WEAPONS.get(int(base_row)) if base_row is not None else None
+    if not stats:
+        return "—"
+    try:
+        n = int(stats.get("NumDice", "0") or 0)
+        d = int(stats.get("DieToRoll", "0") or 0)
+    except ValueError:
+        n, d = 0, 0
+    if n <= 0 or d <= 0:
+        return "—"
+    bits = [f"{n}d{d}"]
+    flat = (0 if is_ranged else str_mod) + iprop_dmg_bonus
+    if flat > 0:
+        bits.append(f"+{flat}")
+    elif flat < 0:
+        bits.append(str(flat))
+    base = "".join(bits)
+    lo = n + max(flat, -n * d + n)  # min damage clamps at "all ones + flat"
+    hi = n * d + flat
+    rng = f"({lo}–{hi})" if hi > lo else f"({hi})"
+    extras = ", ".join(iprop_extra or [])
+    out = f"{base} {rng}"
+    if extras:
+        out += f" + {extras}"
+    return out
+
+
+def weapon_crit_string(base_row: int | None) -> str:
+    stats = WEAPONS.get(int(base_row)) if base_row is not None else None
+    if not stats:
+        return ""
+    threat = stats.get("CritThreat", "")
+    mult = stats.get("CritHitMult", "")
+    if not threat or not mult:
+        return ""
+    try:
+        t = int(threat)
+        m = int(mult)
+    except ValueError:
+        return ""
+    if t <= 1:
+        return f"20/x{m}"
+    return f"{20 - t + 1}-20/x{m}"
+
+
+def item_ac_bonus(item: dict | None) -> tuple[int, list[str]]:
+    """Sum AC-related item properties on a single item. Returns
+    (numeric_bonus, descriptors) — descriptors lists deflection / dodge /
+    natural / etc. so the reader can see the breakdown."""
+    if not item:
+        return 0, []
+    total = 0
+    notes: list[str] = []
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pdef = IPROP_DEFS.get(int(pname_id), {})
+        pname = (pdef.get("name") or "").lower()
+        cost = fld(p, "CostValue", 0) or 0
+        try:
+            cost_int = int(cost)
+        except (TypeError, ValueError):
+            cost_int = 0
+        if "ac bonus" in pname or pname == "ac":
+            total += cost_int
+            notes.append(f"+{cost_int} {pdef.get('name','AC')}")
+    return total, notes
+
+
+def item_attack_bonus(item: dict | None) -> int:
+    """Sum 'Attack Bonus' / 'Enhancement Bonus' iprops on a weapon."""
+    if not item:
+        return 0
+    total = 0
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pname = (IPROP_DEFS.get(int(pname_id), {}).get("name") or "").lower()
+        if "attack bonus" in pname or "enhancement bonus" in pname:
+            try:
+                total += int(fld(p, "CostValue", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def item_damage_bonus(item: dict | None) -> tuple[int, list[str]]:
+    """Sum flat 'Damage Bonus' iprops; collect non-numeric extras (elemental,
+    massive crit, etc.) as descriptive strings."""
+    if not item:
+        return 0, []
+    flat = 0
+    extras: list[str] = []
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pdef = IPROP_DEFS.get(int(pname_id), {})
+        pname = (pdef.get("name") or "").lower()
+        if "damage bonus" in pname:
+            try:
+                cost = int(fld(p, "CostValue", 0) or 0)
+            except (TypeError, ValueError):
+                cost = 0
+            line = itemprop_oneliner(p)
+            # Damage Bonus w/ a "physical" or generic subtype usually flat;
+            # elemental subtypes display as bonus-line extras.
+            sub_id = fld(p, "Subtype")
+            if sub_id in (None, 0, 7):  # 7 = Physical (most flat)
+                flat += cost
+            else:
+                extras.append(line)
+        elif "massive criticals" in pname or "on hit" in pname or "vampiric" in pname:
+            extras.append(itemprop_oneliner(p))
+    return flat, extras
 
 
 # ---------------------------------------------------------------------------
@@ -1537,6 +1799,182 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
     if desc:
         sections.append(f'<p class="desc">{E(desc)}</p>')
 
+    # ----- Combat: saves / AC / BAB / attacks -------------------------------
+    str_score = fld(c, "Str", 10) or 10
+    dex_score = fld(c, "Dex", 10) or 10
+    con_score = fld(c, "Con", 10) or 10
+    wis_score = fld(c, "Wis", 10) or 10
+    str_mod = ability_mod(str_score)
+    dex_mod = ability_mod(dex_score)
+    con_mod = ability_mod(con_score)
+    wis_mod = ability_mod(wis_score)
+
+    # Saves: NWN UTC stores per-save *bonus* fields (fortbonus, refbonus,
+    # willbonus); the per-class progression is added at runtime. We surface
+    # the override + ability mod so the reader has a floor.
+    fort = (fld(c, "fortbonus", 0) or 0) + con_mod
+    ref = (fld(c, "refbonus", 0) or 0) + dex_mod
+    will = (fld(c, "willbonus", 0) or 0) + wis_mod
+
+    bab = creature_bab(classes)
+
+    # Find equipped armor / shield / weapons via slot bitmasks.
+    equip_by_slot: dict[int, dict] = {}
+    for e in equip:
+        slot = fld(e, "__struct_id")
+        if isinstance(slot, int):
+            equip_by_slot[slot] = e
+
+    def _equipped_item(slot: int) -> dict | None:
+        e = equip_by_slot.get(slot)
+        if not e:
+            return None
+        irr = fld(e, "EquippedRes", "")
+        return db.items.get(irr) if irr else None
+
+    armor_item = _equipped_item(SLOT_CHEST)
+    armor_base_ac = 0
+    if armor_item is not None:
+        a_stats = WEAPONS.get(int(fld(armor_item, "BaseItem", -1) or -1))
+        if a_stats:
+            try:
+                armor_base_ac = int(a_stats.get("BaseAC", "0") or 0)
+            except ValueError:
+                armor_base_ac = 0
+    shield_item = None
+    left = equip_by_slot.get(SLOT_LEFT)
+    if left:
+        irr = fld(left, "EquippedRes", "")
+        li = db.items.get(irr)
+        if li and int(fld(li, "BaseItem", -1) or -1) in SHIELD_BASEITEMS:
+            shield_item = li
+    shield_base_ac = 0
+    if shield_item is not None:
+        s_stats = WEAPONS.get(int(fld(shield_item, "BaseItem", -1) or -1))
+        if s_stats:
+            try:
+                shield_base_ac = int(s_stats.get("BaseAC", "0") or 0)
+            except ValueError:
+                shield_base_ac = 0
+
+    armor_ac_bonus, armor_notes = item_ac_bonus(armor_item)
+    shield_ac_bonus, shield_notes = item_ac_bonus(shield_item)
+    natural_ac = fld(c, "NaturalAC", 0) or 0
+    ac_total = (10 + dex_mod + int(natural_ac)
+                + armor_base_ac + armor_ac_bonus
+                + shield_base_ac + shield_ac_bonus)
+
+    ac_breakdown = [
+        f"10 base",
+        f"{dex_mod:+d} Dex",
+    ]
+    if natural_ac:
+        ac_breakdown.append(f"+{natural_ac} natural (NaturalAC)")
+    if armor_base_ac:
+        ac_breakdown.append(f"+{armor_base_ac} armor")
+    if armor_ac_bonus:
+        ac_breakdown.append(f"+{armor_ac_bonus} armor enchant")
+    if shield_base_ac:
+        ac_breakdown.append(f"+{shield_base_ac} shield")
+    if shield_ac_bonus:
+        ac_breakdown.append(f"+{shield_ac_bonus} shield enchant")
+    ac_extra = armor_notes + shield_notes
+
+    sections.append("<h2>Combat</h2>")
+    sections.append(
+        '<table class="data"><tr>'
+        f"<th>HP</th><td>{E(fld(c, 'MaxHitPoints', fld(c, 'HitPoints', '')))}</td>"
+        f"<th>AC</th><td>{ac_total} <small class=\"muted\">"
+        f"({E(' + '.join(ac_breakdown))})</small></td>"
+        f"<th>BAB</th><td>+{bab}</td>"
+        "</tr><tr>"
+        f"<th>Fort</th><td>{fort:+d}</td>"
+        f"<th>Ref</th><td>{ref:+d}</td>"
+        f"<th>Will</th><td>{will:+d}</td>"
+        "</tr></table>"
+    )
+    if ac_extra:
+        sections.append(f"<p class=\"muted\">AC extras: {E(', '.join(ac_extra))}</p>")
+    # Saves caveat — class-progression bonuses (good-save tables) are added
+    # by the engine at load time, so the wiki can't reproduce them exactly.
+    sections.append('<p class="muted">'
+                    'Saves shown = stored bonus + ability mod; class-table '
+                    'progression and feat bonuses (Great Fortitude, etc.) '
+                    'are applied at runtime.</p>')
+
+    # Magic resistance — NWN doesn't expose SR on the UTC; it's granted by
+    # feats / items. Surface any SR-flavored feats so the reader knows.
+    feat_ids = [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
+    sr_feat_lines = [feat_name(fid) for fid in feat_ids
+                     if "spell resistance" in feat_name(fid).lower()
+                     or "magic resistance" in feat_name(fid).lower()]
+    if sr_feat_lines:
+        sections.append(
+            "<p><strong>Spell resistance:</strong> "
+            f"granted by feats: {E(', '.join(sr_feat_lines))}</p>"
+        )
+
+    # ----- Weapons / attack schedule ----------------------------------------
+    weapon_rows: list[str] = []
+    for slot in (SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B):
+        e = equip_by_slot.get(slot)
+        if not e:
+            continue
+        irr = fld(e, "EquippedRes", "")
+        item = db.items.get(irr)
+        base_row = fld(item, "BaseItem") if item else None
+        # Skip non-weapons in the left-hand slot (shields).
+        if slot == SLOT_LEFT and item and int(base_row or -1) in SHIELD_BASEITEMS:
+            continue
+        ranged = is_ranged_weapon(base_row)
+        kind = "Ranged" if ranged else "Melee"
+        ab_iprop = item_attack_bonus(item)
+        dmg_flat, dmg_extras = item_damage_bonus(item)
+        atk_mod = (dex_mod if ranged else str_mod) + ab_iprop
+        attacks = attack_schedule(bab, ability_mod=atk_mod)
+        atk_str = "/".join(f"{a:+d}" for a in attacks)
+        dmg_str = weapon_damage_string(
+            base_row, str_mod=str_mod, is_ranged=ranged,
+            iprop_dmg_bonus=dmg_flat, iprop_extra=dmg_extras,
+        )
+        crit_str = weapon_crit_string(base_row)
+        wname = db.item_name(irr) if irr in db.items else (irr or "(empty)")
+        wlink = (link(f"../items/{irr}.html", wname)
+                 if irr in db.items else E(wname))
+        bname = baseitem_name(base_row) if base_row is not None else ""
+        rng_str = ""
+        stats = WEAPONS.get(int(base_row)) if base_row is not None else None
+        if ranged and stats:
+            rng_str = f"{stats.get('MaxRange', '?')}"
+        weapon_rows.append(
+            f"<tr><td>{E(SLOT_NAMES.get(slot, slot))}</td>"
+            f"<td>{wlink}</td>"
+            f"<td>{E(bname)}</td>"
+            f"<td>{E(kind)}{(' (' + rng_str + ')') if rng_str else ''}</td>"
+            f"<td>{E(atk_str)}</td>"
+            f"<td>{E(dmg_str)}</td>"
+            f"<td>{E(crit_str)}</td></tr>"
+        )
+    if weapon_rows:
+        sections.append(
+            "<h3>Weapons</h3>"
+            '<table class="data"><thead><tr>'
+            "<th>Slot</th><th>Item</th><th>Base</th><th>Type</th>"
+            "<th>Attack schedule</th><th>Damage</th><th>Crit</th>"
+            "</tr></thead><tbody>" + "\n".join(weapon_rows) + "</tbody></table>"
+        )
+    elif bab > 0:
+        # Unarmed — show the schedule with Str-mod damage so the reader still
+        # has something to work with.
+        attacks = attack_schedule(bab, ability_mod=str_mod)
+        atk_str = "/".join(f"{a:+d}" for a in attacks)
+        sections.append(
+            "<h3>Weapons</h3>"
+            f"<p>Unarmed: {E(atk_str)} · 1d{3 if str_mod < 5 else 6} "
+            f"{('+' + str(str_mod)) if str_mod > 0 else (str(str_mod) if str_mod < 0 else '')}"
+            "</p>"
+        )
+
     # Equipment
     if equip:
         sections.append("<h2>Equipment</h2>")
@@ -1546,7 +1984,8 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
             cell = (link(f"../items/{irr}.html", db.item_name(irr))
                     if irr in db.items else E(irr or "(empty)"))
             slot = fld(e, "__struct_id", "")
-            rows.append(f"<tr><td>{E(slot)}</td><td>{cell}</td></tr>")
+            slot_label = SLOT_NAMES.get(int(slot), str(slot)) if isinstance(slot, int) else str(slot)
+            rows.append(f"<tr><td>{E(slot_label)}</td><td>{cell}</td></tr>")
         sections.append(
             '<table class="data"><thead><tr><th>Slot</th><th>Item</th></tr></thead>'
             "<tbody>" + "\n".join(rows) + "</tbody></table>"
@@ -1566,6 +2005,108 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
             "<tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
+    # ----- Feats ------------------------------------------------------------
+    if feats:
+        # Group identical feat ids (some appear multiple times for stacking
+        # epic feats like Epic Toughness 1..10).
+        counts = Counter(feat_ids)
+        feat_cells: list[str] = []
+        for fid, n in sorted(counts.items(), key=lambda kv: feat_name(kv[0]).lower()):
+            label = feat_name(fid)
+            cell = E(label) + (f" ×{n}" if n > 1 else "")
+            feat_cells.append(f"<li>{cell}</li>")
+        sections.append(
+            f"<h2>Feats <small class=\"muted\">({len(feats)})</small></h2>"
+            f'<ul class="featlist">{"".join(feat_cells)}</ul>'
+        )
+
+    # ----- Skills (skip zero ranks) -----------------------------------------
+    if skills:
+        skill_rows: list[str] = []
+        for idx, s in enumerate(skills):
+            rank = fld(s, "Rank", 0) or 0
+            if int(rank) <= 0:
+                continue
+            skill_rows.append(
+                f"<tr><td>{E(skill_name(idx))}</td><td>{E(rank)}</td></tr>"
+            )
+        if skill_rows:
+            sections.append(
+                "<h2>Skills</h2>"
+                '<table class="data"><thead><tr>'
+                "<th>Skill</th><th>Ranks</th>"
+                "</tr></thead><tbody>" + "\n".join(skill_rows) + "</tbody></table>"
+            )
+
+    # ----- Spells (memorized + known) ---------------------------------------
+    spell_blocks: list[str] = []
+    for cl in classes:
+        cid = fld(cl, "Class")
+        if cid is None:
+            continue
+        # Detect any per-level memorized / known list on this class entry.
+        per_level: list[tuple[int, str, list[dict]]] = []
+        for lvl in range(10):
+            mem = list_items(cl.get(f"MemorizedList{lvl}"))
+            if mem:
+                per_level.append((lvl, "Memorized", mem))
+            known = list_items(cl.get(f"KnownList{lvl}"))
+            if known:
+                per_level.append((lvl, "Known", known))
+        if not per_level:
+            continue
+        cls_label = class_name(int(cid))
+        block = [f"<h3>{E(cls_label)}</h3>"]
+        rows: list[str] = []
+        for lvl, kind, lst in per_level:
+            spell_cells: list[str] = []
+            for s in lst:
+                sid = fld(s, "Spell")
+                meta = fld(s, "SpellMetaMagic", 0) or 0
+                label = spell_name(sid)
+                if meta:
+                    label = f"{label} <small>[mm:{meta}]</small>"
+                spell_cells.append(label)
+            label = ("Cantrips" if lvl == 0 else f"Level {lvl}") + f" ({kind})"
+            rows.append(
+                f"<tr><th>{E(label)}</th>"
+                f"<td>{', '.join(spell_cells)}</td></tr>"
+            )
+        block.append(
+            '<table class="data"><tbody>' + "\n".join(rows) + "</tbody></table>"
+        )
+        spell_blocks.append("\n".join(block))
+
+    # SpecAbilityList — innate spell-likes (SR feats, monster abilities).
+    # Group identical (spell, caster_level) entries; many UTCs list the same
+    # ability ten times to give it ten uses/day.
+    spec_abil = list_items(c.get("SpecAbilityList"))
+    if spec_abil:
+        bucket: dict[tuple[Any, Any], int] = defaultdict(int)
+        for s in spec_abil:
+            key = (fld(s, "Spell"), fld(s, "SpellCasterLevel", ""))
+            bucket[key] += 1
+        rows = []
+        for (sid, slvl), n in sorted(
+                bucket.items(),
+                key=lambda kv: spell_name(kv[0][0]).lower()):
+            uses = f"{n}/day" if n > 1 else "1/day"
+            rows.append(
+                f"<tr><td>{E(spell_name(sid))}</td>"
+                f"<td>{E(slvl)}</td>"
+                f"<td>{E(uses)}</td></tr>"
+            )
+        spell_blocks.append(
+            "<h3>Special abilities</h3>"
+            '<table class="data"><thead><tr>'
+            "<th>Spell/ability</th><th>Caster level</th><th>Uses</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    if spell_blocks:
+        sections.append("<h2>Spells</h2>")
+        sections.extend(spell_blocks)
+
     # Scripts
     sections.append("<h2>Scripts</h2>")
     script_fields = [
@@ -1582,12 +2123,6 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
         '<table class="data"><thead><tr><th>Event</th><th>Script</th></tr></thead>'
         "<tbody>" + "\n".join(rows) + "</tbody></table>"
     )
-
-    # Counts of feats/skills (full lists are noisy)
-    if feats:
-        sections.append(f"<p>{len(feats)} feats.</p>")
-    if skills:
-        sections.append(f"<p>{len(skills)} skill entries.</p>")
 
     # "Appears in" — areas that place this creature
     appears = sorted({a for a, lst in db.area_npcs.items()
