@@ -1841,6 +1841,45 @@ _C_TOKEN_RE = re.compile(r"<<?/c>|<<?c.{3}>", re.DOTALL)
 _C_OPEN_RE = re.compile(r"<<?c(.)(.)(.)>", re.DOTALL)
 
 
+# Canonical NWN1 in-game text colours for damage / effect / save types.
+# Source: https://nwn.wiki/spaces/NWN1/pages/38177018/Colour+Tokens
+# Applied to property subtypes, weapon damage extras, and creature feat /
+# spell labels so the wiki echoes the colour cues a player sees in the game.
+NWN_DAMAGE_COLORS: dict[str, str] = {
+    "Acid":       "#01ff01",
+    "Cold":       "#99ffff",
+    "Divine":     "#ffff01",
+    "Electrical": "#0166ff",
+    "Fire":       "#ff0101",
+    "Magical":    "#cc77ff",
+    "Negative":   "#999999",
+    "Positive":   "#ffffff",
+    "Sonic":      "#ff9901",
+}
+
+_DMG_WORD_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in NWN_DAMAGE_COLORS) + r")\b"
+)
+
+
+def colorize_damage_words(s: str) -> str:
+    """Wrap NWN damage / effect type words in spans with their canonical
+    in-game hex colour. Safe to call on either plain text or already-escaped
+    HTML — the substitution only matches bare words, never markup. The CSS
+    class `nwn-dmg` adds a text-shadow so the lighter NWN colours (Cold,
+    Divine, Positive) stay legible on the wiki's light background."""
+    if not s:
+        return s
+    return _DMG_WORD_RE.sub(
+        lambda m: (
+            f'<span class="nwn-dmg nwn-dmg-{m.group(1).lower()}" '
+            f'style="color:{NWN_DAMAGE_COLORS[m.group(1)]}">'
+            f"{m.group(1)}</span>"
+        ),
+        s,
+    )
+
+
 def nwn_text(s: Any) -> str:
     """Strip NWN colour tokens, returning plain text (no HTML escaping).
 
@@ -2868,7 +2907,7 @@ def _creature_detail_sections(
             f"<td>{E(bname)}</td>"
             f"<td>{E(kind)}{(' (' + rng_str + ')') if rng_str else ''}</td>"
             f"<td>{E(atk_str)}</td>"
-            f"<td>{E(dmg_str)}</td>"
+            f"<td>{colorize_damage_words(E(dmg_str))}</td>"
             f"<td>{E(crit_str)}</td></tr>"
         )
     if weapon_rows:
@@ -2938,7 +2977,7 @@ def _creature_detail_sections(
         feat_cells: list[str] = []
         for fid, n in sorted(counts.items(), key=lambda kv: feat_name(kv[0]).lower()):
             label = feat_name(fid)
-            cell = E(label) + (f" ×{n}" if n > 1 else "")
+            cell = colorize_damage_words(E(label)) + (f" ×{n}" if n > 1 else "")
             feat_cells.append(f"<li>{cell}</li>")
         sections.append(
             f"<h2>Feats <small class=\"muted\">({len(feats)})</small></h2>"
@@ -2988,7 +3027,7 @@ def _creature_detail_sections(
             for s in lst:
                 sid = fld(s, "Spell")
                 meta = fld(s, "SpellMetaMagic", 0) or 0
-                label = spell_name(sid)
+                label = colorize_damage_words(spell_name(sid))
                 if meta:
                     label = f"{label} <small>[mm:{meta}]</small>"
                 spell_cells.append(label)
@@ -3019,7 +3058,7 @@ def _creature_detail_sections(
                 key=lambda kv: spell_name(kv[0][0]).lower()):
             uses = f"{n}/day" if n > 1 else "1/day"
             rows.append(
-                f"<tr><td>{E(spell_name(sid))}</td>"
+                f"<tr><td>{colorize_damage_words(E(spell_name(sid)))}</td>"
                 f"<td>{E(slvl)}</td>"
                 f"<td>{E(uses)}</td></tr>"
             )
@@ -3320,8 +3359,8 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         for p in props:
             f = itemprop_format(p)
             rows.append(
-                f"<tr><td>{E(f['property'])}</td>"
-                f"<td>{E(f['subtype'])}</td>"
+                f"<tr><td>{colorize_damage_words(E(f['property']))}</td>"
+                f"<td>{colorize_damage_words(E(f['subtype']))}</td>"
                 f"<td>{E(f['cost'])}</td>"
                 f"<td>{E(f['param'])}</td>"
                 f"<td>{E(f['chance'])}</td></tr>"

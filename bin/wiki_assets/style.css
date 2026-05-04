@@ -280,3 +280,21 @@ svg .convo-node text {
   outline: 2px solid var(--accent-soft);
   outline-offset: 2px;
 }
+
+/* NWN canonical damage / effect text colours.
+ * Source: https://nwn.wiki/spaces/NWN1/pages/38177018/Colour+Tokens
+ * The hex colours come through inline so the page works without this
+ * stylesheet; the rules here just make the lighter NWN palette legible
+ * on the wiki's light page background. */
+.nwn-dmg {
+  font-weight: 600;
+  text-shadow:
+     0 0 1px rgba(0, 0, 0, 0.55),
+     0 0 2px rgba(0, 0, 0, 0.35);
+}
+/* Positive damage is white in-game; on a light page it needs a real outline. */
+.nwn-dmg-positive {
+  text-shadow:
+    -1px 0 0 #444,  1px 0 0 #444,
+     0 -1px 0 #444, 0  1px 0 #444;
+}
