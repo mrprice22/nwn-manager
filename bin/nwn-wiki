@@ -3853,8 +3853,18 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
                 extras.append("starts: " + ", ".join(
                     link(f"{o}.html", o) if o in db.dialogs else E(o) for o in outs))
             if s["resref"] in db.script_teleport_tags:
-                extras.append("teleports to: " + ", ".join(
-                    f"<code>{E(t)}</code>" for t in sorted(db.script_teleport_tags[s["resref"]])))
+                tp_parts = []
+                for t in sorted(db.script_teleport_tags[s["resref"]]):
+                    dst_area = db.tag_to_area.get(t)
+                    if dst_area:
+                        tp_parts.append(
+                            f"<code>{E(t)}</code> ("
+                            + link(f"../areas/{dst_area}.html", db.area_name(dst_area))
+                            + ")"
+                        )
+                    else:
+                        tp_parts.append(f"<code>{E(t)}</code>")
+                extras.append("teleports to: " + ", ".join(tp_parts))
             rows.append(
                 f"<tr><td><code>{E(s['resref'])}</code></td>"
                 f"<td>{E(s['kind'])}</td>"
