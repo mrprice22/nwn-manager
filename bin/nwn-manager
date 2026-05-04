@@ -104,21 +104,44 @@ sanitize_mod_path() {
   printf '%s\n' "$link"
 }
 
-# Detect the NWN install root from $NWN_INSTALL or by walking up from
-# .nasher/source (.mod is conventionally at <install>/data/mod/<name>.mod).
-# Echoes the detected path or empty if none found.
+# Detect the NWN game-data install root for TLK extraction.
+# Resolution order:
+#   1. $NWN_INSTALL (if set and exists)
+#   2. Walk up from .nasher/source assuming <install>/data/mod/<name>.mod
+#      (legacy path — was true when .mod lived in the Steam install dir)
+#   3. Fixed fallback list of common Steam install locations on Linux
+#
+# Note: the EE *user* directory (~/.local/share/Neverwinter Nights/) does
+# NOT count as an "install" here — it has no dialog.tlk. When the .mod
+# lives in <userdir>/modules/<name>.mod (the modern layout), .nasher/source
+# can't help us find dialog.tlk and we fall through to the fallback list.
 detect_nwn_install() {
   if [[ -n "${NWN_INSTALL:-}" && -d "$NWN_INSTALL" ]]; then
     printf '%s\n' "$NWN_INSTALL"; return 0
   fi
-  [[ -f .nasher/source ]] || return 0
-  local mod_path mod_dir parent
-  mod_path=$(cat .nasher/source)
-  mod_dir=$(dirname "$mod_path")
-  parent=$(dirname "$mod_dir")
-  if [[ "$(basename "$mod_dir")" == "mod" && "$(basename "$parent")" == "data" ]]; then
-    printf '%s\n' "$(dirname "$parent")"
+
+  if [[ -f .nasher/source ]]; then
+    local mod_path mod_dir parent
+    mod_path=$(cat .nasher/source)
+    mod_dir=$(dirname "$mod_path")
+    parent=$(dirname "$mod_dir")
+    if [[ "$(basename "$mod_dir")" == "mod" && "$(basename "$parent")" == "data" ]]; then
+      printf '%s\n' "$(dirname "$parent")"
+      return 0
+    fi
   fi
+
+  local cand
+  for cand in \
+    "$HOME/.local/share/Steam/steamapps/common/Neverwinter Nights" \
+    "/var/home/$USER/.local/share/Steam/steamapps/common/Neverwinter Nights" \
+    "$HOME/.steam/steam/steamapps/common/Neverwinter Nights" \
+    "/opt/nwn"
+  do
+    if [[ -f "$cand/lang/en/data/dialog.tlk" || -f "$cand/data/tlk/dialog.tlk" ]]; then
+      printf '%s\n' "$cand"; return 0
+    fi
+  done
 }
 
 # Extract the base dialog.tlk and the custom TLK (named in module.ifo's
@@ -322,6 +345,22 @@ cmd_unpack() {
   print_unpacked_summary
 }
 
+# Read the `file = "..."` value from the first [target] in nasher.cfg.
+# Echoes the bare filename or empty if not found. Used to locate the .mod
+# nasher just packed; nasher writes it to the project root by default.
+nasher_target_file() {
+  [[ -f nasher.cfg ]] || return 0
+  awk '
+    /^\[target/ { in_target=1; next }
+    /^\[/        { in_target=0 }
+    in_target && /^[[:space:]]*file[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*"?/, "")
+      sub(/"?[[:space:]]*$/, "")
+      print; exit
+    }
+  ' nasher.cfg
+}
+
 cmd_repack() {
   local root
   root=$(find_project_root) || {
@@ -332,19 +371,28 @@ cmd_repack() {
 
   nasher pack --yes "$@"
 
-  if [[ -d dist ]]; then
-    echo "[$PROG] dist/ contents:"
-    ls -lh dist/ | tail -n +2 | sed 's/^/  /'
+  # nasher's default output location is the project root, named per the
+  # target's `file = ...`. Older configs that route through dist/ still work
+  # via the fallback below.
+  local built=""
+  local target_file
+  target_file=$(nasher_target_file)
+  if [[ -n $target_file && -f $target_file ]]; then
+    built=$(realpath "$target_file")
+  elif [[ -d dist ]]; then
+    built=$(ls -t dist/*.mod 2>/dev/null | head -1 || true)
+    [[ -n $built ]] && built=$(realpath "$built")
   fi
 
+  if [[ -z $built ]]; then
+    echo "[$PROG] no built .mod found at project root or in dist/ — skipping install copy" >&2
+    return 0
+  fi
+  echo "[$PROG] built: $built"
+
   if [[ -f .nasher/source ]]; then
-    local install built
+    local install
     install=$(cat .nasher/source)
-    built=$(ls -t dist/*.mod 2>/dev/null | head -1 || true)
-    if [[ -z $built ]]; then
-      echo "[$PROG] no .mod in dist/ — skipping install copy" >&2
-      return 0
-    fi
     if [[ ! -d $(dirname "$install") ]]; then
       echo "[$PROG] install dir $(dirname "$install") does not exist — skipping copy" >&2
       return 0

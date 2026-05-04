@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Desktop-launcher target: repack Homer's LotR from ./unpacked/ into a .mod
+# and copy it to the install location recorded in .nasher/source.
+#
+# nasher prints alarming "N errored" tallies for the long-standing pile of
+# broken scripts (zep_cr_*, openstore_*, dmw_do_dialog*, godmode, etc.) —
+# all benign, all known, all documented in the bin/ CLAUDE.md. The launcher
+# determines actual success by checking that the .mod was rebuilt with a
+# newer mtime than the script started, and reports that explicitly.
+
+set -o pipefail
+
+PROJECT=/var/home/james/GIT/nwn_homers_lotr
+NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
+
+export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
+
+cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
+
+# Force a clean rebuild — nasher otherwise no-ops if it thinks nothing
+# changed since the last pack (see bin/CLAUDE.md L6).
+rm -f homers_lotr_v3.mod
+
+start=$(date +%s)
+nwn-manager repack
+nasher_status=$?
+
+echo
+echo "=========================================================================="
+if [[ -f homers_lotr_v3.mod ]]; then
+  built=$(stat -c %Y homers_lotr_v3.mod)
+  size=$(stat -c %s homers_lotr_v3.mod)
+  size_mb=$(( size / 1024 / 1024 ))
+  if [[ $built -ge $start ]]; then
+    echo "[OK] homers_lotr_v3.mod rebuilt (${size_mb} MB)"
+    echo "     The 'N errored' tally above is pre-existing module noise — see"
+    echo "     /var/home/james/.local/share/Steam/steamapps/common/Neverwinter Nights/bin/CLAUDE.md"
+    echo
+    echo "Next: launch the server with the 'Host Homer's LotR Server' app-grid"
+    echo "      shortcut (or run bin/serve from the project root)."
+    status=0
+  else
+    echo "[STALE] homers_lotr_v3.mod exists but was not updated this run."
+    echo "        nasher exit: $nasher_status — check output above."
+    status=1
+  fi
+else
+  echo "[FAILED] no homers_lotr_v3.mod produced (nasher exit $nasher_status)"
+  status=1
+fi
+echo
+read -rp "Press Enter to close..."
+exit $status
