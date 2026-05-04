@@ -269,6 +269,13 @@ svg .convo-node text {
   color: var(--muted);
 }
 .dlg-links a { color: var(--link); }
+.featlist {
+  column-count: 2;
+  column-gap: 1.5em;
+  padding-left: 1.5em;
+}
+.featlist li { break-inside: avoid; }
+
 .dlg-node:target {
   outline: 2px solid var(--accent-soft);
   outline-offset: 2px;
