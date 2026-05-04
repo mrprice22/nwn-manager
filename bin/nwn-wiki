@@ -1998,7 +1998,8 @@ def write(path: Path, content: str) -> None:
 
 def render_index(db: Db, out: Path, module_title: str,
                  positions: dict[str, tuple[float, float]],
-                 sizes: dict[str, tuple[float, float]]) -> None:
+                 sizes: dict[str, tuple[float, float]],
+                 base_url: str = "") -> None:
     # Module overview block
     ifo = db.ifo or {}
     start_area = fld(ifo, "Mod_Entry_Area", "")
@@ -2078,16 +2079,21 @@ def render_index(db: Db, out: Path, module_title: str,
                     '<span class="legend convo">conversation teleport</span>. '
                     '<span class="legend pseudo">★</span> = a global-trigger '
                     'conversation node (e.g. Rest Menu).</p>')
-    overview.append(render_map_svg(db, positions, sizes))
+    overview.append(render_map_svg(db, positions, sizes, base_url=base_url))
 
     body = "\n".join(overview)
     write(out / "index.html", page(module_title, body, root_rel="."))
 
 
 def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
-                   sizes: dict[str, tuple[float, float]]) -> str:
+                   sizes: dict[str, tuple[float, float]],
+                   base_url: str = "") -> str:
     if not positions:
         return "<p>(no areas)</p>"
+
+    # When a publish URL is given, rewrite node anchor hrefs as absolute URLs
+    # so the downloaded standalone SVG keeps clickable links.
+    url_prefix = base_url.rstrip("/") + "/" if base_url else ""
 
     # Box sizes are in "tile units"; positions share those units. We scale
     # everything up to give text room — bigger labels, bigger boxes — so the
@@ -2146,10 +2152,15 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         cls = "edge-trigger" if tr["kind"] == "trigger" else "edge-door"
         names = sorted([node_label(a), node_label(b)], key=str.lower)
         title = f"{names[0]} connected to {names[1]}"
+        # Pair each visible thin line with a transparent thick hit-area line
+        # so the <title> tooltip is easy to trigger by hovering the edge.
         edge_lines.append(
+            f'<g class="edge-group"><title>{E(title)}</title>'
             f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
-            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}">'
-            f'<title>{E(title)}</title></line>'
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="edge-hit"/>'
+            f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}"/>'
+            f'</g>'
         )
 
     # Conversation-teleport edges. Drawn as a separate, dashed style so a
@@ -2171,10 +2182,13 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         bx, by = rect_edge_point(d, positions[s])
         title = f"From: {node_label(s)} To: {node_label(d)}"
         edge_lines.append(
+            f'<g class="edge-group"><title>{E(title)}</title>'
+            f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="edge-hit"/>'
             f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
             f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" '
-            f'class="edge-convo" marker-end="url(#convo-arrow)">'
-            f'<title>{E(title)}</title></line>'
+            f'class="edge-convo" marker-end="url(#convo-arrow)"/>'
+            f'</g>'
         )
 
     # Nodes — boxes sized by area's tile dimensions. Label sizing trades off
@@ -2194,7 +2208,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             # shape itself is what tells the reader "this isn't an area".
             info = db.global_convo_pseudo[nid]
             label = info["label"]
-            href = f"conversations/{info['conv_resref']}.html"
+            href = url_prefix + f"conversations/{info['conv_resref']}.html"
             r = min(pw, ph) * 0.45
             # Regular octagon centred on (cx, cy).
             pts = []
@@ -2223,7 +2237,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         # per character at this font.
         max_chars = max(6, int(pw / (font_size * 0.55)))
         label = name if len(name) <= max_chars else name[: max_chars - 1] + "…"
-        href = f"areas/{nid}.html"
+        href = url_prefix + f"areas/{nid}.html"
         node_g.append(
             f'<a href="{E(href)}"><g class="area-node">'
             f'<rect x="{px:.1f}" y="{py:.1f}" '
@@ -2263,6 +2277,8 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         '.edge-door{stroke:#2d6a3a;stroke-width:2.5;opacity:0.55;fill:none}'
         '.edge-convo{stroke:#9b4dca;stroke-width:2.5;opacity:0.7;fill:none;'
         'stroke-dasharray:6,4}'
+        '.edge-hit{stroke:transparent;stroke-width:30;fill:none;'
+        'pointer-events:stroke;cursor:help}'
         '.convo-node polygon{fill:#f3e8ff;stroke:#9b4dca;stroke-width:2.4}'
         '.convo-node:hover polygon{fill:#e3c9ff}'
         '.convo-node text{fill:#5a2b78;pointer-events:none}'
@@ -4068,6 +4084,11 @@ def main() -> int:
     ap.add_argument("--custom-tlk", default=None,
                     help="path to the module's custom TLK (named in module.ifo "
                          "Mod_CustomTlk) for resolving StrRefs >= 16777216.")
+    ap.add_argument("--base-url", default="",
+                    help="public URL the wiki is served from (e.g. "
+                         "https://user.github.io/project/). When set, the area "
+                         "map SVG uses absolute URLs for node links so a "
+                         "downloaded standalone SVG keeps clickable links.")
     args = ap.parse_args()
 
     src = Path(args.src).resolve()
@@ -4194,7 +4215,7 @@ def main() -> int:
 
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
-    render_index(db, out, title, positions, sizes)
+    render_index(db, out, title, positions, sizes, base_url=args.base_url)
     render_areas_index(db, out)
     for resref in db.areas:
         render_area_page(db, resref, out)

@@ -224,6 +224,16 @@ svg .edge-convo   {
   stroke: #9b4dca; stroke-width: 2.5; opacity: 0.7; fill: none;
   stroke-dasharray: 6, 4;
 }
+/* Invisible thicker hit-area paired with each visible edge so the SVG
+ * <title> tooltip fires on a generous hover target instead of needing the
+ * user to land on a near-pixel-thin line. */
+svg .edge-hit {
+  stroke: transparent;
+  stroke-width: 30;
+  fill: none;
+  pointer-events: stroke;
+  cursor: help;
+}
 svg .external-node rect { fill: #ddd; stroke: #999; stroke-dasharray: 3,3; }
 
 svg .convo-node polygon {
