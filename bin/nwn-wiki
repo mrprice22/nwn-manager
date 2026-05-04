@@ -2728,12 +2728,22 @@ def _creature_detail_sections(
         if isinstance(slot, int):
             equip_by_slot[slot] = e
 
+    def _equip_resref(e: dict) -> str:
+        # Blueprint equip entries reference an external UTI via EquippedRes;
+        # GIT instances inline the item but still carry TemplateResRef.
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _equip_item(e: dict) -> dict | None:
+        irr = _equip_resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        # GIT instances embed the full item struct (BaseItem, PropertiesList,
+        # LocalizedName, …) directly into the equip entry.
+        return e if "BaseItem" in e else None
+
     def _equipped_item(slot: int) -> dict | None:
         e = equip_by_slot.get(slot)
-        if not e:
-            return None
-        irr = fld(e, "EquippedRes", "")
-        return db.items.get(irr) if irr else None
+        return _equip_item(e) if e else None
 
     armor_item = _equipped_item(SLOT_CHEST)
     armor_base_ac = 0
@@ -2823,8 +2833,8 @@ def _creature_detail_sections(
         e = equip_by_slot.get(slot)
         if not e:
             continue
-        irr = fld(e, "EquippedRes", "")
-        item = db.items.get(irr)
+        irr = _equip_resref(e)
+        item = _equip_item(e)
         base_row = fld(item, "BaseItem") if item else None
         # Skip non-weapons in the left-hand slot (shields).
         if slot == SLOT_LEFT and item and int(base_row or -1) in SHIELD_BASEITEMS:
@@ -2841,7 +2851,10 @@ def _creature_detail_sections(
             iprop_dmg_bonus=dmg_flat, iprop_extra=dmg_extras,
         )
         crit_str = weapon_crit_string(base_row)
-        wname = db.item_name(irr) if irr in db.items else (irr or "(empty)")
+        if irr in db.items:
+            wname = db.item_name(irr)
+        else:
+            wname = loc(e.get("LocalizedName")) or irr or "(empty)"
         wlink = (link(f"{items_dir}/{irr}.html", wname)
                  if irr in db.items else nwn_html(wname))
         bname = baseitem_name(base_row) if base_row is not None else ""
@@ -2883,9 +2896,12 @@ def _creature_detail_sections(
         sections.append("<h2>Equipment</h2>")
         rows = []
         for e in equip:
-            irr = fld(e, "EquippedRes", "")
-            cell = (link(f"{items_dir}/{irr}.html", db.item_name(irr))
-                    if irr in db.items else E(irr or "(empty)"))
+            irr = _equip_resref(e)
+            if irr in db.items:
+                cell = link(f"{items_dir}/{irr}.html", db.item_name(irr))
+            else:
+                disp = loc(e.get("LocalizedName")) or irr or "(empty)"
+                cell = nwn_html(disp)
             slot = fld(e, "__struct_id", "")
             slot_label = SLOT_NAMES.get(int(slot), str(slot)) if isinstance(slot, int) else str(slot)
             rows.append(f"<tr><td>{E(slot_label)}</td><td>{cell}</td></tr>")
@@ -2902,7 +2918,10 @@ def _creature_detail_sections(
             irr = (fld(it, "InventoryRes", "") or
                    fld(it, "TemplateResRef", "") or
                    fld(it, "EquippedRes", ""))
-            iname = db.item_name(irr) if irr in db.items else (irr or "(unknown)")
+            if irr in db.items:
+                iname = db.item_name(irr)
+            else:
+                iname = loc(it.get("LocalizedName")) or irr or "(unknown)"
             cell = (link(f"{items_dir}/{irr}.html", iname)
                     if irr in db.items else nwn_html(iname))
             rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
