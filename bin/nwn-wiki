@@ -3583,11 +3583,26 @@ def _dialog_node_anchor(kind: str, idx: int) -> str:
     return f"{kind[0]}{idx}"   # e.g. "e3", "r12"
 
 
+def _dialog_text_preview(node: dict, max_len: int = 80) -> str:
+    """First non-empty line of a dialog node's text, truncated. Strips
+    NWN colour tokens so the preview is plain readable text."""
+    text = nwn_text(loc(node.get("Text"))).strip()
+    if not text:
+        return ""
+    line = text.splitlines()[0].strip()
+    if len(line) > max_len:
+        line = line[:max_len].rstrip() + "…"
+    return line
+
+
 def _render_dialog_node_refs(db: Db, refs_field: list[dict],
-                             tgt_kind: str) -> str:
+                             tgt_kind: str,
+                             tgt_nodes: list[dict] | None = None) -> str:
     """Render a node's child-pointer list ("RepliesList" inside an entry,
     "EntriesList" inside a reply) as inline anchor links to other nodes
-    on the same page. tgt_kind is "reply" or "entry"."""
+    on the same page. tgt_kind is "reply" or "entry". When tgt_nodes is
+    supplied, append a short text preview of the target so the reader
+    doesn't have to jump to scan each branch."""
     if not refs_field:
         return ""
     cells = []
@@ -3598,10 +3613,122 @@ def _render_dialog_node_refs(db: Db, refs_field: list[dict],
         anchor = _dialog_node_anchor(tgt_kind, int(idx)) if isinstance(idx, int) else "?"
         label = "→ child" if is_child else f"→ {tgt_kind} #{idx}"
         bits = [f'<a href="#{E(anchor)}">{E(label)}</a>']
+        if (tgt_nodes is not None and isinstance(idx, int)
+                and 0 <= idx < len(tgt_nodes)):
+            preview = _dialog_text_preview(tgt_nodes[idx])
+            if preview:
+                bits.append(f' <span class="dlg-link-preview">“{nwn_html(preview)}”</span>')
         if active:
             bits.append(f' <small class="muted">(if <code>{E(active)}</code>)</small>')
         cells.append("".join(bits))
-    return '<div class="dlg-links">' + " · ".join(cells) + "</div>"
+    return '<ul class="dlg-links"><li>' + "</li><li>".join(cells) + "</li></ul>"
+
+
+def _render_dialog_tree(db: Db, entries: list[dict], replies: list[dict],
+                        starts: list[dict]) -> str:
+    """Render the dialog as nested <details> blocks, recursing from each
+    starting entry. Cycles and shared continuations are broken with a
+    backref link to the node's first occurrence so the tree can't
+    explode (NWN dialog graphs frequently cycle)."""
+    if not starts:
+        return ""
+
+    visited_e: set[int] = set()
+    visited_r: set[int] = set()
+    parts: list[str] = []
+    # Recursion depth guard — defensive; visited-sets should already cap it,
+    # but protects against pathological refs (negative indices, etc.).
+    MAX_DEPTH = 200
+
+    def cond_html(active: str) -> str:
+        return (f' <small class="muted">(if <code>{E(active)}</code>)</small>'
+                if active else "")
+
+    def render_entry(idx: int, ref_active: str, depth: int) -> None:
+        if depth > MAX_DEPTH:
+            parts.append('<div class="dlg-tree-broken">⚠ max depth</div>')
+            return
+        if not isinstance(idx, int) or idx < 0 or idx >= len(entries):
+            parts.append(f'<div class="dlg-tree-broken">⚠ entry #{E(idx)} (out of range)</div>')
+            return
+        anchor = _dialog_node_anchor("entry", idx)
+        if idx in visited_e:
+            preview = _dialog_text_preview(entries[idx])
+            parts.append(
+                f'<div class="dlg-tree-ref entry-ref">'
+                f'↩ <a href="#{E(anchor)}">entry #{idx}</a>'
+                + (f' <span class="dlg-link-preview">“{nwn_html(preview)}”</span>'
+                   if preview else "")
+                + cond_html(ref_active) + '</div>'
+            )
+            return
+        visited_e.add(idx)
+        e = entries[idx]
+        speaker = fld(e, "Speaker", "")
+        action = fld(e, "Script", "")
+        text_html = nwn_html(loc(e.get("Text"))) or "<em>(no text)</em>"
+        head = (f'<span class="dlg-id">entry #{idx}</span>'
+                + (f' <span class="dlg-speaker">[{E(speaker)}]</span>' if speaker else "")
+                + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
+                + cond_html(ref_active))
+        parts.append('<details class="dlg-tree-node entry" open>')
+        parts.append(f'<summary>{head} '
+                     f'<a class="dlg-anchor" href="#{E(anchor)}" '
+                     f'title="jump to flat entry #{idx}">¶</a></summary>')
+        parts.append(f'<div class="dlg-text">{text_html}</div>')
+        children = list_items(e.get("RepliesList"))
+        if children:
+            parts.append('<div class="dlg-tree-children">')
+            for ref in children:
+                render_reply(fld(ref, "Index"),
+                             fld(ref, "Active", ""), depth + 1)
+            parts.append('</div>')
+        parts.append('</details>')
+
+    def render_reply(idx: int, ref_active: str, depth: int) -> None:
+        if depth > MAX_DEPTH:
+            parts.append('<div class="dlg-tree-broken">⚠ max depth</div>')
+            return
+        if not isinstance(idx, int) or idx < 0 or idx >= len(replies):
+            parts.append(f'<div class="dlg-tree-broken">⚠ reply #{E(idx)} (out of range)</div>')
+            return
+        anchor = _dialog_node_anchor("reply", idx)
+        if idx in visited_r:
+            preview = _dialog_text_preview(replies[idx])
+            parts.append(
+                f'<div class="dlg-tree-ref reply-ref">'
+                f'↩ <a href="#{E(anchor)}">reply #{idx}</a>'
+                + (f' <span class="dlg-link-preview">“{nwn_html(preview)}”</span>'
+                   if preview else "")
+                + cond_html(ref_active) + '</div>'
+            )
+            return
+        visited_r.add(idx)
+        r = replies[idx]
+        action = fld(r, "Script", "")
+        text_html = nwn_html(loc(r.get("Text"))) or "<em>(no text)</em>"
+        head = (f'<span class="dlg-id">reply #{idx}</span>'
+                + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
+                + cond_html(ref_active))
+        parts.append('<details class="dlg-tree-node reply" open>')
+        parts.append(f'<summary>{head} '
+                     f'<a class="dlg-anchor" href="#{E(anchor)}" '
+                     f'title="jump to flat reply #{idx}">¶</a></summary>')
+        parts.append(f'<div class="dlg-text">{text_html}</div>')
+        children = list_items(r.get("EntriesList"))
+        if children:
+            parts.append('<div class="dlg-tree-children">')
+            for ref in children:
+                render_entry(fld(ref, "Index"),
+                             fld(ref, "Active", ""), depth + 1)
+            parts.append('</div>')
+        parts.append('</details>')
+
+    parts.append('<div class="dlg-tree">')
+    for s in starts:
+        render_entry(fld(s, "Index"), fld(s, "Active", ""), 0)
+    parts.append('</div>')
+    return "\n".join(parts)
 
 
 def render_conversations_index(db: Db, out: Path) -> None:
@@ -3761,8 +3888,20 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             )
         sections.append("</ul>")
 
-    # ---- Entries ----
-    sections.append("<h2>NPC lines (entries)</h2>")
+    # ---- Conversation flow (recursive tree from each starting entry) ----
+    tree_html = _render_dialog_tree(db, entries, replies, starts)
+    if tree_html:
+        sections.append("<h2>Conversation flow</h2>")
+        sections.append(
+            '<p class="muted">Each starting entry is expanded recursively. '
+            "Repeated nodes (cycles, shared continuations) appear inline as "
+            "<code>↩ link</code> backrefs to the first occurrence.</p>"
+        )
+        sections.append(tree_html)
+
+    # ---- Flat node index (preserves anchors used by Triggered-by /
+    # Scripts tables; useful for direct lookup by node number).
+    sections.append("<h2>NPC lines (entries) — flat index</h2>")
     for i, e in enumerate(entries):
         anchor = _dialog_node_anchor("entry", i)
         text = loc(e.get("Text"))
@@ -3775,12 +3914,13 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
             + '</div>'
             f'<div class="dlg-text">{nwn_html(text) or "<em>(no text)</em>"}</div>'
-            + _render_dialog_node_refs(db, list_items(e.get("RepliesList")), "reply")
+            + _render_dialog_node_refs(db, list_items(e.get("RepliesList")),
+                                       "reply", tgt_nodes=replies)
             + '</div>'
         )
 
     # ---- Replies ----
-    sections.append("<h2>PC replies</h2>")
+    sections.append("<h2>PC replies — flat index</h2>")
     for i, r in enumerate(replies):
         anchor = _dialog_node_anchor("reply", i)
         text = loc(r.get("Text"))
@@ -3791,7 +3931,8 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
             + '</div>'
             f'<div class="dlg-text">{nwn_html(text) or "<em>(no text)</em>"}</div>'
-            + _render_dialog_node_refs(db, list_items(r.get("EntriesList")), "entry")
+            + _render_dialog_node_refs(db, list_items(r.get("EntriesList")),
+                                       "entry", tgt_nodes=entries)
             + '</div>'
         )
 
