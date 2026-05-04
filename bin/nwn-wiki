@@ -834,6 +834,11 @@ class Db:
         # Keyed by area + ordinal for stable URLs.
         self.creature_instances: list[dict] = []
         self.area_creature_instances: dict[str, list[dict]] = defaultdict(list)
+        # Creature blueprint resref → list of {"area": area_rr, "encounter_resref": rr}
+        # entries, one per (encounter placement, creature in its spawn pool).
+        # Lets the creature page surface "spawned from encounter X in area Y"
+        # alongside direct GIT placements.
+        self.creature_encounter_spawns: dict[str, list[dict]] = defaultdict(list)
         self.faction_friendly: dict[int, bool] = {}  # FactionID → friendly to PC?
 
         # nss script index (resref → relative path) — used for "this script
@@ -1051,6 +1056,22 @@ class Db:
                 items = list_items(p.get("ItemList"))
                 if items:
                     self.area_containers[area_resref].append({"idx": idx, "p": p})
+
+        # Encounter spawn pools: walk every encounter placement, pull its
+        # CreatureList (preferring the blueprint's, falling back to the
+        # placement's), and record which creatures can spawn where.
+        for area_resref, encs in self.area_encounters.items():
+            for e in encs:
+                rr = fld(e, "TemplateResRef", "")
+                blueprint = self.encounters.get(rr, {})
+                spawns = (list_items(blueprint.get("CreatureList"))
+                          or list_items(e.get("CreatureList")))
+                for s in spawns:
+                    crr = fld(s, "ResRef", "") or ""
+                    if crr:
+                        self.creature_encounter_spawns[crr].append(
+                            {"area": area_resref, "encounter_resref": rr}
+                        )
         print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
               f"{len(self.transitions)} transitions, "
               f"{len(self.creatures)} creatures, {len(self.items)} items")
@@ -3150,6 +3171,36 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
             '<table class="data"><thead><tr>'
             "<th>Name</th><th>Area</th><th>Faction</th><th>Notes</th>"
             "</tr></thead><tbody>" + "\n".join(inst_rows) + "</tbody></table>"
+        )
+
+    # Encounter spawns — areas where this creature can appear via an encounter
+    # trigger's spawn pool. Aggregate by (area, encounter blueprint) so a
+    # single encounter placed once doesn't get listed once per pool entry.
+    enc_spawns = db.creature_encounter_spawns.get(resref, [])
+    if enc_spawns:
+        agg: dict[tuple[str, str], int] = defaultdict(int)
+        for s in enc_spawns:
+            agg[(s["area"], s["encounter_resref"])] += 1
+        spawn_rows = []
+        for (area_rr, enc_rr) in sorted(
+            agg.keys(),
+            key=lambda k: (db.area_name(k[0]).lower(), k[1]),
+        ):
+            blueprint = db.encounters.get(enc_rr, {})
+            ename = (loc(blueprint.get("LocalizedName"))
+                     or enc_rr or "(unnamed)")
+            spawn_rows.append(
+                f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                f"<td>{nwn_html(ename)}</td>"
+                f"<td><code>{E(enc_rr)}</code></td></tr>"
+            )
+        n_areas = len({a for (a, _) in agg.keys()})
+        sections.append(
+            f"<h2>Encounter spawns <small class=\"muted\">"
+            f"({n_areas} area{'s' if n_areas != 1 else ''})</small></h2>"
+            '<table class="data"><thead><tr>'
+            "<th>Area</th><th>Encounter</th><th>Encounter ResRef</th>"
+            "</tr></thead><tbody>" + "\n".join(spawn_rows) + "</tbody></table>"
         )
 
     write(out / "creatures" / f"{resref}.html",
