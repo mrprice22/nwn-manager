@@ -2125,6 +2125,11 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         s = min(sx, sy)
         return cx + dx * s, cy + dy * s
 
+    def node_label(nid: str) -> str:
+        if nid in db.global_convo_pseudo:
+            return db.global_convo_pseudo[nid]["label"]
+        return nwn_text(db.area_name(nid))
+
     edge_lines = []
     drawn = set()
     for tr in db.transitions:
@@ -2139,9 +2144,12 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         ax, ay = rect_edge_point(a, positions[b])
         bx, by = rect_edge_point(b, positions[a])
         cls = "edge-trigger" if tr["kind"] == "trigger" else "edge-door"
+        names = sorted([node_label(a), node_label(b)], key=str.lower)
+        title = f"{names[0]} connected to {names[1]}"
         edge_lines.append(
             f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
-            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}"/>'
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}">'
+            f'<title>{E(title)}</title></line>'
         )
 
     # Conversation-teleport edges. Drawn as a separate, dashed style so a
@@ -2161,10 +2169,12 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         conv_drawn.add(key)
         ax, ay = rect_edge_point(s, positions[d])
         bx, by = rect_edge_point(d, positions[s])
+        title = f"From: {node_label(s)} To: {node_label(d)}"
         edge_lines.append(
             f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
             f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" '
-            f'class="edge-convo" marker-end="url(#convo-arrow)"/>'
+            f'class="edge-convo" marker-end="url(#convo-arrow)">'
+            f'<title>{E(title)}</title></line>'
         )
 
     # Nodes — boxes sized by area's tile dimensions. Label sizing trades off
@@ -2241,8 +2251,25 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
     zoom = 4.0
     display_w = vw * fit * zoom
     display_h = vh * fit * zoom
+    # Inline styles so the SVG renders correctly when downloaded and opened
+    # standalone (the page's external stylesheet won't be available there).
+    # Kept in sync with wiki_assets/style.css's svg .* rules.
+    embedded_css = (
+        'svg{background:#fff;font-family:"Iowan Old Style",Georgia,serif}'
+        '.area-node rect{fill:#fff;stroke:#3a5a8a;stroke-width:2.4}'
+        '.area-node:hover rect{fill:#e6efff}'
+        '.area-node text{fill:#222;pointer-events:none}'
+        '.edge-trigger{stroke:#6b3a1c;stroke-width:2.5;opacity:0.55;fill:none}'
+        '.edge-door{stroke:#2d6a3a;stroke-width:2.5;opacity:0.55;fill:none}'
+        '.edge-convo{stroke:#9b4dca;stroke-width:2.5;opacity:0.7;fill:none;'
+        'stroke-dasharray:6,4}'
+        '.convo-node polygon{fill:#f3e8ff;stroke:#9b4dca;stroke-width:2.4}'
+        '.convo-node:hover polygon{fill:#e3c9ff}'
+        '.convo-node text{fill:#5a2b78;pointer-events:none}'
+    )
     defs = (
         '<defs>'
+        f'<style>{embedded_css}</style>'
         '<marker id="convo-arrow" viewBox="0 0 12 12" refX="10" refY="6" '
         'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
         '<path d="M0,0 L12,6 L0,12 Z" fill="#9b4dca"/>'
@@ -2250,11 +2277,17 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         '</defs>'
     )
     return (
-        f'<div class="map-wrap" id="area-map-wrap">'
-        f'<svg class="area-map" '
-        f'width="{display_w:.0f}" height="{display_h:.0f}" '
-        f'viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
-        f'preserveAspectRatio="xMidYMid meet">'
+        '<div class="map-toolbar">'
+        '<button type="button" id="area-map-download" '
+        'onclick="downloadAreaMap()">Download SVG</button>'
+        '</div>'
+        + f'<div class="map-wrap" id="area-map-wrap">'
+        + f'<svg class="area-map" id="area-map-svg" '
+        + 'xmlns="http://www.w3.org/2000/svg" '
+        + 'xmlns:xlink="http://www.w3.org/1999/xlink" '
+        + f'width="{display_w:.0f}" height="{display_h:.0f}" '
+        + f'viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
+        + f'preserveAspectRatio="xMidYMid meet">'
         + defs
         + "\n".join(edge_lines)
         + "\n"
@@ -2262,7 +2295,20 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         + '</svg></div>'
         + '<script>(function(){var w=document.getElementById("area-map-wrap");'
           'if(w){w.scrollLeft=(w.scrollWidth-w.clientWidth)/2;'
-          'w.scrollTop=(w.scrollHeight-w.clientHeight)/2;}})();</script>'
+          'w.scrollTop=(w.scrollHeight-w.clientHeight)/2;}})();'
+          'window.downloadAreaMap=function(){'
+          'var svg=document.getElementById("area-map-svg");'
+          'if(!svg)return;'
+          'var src=new XMLSerializer().serializeToString(svg);'
+          'if(!src.match(/^<\\?xml/))src=\'<?xml version="1.0" encoding="UTF-8"?>\\n\'+src;'
+          'var blob=new Blob([src],{type:"image/svg+xml;charset=utf-8"});'
+          'var url=URL.createObjectURL(blob);'
+          'var a=document.createElement("a");'
+          'a.href=url;a.download="area-map.svg";'
+          'document.body.appendChild(a);a.click();'
+          'document.body.removeChild(a);'
+          'setTimeout(function(){URL.revokeObjectURL(url);},100);'
+          '};</script>'
     )
 
 
