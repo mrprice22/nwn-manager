@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# nwn_script_comp_wrapper — invoked by nasher in place of nwn_script_comp.
+# nasher passes --root and --userdirectory as separate space-bearing args
+# (e.g. "Neverwinter Nights"). Argv is intact, but nasher's underlying
+# execProcess on Linux re-shells the command, which splits paths on
+# whitespace. We replace any spaced path with a /tmp/nwnmgr_* symlink
+# (no spaces), then exec the real compiler.
+set -euo pipefail
+
+REAL_COMP="${NWN_SCRIPT_COMP_REAL:-nwn_script_comp}"
+
+# Debug: dump argv to a log file so we can see exactly what nasher passes.
+{
+  printf 'argc=%d cwd=%s\n' "$#" "$PWD"
+  i=0
+  for a in "$@"; do
+    printf '  argv[%d]=%q\n' "$i" "$a"
+    i=$((i+1))
+  done
+} >> /tmp/nwnmgr_wrapper.log
+
+sanitize() {
+  local p=$1
+  case "$p" in
+    *" "*)
+      local clean link
+      clean=$(printf '%s' "$p" | tr -c '[:alnum:]._/-' '_')
+      link="/tmp/nwnmgr_path_${clean//\//__}"
+      ln -sfn "$p" "$link"
+      printf '%s\n' "$link"
+      ;;
+    *) printf '%s\n' "$p" ;;
+  esac
+}
+
+new_args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --root|--userdirectory)
+      if (( $# >= 2 )); then
+        new_args+=("$1" "$(sanitize "$2")")
+        shift 2
+        continue
+      fi
+      ;;
+    --root=*|--userdirectory=*)
+      key=${1%%=*}
+      val=${1#*=}
+      new_args+=("$key=$(sanitize "$val")")
+      shift
+      continue
+      ;;
+  esac
+  new_args+=("$1")
+  shift
+done
+
+{
+  printf 'exec args:'
+  for a in "${new_args[@]}"; do printf ' %q' "$a"; done
+  printf '\n'
+} >> /tmp/nwnmgr_wrapper.log
+"$REAL_COMP" "${new_args[@]}" 2>>/tmp/nwnmgr_wrapper.log
+rc=$?
+printf 'exit=%d\n' "$rc" >> /tmp/nwnmgr_wrapper.log
+exit "$rc"

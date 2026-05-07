@@ -144,6 +144,63 @@ detect_nwn_install() {
   done
 }
 
+# Detect the NWN:EE user directory (where modules/, hak/, override/ live).
+# Resolution order: $NWN_USERDIR, then platform defaults.
+detect_nwn_userdir() {
+  if [[ -n "${NWN_USERDIR:-}" && -d "$NWN_USERDIR" ]]; then
+    printf '%s\n' "$NWN_USERDIR"; return 0
+  fi
+  local cand
+  for cand in \
+    "$HOME/.local/share/Neverwinter Nights" \
+    "/var/home/$USER/.local/share/Neverwinter Nights" \
+    "$HOME/Documents/Neverwinter Nights"
+  do
+    if [[ -d "$cand/hak" || -d "$cand/modules" ]]; then
+      printf '%s\n' "$cand"; return 0
+    fi
+  done
+}
+
+# Build the comma-separated list of hak file paths the module declares in
+# its Mod_HakList. Each hak is symlinked into /tmp under a no-space name
+# so it survives nasher's whitespace-splitting of --nssFlags. Echoes the
+# comma-separated list, or empty if module.ifo.json or userdir is missing.
+build_compiler_erfs() {
+  [[ -f unpacked/module.ifo.json ]] || return 0
+  local userdir
+  userdir=$(detect_nwn_userdir) || return 0
+  [[ -d "$userdir/hak" ]] || return 0
+
+  local haks
+  haks=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open("unpacked/module.ifo.json"))
+    for h in d.get("Mod_HakList", {}).get("value", []):
+        n = h.get("Mod_Hak", {}).get("value", "").strip()
+        if n: print(n)
+except Exception:
+    pass') || return 0
+
+  local out=""
+  local h hak link
+  while IFS= read -r h; do
+    [[ -z $h ]] && continue
+    hak="$userdir/hak/${h}.hak"
+    if [[ ! -f $hak ]]; then
+      echo "[$PROG] warn: declared hak $h.hak not found at $hak — compiler may miss its includes" >&2
+      continue
+    fi
+    link="/tmp/nwnmgr_hak_${h}.hak"
+    ln -sfn "$hak" "$link"
+    out+="${link},"
+  done <<< "$haks"
+
+  out="${out%,}"
+  printf '%s\n' "$out"
+}
+
 # Extract the base dialog.tlk and the custom TLK (named in module.ifo's
 # Mod_CustomTlk, if any) from the NWN install into ./tlk/. Non-fatal: if
 # the install can't be located, the wiki still renders but TLK refs stay
@@ -369,7 +426,30 @@ cmd_repack() {
   }
   cd "$root"
 
-  nasher pack --yes "$@"
+  # Build --erfs flag pointing at the haks the module declares so the
+  # script compiler can resolve includes (e.g. zep_inc_main.nss,
+  # ITEM_PROPERTY_BOOMERANG, gplotAppraiseOpenStore from CEP / engine
+  # base). Without this, nasher only sees nss in unpacked/ and most
+  # CEP-dependent scripts fail to compile.
+  local erfs
+  erfs=$(build_compiler_erfs)
+  local pack_args=(--yes)
+  if [[ -n $erfs ]]; then
+    # -y: continue past per-script errors so we see the full picture instead
+    # of stopping at the first one and reporting "0 of N compiled".
+    pack_args+=("--nssFlags:-y --erfs=$erfs")
+    echo "[$PROG] compiler --erfs: $erfs"
+  fi
+
+  # Wrap nwn_script_comp so the --root/--userdirectory paths nasher
+  # auto-detects (which contain "Neverwinter Nights" with a space) get
+  # symlinked to no-space /tmp paths before invocation.
+  local wrapper="$SCRIPT_DIR/nwn_script_comp_wrapper"
+  if [[ -x $wrapper ]]; then
+    pack_args+=("--nssCompiler:$wrapper")
+  fi
+
+  nasher pack "${pack_args[@]}" "$@"
 
   # nasher's default output location is the project root, named per the
   # target's `file = ...`. Older configs that route through dist/ still work
