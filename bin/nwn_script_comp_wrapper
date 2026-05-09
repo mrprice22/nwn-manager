@@ -9,16 +9,6 @@ set -euo pipefail
 
 REAL_COMP="${NWN_SCRIPT_COMP_REAL:-nwn_script_comp}"
 
-# Debug: dump argv to a log file so we can see exactly what nasher passes.
-{
-  printf 'argc=%d cwd=%s\n' "$#" "$PWD"
-  i=0
-  for a in "$@"; do
-    printf '  argv[%d]=%q\n' "$i" "$a"
-    i=$((i+1))
-  done
-} >> /tmp/nwnmgr_wrapper.log
-
 sanitize() {
   local p=$1
   case "$p" in
@@ -55,12 +45,4 @@ while (( $# > 0 )); do
   shift
 done
 
-{
-  printf 'exec args:'
-  for a in "${new_args[@]}"; do printf ' %q' "$a"; done
-  printf '\n'
-} >> /tmp/nwnmgr_wrapper.log
-"$REAL_COMP" "${new_args[@]}" 2>>/tmp/nwnmgr_wrapper.log
-rc=$?
-printf 'exit=%d\n' "$rc" >> /tmp/nwnmgr_wrapper.log
-exit "$rc"
+exec "$REAL_COMP" "${new_args[@]}"
