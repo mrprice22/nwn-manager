@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""nwn-area-path — compute shortest paths between areas in a generated wiki.
+
+Parses the static HTML wiki produced by ``nwn-wiki`` (``<module>/docs/areas/*.html``)
+to build a directed graph of area-to-area transitions, then runs BFS to find
+the shortest hop-count path from a source area to a target.
+
+Edges are extracted from three sources, in order of confidence:
+  1. **Doors** listed under "Outgoing transitions" (kind=door).
+  2. **Triggers** listed under "Outgoing transitions" (kind=trigger).
+  3. **Conversation teleports**: rows under "Conversations triggered here"
+     whose "Teleports to" column lists destination areas. These are
+     emitted as edges with kind=talk and the NPC name in the label.
+
+Usage:
+    nwn-area-path <source> <target>           # show path
+    nwn-area-path <source>                    # list distances from source
+    nwn-area-path --list                      # list every area resref
+    nwn-area-path --json <source> <target>    # machine-readable output
+
+Examples:
+    nwn-area-path thewelloferu rivendellupperha
+    nwn-area-path thewelloferu --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import html
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Iterator
+
+
+# ---------- module-root discovery -----------------------------------------
+
+def find_module_root(start: Path | None = None) -> Path:
+    """Walk upward from CWD (or `start`) looking for a docs/areas dir."""
+    p = (start or Path.cwd()).resolve()
+    candidates = [p, *p.parents]
+    # Plus the directory containing this script's repo neighbour
+    here = Path(__file__).resolve().parent
+    candidates.extend([here, *here.parents])
+    for c in candidates:
+        # Common siblings: nwn_manager and a *_lotr* module next to each other
+        for sib in [c, *((c.parent / d) for d in (c.parent.iterdir() if c.parent.is_dir() else []))]:
+            if (sib / "docs" / "areas").is_dir():
+                return sib
+    raise SystemExit(
+        "Could not locate a module with docs/areas/. "
+        "Run from inside an unpacked module, or pass --root."
+    )
+
+
+# ---------- HTML parsing --------------------------------------------------
+
+_RE_TITLE     = re.compile(r"<title>\s*([^<]*)</title>", re.IGNORECASE)
+_RE_SECTION   = re.compile(r"<h2>([^<]+)</h2>(.*?)(?=<h2>|</main>)", re.DOTALL | re.IGNORECASE)
+_RE_TBODY     = re.compile(r"<tbody>(.*?)</tbody>", re.DOTALL | re.IGNORECASE)
+_RE_TR        = re.compile(r"<tr>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
+_RE_TD        = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL | re.IGNORECASE)
+_RE_AREA_LINK = re.compile(r'<a\s+href="([a-z0-9_]+)\.html">', re.IGNORECASE)
+_RE_NPC_LINK  = re.compile(r'<a\s+href="\.\./creatures/instances/[^"]+\.html">([^<]+)</a>', re.IGNORECASE)
+_RE_TAGS      = re.compile(r"<[^>]+>")
+
+
+def _strip(s: str) -> str:
+    return html.unescape(_RE_TAGS.sub("", s)).strip()
+
+
+def parse_area_html(path: Path, known: set[str]) -> tuple[str, str, list[tuple[str, str, str]]]:
+    """Return (resref, display_name, edges) for one area.
+
+    ``edges`` is a list of ``(dest_resref, kind, label)``.
+    Edges to unknown destinations and self-loops are filtered out.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    resref = path.stem
+    m = _RE_TITLE.search(text)
+    name = _strip(m.group(1)) if m else resref
+
+    sections = {_strip(h): body for h, body in _RE_SECTION.findall(text)}
+    edges: list[tuple[str, str, str]] = []
+
+    # Outgoing transitions: kind | label | destination | waypoint
+    body = sections.get("Outgoing transitions", "")
+    tbody = _RE_TBODY.search(body)
+    if tbody:
+        for row in _RE_TR.findall(tbody.group(1)):
+            tds = _RE_TD.findall(row)
+            if len(tds) < 3:
+                continue
+            kind  = _strip(tds[0])
+            label = _strip(tds[1])
+            dest  = _RE_AREA_LINK.search(tds[2])
+            if dest and dest.group(1) in known and dest.group(1) != resref:
+                edges.append((dest.group(1), kind, label or kind))
+
+    # Conversation teleports
+    body = sections.get("Conversations triggered here", "")
+    tbody = _RE_TBODY.search(body)
+    if tbody:
+        for row in _RE_TR.findall(tbody.group(1)):
+            tds = _RE_TD.findall(row)
+            if len(tds) < 4:
+                continue
+            # tds[2] = "NPC blueprint X; NPC <link>Name</link>"
+            npc = _RE_NPC_LINK.search(tds[2])
+            who = _strip(npc.group(1)) if npc else "an NPC"
+            # tds[3] = comma-separated destination links
+            for m in _RE_AREA_LINK.finditer(tds[3]):
+                dest = m.group(1)
+                if dest in known and dest != resref:
+                    edges.append((dest, "talk", f"talk to {who}"))
+
+    # De-dup identical edges (same dest/kind/label)
+    seen: set[tuple[str, str, str]] = set()
+    out: list[tuple[str, str, str]] = []
+    for e in edges:
+        if e not in seen:
+            seen.add(e)
+            out.append(e)
+    return resref, name, out
+
+
+def load_graph(root: Path) -> tuple[dict, dict]:
+    """Parse every <root>/docs/areas/*.html into a graph.
+
+    Also merges in any manual edges from <root>/docs/area_edges_extra.json
+    (a list of {"from","to","kind","label"} objects). Useful for custom
+    teleporters the wiki generator doesn't extract — e.g. placeables with
+    OnUsed scripts that jump cross-area, or NWScript-driven teleports.
+    """
+    areas_dir = root / "docs" / "areas"
+    files = [f for f in areas_dir.glob("*.html") if f.stem != "index"]
+    known = {f.stem for f in files}
+    graph: dict[str, list[tuple[str, str, str]]] = {}
+    names: dict[str, str] = {}
+    for f in files:
+        resref, name, edges = parse_area_html(f, known)
+        graph[resref] = edges
+        names[resref] = name
+
+    extras_path = root / "docs" / "area_edges_extra.json"
+    if extras_path.is_file():
+        try:
+            extras = json.loads(extras_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"warning: could not parse {extras_path}: {e}", file=sys.stderr)
+            extras = []
+        for e in extras:
+            src  = e.get("from")
+            dst  = e.get("to")
+            kind = e.get("kind", "extra")
+            label = e.get("label", kind)
+            if not src or not dst:
+                continue
+            if src not in known or dst not in known:
+                print(f"warning: skipping override edge {src} -> {dst} (unknown area)", file=sys.stderr)
+                continue
+            graph.setdefault(src, []).append((dst, kind, label))
+
+    return graph, names
+
+
+# ---------- BFS -----------------------------------------------------------
+
+def shortest_path(graph, src: str, dst: str):
+    """Return list of (from, to, kind, label) tuples, or None."""
+    if src == dst:
+        return []
+    came_from: dict[str, str | None] = {src: None}
+    edge_in: dict[str, tuple[str, str]] = {}
+    q = collections.deque([src])
+    while q:
+        cur = q.popleft()
+        for dest, kind, label in graph.get(cur, ()):
+            if dest in came_from:
+                continue
+            came_from[dest] = cur
+            edge_in[dest] = (kind, label)
+            if dest == dst:
+                steps = []
+                node = dst
+                while came_from[node] is not None:
+                    prev = came_from[node]
+                    k, l = edge_in[node]
+                    steps.append((prev, node, k, l))
+                    node = prev
+                return list(reversed(steps))
+            q.append(dest)
+    return None
+
+
+def distances_from(graph, src: str) -> dict[str, int]:
+    """BFS hop count to every reachable area."""
+    dist = {src: 0}
+    q = collections.deque([src])
+    while q:
+        cur = q.popleft()
+        d = dist[cur]
+        for dest, _, _ in graph.get(cur, ()):
+            if dest not in dist:
+                dist[dest] = d + 1
+                q.append(dest)
+    return dist
+
+
+# ---------- CLI -----------------------------------------------------------
+
+def format_path(path, names) -> Iterator[str]:
+    if not path:
+        yield "(source equals target)"
+        return
+    src = path[0][0]
+    yield f"From {names.get(src, src)} ({src}) — {len(path)} hops"
+    for i, (a, b, kind, label) in enumerate(path, 1):
+        arrow = f"{names.get(a, a)} → {names.get(b, b)}"
+        if kind == "door":
+            via = f"use the {label!r} door"
+        elif kind == "trigger":
+            via = f"step on the {label!r} trigger"
+        elif kind in ("talk", "use", "extra"):
+            via = label  # label is the action description
+        else:
+            via = f"{kind} ({label})"
+        yield f"  {i:>2}. {arrow}  [{via}]"
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        prog="nwn-area-path",
+        description="Shortest path between areas in a generated NWN module wiki.",
+    )
+    p.add_argument("source", nargs="?", help="Source area resref (e.g. thewelloferu)")
+    p.add_argument("target", nargs="?", help="Target area resref")
+    p.add_argument("--root", type=Path, help="Module root (auto-detected if omitted)")
+    p.add_argument("--list", action="store_true", help="List every known area resref and display name")
+    p.add_argument("--json", action="store_true", help="Machine-readable output (path or distances)")
+    args = p.parse_args(argv)
+
+    root = args.root if args.root else find_module_root()
+    graph, names = load_graph(root)
+
+    if args.list:
+        for r in sorted(names):
+            print(f"  {r:30s} {names[r]}")
+        return 0
+
+    if not args.source:
+        p.print_usage()
+        return 2
+
+    if args.source not in graph:
+        print(f"Unknown source area: {args.source!r}. Try --list.", file=sys.stderr)
+        return 2
+
+    if args.target:
+        if args.target not in graph:
+            print(f"Unknown target area: {args.target!r}. Try --list.", file=sys.stderr)
+            return 2
+        path = shortest_path(graph, args.source, args.target)
+        if path is None:
+            if args.json:
+                json.dump({"reachable": False, "source": args.source, "target": args.target}, sys.stdout)
+                print()
+            else:
+                print(f"No path found from {args.source} to {args.target}.")
+            return 1
+        if args.json:
+            json.dump(
+                {
+                    "reachable": True,
+                    "source": args.source,
+                    "target": args.target,
+                    "hops": len(path),
+                    "steps": [
+                        {"from": a, "to": b, "kind": k, "label": l, "from_name": names.get(a, a), "to_name": names.get(b, b)}
+                        for a, b, k, l in path
+                    ],
+                },
+                sys.stdout,
+                indent=2,
+            )
+            print()
+        else:
+            for line in format_path(path, names):
+                print(line)
+        return 0
+
+    # No target: list distances from source.
+    dist = distances_from(graph, args.source)
+    if args.json:
+        json.dump(
+            {
+                "source": args.source,
+                "reachable": {r: {"hops": d, "name": names.get(r, r)} for r, d in dist.items()},
+                "unreachable": sorted(r for r in names if r not in dist),
+            },
+            sys.stdout,
+            indent=2,
+        )
+        print()
+    else:
+        reachable = sorted(dist.items(), key=lambda kv: (kv[1], kv[0]))
+        print(f"{len(reachable)} reachable areas from {args.source}:")
+        for resref, d in reachable:
+            print(f"  {d:>2}  {resref:30s} {names.get(resref, '?')}")
+        unreachable = sorted(r for r in names if r not in dist)
+        if unreachable:
+            print(f"\n{len(unreachable)} unreachable from {args.source}.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

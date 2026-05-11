@@ -889,6 +889,12 @@ class Db:
         # Edges (area-or-pseudo-id → area resref) introduced by conversation
         # teleports, drawn alongside trigger/door transitions on the map.
         self.conv_transitions: list[dict] = []
+        # Player-option labels (exact, post-strip, color-tokens removed) whose
+        # subtree of teleport scripts should NOT contribute to the area map.
+        # Lets a builder hide admin/DM teleport menus (e.g. "[Admin Options]")
+        # from cluttering map edges while still surfacing them on the
+        # conversation page. Set via --exclude-conv-option on the CLI.
+        self.exclude_option_texts: list[str] = []
 
     # ---- Loading ----
 
@@ -1233,6 +1239,47 @@ class Db:
         for i, r in enumerate(list_items(dlg.get("ReplyList"))):
             yield ("reply", i, r)
 
+    def _excluded_dialog_nodes(self, dlg: dict) -> set[tuple[str, int]]:
+        """Return the set of (kind, idx) dialog nodes whose teleport scripts
+        should be ignored for area-map purposes. A node is excluded if any
+        ancestor entry/reply's text exact-matches (after stripping NWN colour
+        tokens and surrounding whitespace) one of self.exclude_option_texts —
+        we then walk RepliesList/EntriesList from that ancestor to mark the
+        whole subtree."""
+        if not self.exclude_option_texts:
+            return set()
+        targets = {t.strip() for t in self.exclude_option_texts if t.strip()}
+        if not targets:
+            return set()
+        entries = list_items(dlg.get("EntryList"))
+        replies = list_items(dlg.get("ReplyList"))
+        excluded: set[tuple[str, int]] = set()
+
+        def walk(kind: str, idx: int) -> None:
+            if not isinstance(idx, int) or idx < 0:
+                return
+            if (kind, idx) in excluded:
+                return
+            excluded.add((kind, idx))
+            if kind == "entry":
+                if idx >= len(entries):
+                    return
+                for ref in list_items(entries[idx].get("RepliesList")):
+                    walk("reply", fld(ref, "Index"))
+            else:
+                if idx >= len(replies):
+                    return
+                for ref in list_items(replies[idx].get("EntriesList")):
+                    walk("entry", fld(ref, "Index"))
+
+        for i, r in enumerate(replies):
+            if nwn_text(loc(r.get("Text"))).strip() in targets:
+                walk("reply", i)
+        for i, e in enumerate(entries):
+            if nwn_text(loc(e.get("Text"))).strip() in targets:
+                walk("entry", i)
+        return excluded
+
     def _synthesize_zdialogs(self) -> None:
         """Inject a pseudo-dialog entry into self.dialogs for every z-dialog
         handler that we saw via StartDlg(...). Z-dialogs aren't real .dlg
@@ -1494,7 +1541,16 @@ class Db:
         # Pseudo-nodes + conv_transitions for the area map.
         # A conversation contributes to the map if it has at least one
         # teleport destination resolvable to a real area.
+        n_excluded_edges = 0
         for dlg_resref, teleports in self.dialog_teleports.items():
+            if self.exclude_option_texts and dlg_resref in self.dialogs:
+                excluded = self._excluded_dialog_nodes(self.dialogs[dlg_resref])
+                if excluded:
+                    kept = [t for t in teleports
+                            if (t.get("node_kind"), t.get("node_index"))
+                            not in excluded]
+                    n_excluded_edges += len(teleports) - len(kept)
+                    teleports = kept
             dest_areas = sorted({t["area"] for t in teleports
                                  if t["area"] and t["area"] in self.areas})
             if not dest_areas:
@@ -1553,9 +1609,11 @@ class Db:
         n_glob = len(self.global_convo_pseudo)
         n_conv_edges = len(self.conv_transitions)
         n_callers = sum(len(v) for v in self.dialog_callers.values())
+        excl_msg = (f", {n_excluded_edges} edges suppressed by --exclude-conv-option"
+                    if n_excluded_edges else "")
         print(f"  dialog xref in {time.time()-t0:.1f}s — {len(self.dialogs)} dialogs, "
               f"{n_callers} callers, {n_glob} global pseudo-nodes, "
-              f"{n_conv_edges} conv map edges")
+              f"{n_conv_edges} conv map edges{excl_msg}")
 
     # ---- Convenience getters ----
 
@@ -4326,6 +4384,17 @@ def main() -> int:
                          "https://user.github.io/project/). When set, the area "
                          "map SVG uses absolute URLs for node links so a "
                          "downloaded standalone SVG keeps clickable links.")
+    ap.add_argument("--exclude-conv-option", action="append", default=[],
+                    metavar="TEXT",
+                    help="Player-option label (exact match, after stripping "
+                         "NWN colour tokens and surrounding whitespace) whose "
+                         "dialog subtree should NOT contribute teleport edges "
+                         "to the area map. Repeat the flag for multiple "
+                         "labels (e.g. --exclude-conv-option '[Admin Options]' "
+                         "--exclude-conv-option '[DM Options]'). Use this to "
+                         "hide admin/DM teleport menus from cluttering the map "
+                         "— the teleports still appear on the conversation "
+                         "page, only the map edges are suppressed.")
     args = ap.parse_args()
 
     src = Path(args.src).resolve()
@@ -4353,6 +4422,10 @@ def main() -> int:
 
     print(f"[nwn-wiki] reading {src}")
     db = Db(src)
+    db.exclude_option_texts = list(args.exclude_conv_option or [])
+    if db.exclude_option_texts:
+        print(f"[nwn-wiki] excluding map edges from dialog subtrees under: "
+              + ", ".join(repr(t) for t in db.exclude_option_texts))
     db.load()
     db.index()
     db.index_dialogs()

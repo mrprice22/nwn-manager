@@ -243,6 +243,26 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
 
   Static analysis only: dialogs invoked through string-built resrefs or
   pure runtime dispatch tables won't be picked up.
+
+  **Hiding admin / DM teleport menus from the map** — modules often expose
+  a deeply branched "[Admin Options]" or "[DM Options]" sub-menu off a
+  central NPC's dialog that can warp the party to dozens of locations.
+  Those edges drown the area map even though they're not part of normal
+  play. Pass `--exclude-conv-option "<player-option text>"` (repeatable)
+  to skip every teleport reachable in the subtree under a reply (or
+  entry) whose text exact-matches the given label. The match is against
+  the *player-visible* option text after stripping NWN colour tokens
+  (`<cRGB>...</c>`) and trimming surrounding whitespace; pass the label
+  exactly as it appears in-game (e.g. `--exclude-conv-option
+  '[Admin Options]'`). The teleport entries are still listed on the
+  conversation page — only the area-map edges (and any pseudo-nodes that
+  would have existed solely to host them) are suppressed.
+
+  ```sh
+  nwn-manager wiki \
+    --exclude-conv-option "[Admin Options]" \
+    --exclude-conv-option "[Options of the Homeless]"
+  ```
 - `assets/style.css` — bundled stylesheet.
 
 The wiki is **never** rebuilt automatically. `repack` does not trigger
@@ -412,6 +432,35 @@ register the same JSON name in `nwn-wiki`'s `_OVERLAY_TARGETS` and
 nwn-manager --help
 nwn-wiki --help
 ```
+
+### Placement helper
+
+`bin/place-helper.py` surveys an area's `.are.json` / `.git.json` to help
+you find open coordinates for new placeables or creatures.
+
+```sh
+# Area overview + ASCII map of all instances
+bin/place-helper.py <area_resref>
+
+# Clearance report for a specific (x, y) coordinate
+bin/place-helper.py <area_resref> <x> <y>
+
+# Suggest N clear, reachable spots (anchored near existing creatures)
+bin/place-helper.py <area_resref> --suggest [--n 8]
+```
+
+Examples:
+
+```sh
+bin/place-helper.py thewelloferu
+bin/place-helper.py thewelloferu 20 12
+bin/place-helper.py rivendellupperha --suggest
+```
+
+The script reads directly from the project's `unpacked/` tree — no
+repacking required. Collision radii are approximate (2.5 m for placeables,
+1 m for creatures); reachability is proxied by proximity to existing
+creature spawn points.
 
 ### Tuning the area map
 
