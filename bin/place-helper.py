@@ -93,67 +93,100 @@ def report_target(resref, tx, ty):
     print(f'Area: {resref}  ({W}x{H} m)  target: ({tx}, {ty})')
     if not (0 <= tx <= W and 0 <= ty <= H):
         print('  ⚠ OUT OF BOUNDS')
-    # Nearest 10 instances
-    ranked = sorted(instances, key=lambda i: math.hypot(i[3]-tx, i[4]-ty))[:10]
+    # Auto-ignore: if an instance sits exactly at the target, treat it as "self"
+    self_tag = None
+    for cat, tag, tres, x, y in instances:
+        if abs(x - tx) < 0.05 and abs(y - ty) < 0.05:
+            self_tag = tag or tres
+            print(f'  (auto-ignoring self at target: {cat} "{self_tag}")')
+            break
+    filtered = [i for i in instances if (i[1] or i[2]) != self_tag]
+    # Nearest 10 instances (other than self)
+    ranked = sorted(filtered, key=lambda i: math.hypot(i[3]-tx, i[4]-ty))[:10]
     print('\nNearest 10 instances:')
     for cat, tag, tres, x, y in ranked:
         d = math.hypot(x-tx, y-ty)
         r = RADIUS.get(cat, 0)
         flag = '⚠ COLLIDE' if d < r else ('• tight' if d < r + 1.5 else '  ok')
         print(f'  {flag}  {cat:9s} d={d:5.1f}m  r={r:.1f}  ({x:5.1f},{y:5.1f})  {tag or tres}')
-    worst, slack = clearance(tx, ty, instances)
+    worst, slack = clearance(tx, ty, filtered)
     if worst:
         cat, tag, tres, x, y, d, r = worst
         if slack < 0:
             print(f'\nVERDICT: COLLIDES with {cat} "{tag or tres}" at ({x:.1f},{y:.1f}) — its r={r:.1f} but distance is only {d:.1f}m')
         else:
             print(f'\nVERDICT: clear (closest obstacle: {cat} "{tag or tres}" at {d:.1f}m, slack {slack:.1f}m)')
-    # Reachability proxy: nearest creature (creatures live on walkable tiles)
-    creatures = [i for i in instances if i[0]=='creature']
-    if creatures:
-        nearest_c = min(creatures, key=lambda i: math.hypot(i[3]-tx, i[4]-ty))
-        d = math.hypot(nearest_c[3]-tx, nearest_c[4]-ty)
-        print(f'Nearest creature (reachability anchor): {nearest_c[1] or nearest_c[2]} at ({nearest_c[3]:.1f},{nearest_c[4]:.1f}) — {d:.1f}m away')
-        if d > 15:
-            print(f'  ⚠ {d:.0f}m is far — target may be on unreachable terrain (no creature within 15m)')
+    # Reachability proxy — tiered anchors:
+    #   1) Placed creatures (strongest — provably walking around in-game)
+    #   2) Encounter spawn points (engine spawns creatures there)
+    #   3) Waypoints (NPC walk paths)
+    def nearest(cats, label, strong_dist=15, weak_dist=25):
+        pool = [i for i in filtered if i[0] in cats]
+        if not pool: return None
+        n = min(pool, key=lambda i: math.hypot(i[3]-tx, i[4]-ty))
+        d = math.hypot(n[3]-tx, n[4]-ty)
+        return (label, n, d, strong_dist, weak_dist)
+    anchors = [
+        nearest({'creature'}, 'creature', 15, 25),
+        nearest({'encounter'}, 'encounter spawn', 20, 35),
+        nearest({'waypoint'}, 'waypoint', 20, 35),
+    ]
+    found_strong = False
+    for a in anchors:
+        if a is None: continue
+        label, n, d, strong, weak = a
+        verdict = 'ok' if d <= strong else ('weak' if d <= weak else 'far ⚠')
+        print(f'Nearest {label:15s} {n[1] or n[2]:25s} at ({n[3]:.1f},{n[4]:.1f}) — {d:.1f}m  [{verdict}]')
+        if d <= strong: found_strong = True
+    if not found_strong:
+        print('  ⚠ No strong reachability anchor within range — target may be on unreachable terrain')
 
-def suggest_spots(resref, n=8, near_creature_max=8.0, placeable_min=4.0):
-    """Find candidate (x,y) near existing creatures, far from placeables."""
+def suggest_spots(resref, n=8, anchor_max=8.0, placeable_min=4.0):
+    """Find candidate (x,y) near reachability anchors, clear of placeables.
+    Anchors: creatures (strongest) → encounter spawns → waypoints (weakest)."""
     are, git, W, H = load_area(resref)
     instances = list(all_instances(git))
-    creatures = [i for i in instances if i[0]=='creature']
-    if not creatures:
-        print('No creatures in this area to anchor reachability — falling back to grid sweep.')
-        creatures = [('creature','','',W/2,H/2)]
+    # Exclude mw_* creatures from anchors — they're often the thing we're trying
+    # to place, and using them as their own anchor is circular.
+    creatures = [i for i in instances if i[0]=='creature' and not (i[1] or i[2]).startswith('mw_')]
+    encounters = [i for i in instances if i[0]=='encounter']
+    waypoints = [i for i in instances if i[0]=='waypoint']
+    if creatures:
+        anchors = creatures; anchor_kind = 'creature'
+    elif encounters:
+        anchors = encounters; anchor_kind = 'encounter'
+    elif waypoints:
+        anchors = waypoints; anchor_kind = 'waypoint'
+    else:
+        print('No reachability anchors at all — falling back to area centre.')
+        anchors = [('creature','','',W/2,H/2)]; anchor_kind = 'centre'
+    print(f'Using {anchor_kind} anchors ({len(anchors)} of them).')
     suggestions = []
-    # Sample rings around each creature anchor
-    for anc in creatures:
+    for anc in anchors:
         ax, ay = anc[3], anc[4]
-        for r in (2.5, 4.0, 6.0):
+        for r in (3.0, 5.0, 7.0):
             for ang_deg in range(0, 360, 30):
                 ang = math.radians(ang_deg)
                 cx = ax + r*math.cos(ang)
                 cy = ay + r*math.sin(ang)
                 if not (1 < cx < W-1 and 1 < cy < H-1): continue
                 worst, slack = clearance(cx, cy, instances)
-                if slack < placeable_min - 2.5: continue  # too close to a placeable
-                # Distance to nearest creature must be small (proxy for reachability)
-                nc = min(creatures, key=lambda i: math.hypot(i[3]-cx, i[4]-cy))
+                if slack < placeable_min - 2.5: continue
+                nc = min(anchors, key=lambda i: math.hypot(i[3]-cx, i[4]-cy))
                 ncd = math.hypot(nc[3]-cx, nc[4]-cy)
-                if ncd > near_creature_max: continue
-                suggestions.append((slack, cx, cy, anc[1] or anc[2], ncd))
-    # Dedupe nearby suggestions
+                if ncd > anchor_max: continue
+                suggestions.append((slack, cx, cy, nc[1] or nc[2], ncd))
     suggestions.sort(reverse=True)
     chosen = []
     for s in suggestions:
         slack, cx, cy, anc, ncd = s
-        if any(math.hypot(cx-c[1], cy-c[2]) < 3 for c in chosen): continue
+        if any(math.hypot(cx-c[0], cy-c[1]) < 3 for c in chosen): continue
         chosen.append((cx, cy, slack, anc, ncd))
         if len(chosen) >= n: break
     print(f'Suggested clear spots in {resref}:')
-    print(f'  (anchored ≤{near_creature_max}m from an existing creature, ≥{placeable_min}m clearance from any placeable)')
+    print(f'  (anchored ≤{anchor_max}m from a {anchor_kind}, ≥{placeable_min}m clearance from any placeable)')
     for cx, cy, slack, anc, ncd in chosen:
-        print(f'  ({cx:5.1f},{cy:5.1f})  clearance={slack:.1f}m   anchor={anc} ({ncd:.1f}m away)')
+        print(f'  ({cx:5.1f},{cy:5.1f})  clearance={slack:.1f}m   anchor={anc} ({ncd:.1f}m)')
 
 def overview(resref):
     are, git, W, H = load_area(resref)
