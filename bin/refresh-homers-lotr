@@ -6,13 +6,22 @@
 set -o pipefail
 
 PROJECT=/var/home/james/GIT/nwn_homers_lotr
+MOD="$PROJECT/homers_lotr_v3.mod"
 NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
 
 export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 
 cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
 
-nwn-manager unpack && nwn-manager wiki --base-url https://mrprice22.github.io/nwn-homers-lotr/
+if [[ ! -f $MOD ]]; then
+  echo "error: module not found at: $MOD"
+  read -rp "Press Enter..."; exit 1
+fi
+
+echo "[unpack] reading: $MOD"
+echo "[unpack] into:    $PROJECT/unpacked/"
+echo
+nwn-manager unpack "$MOD" && nwn-manager wiki --base-url https://mrprice22.github.io/nwn-homers-lotr/
 status=$?
 
 echo

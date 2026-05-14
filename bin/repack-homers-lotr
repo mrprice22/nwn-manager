@@ -36,6 +36,16 @@ if [[ -f homers_lotr_v3.mod ]]; then
     echo "     The 'N errored' tally above is pre-existing module noise — see"
     echo "     /var/home/james/.local/share/Steam/steamapps/common/Neverwinter Nights/bin/CLAUDE.md"
     echo
+    # Second install copy: local NWN modules dir (for toolset access)
+    NWN_MOD_DIR="$HOME/.local/share/Neverwinter Nights/modules"
+    NWN_MOD_DEST="$NWN_MOD_DIR/Homer's LOTR VEL v3.mod"
+    if [[ -d $NWN_MOD_DIR ]]; then
+      cp -v "homers_lotr_v3.mod" "$NWN_MOD_DEST"
+      echo "[install] → $NWN_MOD_DEST"
+    else
+      echo "[install] WARNING: $NWN_MOD_DIR not found, skipping local NWN copy"
+    fi
+    echo
     # Refresh nwsync so connecting EE clients pull the new module's haks/tlk
     # snapshot. Non-fatal: if this fails, the .mod itself is still good.
     if [[ -x "$PROJECT/bin/refresh-nwsync" ]]; then
