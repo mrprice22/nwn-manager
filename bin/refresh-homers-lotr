@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Desktop-launcher target: refresh the Homer's LotR module unpacked tree
-# and regenerate its static wiki. Pauses at the end so failure output stays
-# visible when launched from the GNOME app grid (no parent shell to read).
+# Desktop-launcher target: unpack Homer's LotR .mod into the unpacked/ source
+# tree. Reads the .mod from the OneDrive modules directory.
+# Wiki regeneration is a separate step — use "Regenerate Homer's LotR Wiki".
 
 set -o pipefail
 
 PROJECT=/var/home/james/GIT/nwn_homers_lotr
-MOD="$PROJECT/homers_lotr_v3.mod"
+MOD="$HOME/OneDrive/Documents/Neverwinter Nights/modules/homers_lotr_v3.mod"
 NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
 
 export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
@@ -21,12 +21,13 @@ fi
 echo "[unpack] reading: $MOD"
 echo "[unpack] into:    $PROJECT/unpacked/"
 echo
-nwn-manager unpack "$MOD" && nwn-manager wiki --base-url https://mrprice22.github.io/nwn-homers-lotr/
+nwn-manager unpack "$MOD"
 status=$?
 
 echo
 if [[ $status -eq 0 ]]; then
-  echo "[done] wiki regenerated → $PROJECT/docs/index.html"
+  echo "[done] unpacked → $PROJECT/unpacked/"
+  echo "       Run 'Regenerate Homer's LotR Wiki' to rebuild docs."
 else
   echo "[FAILED] exit $status"
 fi

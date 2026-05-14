@@ -36,7 +36,17 @@ if [[ -f homers_lotr_v3.mod ]]; then
     echo "     The 'N errored' tally above is pre-existing module noise — see"
     echo "     /var/home/james/.local/share/Steam/steamapps/common/Neverwinter Nights/bin/CLAUDE.md"
     echo
-    # Second install copy: local NWN modules dir (for toolset access)
+    # Copy 1: OneDrive modules dir (primary — used by the Unpack pipeline)
+    ONEDRIVE_MOD_DIR="$HOME/OneDrive/Documents/Neverwinter Nights/modules"
+    ONEDRIVE_MOD_DEST="$ONEDRIVE_MOD_DIR/homers_lotr_v3.mod"
+    if [[ -d $ONEDRIVE_MOD_DIR ]]; then
+      cp -v "homers_lotr_v3.mod" "$ONEDRIVE_MOD_DEST"
+      echo "[install] → $ONEDRIVE_MOD_DEST"
+    else
+      echo "[install] WARNING: $ONEDRIVE_MOD_DIR not found, skipping OneDrive copy"
+    fi
+    echo
+    # Copy 2: local NWN modules dir (for toolset access)
     NWN_MOD_DIR="$HOME/.local/share/Neverwinter Nights/modules"
     NWN_MOD_DEST="$NWN_MOD_DIR/Homer's LOTR VEL v3.mod"
     if [[ -d $NWN_MOD_DIR ]]; then
@@ -45,6 +55,11 @@ if [[ -f homers_lotr_v3.mod ]]; then
     else
       echo "[install] WARNING: $NWN_MOD_DIR not found, skipping local NWN copy"
     fi
+    echo
+    # Copy 3: timestamped archive in project root
+    ARCHIVE_DEST="$PROJECT/homers_lotr_v3_$(date +%Y%m%d_%H%M%S).mod"
+    cp -v "homers_lotr_v3.mod" "$ARCHIVE_DEST"
+    echo "[archive] → $ARCHIVE_DEST"
     echo
     # Refresh nwsync so connecting EE clients pull the new module's haks/tlk
     # snapshot. Non-fatal: if this fails, the .mod itself is still good.
