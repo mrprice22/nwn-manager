@@ -371,6 +371,80 @@ svg .convo-node text {
   outline-offset: 2px;
 }
 
+/* Documents nav dropdown */
+.nav-dropdown {
+  display: inline-block;
+  position: relative;
+  vertical-align: middle;
+}
+.nav-dropdown-label {
+  margin-right: 1.2em;
+  color: #fff;
+  cursor: default;
+  white-space: nowrap;
+}
+.nav-dropdown-menu {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  background: var(--accent);
+  border: 1px solid var(--accent-soft);
+  min-width: 11em;
+  z-index: 100;
+  padding: 0.25em 0;
+}
+.nav-dropdown:hover .nav-dropdown-menu { display: block; }
+.nav-dropdown-menu a {
+  display: block;
+  padding: 0.35em 0.85em;
+  color: #fff;
+  white-space: nowrap;
+  margin-right: 0;
+}
+.nav-dropdown-menu a:hover {
+  background: rgba(255,255,255,0.18);
+  text-decoration: none;
+}
+
+/* Submenu (folder entries inside the Documents dropdown) */
+.nav-submenu {
+  position: relative;
+}
+.nav-submenu-label {
+  display: block;
+  padding: 0.35em 0.85em;
+  color: rgba(255,255,255,0.75);
+  white-space: nowrap;
+  font-size: 0.88em;
+  letter-spacing: 0.03em;
+  cursor: default;
+}
+.nav-submenu-label::after { content: " \25b8"; }
+.nav-submenu-menu {
+  display: none;
+  position: absolute;
+  left: 100%;
+  top: 0;
+  background: var(--accent);
+  border: 1px solid var(--accent-soft);
+  min-width: 11em;
+  z-index: 102;
+  padding: 0.25em 0;
+}
+.nav-submenu:hover .nav-submenu-menu { display: block; }
+.nav-submenu-menu a {
+  display: block;
+  padding: 0.35em 0.85em;
+  color: #fff;
+  white-space: nowrap;
+  margin-right: 0;
+}
+.nav-submenu-menu a:hover {
+  background: rgba(255,255,255,0.18);
+  text-decoration: none;
+}
+
 /* NWN canonical damage / effect text colours.
  * Source: https://nwn.wiki/spaces/NWN1/pages/38177018/Colour+Tokens
  * The hex colours come through inline so the page works without this

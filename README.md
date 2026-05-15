@@ -40,6 +40,7 @@ my_module/
   unpacked/              source tree of GFF JSON + .nss scripts (committed)
   dist/                  packed .mod output (gitignored)
   docs/                  generated wiki — committed; GitHub Pages serves from here
+  docs.manual/           optional hand-written docs (committed) — see below
   tlk/                   per-project TLK cache for wiki StrRef resolution (gitignored)
   .nasher/               nasher cache + last-used source path (gitignored)
   .gitignore
@@ -264,6 +265,48 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
     --exclude-conv-option "[Options of the Homeless]"
   ```
 - `assets/style.css` — bundled stylesheet.
+- `manual/` — rendered hand-written documentation pages (see below).
+
+#### Manual documents
+
+If your project contains a `docs.manual/` folder at the project root (the
+same level as `unpacked/`), every `.md` file found there is converted to
+HTML and published alongside the generated wiki. A **Documents** drop-down
+menu appears in the site header linking to each page.
+
+**Top-level files** — `.md` files placed directly in `docs.manual/` become
+individual entries in the Documents menu:
+
+```
+docs.manual/
+  lore.md           → docs/manual/lore.html          (menu: "Lore")
+  questIdeas.md     → docs/manual/questIdeas.html     (menu: "Quest Ideas")
+```
+
+**Sub-folders** — each sub-directory becomes a submenu that opens to the
+right when hovered. The sub-folder name (with hyphens/underscores replaced
+by spaces) is the submenu label, and every `.md` inside it is a link within
+that submenu:
+
+```
+docs.manual/
+  Leveling Guides/
+    fighter.md      → docs/manual/Leveling Guides/fighter.html
+    wizard.md       → docs/manual/Leveling Guides/wizard.html
+  lore.md           → docs/manual/lore.html
+```
+
+Renders as: **Documents ▾** → direct link "Lore" + submenu "Leveling
+Guides ▸" containing "Fighter" and "Wizard".
+
+The page title shown in the menu is taken from the first `# Heading` in
+the file. If there is no heading, the filename stem is title-cased
+(`leveling-guide` → `Leveling Guide`).
+
+`docs.manual/` is picked up automatically on every `nwn-manager wiki` run
+— no flags needed. The folder is optional; if absent the Documents menu
+simply doesn't appear. Only one level of sub-folders is supported (files
+nested deeper are ignored).
 
 The wiki is **never** rebuilt automatically. `repack` does not trigger
 it; run `nwn-manager wiki` explicitly when you want fresh output.

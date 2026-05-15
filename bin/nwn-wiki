@@ -31,6 +31,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR / "wiki_data"
 ASSETS_DIR = SCRIPT_DIR / "wiki_assets"
 
+# Populated by render_manual_pages(); used by page() to build the Documents dropdown.
+# Each entry is one of:
+#   {"kind": "file", "title": str, "stem": str}
+#   {"kind": "dir",  "title": str, "dirname": str,
+#    "items": [{"title": str, "stem": str}, ...]}
+_MANUAL_PAGES: list[dict] = []
+
 
 # ---------------------------------------------------------------------------
 # GFF helpers
@@ -2111,6 +2118,173 @@ def _faction_dd(db: Db, faction_id, root_rel: str = ".") -> str:
     return (f'<a href="{E(root_rel)}/factions.html">{E(faction_id)}</a>')
 
 
+def md_to_html(text: str) -> str:
+    """Convert a subset of Markdown to HTML (no third-party deps)."""
+    import html as _html
+
+    lines = text.splitlines()
+    out: list[str] = []
+    in_ul = False
+    in_ol = False
+    in_code = False
+    code_buf: list[str] = []
+
+    def close_lists():
+        nonlocal in_ul, in_ol
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+        if in_ol:
+            out.append("</ol>")
+            in_ol = False
+
+    def inline(s: str) -> str:
+        s = _html.escape(s, quote=False)
+        # inline code
+        s = re.sub(r"`([^`]+)`", lambda m: f"<code>{m.group(1)}</code>", s)
+        # bold
+        s = re.sub(r"\*\*(.+?)\*\*|__(.+?)__",
+                   lambda m: f"<strong>{m.group(1) or m.group(2)}</strong>", s)
+        # italic
+        s = re.sub(r"\*([^*]+)\*|_([^_]+)_",
+                   lambda m: f"<em>{m.group(1) or m.group(2)}</em>", s)
+        # links
+        s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)",
+                   lambda m: f'<a href="{_html.escape(m.group(2), quote=True)}">'
+                             f"{m.group(1)}</a>", s)
+        return s
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+
+        # fenced code block
+        if raw.startswith("```"):
+            if in_code:
+                out.append(f"<pre><code>{''.join(code_buf)}</code></pre>")
+                code_buf.clear()
+                in_code = False
+            else:
+                close_lists()
+                in_code = True
+            i += 1
+            continue
+        if in_code:
+            code_buf.append(_html.escape(raw) + "\n")
+            i += 1
+            continue
+
+        stripped = raw.strip()
+
+        # blank line
+        if not stripped:
+            close_lists()
+            i += 1
+            continue
+
+        # ATX headings
+        m = re.match(r"^(#{1,3})\s+(.*)", stripped)
+        if m:
+            close_lists()
+            lvl = len(m.group(1))
+            out.append(f"<h{lvl}>{inline(m.group(2))}</h{lvl}>")
+            i += 1
+            continue
+
+        # horizontal rule
+        if re.match(r"^[-*_]{3,}$", stripped):
+            close_lists()
+            out.append("<hr>")
+            i += 1
+            continue
+
+        # unordered list
+        m = re.match(r"^[-*]\s+(.*)", stripped)
+        if m:
+            if in_ol:
+                out.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                out.append("<ul>")
+                in_ul = True
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            i += 1
+            continue
+
+        # ordered list
+        m = re.match(r"^\d+\.\s+(.*)", stripped)
+        if m:
+            if in_ul:
+                out.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                out.append("<ol>")
+                in_ol = True
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            i += 1
+            continue
+
+        # paragraph: collect consecutive non-blank, non-heading lines
+        close_lists()
+        para: list[str] = []
+        while i < len(lines):
+            r = lines[i].strip()
+            if (not r or r.startswith("#") or r.startswith("```")
+                    or re.match(r"^[-*_]{3,}$", r)
+                    or re.match(r"^[-*]\s+", r)
+                    or re.match(r"^\d+\.\s+", r)):
+                break
+            para.append(inline(r))
+            i += 1
+        out.append(f"<p>{'<br>'.join(para)}</p>")
+
+    close_lists()
+    if in_code and code_buf:
+        out.append(f"<pre><code>{''.join(code_buf)}</code></pre>")
+    return "\n".join(out)
+
+
+def _docs_dropdown(root_rel: str) -> str:
+    """Return the Documents nav dropdown HTML, or empty string if none."""
+    if not _MANUAL_PAGES:
+        return ""
+    rows: list[str] = []
+    for entry in _MANUAL_PAGES:
+        if entry["kind"] == "file":
+            rows.append(
+                f'<a href="{E(root_rel)}/manual/{E(entry["stem"])}.html">'
+                f'{E(entry["title"])}</a>'
+            )
+        else:
+            sub_items = "\n".join(
+                f'<a href="{E(root_rel)}/manual/{E(entry["dirname"])}/{E(it["stem"])}.html">'
+                f'{E(it["title"])}</a>'
+                for it in entry["items"]
+            )
+            rows.append(
+                f'<div class="nav-submenu">'
+                f'<span class="nav-submenu-label">{E(entry["title"])}</span>'
+                f'<div class="nav-submenu-menu">{sub_items}</div>'
+                f'</div>'
+            )
+    inner = "\n".join(rows)
+    return (
+        '<div class="nav-dropdown">'
+        '<span class="nav-dropdown-label">Documents &#9660;</span>'
+        f'<div class="nav-dropdown-menu">{inner}</div>'
+        '</div>'
+    )
+
+
+def _md_title(text: str, stem: str) -> str:
+    """Extract title from first # heading, or derive from filename stem."""
+    for line in text.splitlines():
+        m = re.match(r"^#\s+(.*)", line.strip())
+        if m:
+            return m.group(1).strip()
+    return stem.replace("-", " ").replace("_", " ").title()
+
+
 def page(title: str, body: str, root_rel: str = ".") -> str:
     """Wrap body in the standard wiki page shell."""
     return f"""<!doctype html>
@@ -2133,6 +2307,7 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
       <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
       <a href="{E(root_rel)}/factions.html">Factions</a>
       <a href="{E(root_rel)}/journal.html">Journal</a>
+      {_docs_dropdown(root_rel)}
     </nav>
   </header>
   <main>
@@ -4362,6 +4537,50 @@ def render_scripts_index(db: Db, out: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def render_manual_pages(project_root: Path, out: Path) -> None:
+    """Scan <project_root>/docs.manual/ for .md files and subdirs, render each."""
+    global _MANUAL_PAGES
+    _MANUAL_PAGES = []
+    manual_dir = project_root / "docs.manual"
+    if not manual_dir.is_dir():
+        return
+
+    total = 0
+
+    # Top-level .md files
+    for md_path in sorted(manual_dir.glob("*.md")):
+        text = md_path.read_text(encoding="utf-8")
+        stem = md_path.stem
+        title = _md_title(text, stem)
+        _MANUAL_PAGES.append({"kind": "file", "title": title, "stem": stem})
+        write(out / "manual" / f"{stem}.html", page(title, md_to_html(text), root_rel=".."))
+        total += 1
+
+    # Subdirectories → submenu entries
+    for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
+        md_files = sorted(sub_dir.glob("*.md"))
+        if not md_files:
+            continue
+        dirname = sub_dir.name
+        folder_title = dirname.replace("-", " ").replace("_", " ")
+        items: list[dict] = []
+        for md_path in md_files:
+            text = md_path.read_text(encoding="utf-8")
+            stem = md_path.stem
+            title = _md_title(text, stem)
+            items.append({"title": title, "stem": stem})
+            write(
+                out / "manual" / dirname / f"{stem}.html",
+                page(title, md_to_html(text), root_rel="../.."),
+            )
+            total += 1
+        _MANUAL_PAGES.append({"kind": "dir", "title": folder_title,
+                               "dirname": dirname, "items": items})
+
+    if total:
+        print(f"[nwn-wiki] rendered {total} manual page(s) from {manual_dir}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", required=True, help="path to unpacked/ tree")
@@ -4522,6 +4741,8 @@ def main() -> int:
         seed=args.seed,
     )
     print(f"  layout in {time.time() - t0:.1f}s")
+
+    render_manual_pages(src.parent, out)
 
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
