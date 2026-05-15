@@ -316,7 +316,44 @@ finer control:
 
 ```sh
 nwn-wiki --src ./unpacked --out ./docs --module-name "My Module" --seed 42
+nwn-wiki --src ./unpacked --out ./docs --log-dir ~/.local/state/nwnxee-mygame
 ```
+
+#### Player activity charts
+
+Pass `--log-dir` to generate an **Activity** page with charts derived from
+NWN server logs. The page is added to the wiki nav automatically and shows:
+
+- Summary stats (unique players, total sessions, combined play-hours,
+  busiest day, most active player)
+- Sessions per player (horizontal bar chart)
+- Play-hours per player (horizontal bar chart)
+- Daily session count over the observed date range
+- Sessions by hour of day (when the server is busiest)
+- Sessions by day of week
+
+```sh
+nwn-manager wiki --log-dir /path/to/server-state-dir
+```
+
+`--log-dir` accepts either a directory that contains `nwserverLog*.txt`
+files directly, or a parent directory whose immediate subdirectories contain
+them. The NWN EE dedicated server default is a `logs.0/`, `logs.1/`, …
+rotation under your server state directory — point `--log-dir` at the
+state root and all rotated logs are picked up automatically:
+
+```sh
+# Typical nwnxee layout: ~/.local/state/nwnxee-<name>/logs.{0-N}/nwserverLog1.txt
+nwn-manager wiki --log-dir ~/.local/state/nwnxee-mygame
+```
+
+Repeat the flag for multiple log roots (e.g. after migrating the server to
+a new machine). Only player sessions (not GM logins) are counted in the
+charts. Sessions without a matching leave event (server crash, log
+rollover) are counted for session totals but excluded from playtime totals.
+
+The page is skipped — and the Activity nav link omitted — when `--log-dir`
+is absent or no parseable player sessions are found.
 
 #### TLK resolution (StrRef references)
 

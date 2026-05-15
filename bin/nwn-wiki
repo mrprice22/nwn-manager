@@ -24,6 +24,7 @@ import struct
 import sys
 import time
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -37,6 +38,7 @@ ASSETS_DIR = SCRIPT_DIR / "wiki_assets"
 #   {"kind": "dir",  "title": str, "dirname": str,
 #    "items": [{"title": str, "stem": str}, ...]}
 _MANUAL_PAGES: list[dict] = []
+_HAS_ACTIVITY_PAGE: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -2307,6 +2309,7 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
       <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
       <a href="{E(root_rel)}/factions.html">Factions</a>
       <a href="{E(root_rel)}/journal.html">Journal</a>
+      {f'<a href="{E(root_rel)}/activity.html">Activity</a>' if _HAS_ACTIVITY_PAGE else ""}
       {_docs_dropdown(root_rel)}
     </nav>
   </header>
@@ -4559,6 +4562,384 @@ def _manual_doc_body(path: Path) -> tuple[str, str]:
     return _md_title(text, path.stem), md_to_html(text)
 
 
+# =============================================================================
+# NWN server log parser
+# =============================================================================
+
+_LOG_JOIN_RE = re.compile(
+    r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\] (\S+) \(\w+\) Joined as (Player|Game Master) \d+'
+)
+_LOG_LEAVE_RE = re.compile(
+    r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\] (\S+) Left as a (Player|Game Master)'
+)
+_LOG_HEADER_RE = re.compile(
+    r'^Messages for: \w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2} (\d{4})'
+)
+
+
+def _collect_log_files(log_dirs: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for d in log_dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("nwserverLog*.txt")):
+            if f not in seen:
+                files.append(f)
+                seen.add(f)
+        for sub in sorted(p for p in d.iterdir() if p.is_dir()):
+            for f in sorted(sub.glob("nwserverLog*.txt")):
+                if f not in seen:
+                    files.append(f)
+                    seen.add(f)
+    return files
+
+
+def parse_nwserver_logs(log_dirs: list[Path]) -> dict:
+    """Parse NWN server log files; return {"sessions": [...], "file_count": N}.
+
+    Each session dict has: player (str), role ("Player"|"Game Master"),
+    join (datetime), leave (datetime|None), duration_min (float|None).
+    """
+    log_files = _collect_log_files(log_dirs)
+    sessions: list[dict] = []
+    open_sessions: dict[str, dict] = {}
+
+    for log_path in log_files:
+        year = datetime.now().year
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = _LOG_HEADER_RE.match(line)
+            if m:
+                year = int(m.group(1))
+                continue
+            m = _LOG_JOIN_RE.match(line)
+            if m:
+                ts_str, player, role = m.group(1), m.group(2), m.group(3)
+                try:
+                    norm = re.sub(r' +', ' ', ts_str.strip())
+                    ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+                except ValueError:
+                    continue
+                if player in open_sessions:
+                    prev = open_sessions.pop(player)
+                    dur = (ts - prev["join"]).total_seconds() / 60
+                    sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
+                open_sessions[player] = {"player": player, "role": role, "join": ts}
+                continue
+            m = _LOG_LEAVE_RE.match(line)
+            if m:
+                ts_str, player = m.group(1), m.group(2)
+                try:
+                    norm = re.sub(r' +', ' ', ts_str.strip())
+                    ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+                except ValueError:
+                    continue
+                if player in open_sessions:
+                    prev = open_sessions.pop(player)
+                    dur = (ts - prev["join"]).total_seconds() / 60
+                    sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
+
+    for player, data in open_sessions.items():
+        sessions.append({**data, "leave": None, "duration_min": None})
+
+    return {"sessions": sessions, "file_count": len(log_files)}
+
+
+# =============================================================================
+# SVG chart helpers (pure stdlib — no third-party deps)
+# =============================================================================
+
+def _nice_upper(val: float) -> float:
+    """Round val up to a visually nice axis maximum."""
+    if val <= 0:
+        return 1.0
+    exp = 10 ** math.floor(math.log10(val))
+    norm = val / exp
+    for nice in (1, 2, 2.5, 5, 10):
+        if nice >= norm:
+            return nice * exp
+    return float(val)
+
+
+def _fmt_num(val: float) -> str:
+    if val == int(val):
+        return str(int(val))
+    return f"{val:.1f}" if val < 10 else str(int(round(val)))
+
+
+def _se(s: Any) -> str:
+    """html.escape shorthand for SVG text content."""
+    return html.escape(str(s))
+
+
+def svg_vbar_chart(
+    labels: list[str], values: list[float], title: str,
+    ylabel: str = "", bar_color: str = "#6b3a1c",
+    width: int = 700, height: int = 270,
+    rotate_labels: bool = False,
+) -> str:
+    """Vertical bar chart returned as an inline SVG string."""
+    mt, mb = 32, (72 if rotate_labels else 50)
+    ml, mr = 55, 20
+    pw, ph = width - ml - mr, height - mt - mb
+    n = len(labels)
+    if n == 0:
+        return f'<svg width="{width}" height="{height}"><text x="10" y="20">No data</text></svg>'
+    y_max = _nice_upper(max(values) if values else 1)
+    bar_w = max(2.0, pw / n * 0.65)
+    bar_gap = pw / n
+    out: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'style="font-family:Georgia,serif;background:#fff;'
+        f'border:1px solid #d6d2c4;border-radius:4px;display:block;">'
+    ]
+    out.append(
+        f'<text x="{width/2:.1f}" y="22" text-anchor="middle" '
+        f'font-size="13" fill="#6b3a1c">{_se(title)}</text>'
+    )
+    if ylabel:
+        cy = mt + ph / 2
+        out.append(
+            f'<text x="13" y="{cy:.1f}" text-anchor="middle" font-size="11" fill="#6b6b6b" '
+            f'transform="rotate(-90 13 {cy:.1f})">{_se(ylabel)}</text>'
+        )
+    for i in range(6):
+        tv = y_max * i / 5
+        y = mt + ph - (tv / y_max) * ph
+        out.append(
+            f'<line x1="{ml}" y1="{y:.1f}" x2="{ml+pw}" y2="{y:.1f}" '
+            f'stroke="#d6d2c4" stroke-width="1" stroke-dasharray="3,3"/>'
+        )
+        out.append(
+            f'<text x="{ml-6}" y="{y+4:.1f}" text-anchor="end" '
+            f'font-size="10" fill="#6b6b6b">{_fmt_num(tv)}</text>'
+        )
+    out.append(
+        f'<line x1="{ml}" y1="{mt}" x2="{ml}" y2="{mt+ph}" '
+        f'stroke="#9a9a9a" stroke-width="1.5"/>'
+    )
+    out.append(
+        f'<line x1="{ml}" y1="{mt+ph}" x2="{ml+pw}" y2="{mt+ph}" '
+        f'stroke="#9a9a9a" stroke-width="1.5"/>'
+    )
+    for i, (lbl, val) in enumerate(zip(labels, values)):
+        bx = ml + i * bar_gap + (bar_gap - bar_w) / 2
+        bh = (val / y_max) * ph
+        by = mt + ph - bh
+        out.append(
+            f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bar_w:.1f}" height="{bh:.1f}" '
+            f'fill="{bar_color}" opacity="0.82"/>'
+        )
+        if val > 0:
+            out.append(
+                f'<text x="{bx+bar_w/2:.1f}" y="{by-3:.1f}" text-anchor="middle" '
+                f'font-size="10" fill="{bar_color}">{_fmt_num(val)}</text>'
+            )
+        cx = bx + bar_w / 2
+        if rotate_labels:
+            out.append(
+                f'<text x="{cx:.1f}" y="{mt+ph+10}" text-anchor="end" font-size="10" '
+                f'fill="#6b6b6b" transform="rotate(-45 {cx:.1f} {mt+ph+10})">'
+                f'{_se(lbl)}</text>'
+            )
+        else:
+            out.append(
+                f'<text x="{cx:.1f}" y="{mt+ph+16}" text-anchor="middle" '
+                f'font-size="11" fill="#6b6b6b">{_se(lbl)}</text>'
+            )
+    out.append('</svg>')
+    return "\n".join(out)
+
+
+def svg_hbar_chart(
+    labels: list[str], values: list[float], title: str,
+    xlabel: str = "", bar_color: str = "#6b3a1c",
+) -> str:
+    """Horizontal bar chart returned as an inline SVG string."""
+    bar_h, bar_gap = 22, 30
+    n = len(labels)
+    width = 700
+    ml, mr, mt, mb = 130, 65, 34, 38
+    height = mt + n * bar_gap + mb
+    pw = width - ml - mr
+    x_max = _nice_upper(max(values) if values else 1)
+    y_bot = mt + n * bar_gap
+    out: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'style="font-family:Georgia,serif;background:#fff;'
+        f'border:1px solid #d6d2c4;border-radius:4px;display:block;">'
+    ]
+    out.append(
+        f'<text x="{width/2:.1f}" y="24" text-anchor="middle" '
+        f'font-size="13" fill="#6b3a1c">{_se(title)}</text>'
+    )
+    for i in range(6):
+        tv = x_max * i / 5
+        x = ml + (tv / x_max) * pw
+        out.append(
+            f'<line x1="{x:.1f}" y1="{mt}" x2="{x:.1f}" y2="{y_bot}" '
+            f'stroke="#d6d2c4" stroke-width="1" stroke-dasharray="3,3"/>'
+        )
+        out.append(
+            f'<text x="{x:.1f}" y="{y_bot+14}" text-anchor="middle" '
+            f'font-size="10" fill="#6b6b6b">{_fmt_num(tv)}</text>'
+        )
+    if xlabel:
+        out.append(
+            f'<text x="{ml+pw/2:.1f}" y="{y_bot+30}" text-anchor="middle" '
+            f'font-size="11" fill="#6b6b6b">{_se(xlabel)}</text>'
+        )
+    out.append(
+        f'<line x1="{ml}" y1="{mt}" x2="{ml}" y2="{y_bot}" '
+        f'stroke="#9a9a9a" stroke-width="1.5"/>'
+    )
+    out.append(
+        f'<line x1="{ml}" y1="{y_bot}" x2="{ml+pw}" y2="{y_bot}" '
+        f'stroke="#9a9a9a" stroke-width="1.5"/>'
+    )
+    for i, (lbl, val) in enumerate(zip(labels, values)):
+        by = mt + i * bar_gap + (bar_gap - bar_h) / 2
+        bw = (val / x_max) * pw
+        out.append(
+            f'<rect x="{ml}" y="{by:.1f}" width="{bw:.1f}" height="{bar_h}" '
+            f'fill="{bar_color}" opacity="0.82"/>'
+        )
+        if val > 0:
+            out.append(
+                f'<text x="{ml+bw+5:.1f}" y="{by+bar_h/2+4:.1f}" '
+                f'font-size="10" fill="{bar_color}">{_fmt_num(val)}</text>'
+            )
+        out.append(
+            f'<text x="{ml-8}" y="{by+bar_h/2+4:.1f}" text-anchor="end" '
+            f'font-size="11" fill="#1f1f1f">{_se(lbl)}</text>'
+        )
+    out.append('</svg>')
+    return "\n".join(out)
+
+
+# =============================================================================
+# Activity page renderer
+# =============================================================================
+
+def render_activity_page(activity: dict, out: Path) -> None:
+    """Write activity.html with player-activity charts derived from server logs."""
+    sessions = activity.get("sessions", [])
+    file_count = activity.get("file_count", 0)
+
+    ps = [s for s in sessions if s.get("join") is not None and s.get("role") == "Player"]
+    if not ps:
+        return
+
+    sess_by_player: Counter = Counter(s["player"] for s in ps)
+    time_by_player: dict[str, float] = {}
+    for s in ps:
+        if s.get("duration_min") is not None:
+            time_by_player[s["player"]] = (
+                time_by_player.get(s["player"], 0.0) + s["duration_min"]
+            )
+
+    hour_counts: Counter = Counter(s["join"].hour for s in ps)
+    dow_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    dow_counts: Counter = Counter(s["join"].strftime("%a") for s in ps)
+
+    all_dates = sorted({s["join"].date() for s in ps})
+    if all_dates:
+        min_date, max_date = all_dates[0], all_dates[-1]
+        date_range = [
+            min_date + timedelta(days=i)
+            for i in range((max_date - min_date).days + 1)
+        ]
+    else:
+        date_range = []
+    date_counts: Counter = Counter(s["join"].date() for s in ps)
+
+    n_players = len(sess_by_player)
+    n_sessions = len(ps)
+    total_hours = sum(time_by_player.values()) / 60
+    top_player = sess_by_player.most_common(1)[0][0] if sess_by_player else "—"
+    top_date_pair = date_counts.most_common(1)[0] if date_counts else (None, 0)
+    top_day_str = top_date_pair[0].strftime("%b %d, %Y") if top_date_pair[0] else "—"
+
+    top_players = [p for p, _ in sess_by_player.most_common(10)]
+    chart_sess = svg_hbar_chart(
+        list(reversed(top_players)),
+        [sess_by_player[p] for p in reversed(top_players)],
+        "Sessions per player",
+        xlabel="sessions",
+    )
+    chart_time = svg_hbar_chart(
+        list(reversed(top_players)),
+        [round(time_by_player.get(p, 0.0) / 60, 2) for p in reversed(top_players)],
+        "Play-hours per player",
+        xlabel="hours",
+        bar_color="#5a2b78",
+    )
+    chart_hour = svg_vbar_chart(
+        [str(h) for h in range(24)],
+        [hour_counts.get(h, 0) for h in range(24)],
+        "Sessions by hour of day (server time)",
+        ylabel="sessions",
+        width=700, height=260,
+    )
+    chart_dow = svg_vbar_chart(
+        dow_order,
+        [dow_counts.get(d, 0) for d in dow_order],
+        "Sessions by day of week",
+        ylabel="sessions",
+        width=500, height=240,
+        bar_color="#5a2b78",
+    )
+    if len(date_range) > 60:
+        date_range = date_range[-60:]
+    date_labels = [d.strftime("%b %-d") for d in date_range]
+    date_values = [date_counts.get(d, 0) for d in date_range]
+    chart_daily = svg_vbar_chart(
+        date_labels, date_values,
+        "Daily sessions",
+        ylabel="sessions",
+        width=max(700, len(date_range) * 20 + 80),
+        height=270,
+        rotate_labels=True,
+    )
+
+    range_str = (
+        f"{all_dates[0].strftime('%b %d, %Y')} – {all_dates[-1].strftime('%b %d, %Y')}"
+        if all_dates else ""
+    )
+    body = (
+        "<h1>Player Activity</h1>\n"
+        f'<p class="muted">Parsed from {file_count} server log file'
+        f'{"s" if file_count != 1 else ""}'
+        f'{f" &mdash; {E(range_str)}" if range_str else ""}</p>\n'
+        "<h2>Summary</h2>\n"
+        '<dl class="meta">\n'
+        f"  <dt>Unique players</dt><dd>{n_players}</dd>\n"
+        f"  <dt>Total sessions</dt><dd>{n_sessions}</dd>\n"
+        f"  <dt>Combined play-hours</dt><dd>{total_hours:.1f} h</dd>\n"
+        f"  <dt>Most active player</dt><dd>{E(top_player)}</dd>\n"
+        f"  <dt>Busiest day</dt><dd>{E(top_day_str)}"
+        f" ({top_date_pair[1]} session"
+        f'{"s" if top_date_pair[1] != 1 else ""})</dd>\n'
+        "</dl>\n"
+        "<h2>Sessions per player</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_sess}</div>\n'
+        "<h2>Play-hours per player</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_time}</div>\n'
+        "<h2>Daily sessions</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_daily}</div>\n'
+        "<h2>Active time of day</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_hour}</div>\n'
+        "<h2>Day of week</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_dow}</div>\n'
+    )
+    write(out / "activity.html", page("Player Activity", body))
+    print(f"[nwn-wiki] rendered activity page ({n_sessions} sessions, {n_players} players)")
+
+
 def render_manual_pages(project_root: Path, out: Path) -> None:
     """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each."""
     global _MANUAL_PAGES
@@ -4641,6 +5022,14 @@ def main() -> int:
                          "hide admin/DM teleport menus from cluttering the map "
                          "— the teleports still appear on the conversation "
                          "page, only the map edges are suppressed.")
+    ap.add_argument("--log-dir", action="append", default=[], dest="log_dirs",
+                    metavar="DIR",
+                    help="Directory containing NWN server logs (nwserverLog*.txt) "
+                         "or a parent directory whose subdirectories contain them "
+                         "(e.g. ~/.local/state/nwnxee-mygame/ whose logs.0/, "
+                         "logs.1/, … hold nwserverLog1.txt). Repeat for multiple "
+                         "log roots. When provided, an Activity page with "
+                         "player-activity charts is generated and added to the wiki.")
     args = ap.parse_args()
 
     src = Path(args.src).resolve()
@@ -4769,7 +5158,29 @@ def main() -> int:
     )
     print(f"  layout in {time.time() - t0:.1f}s")
 
+    # Parse server logs and set the activity-page flag BEFORE any page() calls
+    # so the Activity nav link appears on every rendered page.
+    global _HAS_ACTIVITY_PAGE
+    activity: dict | None = None
+    if args.log_dirs:
+        log_dir_paths = [Path(d).resolve() for d in args.log_dirs]
+        activity = parse_nwserver_logs(log_dir_paths)
+        player_sessions = [
+            s for s in activity["sessions"]
+            if s.get("join") is not None and s.get("role") == "Player"
+        ]
+        if player_sessions:
+            _HAS_ACTIVITY_PAGE = True
+            print(f"[nwn-wiki] found {len(player_sessions)} player sessions "
+                  f"across {activity['file_count']} log file(s)")
+        else:
+            print("[nwn-wiki] log-dir specified but no player sessions found; "
+                  "skipping activity page", file=sys.stderr)
+
     render_manual_pages(src.parent, out)
+
+    if activity and _HAS_ACTIVITY_PAGE:
+        render_activity_page(activity, out)
 
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
