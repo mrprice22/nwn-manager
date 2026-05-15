@@ -4948,9 +4948,10 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
     if not manual_dir.is_dir():
         return
 
-    total = 0
+    # Pass 1: collect all page metadata and content so _MANUAL_PAGES is complete
+    # before any page HTML is written (the dropdown in every page must list all docs).
+    pages_to_write: list[tuple[Path, str, str, str]] = []  # (out_path, title, body, root_rel)
 
-    # Top-level .md and .html files
     top_files = sorted(
         p for p in manual_dir.iterdir()
         if p.is_file() and p.suffix.lower() in (".md", ".html")
@@ -4959,10 +4960,8 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         title, body = _manual_doc_body(doc_path)
         stem = doc_path.stem
         _MANUAL_PAGES.append({"kind": "file", "title": title, "stem": stem})
-        write(out / "manual" / f"{stem}.html", page(title, body, root_rel=".."))
-        total += 1
+        pages_to_write.append((out / "manual" / f"{stem}.html", title, body, ".."))
 
-    # Subdirectories → submenu entries
     for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
         doc_files = sorted(
             p for p in sub_dir.iterdir()
@@ -4977,14 +4976,17 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
             title, body = _manual_doc_body(doc_path)
             stem = doc_path.stem
             items.append({"title": title, "stem": stem})
-            write(
-                out / "manual" / dirname / f"{stem}.html",
-                page(title, body, root_rel="../.."),
-            )
-            total += 1
+            pages_to_write.append((
+                out / "manual" / dirname / f"{stem}.html", title, body, "../..",
+            ))
         _MANUAL_PAGES.append({"kind": "dir", "title": folder_title,
                                "dirname": dirname, "items": items})
 
+    # Pass 2: write all pages now that _MANUAL_PAGES is fully populated.
+    for out_path, title, body, root_rel in pages_to_write:
+        write(out_path, page(title, body, root_rel=root_rel))
+
+    total = len(pages_to_write)
     if total:
         print(f"[nwn-wiki] rendered {total} manual page(s) from {manual_dir}")
 
