@@ -4537,8 +4537,30 @@ def render_scripts_index(db: Db, out: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _html_title(text: str, stem: str) -> str:
+    """Extract title from <title> or first <h1> tag, or derive from filename stem."""
+    m = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    return stem.replace("-", " ").replace("_", " ").title()
+
+
+def _manual_doc_body(path: Path) -> tuple[str, str]:
+    """Return (title, body_html) for a .md or .html manual doc."""
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".html":
+        # Extract <body> content if present, otherwise use full text as body
+        m = re.search(r"<body[^>]*>(.*?)</body>", text, re.IGNORECASE | re.DOTALL)
+        body = m.group(1) if m else text
+        return _html_title(text, path.stem), body
+    return _md_title(text, path.stem), md_to_html(text)
+
+
 def render_manual_pages(project_root: Path, out: Path) -> None:
-    """Scan <project_root>/docs.manual/ for .md files and subdirs, render each."""
+    """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each."""
     global _MANUAL_PAGES
     _MANUAL_PAGES = []
     manual_dir = project_root / "docs.manual"
@@ -4547,31 +4569,36 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
 
     total = 0
 
-    # Top-level .md files
-    for md_path in sorted(manual_dir.glob("*.md")):
-        text = md_path.read_text(encoding="utf-8")
-        stem = md_path.stem
-        title = _md_title(text, stem)
+    # Top-level .md and .html files
+    top_files = sorted(
+        p for p in manual_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".md", ".html")
+    )
+    for doc_path in top_files:
+        title, body = _manual_doc_body(doc_path)
+        stem = doc_path.stem
         _MANUAL_PAGES.append({"kind": "file", "title": title, "stem": stem})
-        write(out / "manual" / f"{stem}.html", page(title, md_to_html(text), root_rel=".."))
+        write(out / "manual" / f"{stem}.html", page(title, body, root_rel=".."))
         total += 1
 
     # Subdirectories → submenu entries
     for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
-        md_files = sorted(sub_dir.glob("*.md"))
-        if not md_files:
+        doc_files = sorted(
+            p for p in sub_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".md", ".html")
+        )
+        if not doc_files:
             continue
         dirname = sub_dir.name
         folder_title = dirname.replace("-", " ").replace("_", " ")
         items: list[dict] = []
-        for md_path in md_files:
-            text = md_path.read_text(encoding="utf-8")
-            stem = md_path.stem
-            title = _md_title(text, stem)
+        for doc_path in doc_files:
+            title, body = _manual_doc_body(doc_path)
+            stem = doc_path.stem
             items.append({"title": title, "stem": stem})
             write(
                 out / "manual" / dirname / f"{stem}.html",
-                page(title, md_to_html(text), root_rel="../.."),
+                page(title, body, root_rel="../.."),
             )
             total += 1
         _MANUAL_PAGES.append({"kind": "dir", "title": folder_title,
