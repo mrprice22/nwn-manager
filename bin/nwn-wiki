@@ -2005,7 +2005,7 @@ def nwn_html(s: Any) -> str:
     return "".join(out)
 
 
-_C_TOKEN_RE = re.compile(r"<<?/c>|<<?c.{3}>", re.DOTALL)
+_C_TOKEN_RE = re.compile(r"<<?/c>|<<?c.{3}>|</?[A-Za-z][^>]*>", re.DOTALL)
 _C_OPEN_RE = re.compile(r"<<?c(.)(.)(.)>", re.DOTALL)
 
 
