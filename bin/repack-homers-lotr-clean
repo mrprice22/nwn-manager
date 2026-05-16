@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Desktop-launcher target: repack Homer's LotR from ./unpacked/ into a .mod
+# using --clean to wipe nasher's cache before building, forcing a full rebuild
+# of all compiled scripts and converted GFFs (not just changed files).
+#
+# Use this when the regular repack produces stale or unexpected output.
+# It is slower than the regular repack because nasher recompiles everything.
+#
+# NOTE: also purges .nasher/tmp/*.ncs before rebuilding. nasher --clean only
+# clears the cache JSON; stale compiled binaries linger in tmp/ and fool
+# nasher's "no changed files" check even after an include file is edited.
+# Deleting them forces a genuine full recompile from current .nss sources.
+
+set -o pipefail
+
+PROJECT=/var/home/james/GIT/nwn_homers_lotr
+NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
+
+export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
+
+cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
+
+rm -f homers_lotr_v3.mod
+
+# Purge stale compiled scripts so nasher recompiles from current .nss sources.
+# nasher --clean only resets the cache JSON; .nasher/tmp/*.ncs persist and
+# can contain binaries built against old include files (e.g. nw_o2_coninclude).
+ncs_count=$(find .nasher/tmp -name '*.ncs' 2>/dev/null | wc -l)
+if [[ $ncs_count -gt 0 ]]; then
+  echo "[clean] removing $ncs_count stale .ncs files from .nasher/tmp/"
+  find .nasher/tmp -name '*.ncs' -delete
+fi
+
+start=$(date +%s)
+nwn-manager repack --clean
+nasher_status=$?
+
+echo
+echo "=========================================================================="
+if [[ -f homers_lotr_v3.mod ]]; then
+  built=$(stat -c %Y homers_lotr_v3.mod)
+  size=$(stat -c %s homers_lotr_v3.mod)
+  size_mb=$(( size / 1024 / 1024 ))
+  if [[ $built -ge $start ]]; then
+    echo "[OK] homers_lotr_v3.mod rebuilt (${size_mb} MB)"
+    echo "     The 'N errored' tally above is pre-existing module noise — see"
+    echo "     /var/home/james/.local/share/Steam/steamapps/common/Neverwinter Nights/bin/CLAUDE.md"
+    echo
+    # Copy 1: OneDrive modules dir (primary — used by the Unpack pipeline)
+    ONEDRIVE_MOD_DIR="$HOME/OneDrive/Games/NWNHomersLOTR"
+    ONEDRIVE_MOD_DEST="$ONEDRIVE_MOD_DIR/homers_lotr_v3.mod"
+    if [[ -d $ONEDRIVE_MOD_DIR ]]; then
+      cp -v "homers_lotr_v3.mod" "$ONEDRIVE_MOD_DEST"
+      echo "[install] → $ONEDRIVE_MOD_DEST"
+    else
+      echo "[install] WARNING: $ONEDRIVE_MOD_DIR not found, skipping OneDrive copy"
+    fi
+    echo
+    # Copy 2: local NWN modules dir (for toolset access)
+    NWN_MOD_DIR="$HOME/.local/share/Neverwinter Nights/modules"
+    NWN_MOD_DEST="$NWN_MOD_DIR/Homer's LOTR VEL v3.mod"
+    if [[ -d $NWN_MOD_DIR ]]; then
+      cp -v "homers_lotr_v3.mod" "$NWN_MOD_DEST"
+      echo "[install] → $NWN_MOD_DEST"
+    else
+      echo "[install] WARNING: $NWN_MOD_DIR not found, skipping local NWN copy"
+    fi
+    echo
+    # Copy 3: timestamped archive in project root
+    ARCHIVE_DEST="$PROJECT/homers_lotr_v3_$(date +%Y%m%d_%H%M%S).mod"
+    cp -v "homers_lotr_v3.mod" "$ARCHIVE_DEST"
+    echo "[archive] → $ARCHIVE_DEST"
+    echo
+    # Refresh nwsync so connecting EE clients pull the new module's haks/tlk
+    # snapshot. Non-fatal: if this fails, the .mod itself is still good.
+    if [[ -x "$PROJECT/bin/refresh-nwsync" ]]; then
+      echo "--------------------------------------------------------------------------"
+      echo "[nwsync] refreshing manifest..."
+      "$PROJECT/bin/refresh-nwsync" || \
+        echo "[nwsync] WARNING: refresh failed; the .mod is fine, but clients won't see the latest CEP snapshot until you re-run bin/refresh-nwsync"
+      echo
+    fi
+    echo "Next: launch the server with the 'Host Homer's LotR Server' app-grid"
+    echo "      shortcut (or run bin/serve from the project root)."
+    status=0
+  else
+    echo "[STALE] homers_lotr_v3.mod exists but was not updated this run."
+    echo "        nasher exit: $nasher_status — check output above."
+    status=1
+  fi
+else
+  echo "[FAILED] no homers_lotr_v3.mod produced (nasher exit $nasher_status)"
+  status=1
+fi
+echo
+read -rp "Press Enter to close..."
+exit $status
