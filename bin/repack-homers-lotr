@@ -37,7 +37,7 @@ if [[ -f homers_lotr_v3.mod ]]; then
     echo "     /var/home/james/.local/share/Steam/steamapps/common/Neverwinter Nights/bin/CLAUDE.md"
     echo
     # Copy 1: OneDrive modules dir (primary — used by the Unpack pipeline)
-    ONEDRIVE_MOD_DIR="$HOME/OneDrive/Documents/Neverwinter Nights/modules"
+    ONEDRIVE_MOD_DIR="$HOME/OneDrive/Games/NWNHomersLOTR"
     ONEDRIVE_MOD_DEST="$ONEDRIVE_MOD_DIR/homers_lotr_v3.mod"
     if [[ -d $ONEDRIVE_MOD_DIR ]]; then
       cp -v "homers_lotr_v3.mod" "$ONEDRIVE_MOD_DEST"

@@ -6,7 +6,7 @@
 set -o pipefail
 
 PROJECT=/var/home/james/GIT/nwn_homers_lotr
-MOD="$HOME/OneDrive/Documents/Neverwinter Nights/modules/homers_lotr_v3.mod"
+MOD="$HOME/OneDrive/Games/NWNHomersLOTR/homers_lotr_v3.mod"
 NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
 
 export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
