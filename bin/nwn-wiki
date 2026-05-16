@@ -4825,7 +4825,15 @@ def svg_hbar_chart(
 # Activity page renderer
 # =============================================================================
 
-def render_activity_page(activity: dict, out: Path) -> None:
+def _tz_label(offset: int) -> str:
+    """Return a human-readable timezone label for a UTC hour offset (e.g. -5 → 'GMT-5')."""
+    if offset == 0:
+        return "GMT+0"
+    sign = "+" if offset > 0 else "-"
+    return f"GMT{sign}{abs(offset)}"
+
+
+def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> None:
     """Write activity.html with player-activity charts derived from server logs."""
     sessions = activity.get("sessions", [])
     file_count = activity.get("file_count", 0)
@@ -4881,7 +4889,7 @@ def render_activity_page(activity: dict, out: Path) -> None:
     chart_hour = svg_vbar_chart(
         [str(h) for h in range(24)],
         [hour_counts.get(h, 0) for h in range(24)],
-        "Sessions by hour of day (server time)",
+        f"Sessions by hour of day ({tz_label})",
         ylabel="sessions",
         width=700, height=260,
     )
@@ -5032,6 +5040,13 @@ def main() -> int:
                          "logs.1/, … hold nwserverLog1.txt). Repeat for multiple "
                          "log roots. When provided, an Activity page with "
                          "player-activity charts is generated and added to the wiki.")
+    ap.add_argument("--log-timezone", type=int, default=0, dest="log_timezone",
+                    metavar="OFFSET",
+                    help="UTC hour offset of the server log timestamps (e.g. -5 for "
+                         "US Central). Used to label the time-of-day activity chart "
+                         "with the correct timezone name instead of the generic "
+                         "'server time'. The log files must already contain times in "
+                         "this timezone — this flag does not shift timestamps.")
     args = ap.parse_args()
 
     src = Path(args.src).resolve()
@@ -5182,7 +5197,7 @@ def main() -> int:
     render_manual_pages(src.parent, out)
 
     if activity and _HAS_ACTIVITY_PAGE:
-        render_activity_page(activity, out)
+        render_activity_page(activity, out, tz_label=_tz_label(args.log_timezone))
 
     print("[nwn-wiki] rendering pages")
     t0 = time.time()

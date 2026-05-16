@@ -355,6 +355,28 @@ rollover) are counted for session totals but excluded from playtime totals.
 The page is skipped — and the Activity nav link omitted — when `--log-dir`
 is absent or no parseable player sessions are found.
 
+##### Timezone
+
+NWN EE dedicated servers log timestamps in UTC by default. Pass
+`--log-timezone <OFFSET>` to tell the wiki what UTC offset the log
+timestamps are in so the "Sessions by hour of day" chart is labeled with
+the correct timezone instead of the generic "server time":
+
+```sh
+nwn-manager wiki --log-dir ~/.local/state/nwnxee-mygame --log-timezone -5
+```
+
+`OFFSET` is an integer UTC hour offset (e.g. `-5` for US Central, `-8`
+for US Pacific, `0` for UTC). This flag is **label-only** — it does not
+shift timestamps. The log files must already contain times in the
+specified timezone. To convert existing UTC logs to local time in bulk,
+use the one-time migration script in `bin/shift-log-timestamps`.
+
+To make your dedicated server log in local time going forward, set `TZ`
+in `server.env` (e.g. `TZ=America/Chicago`) so the container uses your
+local timezone. After that, log timestamps will naturally match your
+`--log-timezone` offset without any further conversion.
+
 #### TLK resolution (StrRef references)
 
 NWN GFF blobs reference player-visible strings indirectly. A
