@@ -14,12 +14,16 @@ export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 
 cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
 
+# Export TZ from server.env so nwn-wiki labels the activity charts with the
+# correct timezone (e.g. America/Chicago → "GMT-5" / "GMT-4" per DST).
+# shellcheck disable=SC1091
+[[ -f "$PROJECT/server.env" ]] && . "$PROJECT/server.env" && export TZ
+
 nwn-manager wiki \
   --base-url https://homers-lotr-wiki.jamesprice-slightlyepic.workers.dev/ \
   --exclude-conv-option "[Admin Options]" \
   --exclude-conv-option "[Options of the Homeless]" \
-  --log-dir "$HOME/.local/state/nwnxee-homer" \
-  --log-timezone -5
+  --log-dir "$HOME/.local/state/nwnxee-homer"
 status=$?
 
 echo

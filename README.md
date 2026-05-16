@@ -357,25 +357,33 @@ is absent or no parseable player sessions are found.
 
 ##### Timezone
 
-NWN EE dedicated servers log timestamps in UTC by default. Pass
-`--log-timezone <OFFSET>` to tell the wiki what UTC offset the log
-timestamps are in so the "Sessions by hour of day" chart is labeled with
-the correct timezone instead of the generic "server time":
+NWN EE dedicated servers log timestamps in UTC by default. The wiki
+reads the `TZ` environment variable to label the "Sessions by hour of
+day" chart with the correct timezone (e.g. `GMT-5` instead of `GMT+0`).
+DST is handled automatically via Python's `zoneinfo` module.
+
+The cleanest setup is to set `TZ` in your server's `server.env` and
+export it before running the wiki generator:
 
 ```sh
-nwn-manager wiki --log-dir ~/.local/state/nwnxee-mygame --log-timezone -5
+# In server.env:
+TZ=America/Chicago
+
+# In your wiki-generation script (sources server.env, then exports TZ):
+. server.env && export TZ
+nwn-manager wiki --log-dir ~/.local/state/nwnxee-mygame
 ```
 
-`OFFSET` is an integer UTC hour offset (e.g. `-5` for US Central, `-8`
-for US Pacific, `0` for UTC). This flag is **label-only** — it does not
-shift timestamps. The log files must already contain times in the
-specified timezone. To convert existing UTC logs to local time in bulk,
-use the one-time migration script in `bin/shift-log-timestamps`.
+With `TZ` set, the container logs timestamps in local time natively, the
+activity chart is labeled correctly, and no manual offset conversion is
+needed. If `TZ` is unset the chart defaults to `GMT+0`.
 
-To make your dedicated server log in local time going forward, set `TZ`
-in `server.env` (e.g. `TZ=America/Chicago`) so the container uses your
-local timezone. After that, log timestamps will naturally match your
-`--log-timezone` offset without any further conversion.
+To convert existing UTC log files to local time in bulk (a one-time
+migration), use `bin/shift-log-timestamps`:
+
+```sh
+bin/shift-log-timestamps ~/.local/state/nwnxee-mygame -5
+```
 
 #### TLK resolution (StrRef references)
 
