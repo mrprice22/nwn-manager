@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
 # Desktop-launcher target: unpack Homer's LotR .mod into the unpacked/ source
-# tree. Reads the .mod from the OneDrive modules directory.
+# tree. Selects the most recently modified .mod from the git project directory
+# or the OneDrive modules directory.
 # Wiki regeneration is a separate step — use "Regenerate Homer's LotR Wiki".
 
 set -o pipefail
 
 PROJECT=/var/home/james/GIT/nwn_homers_lotr
-MOD="$HOME/OneDrive/Games/NWNHomersLOTR/homers_lotr_v3.mod"
 NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
+
+CANDIDATE_DIRS=(
+  "$PROJECT"
+  "$HOME/OneDrive/Games/NWNHomersLOTR"
+)
 
 export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 
 cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
 
-if [[ ! -f $MOD ]]; then
-  echo "error: module not found at: $MOD"
+MOD=$(find "${CANDIDATE_DIRS[@]}" -maxdepth 1 -name "*.mod" -type f 2>/dev/null \
+  | xargs ls -t 2>/dev/null | head -1)
+
+if [[ -z $MOD ]]; then
+  echo "error: no .mod file found in:"
+  printf "  %s\n" "${CANDIDATE_DIRS[@]}"
   read -rp "Press Enter..."; exit 1
 fi
 
