@@ -4579,6 +4579,12 @@ _LOG_HEADER_RE = re.compile(
 )
 
 
+def _log_subdir_sort_key(p: Path) -> list:
+    """Natural sort key so logs.9 < logs.10 (reversed for oldest-first processing)."""
+    parts = re.split(r'(\d+)', p.name)
+    return [int(x) if x.isdigit() else x for x in parts]
+
+
 def _collect_log_files(log_dirs: list[Path]) -> list[Path]:
     files: list[Path] = []
     seen: set[Path] = set()
@@ -4589,7 +4595,14 @@ def _collect_log_files(log_dirs: list[Path]) -> list[Path]:
             if f not in seen:
                 files.append(f)
                 seen.add(f)
-        for sub in sorted(p for p in d.iterdir() if p.is_dir()):
+        # Sort subdirs in REVERSE numeric order so the oldest rotation (highest
+        # number, e.g. logs.12) is processed before newer ones (logs.0).
+        subdirs = sorted(
+            (p for p in d.iterdir() if p.is_dir()),
+            key=_log_subdir_sort_key,
+            reverse=True,
+        )
+        for sub in subdirs:
             for f in sorted(sub.glob("nwserverLog*.txt")):
                 if f not in seen:
                     files.append(f)
@@ -4597,58 +4610,168 @@ def _collect_log_files(log_dirs: list[Path]) -> list[Path]:
     return files
 
 
-def parse_nwserver_logs(log_dirs: list[Path]) -> dict:
+def _log_file_fingerprint(path: Path) -> dict | None:
+    try:
+        st = path.stat()
+        return {"mtime": round(st.st_mtime, 3), "size": st.st_size}
+    except OSError:
+        return None
+
+
+def _load_activity_cache(cache_path: Path) -> dict:
+    if cache_path.is_file():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("version") == 1:
+                return data
+        except Exception:
+            pass
+    return {"version": 1, "sessions": [], "file_fingerprints": {}}
+
+
+def _save_activity_cache(cache_path: Path, data: dict) -> None:
+    try:
+        cache_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"[nwn-wiki] warn: could not save activity cache: {e}", file=sys.stderr)
+
+
+def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool]:
+    """Parse one NWN server log file.
+
+    Returns (sessions, has_open_sessions). Each session has player, role,
+    join (datetime), leave (datetime|None), duration_min (float|None).
+    Each log file is one server run so sessions never need to span files.
+    """
+    year = datetime.now().year
+    sessions: list[dict] = []
+    open_sessions: dict[str, dict] = {}
+
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [], False
+
+    for line in text.splitlines():
+        m = _LOG_HEADER_RE.match(line)
+        if m:
+            year = int(m.group(1))
+            continue
+        m = _LOG_JOIN_RE.match(line)
+        if m:
+            ts_str, player, role = m.group(1), m.group(2), m.group(3)
+            try:
+                norm = re.sub(r' +', ' ', ts_str.strip())
+                ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+            except ValueError:
+                continue
+            if player in open_sessions:
+                prev = open_sessions.pop(player)
+                dur = (ts - prev["join"]).total_seconds() / 60
+                sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
+            open_sessions[player] = {"player": player, "role": role, "join": ts}
+            continue
+        m = _LOG_LEAVE_RE.match(line)
+        if m:
+            ts_str, player = m.group(1), m.group(2)
+            try:
+                norm = re.sub(r' +', ' ', ts_str.strip())
+                ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+            except ValueError:
+                continue
+            if player in open_sessions:
+                prev = open_sessions.pop(player)
+                dur = (ts - prev["join"]).total_seconds() / 60
+                sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
+
+    has_open = bool(open_sessions)
+    for player, data in open_sessions.items():
+        sessions.append({**data, "leave": None, "duration_min": None})
+
+    return sessions, has_open
+
+
+def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) -> dict:
     """Parse NWN server log files; return {"sessions": [...], "file_count": N}.
 
     Each session dict has: player (str), role ("Player"|"Game Master"),
     join (datetime), leave (datetime|None), duration_min (float|None).
+
+    If cache_path is given, closed sessions are persisted to a JSON file so
+    that hours never decrease even when old log rotations are deleted.
     """
     log_files = _collect_log_files(log_dirs)
-    sessions: list[dict] = []
-    open_sessions: dict[str, dict] = {}
+
+    cache = _load_activity_cache(cache_path) if cache_path else {
+        "version": 1, "sessions": [], "file_fingerprints": {},
+    }
+    cached_sessions: list[dict] = cache.setdefault("sessions", [])
+    cached_fps: dict = cache.setdefault("file_fingerprints", {})
+
+    # Index of sessions already stored: (player, join_isoformat) → True
+    seen_keys: set[tuple] = {
+        (s["player"], s["join"])
+        for s in cached_sessions
+        if s.get("join") and s.get("duration_min") is not None
+    }
+
+    cache_updated = False
+    open_sessions_out: list[dict] = []  # in-progress sessions, never cached
 
     for log_path in log_files:
-        year = datetime.now().year
-        try:
-            text = log_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        path_key = str(log_path)
+        fp = _log_file_fingerprint(log_path)
+
+        # Skip files whose content hasn't changed since last parse
+        if fp is not None and cached_fps.get(path_key) == fp:
             continue
-        for line in text.splitlines():
-            m = _LOG_HEADER_RE.match(line)
-            if m:
-                year = int(m.group(1))
-                continue
-            m = _LOG_JOIN_RE.match(line)
-            if m:
-                ts_str, player, role = m.group(1), m.group(2), m.group(3)
-                try:
-                    norm = re.sub(r' +', ' ', ts_str.strip())
-                    ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
-                except ValueError:
-                    continue
-                if player in open_sessions:
-                    prev = open_sessions.pop(player)
-                    dur = (ts - prev["join"]).total_seconds() / 60
-                    sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
-                open_sessions[player] = {"player": player, "role": role, "join": ts}
-                continue
-            m = _LOG_LEAVE_RE.match(line)
-            if m:
-                ts_str, player = m.group(1), m.group(2)
-                try:
-                    norm = re.sub(r' +', ' ', ts_str.strip())
-                    ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
-                except ValueError:
-                    continue
-                if player in open_sessions:
-                    prev = open_sessions.pop(player)
-                    dur = (ts - prev["join"]).total_seconds() / 60
-                    sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
 
-    for player, data in open_sessions.items():
-        sessions.append({**data, "leave": None, "duration_min": None})
+        file_sessions, has_open = _parse_one_log_file(log_path)
 
-    return {"sessions": sessions, "file_count": len(log_files)}
+        # Persist all newly closed sessions
+        for s in file_sessions:
+            if s.get("duration_min") is None:
+                open_sessions_out.append(s)
+                continue
+            join_key = (s["player"], s["join"].isoformat())
+            if join_key in seen_keys:
+                continue
+            seen_keys.add(join_key)
+            cached_sessions.append({
+                "player": s["player"],
+                "role": s.get("role", "Player"),
+                "join": s["join"].isoformat(),
+                "leave": s["leave"].isoformat() if s.get("leave") else None,
+                "duration_min": s["duration_min"],
+            })
+            cache_updated = True
+
+        # Only fingerprint files that are fully closed (no players still online)
+        if not has_open and fp is not None:
+            cached_fps[path_key] = fp
+            cache_updated = True
+
+    if cache_path is not None and cache_updated:
+        _save_activity_cache(cache_path, cache)
+
+    # Convert cached sessions back to datetime objects for rendering
+    sessions_out: list[dict] = []
+    for s in cached_sessions:
+        try:
+            join_dt = datetime.fromisoformat(s["join"])
+            leave_dt = datetime.fromisoformat(s["leave"]) if s.get("leave") else None
+        except (ValueError, KeyError):
+            continue
+        sessions_out.append({
+            "player": s["player"],
+            "role": s.get("role", "Player"),
+            "join": join_dt,
+            "leave": leave_dt,
+            "duration_min": s.get("duration_min"),
+        })
+
+    sessions_out.extend(open_sessions_out)
+    return {"sessions": sessions_out, "file_count": len(log_files)}
 
 
 # =============================================================================
@@ -5056,6 +5179,12 @@ def main() -> int:
                          "logs.1/, … hold nwserverLog1.txt). Repeat for multiple "
                          "log roots. When provided, an Activity page with "
                          "player-activity charts is generated and added to the wiki.")
+    ap.add_argument("--activity-cache", default=None, dest="activity_cache",
+                    metavar="PATH",
+                    help="JSON file for persisting player-session data across log "
+                         "rotations. Defaults to activity-sessions.json inside the "
+                         "first --log-dir. Keeps historical hours from being lost "
+                         "when old log rotations are deleted by the server.")
     args = ap.parse_args()
 
     global _GENERATED_AT
@@ -5193,7 +5322,11 @@ def main() -> int:
     activity: dict | None = None
     if args.log_dirs:
         log_dir_paths = [Path(d).resolve() for d in args.log_dirs]
-        activity = parse_nwserver_logs(log_dir_paths)
+        if args.activity_cache:
+            cache_path = Path(args.activity_cache).resolve()
+        else:
+            cache_path = log_dir_paths[0] / "activity-sessions.json"
+        activity = parse_nwserver_logs(log_dir_paths, cache_path=cache_path)
         player_sessions = [
             s for s in activity["sessions"]
             if s.get("join") is not None and s.get("role") == "Player"
@@ -5201,7 +5334,8 @@ def main() -> int:
         if player_sessions:
             _HAS_ACTIVITY_PAGE = True
             print(f"[nwn-wiki] found {len(player_sessions)} player sessions "
-                  f"across {activity['file_count']} log file(s)")
+                  f"across {activity['file_count']} log file(s) "
+                  f"(cache: {cache_path})")
         else:
             print("[nwn-wiki] log-dir specified but no player sessions found; "
                   "skipping activity page", file=sys.stderr)
