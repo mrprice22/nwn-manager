@@ -23,7 +23,8 @@ nwn-manager wiki \
   --base-url https://homers-lotr-wiki.jamesprice-slightlyepic.workers.dev/ \
   --exclude-conv-option "[Admin Options]" \
   --exclude-conv-option "[Options of the Homeless]" \
-  --log-dir "$HOME/.local/state/nwnxee-homer"
+  --log-dir "$HOME/.local/state/nwnxee-homer" \
+  --path-from thewelloferu
 status=$?
 
 echo

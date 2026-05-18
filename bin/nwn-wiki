@@ -24,7 +24,7 @@ import shutil
 import struct
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -2665,6 +2665,68 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
     )
 
 
+_OMIT: object = object()  # sentinel: "no path-from section on this page"
+
+
+def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str]]]:
+    """Directed area→area edge graph from door/trigger transitions and conv teleports.
+
+    Uses db.conv_transitions (not db.dialog_teleports directly) so that any
+    --exclude-conv-option labels (e.g. "[Admin Options]") are already stripped
+    out — the same exclusion that applies to the area map SVG edges.
+    """
+    graph: dict[str, list[tuple[str, str, str]]] = {rr: [] for rr in db.areas}
+    seen: set[tuple[str, str, str, str]] = set()
+    for tr in db.transitions:
+        src, dst = tr["src_area"], tr["dst_area"]
+        if not dst or src not in graph or dst not in graph or src == dst:
+            continue
+        key = (src, dst, tr["kind"], tr["label"])
+        if key not in seen:
+            seen.add(key)
+            graph[src].append((dst, tr["kind"], tr["label"]))
+    for tr in db.conv_transitions:
+        src, dst = tr["src"], tr["dst_area"]
+        if src not in graph or dst not in graph or src == dst:
+            continue
+        conv_rr = tr.get("conv_resref", "")
+        label = db.dialog_label(conv_rr) if conv_rr else conv_rr
+        key = (src, dst, "talk", label)
+        if key not in seen:
+            seen.add(key)
+            graph[src].append((dst, "talk", label))
+    return graph
+
+
+def bfs_shortest_path(
+    graph: dict[str, list[tuple[str, str, str]]], src: str, dst: str
+) -> list[tuple[str, str, str, str]] | None:
+    """BFS shortest path; returns list of (from, to, kind, label) or None if unreachable."""
+    if src == dst:
+        return []
+    came_from: dict[str, str | None] = {src: None}
+    edge_in: dict[str, tuple[str, str]] = {}
+    q: deque[str] = deque([src])
+    while q:
+        cur = q.popleft()
+        for dest, kind, label in graph.get(cur, []):
+            if dest in came_from:
+                continue
+            came_from[dest] = cur
+            edge_in[dest] = (kind, label)
+            if dest == dst:
+                steps: list[tuple[str, str, str, str]] = []
+                node = dst
+                while came_from[node] is not None:
+                    prev = came_from[node]
+                    k, l = edge_in[node]
+                    steps.append((prev, node, k, l))
+                    node = prev
+                return list(reversed(steps))
+            q.append(dest)
+    return None
+
+
 def render_areas_index(db: Db, out: Path) -> None:
     rows = []
     for resref in sorted(db.areas.keys(), key=lambda r: nwn_text(db.area_name(r)).lower()):
@@ -2696,7 +2758,8 @@ def render_areas_index(db: Db, out: Path) -> None:
     write(out / "areas" / "index.html", page("Areas", body, root_rel=".."))
 
 
-def render_area_page(db: Db, resref: str, out: Path) -> None:
+def render_area_page(db: Db, resref: str, out: Path,
+                     path_from_name: str = "", path_steps: Any = _OMIT) -> None:
     a = db.areas.get(resref)
     if not a:
         return
@@ -2726,6 +2789,37 @@ def render_area_page(db: Db, resref: str, out: Path) -> None:
         f'<dt>OnUserDefined</dt><dd>{E(on_user)}</dd>'
         '</dl>'
     )
+
+    # Shortest path from the configured source area
+    if path_steps is not _OMIT:
+        sections.append(f"<h2>Path from {nwn_html(path_from_name)}</h2>")
+        if path_steps is None:
+            sections.append(
+                f'<p class="muted">No path found from {nwn_html(path_from_name)} to this area.</p>'
+            )
+        else:
+            n = len(path_steps)
+            hop_word = "hop" if n == 1 else "hops"
+            items = []
+            for a, b, kind, label in path_steps:
+                a_link = link(f"{a}.html", db.area_name(a))
+                b_link = link(f"{b}.html", db.area_name(b))
+                if kind == "door":
+                    via = f'use the &#8220;{E(label)}&#8221; door'
+                elif kind == "trigger":
+                    via = f'step on the &#8220;{E(label)}&#8221; trigger'
+                elif kind in ("talk", "convo"):
+                    via = E(label)
+                else:
+                    via = f'{E(kind)}: {E(label)}'
+                items.append(
+                    f"<li>{a_link} &rarr; {b_link}"
+                    f" <em class=\"muted\">[{via}]</em></li>"
+                )
+            sections.append(
+                f"<p><strong>{n} {hop_word}</strong></p>"
+                f"<ol>{''.join(items)}</ol>"
+            )
 
     # Transitions (out)
     out_trans = [t for t in db.transitions if t["src_area"] == resref]
@@ -5185,6 +5279,11 @@ def main() -> int:
                          "rotations. Defaults to activity-sessions.json inside the "
                          "first --log-dir. Keeps historical hours from being lost "
                          "when old log rotations are deleted by the server.")
+    ap.add_argument("--path-from", default=None, metavar="RESREF",
+                    help="Area resref to compute shortest paths FROM. When given, "
+                         "every area page (except the source itself) shows the "
+                         "shortest path back to this area via door/trigger/conversation "
+                         "transitions. Omit to suppress the section entirely.")
     args = ap.parse_args()
 
     global _GENERATED_AT
@@ -5222,6 +5321,23 @@ def main() -> int:
     db.load()
     db.index()
     db.index_dialogs()
+
+    # Shortest-path data keyed by area resref (only populated when --path-from given).
+    area_paths: dict[str, list | None] = {}
+    path_from_name: str = ""
+    if args.path_from:
+        src_rr = args.path_from
+        if src_rr not in db.areas:
+            print(f"warn: --path-from {src_rr!r} not found in module areas; "
+                  "skipping shortest-path sections", file=sys.stderr)
+        else:
+            path_from_name = db.area_name(src_rr)
+            print(f"[nwn-wiki] computing shortest paths from {src_rr!r} ({path_from_name})")
+            graph = build_area_graph(db)
+            for rr in db.areas:
+                if rr == src_rr:
+                    continue
+                area_paths[rr] = bfs_shortest_path(graph, src_rr, rr)
 
     # Apply 2DA-derived label overrides on top of the bundled stock JSON.
     # The lookup dicts (BASEITEMS, RACES, …) are module-level and only
@@ -5350,7 +5466,9 @@ def main() -> int:
     render_index(db, out, title, positions, sizes, base_url=args.base_url)
     render_areas_index(db, out)
     for resref in db.areas:
-        render_area_page(db, resref, out)
+        render_area_page(db, resref, out,
+                         path_from_name=path_from_name,
+                         path_steps=area_paths.get(resref, _OMIT))
     for resref, conts in db.area_containers.items():
         for c in conts:
             render_container_page(db, resref, c, out)

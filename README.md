@@ -267,6 +267,36 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
 - `assets/style.css` — bundled stylesheet.
 - `manual/` — rendered hand-written documentation pages (see below).
 
+#### Shortest-path sections on area pages
+
+Pass `--path-from <resref>` to add a **Path from …** section near the top of
+every area page. The section shows the fewest-hop route from the named source
+area to that page's area, expressed as a numbered list of transitions:
+
+```
+2 hops
+1. Town Square → Market District  [use the "North Gate" door]
+2. Market District → Warehouse Row  [step on the "Loading Dock" trigger]
+```
+
+Transition types shown are doors, area-transition triggers, and
+conversation-based teleports (the same edges that appear as dashed purple
+lines on the index map). For areas that can't be reached from the source,
+the section reads *"No path found from … to this area."* The source area
+itself doesn't receive a section.
+
+```sh
+nwn-manager wiki -- --path-from <resref>
+# or, calling the generator directly:
+nwn-wiki --src unpacked --out docs --path-from <resref>
+```
+
+Pass the starting area's **resref** (the filename stem of its `.are.json`,
+e.g. `townhall01` — not the in-game display name). The resref is shown in the
+`ResRef` field on each area page, in the areas index table, and in the URL
+(`areas/<resref>.html`). Omit `--path-from` entirely to suppress the
+shortest-path sections.
+
 #### Manual documents
 
 If your project contains a `docs.manual/` folder at the project root (the
