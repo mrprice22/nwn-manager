@@ -4247,7 +4247,9 @@ def render_stores_index(db: Db, out: Path) -> None:
 
     _IDX_TABLE_HEAD = (
         '<table class="data"><thead><tr>'
-        "<th>Name</th><th>ResRef</th><th>Tag</th><th>Items</th>"
+        "<th>Name</th>"
+        # "<th>ResRef</th><th>Tag</th>"
+        "<th>Items</th>"
         "<th>Area</th><th>Opened By</th>"
         '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
         '<th title="Price store pays you for items (% of base)">Buys At</th>'
@@ -4295,20 +4297,23 @@ def render_stores_index(db: Db, out: Path) -> None:
             else:
                 opener_cell = '<em class="muted">unknown</em>'
 
+            mbp_raw = fld(inst, 'MaxBuyPrice', None)
             row = (
                 f"<tr>"
                 f"<td>{name_cell}</td>"
-                f"<td>{E(rr)}</td>"
-                f"<td>{E(tag)}</td>"
+                # f"<td>{E(rr)}</td>"
+                # f"<td>{E(tag)}</td>"
                 f"<td>{n_items}</td>"
                 f"<td>{area_cell}</td>"
                 f"<td>{opener_cell}</td>"
                 f"<td>{mu_str}</td>"
                 f"<td>{md_str}</td>"
-                f"<td>{_buy_limit_str(fld(inst, 'MaxBuyPrice', None))}</td>"
+                f"<td>{_buy_limit_str(mbp_raw)}</td>"
                 f"</tr>"
             )
-            sort_key = nwn_text(name).lower()
+            mbp_sort = float('inf') if mbp_raw == -1 else (mbp_raw if mbp_raw is not None else 0)
+            md_sort = md_val if md_val is not None else 0
+            sort_key = (-mbp_sort, -md_sort, nwn_text(name).lower())
             if display_openers:
                 placed_rows.append((sort_key, row))
             else:
@@ -4318,9 +4323,8 @@ def render_stores_index(db: Db, out: Path) -> None:
     no_opener_rows.sort(key=lambda x: x[0])
 
     # UTM blueprints that were never placed in any area
-    unplaced_rows: list[str] = []
-    for rr in sorted(db.stores.keys(),
-                     key=lambda r: nwn_text(db.store_name(r)).lower()):
+    unplaced_rows: list[tuple] = []
+    for rr in db.stores.keys():
         if rr in placed_resrefs:
             continue
         s = db.stores[rr]
@@ -4328,19 +4332,24 @@ def render_stores_index(db: Db, out: Path) -> None:
         n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
         mu_val = fld(s, "MarkUp", None)
         md_val = fld(s, "MarkDown", None)
-        unplaced_rows.append(
+        mbp_raw = fld(s, 'MaxBuyPrice', None)
+        mbp_sort = float('inf') if mbp_raw == -1 else (mbp_raw if mbp_raw is not None else 0)
+        md_sort = md_val if md_val is not None else 0
+        unplaced_rows.append((
+            (-mbp_sort, -md_sort, nwn_text(db.store_name(rr)).lower()),
             f"<tr>"
             f"<td>{link(f'{rr}.html', db.store_name(rr))}</td>"
-            f"<td>{E(rr)}</td>"
-            f"<td>{E(fld(s, 'Tag', ''))}</td>"
+            # f"<td>{E(rr)}</td>"
+            # f"<td>{E(fld(s, 'Tag', ''))}</td>"
             f"<td>{n_items}</td>"
             f"<td><em>Not placed</em></td>"
             f"<td>—</td>"
             f"<td>{f'{mu_val}%' if mu_val is not None else '—'}</td>"
             f"<td>{f'{md_val}%' if md_val is not None else '—'}</td>"
-            f"<td>{_buy_limit_str(fld(s, 'MaxBuyPrice', None))}</td>"
+            f"<td>{_buy_limit_str(mbp_raw)}</td>"
             f"</tr>"
-        )
+        ))
+    unplaced_rows.sort(key=lambda x: x[0])
 
     n_placed = len(placed_rows) + len(no_opener_rows)
     body = "<h1>Stores</h1>"
@@ -4369,7 +4378,7 @@ def render_stores_index(db: Db, out: Path) -> None:
             "<h2>Unplaced Blueprints</h2>"
             "<p>These store blueprints exist in the module files but are not placed "
             "in any area — they are not accessible to players.</p>"
-            + _IDX_TABLE_HEAD + "\n".join(unplaced_rows) + "</tbody></table>"
+            + _IDX_TABLE_HEAD + "\n".join(r[1] for r in unplaced_rows) + "</tbody></table>"
         )
 
     write(out / "stores" / "index.html", page("Stores", body, root_rel=".."))
