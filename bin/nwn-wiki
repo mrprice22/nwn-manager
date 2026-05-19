@@ -42,6 +42,11 @@ _MANUAL_PAGES: list[dict] = []
 _HAS_ACTIVITY_PAGE: bool = False
 _GENERATED_AT: str = ""  # set in main(); included in every page footer
 
+# Per-module theme assets loaded from <project-root>/wiki-theme/ by load_wiki_theme().
+_THEME_FAVICON: str = ""     # filename in assets/, e.g. "favicon.png"
+_THEME_HEADER_IMG: str = ""  # filename in assets/, e.g. "header.png"
+_THEME_EXTRA_CSS: str = ""   # filename in assets/, e.g. "theme.css"
+
 
 # ---------------------------------------------------------------------------
 # GFF helpers
@@ -2503,16 +2508,25 @@ def _md_title(text: str, stem: str) -> str:
 
 def page(title: str, body: str, root_rel: str = ".") -> str:
     """Wrap body in the standard wiki page shell."""
+    extra_css = (f'\n  <link rel="stylesheet" href="{E(root_rel)}/assets/{E(_THEME_EXTRA_CSS)}">'
+                 if _THEME_EXTRA_CSS else "")
+    favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(_THEME_FAVICON)}">'
+               if _THEME_FAVICON else "")
+    if _THEME_HEADER_IMG:
+        brand = (f'<a class="brand" href="{E(root_rel)}/index.html">'
+                 f'<img class="site-header-img" src="{E(root_rel)}/assets/{E(_THEME_HEADER_IMG)}" alt="Home"></a>')
+    else:
+        brand = f'<a class="brand" href="{E(root_rel)}/index.html">Module Wiki</a>'
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <title>{E(nwn_text(title))}</title>
-  <link rel="stylesheet" href="{E(root_rel)}/assets/style.css">
+  <link rel="stylesheet" href="{E(root_rel)}/assets/style.css">{extra_css}{favicon}
 </head>
 <body>
   <header class="site-header">
-    <a class="brand" href="{E(root_rel)}/index.html">Module Wiki</a>
+    {brand}
     <nav>
       <a href="{E(root_rel)}/index.html">Map</a>
       <a href="{E(root_rel)}/areas/index.html">Areas</a>
@@ -2539,6 +2553,35 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
 def write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+def load_wiki_theme(project_root: Path, out: Path) -> None:
+    """Copy files from <project_root>/wiki-theme/ into output assets and set theme globals."""
+    global _THEME_FAVICON, _THEME_HEADER_IMG, _THEME_EXTRA_CSS
+    theme_dir = project_root / "wiki-theme"
+    if not theme_dir.is_dir():
+        return
+    assets_out = out / "assets"
+    assets_out.mkdir(parents=True, exist_ok=True)
+    favicon_exts = {".ico", ".png", ".svg", ".gif"}
+    img_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
+    loaded: list[str] = []
+    for f in sorted(theme_dir.iterdir()):
+        if not f.is_file():
+            continue
+        shutil.copy2(f, assets_out / f.name)
+        stem, ext = f.stem.lower(), f.suffix.lower()
+        if stem == "favicon" and ext in favicon_exts:
+            _THEME_FAVICON = f.name
+            loaded.append(f"favicon={f.name}")
+        elif stem == "header" and ext in img_exts:
+            _THEME_HEADER_IMG = f.name
+            loaded.append(f"header={f.name}")
+        elif f.name == "theme.css":
+            _THEME_EXTRA_CSS = f.name
+            loaded.append("css=theme.css")
+    if loaded:
+        print(f"[nwn-wiki] loaded wiki-theme ({', '.join(loaded)}) from {theme_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -6208,6 +6251,9 @@ def main() -> int:
         for f in ASSETS_DIR.iterdir():
             if f.is_file():
                 shutil.copy2(f, out / "assets" / f.name)
+
+    # Load per-module theme from wiki-theme/ next to the unpacked/ directory.
+    load_wiki_theme(src.parent, out)
 
     # Module title
     title = args.module_name

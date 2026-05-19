@@ -41,6 +41,7 @@ my_module/
   dist/                  packed .mod output (gitignored)
   docs/                  generated wiki — committed; GitHub Pages serves from here
   docs.manual/           optional hand-written docs (committed) — see below
+  wiki-theme/            optional custom CSS/favicon/header image (committed) — see below
   tlk/                   per-project TLK cache for wiki StrRef resolution (gitignored)
   .nasher/               nasher cache + last-used source path (gitignored)
   .gitignore
@@ -348,6 +349,54 @@ finer control:
 nwn-wiki --src ./unpacked --out ./docs --module-name "My Module" --seed 42
 nwn-wiki --src ./unpacked --out ./docs --log-dir ~/.local/state/nwnxee-mygame
 ```
+
+#### Custom theme (wiki-theme/)
+
+Place a `wiki-theme/` folder at the project root (next to `docs/` and
+`unpacked/`) to customise the look of every page. All files are copied
+to `docs/assets/` on each `nwn-manager wiki` run. Three filenames are
+treated specially:
+
+| File | Effect |
+|------|--------|
+| `theme.css` | Loaded as a second stylesheet after the built-in `style.css`. Use it to override CSS custom properties or add new rules. |
+| `favicon.png` / `favicon.ico` / `favicon.svg` | Set as the site favicon via a `<link rel="icon">` tag on every page. |
+| `header.png` / `header.jpg` / `header.webp` / etc. | Replaces the plain "Module Wiki" brand text in the site header with a clickable banner image that takes the visitor back to the index. |
+
+Any other files in `wiki-theme/` are copied to `assets/` as-is (useful
+for custom fonts or images referenced from `theme.css`).
+
+**Theming tips**
+
+The built-in stylesheet exposes CSS custom properties at `:root` that
+cover every major colour. Redefining them in `theme.css` is the
+quickest way to restyle the site without touching the generator:
+
+```css
+/* wiki-theme/theme.css — example dark override */
+:root {
+  --fg:          #ccc0a0;   /* body text */
+  --bg:          #0e0c0a;   /* page background */
+  --accent:      #c8a045;   /* headings, borders, header background */
+  --accent-soft: #7a5820;
+  --border:      #2a261c;
+  --card:        #161410;
+  --link:        #c8a045;
+  --link-hover:  #e8c060;
+}
+```
+
+The SVG area map embeds its own `<style>` block (so it stays usable as
+a standalone download). To override map colours in a theme stylesheet,
+use a more-specific selector — `.map-wrap svg .area-node rect` beats the
+SVG's own `.area-node rect` — and the page stylesheet wins:
+
+```css
+.map-wrap svg { background: #0e0c0a !important; }
+.map-wrap svg .area-node rect { fill: #1a1710; stroke: var(--accent); }
+```
+
+The `wiki-theme/` folder is optional and ignored if absent.
 
 #### Player activity charts
 
