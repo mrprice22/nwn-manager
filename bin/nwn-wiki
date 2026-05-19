@@ -4219,13 +4219,29 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
             rows = []
             for it in items:
                 irr = fld(it, "TemplateResRef", "") or fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
-                disp = db.item_name(irr) if irr in db.items else irr
-                cell = (link(f"../items/{irr}.html", disp)
-                        if irr in db.items else nwn_html(disp))
-                rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
+                iname = loc(it.get("LocalizedName"))
+                if not iname and irr in db.items:
+                    iname = db.item_name(irr)
+                if not iname:
+                    iname = irr or "(unknown)"
+                cell = (link(f"../items/{irr}.html", iname) if irr in db.items else nwn_html(iname))
+                base = baseitem_label(fld(it, "BaseItem"))
+                stack = fld(it, "StackSize", 1) or 1
+                cost = fld(it, "Cost", "")
+                props = list_items(it.get("PropertiesList"))
+                prop_str = ", ".join(colorize_damage_words(E(itemprop_oneliner(p))) for p in props)
+                rows.append(
+                    f"<tr><td>{cell}</td>"
+                    f"<td>{E(irr)}</td>"
+                    f"<td>{base}</td>"
+                    f"<td>{E(stack) if stack not in (None, 1, '1') else ''}</td>"
+                    f"<td>{E(cost) if cost else ''}</td>"
+                    f"<td>{prop_str}</td></tr>"
+                )
             sections.append(
                 f"<h3>{E(page_label)}</h3>"
-                '<table class="data"><thead><tr><th>Item</th><th>ResRef</th>'
+                '<table class="data"><thead><tr>'
+                "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>Cost (gp)</th><th>Properties</th>"
                 "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
             )
     else:
@@ -4458,13 +4474,29 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
         rows = []
         for it in items:
             irr = fld(it, "TemplateResRef", "") or fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
-            disp = db.item_name(irr) if irr in db.items else irr
-            cell = (link(f"../items/{irr}.html", disp)
-                    if irr in db.items else nwn_html(disp))
-            rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
+            iname = loc(it.get("LocalizedName"))
+            if not iname and irr in db.items:
+                iname = db.item_name(irr)
+            if not iname:
+                iname = irr or "(unknown)"
+            cell = (link(f"../items/{irr}.html", iname) if irr in db.items else nwn_html(iname))
+            base = baseitem_label(fld(it, "BaseItem"))
+            stack = fld(it, "StackSize", 1) or 1
+            cost = fld(it, "Cost", "")
+            props = list_items(it.get("PropertiesList"))
+            prop_str = ", ".join(colorize_damage_words(E(itemprop_oneliner(p))) for p in props)
+            rows.append(
+                f"<tr><td>{cell}</td>"
+                f"<td>{E(irr)}</td>"
+                f"<td>{base}</td>"
+                f"<td>{E(stack) if stack not in (None, 1, '1') else ''}</td>"
+                f"<td>{E(cost) if cost else ''}</td>"
+                f"<td>{prop_str}</td></tr>"
+            )
         sections.append(
-            '<table class="data"><thead><tr><th>Item</th><th>ResRef</th></tr></thead>'
-            "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            '<table class="data"><thead><tr>'
+            "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>Cost (gp)</th><th>Properties</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
     write(out / "stores" / f"{resref}.html",
