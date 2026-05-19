@@ -980,6 +980,13 @@ class Db:
         # These areas, their stores, and their creature placements are omitted
         # from all wiki output (map, index pages, cross-references).
         self.hidden_areas: set[str] = set()
+        # Item source cross-references (built in index())
+        # item resref → stores that sell it: [{"area_rr", "slug", "name"}]
+        self.item_sold_at: dict[str, list[dict]] = defaultdict(list)
+        # item resref → containers that hold it: [{"area_rr", "idx", "pname", "locked", "dc"}]
+        self.item_in_container: dict[str, list[dict]] = defaultdict(list)
+        # item resref → creatures that carry it: [{"area_rr", "crr", "cname"}]
+        self.item_carried_by: dict[str, list[dict]] = defaultdict(list)
 
     # ---- Loading ----
 
@@ -1197,6 +1204,108 @@ class Db:
         for inst_list in self.area_stores.values():
             for inst in inst_list:
                 _absorb_store_pages(list_items(inst.get("StoreList")))
+
+        # Build item-source cross-references for item pages.
+        for area_rr, store_list in self.area_stores.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for inst in store_list:
+                rr = fld(inst, "ResRef", "") or fld(inst, "TemplateResRef", "")
+                tag = fld(inst, "Tag", "")
+                sname = self.store_name(rr) if rr in self.stores else (tag or rr)
+                slug = _store_instance_slug(area_rr, inst)
+                for p in list_items(inst.get("StoreList")):
+                    for it in list_items(p.get("ItemList")):
+                        irr = (fld(it, "TemplateResRef", "")
+                               or fld(it, "InventoryRes", "")
+                               or fld(it, "EquippedRes", "") or "").strip()
+                        if irr:
+                            self.item_sold_at[irr].append(
+                                {"area_rr": area_rr, "slug": slug, "name": sname}
+                            )
+        for area_rr, containers in self.area_containers.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for c in containers:
+                p = c["p"]
+                idx = c["idx"]
+                tag = fld(p, "Tag", "")
+                pname = (loc(p.get("LocName")) or tag
+                         or fld(p, "TemplateResRef", "") or "(unnamed)")
+                locked = bool(int(fld(p, "Locked", 0) or 0))
+                dc = fld(p, "OpenLockDC", 0) or 0
+                for it in list_items(p.get("ItemList")):
+                    irr = (fld(it, "TemplateResRef", "")
+                           or fld(it, "InventoryRes", "")
+                           or fld(it, "EquippedRes", "") or "").strip()
+                    if irr:
+                        self.item_in_container[irr].append(
+                            {"area_rr": area_rr, "idx": idx,
+                             "pname": pname, "locked": locked, "dc": dc}
+                        )
+        _seen_carrier: set[tuple[str, str, str]] = set()
+        for area_rr, insts in self.area_creature_instances.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for inst in insts:
+                c = inst["c"]
+                crr = fld(c, "TemplateResRef", "") or ""
+                bp = self.creatures.get(crr, {})
+                cname = (
+                    (loc(c.get("FirstName") or {}) + " " +
+                     loc(c.get("LastName") or {})).strip()
+                    or self.creature_name(crr)
+                    or crr
+                )
+                equip_list = (list_items(c.get("Equip_ItemList"))
+                              or list_items(bp.get("Equip_ItemList")))
+                for e in equip_list:
+                    irr = (fld(e, "EquippedRes", "")
+                           or fld(e, "TemplateResRef", "") or "").strip()
+                    if irr:
+                        key = (irr, area_rr, crr)
+                        if key not in _seen_carrier:
+                            _seen_carrier.add(key)
+                            self.item_carried_by[irr].append(
+                                {"area_rr": area_rr, "crr": crr, "cname": cname}
+                            )
+                for it in list_items(c.get("ItemList")):
+                    irr = (fld(it, "InventoryRes", "")
+                           or fld(it, "TemplateResRef", "") or "").strip()
+                    if irr:
+                        key = (irr, area_rr, crr)
+                        if key not in _seen_carrier:
+                            _seen_carrier.add(key)
+                            self.item_carried_by[irr].append(
+                                {"area_rr": area_rr, "crr": crr, "cname": cname}
+                            )
+        for crr, spawns in self.creature_encounter_spawns.items():
+            bp = self.creatures.get(crr, {})
+            if not bp:
+                continue
+            cname = self.creature_name(crr)
+            item_irrs: list[str] = []
+            for e in list_items(bp.get("Equip_ItemList")):
+                irr = (fld(e, "EquippedRes", "")
+                       or fld(e, "TemplateResRef", "") or "").strip()
+                if irr:
+                    item_irrs.append(irr)
+            for it in list_items(bp.get("ItemList")):
+                irr = (fld(it, "InventoryRes", "")
+                       or fld(it, "TemplateResRef", "") or "").strip()
+                if irr:
+                    item_irrs.append(irr)
+            for spawn in spawns:
+                area_rr = spawn["area"]
+                if area_rr in self.hidden_areas:
+                    continue
+                for irr in item_irrs:
+                    key = (irr, area_rr, crr)
+                    if key not in _seen_carrier:
+                        _seen_carrier.add(key)
+                        self.item_carried_by[irr].append(
+                            {"area_rr": area_rr, "crr": crr, "cname": cname}
+                        )
 
         hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
                       if self.hidden_areas else "")
@@ -4417,6 +4526,7 @@ def render_items_index(db: Db, out: Path) -> None:
     # Classify every item; broken = TLK-only or completely unnamed.
     buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
     broken: list[tuple[str, dict]] = []
+    inaccessible: list[tuple[str, dict]] = []
 
     for rr in sorted(db.items.keys(), key=lambda r: nwn_text(db.item_name(r)).lower()):
         i = db.items[rr]
@@ -4424,9 +4534,17 @@ def render_items_index(db: Db, out: Path) -> None:
         if name.startswith("[TLK#") or name == rr:
             broken.append((rr, i))
         else:
-            buckets[_item_category(i)].append((rr, i))
+            accessible = (
+                rr in db.item_sold_at
+                or rr in db.item_in_container
+                or rr in db.item_carried_by
+            )
+            if accessible:
+                buckets[_item_category(i)].append((rr, i))
+            else:
+                inaccessible.append((rr, i))
 
-    total = sum(len(v) for v in buckets.values()) + len(broken)
+    total = sum(len(v) for v in buckets.values()) + len(inaccessible) + len(broken)
 
     # Table of contents
     toc_parts: list[str] = []
@@ -4438,6 +4556,11 @@ def render_items_index(db: Db, out: Path) -> None:
                 f'<a href="#{E(slug)}">{E(cat_label)}</a>'
                 f' <span class="muted">({len(items)})</span>'
             )
+    if inaccessible:
+        toc_parts.append(
+            f'<a href="#inaccessible">Inaccessible</a>'
+            f' <span class="muted">({len(inaccessible)})</span>'
+        )
     if broken:
         toc_parts.append(
             f'<a href="#broken">Potentially Broken</a>'
@@ -4467,6 +4590,18 @@ def render_items_index(db: Db, out: Path) -> None:
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
             f' <small class="muted">({len(items)})</small></h2>'
+            + _TABLE_HEAD + rows_html + "</tbody></table>"
+        )
+
+    if inaccessible:
+        inaccessible_sorted = sorted(inaccessible, key=lambda x: nwn_text(db.item_name(x[0])).lower())
+        rows_html = "\n".join(_row(rr, i) for rr, i in inaccessible_sorted)
+        body += (
+            '<h2 id="inaccessible">Inaccessible'
+            f' <small class="muted">({len(inaccessible)})</small></h2>'
+            '<p class="muted">These items are not found in any store, container, or creature '
+            "inventory in the module. They exist as blueprints but appear to have no way for "
+            "players to obtain them through normal gameplay.</p>"
             + _TABLE_HEAD + rows_html + "</tbody></table>"
         )
 
@@ -4593,6 +4728,67 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "<th>Param1/Val</th><th>Chance</th>"
             "</tr></thead><tbody>" + "\n".join(debug_rows) + "</tbody></table>"
             "</details>"
+        )
+
+    # Where to find this item
+    sold_at = db.item_sold_at.get(resref, [])
+    in_containers = db.item_in_container.get(resref, [])
+    carried_by = db.item_carried_by.get(resref, [])
+
+    if sold_at or in_containers or carried_by:
+        sections.append("<h2>Where to find</h2>")
+        if sold_at:
+            rows = []
+            for s in sold_at:
+                area_rr = s["area_rr"]
+                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                             if area_rr in db.areas else E(area_rr))
+                store_cell = link(f"../stores/{s['slug']}.html", s["name"])
+                rows.append(f"<tr><td>{store_cell}</td><td>{area_cell}</td></tr>")
+            sections.append(
+                "<h3>Sold at</h3>"
+                '<table class="data"><thead><tr><th>Store</th><th>Area</th></tr></thead>'
+                "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+        if in_containers:
+            rows = []
+            for c in in_containers:
+                area_rr = c["area_rr"]
+                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                             if area_rr in db.areas else E(area_rr))
+                href = f"../containers/{area_rr}-{c['idx']:03d}.html"
+                lock_note = ""
+                if c["locked"]:
+                    lock_note = f' (locked, DC {c["dc"]})' if c["dc"] else " (locked)"
+                rows.append(
+                    f"<tr><td>{link(href, c['pname'])}{E(lock_note)}</td>"
+                    f"<td>{area_cell}</td></tr>"
+                )
+            sections.append(
+                "<h3>Found in containers</h3>"
+                '<table class="data"><thead><tr><th>Container</th><th>Area</th></tr></thead>'
+                "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+        if carried_by:
+            rows = []
+            for c in carried_by:
+                area_rr = c["area_rr"]
+                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                             if area_rr in db.areas else E(area_rr))
+                crr = c["crr"]
+                creature_cell = (link(f"../creatures/{crr}.html", c["cname"])
+                                 if crr in db.creatures else E(c["cname"]))
+                rows.append(f"<tr><td>{creature_cell}</td><td>{area_cell}</td></tr>")
+            sections.append(
+                "<h3>Carried by</h3>"
+                '<table class="data"><thead><tr><th>Creature</th><th>Area</th></tr></thead>'
+                "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+    elif not is_broken:
+        sections.append(
+            "<h2>Where to find</h2>"
+            '<p class="muted">Not found in any store, container, or creature inventory — '
+            "this item may be inaccessible to players.</p>"
         )
 
     write(out / "items" / f"{resref}.html",
