@@ -3010,7 +3010,10 @@ def bfs_shortest_path(
     return None
 
 
-def render_areas_index(db: Db, out: Path) -> None:
+def render_areas_index(db: Db, out: Path, *,
+                       area_paths: "dict[str, list | None] | None" = None,
+                       path_from_resref: str = "",
+                       path_from_name: str = "") -> None:
     # Classify areas by reachability via fallback transitions.
     # An area is "fallback-only reachable" if every incoming transition that
     # could lead to it from another area uses a WP_-prefix-stripped fallback tag
@@ -3058,8 +3061,26 @@ def render_areas_index(db: Db, out: Path) -> None:
         (r for r in db.areas if r not in db.hidden_areas),
         key=lambda r: nwn_text(db.area_name(r)).lower(),
     )
-    normal_resrefs = [r for r in sorted_resrefs if r not in has_any_fallback]
-    suspect_resrefs = [r for r in sorted_resrefs if r in has_any_fallback]
+
+    # When --path-from is active, split into reachable vs. no-known-path.
+    # The source area itself is always reachable; area_paths[rr] is None
+    # when BFS found no route, or a list (possibly empty) when a route exists.
+    use_path_split = bool(area_paths is not None and path_from_resref)
+    if use_path_split:
+        reachable_resrefs = [
+            r for r in sorted_resrefs
+            if r == path_from_resref or area_paths.get(r) is not None
+        ]
+        no_path_resrefs = [
+            r for r in sorted_resrefs
+            if r != path_from_resref and area_paths.get(r) is None
+        ]
+    else:
+        reachable_resrefs = sorted_resrefs
+        no_path_resrefs = []
+
+    normal_resrefs = [r for r in reachable_resrefs if r not in has_any_fallback]
+    suspect_resrefs = [r for r in reachable_resrefs if r in has_any_fallback]
 
     table_head = (
         '<table class="data"><thead><tr>'
@@ -3087,6 +3108,19 @@ def render_areas_index(db: Db, out: Path) -> None:
             ' areas may still work normally.</p>',
             table_head,
             "\n".join(_area_row(r) for r in suspect_resrefs),
+            "</tbody></table>",
+        ]
+
+    if no_path_resrefs:
+        src_label = nwn_html(path_from_name) if path_from_name else E(path_from_resref)
+        body_parts += [
+            f'<h2 id="no-path">No known path from {src_label}</h2>',
+            f'<p class="warn-fallback-note">&#9888; The areas below have no known route'
+            f' from {src_label} via door, trigger, or conversation teleport. They may be'
+            f' accessible by other means (login spawn, admin, DM warp), or their'
+            f' transitions may not yet be indexed.</p>',
+            table_head,
+            "\n".join(_area_row(r) for r in no_path_resrefs),
             "</tbody></table>",
         ]
 
@@ -6430,7 +6464,10 @@ def main() -> int:
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
     render_index(db, out, title, positions, sizes, base_url=args.base_url)
-    render_areas_index(db, out)
+    render_areas_index(db, out,
+                       area_paths=area_paths if args.path_from else None,
+                       path_from_resref=args.path_from or "",
+                       path_from_name=path_from_name)
     for resref in db.areas:
         if resref in db.hidden_areas:
             continue
