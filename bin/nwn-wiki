@@ -3217,9 +3217,9 @@ def render_area_page(db: Db, resref: str, out: Path,
         for inst in stores:
             rr = fld(inst, "ResRef", "") or fld(inst, "TemplateResRef", "")
             tag = fld(inst, "Tag", "")
-            name = db.store_name(rr) if rr in db.stores else (tag or rr)
+            store_label = db.store_name(rr) if rr in db.stores else (tag or rr)
             slug = _store_instance_slug(resref, inst)
-            name_cell = link(f"../stores/{slug}.html", name)
+            name_cell = link(f"../stores/{slug}.html", store_label)
 
             pages = list_items(inst.get("StoreList"))
             n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
