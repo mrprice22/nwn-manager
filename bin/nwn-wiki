@@ -829,6 +829,8 @@ class Db:
         self.waypoint_area: dict[str, str] = {}
         # Transitions: list of {src_area, dst_area, dst_tag, kind, label, src_resref}
         self.transitions: list[dict] = []
+        # Direct-teleport transitions from placeable OnUsed scripts (not dialog-based).
+        self.script_transitions: list[dict] = []
         self.area_npcs: dict[str, list[dict]] = defaultdict(list)
         self.area_encounters: dict[str, list[dict]] = defaultdict(list)
         self.area_placeables: dict[str, list[dict]] = defaultdict(list)
@@ -1251,6 +1253,12 @@ class Db:
                 tag = fld(wp, "Tag")
                 if tag and tag not in self.tag_to_area:
                     self.tag_to_area[tag] = area_resref
+                # Also expose tag without the conventional WP_ prefix so
+                # GetWaypointByTag("foo") can match a waypoint tagged "WP_foo".
+                if tag and tag.upper().startswith("WP_"):
+                    short = tag[3:]
+                    if short and short not in self.tag_to_area:
+                        self.tag_to_area[short] = area_resref
             for d in list_items(git.get("Door List")):
                 tag = fld(d, "Tag")
                 if tag and tag not in self.tag_to_area:
@@ -1267,6 +1275,38 @@ class Db:
                 tag = fld(c, "Tag")
                 if tag and tag not in self.tag_to_area:
                     self.tag_to_area[tag] = area_resref
+
+    def _build_direct_teleport_transitions(self) -> None:
+        """Detect placeables whose OnUsed script directly calls ActionJumpToLocation
+        (not via a dialog) and populate self.script_transitions.
+
+        Must run after _parse_scripts (for script_teleport_tags) and
+        _build_tag_to_area (for tag_to_area) are complete."""
+        for area_resref, placeables in self.area_placeables.items():
+            for p in placeables:
+                bp_rr = (fld(p, "TemplateResRef", "") or "").lower()
+                # Instance-level script takes priority; fall back to blueprint.
+                script = ((fld(p, "OnUsed", "") or "").lower()
+                          or (fld(self.placeables.get(bp_rr, {}), "OnUsed", "") or "").lower())
+                if not script:
+                    continue
+                # Skip dialog-launching scripts — those are in conv_transitions.
+                if self._script_dialog_targets(script):
+                    continue
+                tags = self.script_teleport_tags.get(script)
+                if not tags:
+                    continue
+                p_tag = fld(p, "Tag", "") or bp_rr
+                for tag in tags:
+                    area = self.tag_to_area.get(tag)
+                    if area and area != area_resref and area in self.areas:
+                        self.script_transitions.append({
+                            "src_area": area_resref,
+                            "dst_area": area,
+                            "dst_tag": tag,
+                            "kind": "use",
+                            "label": p_tag,
+                        })
 
     def _walk_dialog_nodes(self, dlg: dict) -> Iterable[tuple[str, int, dict]]:
         """Yield (kind, index, node) for every Entry and Reply in a dlg."""
@@ -1651,6 +1691,7 @@ class Db:
               f"{n_callers} callers, {n_glob} global pseudo-nodes, "
               f"{n_conv_edges} conv map edges{excl_msg}")
 
+        self._build_direct_teleport_transitions()
         self._build_store_openers()
 
     def _build_store_openers(self) -> None:
@@ -2866,6 +2907,14 @@ def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str]]]:
         if key not in seen:
             seen.add(key)
             graph[src].append((dst, "talk", label))
+    for tr in db.script_transitions:
+        src, dst = tr["src_area"], tr["dst_area"]
+        if not dst or src not in graph or dst not in graph or src == dst:
+            continue
+        key = (src, dst, tr["kind"], tr["label"])
+        if key not in seen:
+            seen.add(key)
+            graph[src].append((dst, tr["kind"], tr["label"]))
     return graph
 
 
@@ -2993,7 +3042,8 @@ def render_area_page(db: Db, resref: str, out: Path,
             )
 
     # Transitions (out)
-    out_trans = [t for t in db.transitions if t["src_area"] == resref]
+    out_trans = ([t for t in db.transitions if t["src_area"] == resref]
+                 + [t for t in db.script_transitions if t["src_area"] == resref])
     if out_trans:
         sections.append("<h2>Outgoing transitions</h2>")
         rows = []
@@ -3014,7 +3064,8 @@ def render_area_page(db: Db, resref: str, out: Path,
         )
 
     # Transitions (in)
-    in_trans = [t for t in db.transitions if t["dst_area"] == resref]
+    in_trans = ([t for t in db.transitions if t["dst_area"] == resref]
+                + [t for t in db.script_transitions if t["dst_area"] == resref])
     if in_trans:
         sections.append("<h2>Incoming transitions</h2>")
         rows = []
@@ -6171,6 +6222,10 @@ def main() -> int:
     for tr in db.transitions:
         a, b = tr["src_area"], tr["dst_area"]
         if a in db.areas and b in db.areas:
+            edges.append((a, b))
+    for tr in db.script_transitions:
+        a, b = tr["src_area"], tr["dst_area"]
+        if a in db.areas and b and b in db.areas:
             edges.append((a, b))
     # Conversation-teleport edges and the pseudo-nodes that sit at the
     # source of "global" trigger conversations (rest menu, item activators).
