@@ -4185,10 +4185,11 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
 
     # Opened By
     openers = db.store_tag_openers.get(tag.lower(), [])
-    # Filter to openers in the same area first, then fall back to all openers.
-    area_openers = [o for o in openers if area_rr in o.get("areas", []) or
-                    o.get("area") == area_rr]
-    display_openers = area_openers or openers
+    # Only show openers whose area matches this store instance. All store-opening
+    # scripts use GetNearestObjectByTag (area-local), so cross-area openers with
+    # the same tag are opening a different instance, not this one.
+    display_openers = [o for o in openers if area_rr in o.get("areas", []) or
+                       o.get("area") == area_rr]
     if display_openers:
         sections.append("<h2>Opened by</h2><ul>")
         seen_html: set[str] = set()
@@ -4294,11 +4295,12 @@ def render_stores_index(db: Db, out: Path) -> None:
 
             area_cell = link(f"../areas/{area_rr}.html", db.area_name(area_rr))
 
-            # Opener column: prefer openers in the same area, fall back to any.
+            # Only show openers in the same area. All store-opening scripts use
+            # GetNearestObjectByTag (area-local), so a cross-area NPC with the
+            # same tag is opening a different instance, not this one.
             all_openers = db.store_tag_openers.get(tag.lower(), [])
-            area_openers = [o for o in all_openers
-                            if area_rr in o.get("areas", []) or o.get("area") == area_rr]
-            display_openers = area_openers or all_openers
+            display_openers = [o for o in all_openers
+                               if area_rr in o.get("areas", []) or o.get("area") == area_rr]
             if display_openers:
                 seen_html: set[str] = set()
                 opener_parts = []
