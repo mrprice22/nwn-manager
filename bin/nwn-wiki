@@ -896,6 +896,10 @@ class Db:
         self.dialog_scripts: dict[str, list[dict]] = defaultdict(list)
         # script resref → set of store tags the script opens via OpenStore().
         self.script_store_tags: dict[str, set[str]] = defaultdict(set)
+        # scripts that call OpenStore but without a literal tag lookup —
+        # typically Bedlamson's Dynamic Merchant System (bdm_cnv_opn_stor),
+        # which opens whichever store object was stored in a local var at spawn.
+        self.script_bdm_open: set[str] = set()
         # store instance tag (lowercase) → list of opener descriptors, same
         # shape as dialog_callers entries plus optional "via_dialog"/"via_script".
         self.store_tag_openers: dict[str, list[dict]] = defaultdict(list)
@@ -1226,10 +1230,17 @@ class Db:
                     self.script_teleport_tags[resref].add(m.group(1))
             # Store-opening heuristic: a script that calls OpenStore (or the
             # HoMERs appraise variant) and resolves an object by tag is assumed
-            # to be opening the store with that tag.
+            # to be opening the store with that tag.  Scripts that call
+            # OpenStore without any tag lookup (e.g. Bedlamson's Dynamic
+            # Merchant System bdm_cnv_opn_stor, which uses a runtime local
+            # object variable set by proximity) are recorded separately.
             if self._RE_OPEN_STORE.search(text):
-                for m in self._RE_GET_TAG.finditer(text):
-                    self.script_store_tags[resref].add(m.group(1))
+                tag_matches = list(self._RE_GET_TAG.finditer(text))
+                if tag_matches:
+                    for m in tag_matches:
+                        self.script_store_tags[resref].add(m.group(1))
+                else:
+                    self.script_bdm_open.add(resref)
 
     def _build_tag_to_area(self) -> None:
         """Tag → area resref index spanning every placement (waypoints,
@@ -1658,6 +1669,35 @@ class Db:
                         self.store_tag_openers[tag.lower()].append({
                             **caller,
                             "via_script": s["resref"],
+                            "via_dialog": dlg_resref,
+                        })
+
+        # 1b. Proximity-based store openers (Bedlamson's Dynamic Merchant
+        # System and similar patterns): the action script calls OpenStore on a
+        # runtime local-variable object, not by tag. At spawn the NPC stores
+        # GetNearestObject(OBJECT_TYPE_STORE) in a local var, so in practice
+        # the store opened is the one placed in the same area. Link the dialog
+        # caller to every store in its placement area(s).
+        for dlg_resref, script_list in self.dialog_scripts.items():
+            bdm_script = next(
+                (s["resref"] for s in script_list
+                 if s["kind"] == "action" and s["resref"] in self.script_bdm_open),
+                None,
+            )
+            if bdm_script is None:
+                continue
+            for caller in self.dialog_callers.get(dlg_resref, []):
+                caller_areas = caller.get("areas") or (
+                    [caller["area"]] if "area" in caller else []
+                )
+                for area_rr in caller_areas:
+                    for store_inst in self.area_stores.get(area_rr, []):
+                        tag = fld(store_inst, "Tag", "")
+                        if not tag:
+                            continue
+                        self.store_tag_openers[tag.lower()].append({
+                            **caller,
+                            "via_script": bdm_script,
                             "via_dialog": dlg_resref,
                         })
 
