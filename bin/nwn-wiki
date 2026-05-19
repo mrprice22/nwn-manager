@@ -4481,6 +4481,14 @@ def render_stores_index(db: Db, out: Path) -> None:
     no_opener_rows: list[tuple[str, str]] = []   # (sort_key, html_row) — no opener found
     placed_resrefs: set[str] = set()
 
+    # Track the single most valuable item across all accessible stores.
+    gm_cost: int = 0          # highest item base cost found so far
+    gm_irr: str = ""          # item resref
+    gm_item_name: str = ""    # item display name
+    gm_store_name: str = ""   # store display name
+    gm_slug: str = ""         # store instance slug (for link)
+    gm_area_rr: str = ""      # area resref (for link)
+
     _IDX_TABLE_HEAD = (
         '<table class="data"><thead><tr>'
         "<th>Name</th>"
@@ -4537,7 +4545,7 @@ def render_stores_index(db: Db, out: Path) -> None:
                 opener_cell = '<em class="muted">unknown</em>'
 
             mbp_raw = fld(inst, 'MaxBuyPrice', None)
-            max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
+            max_gp, max_irr, max_item_name, avg_gp = _store_item_gp_stats(db, pages)
             max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
             avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
             row = (
@@ -4560,6 +4568,13 @@ def render_stores_index(db: Db, out: Path) -> None:
             sort_key = (-mbp_sort, -md_sort, nwn_text(name).lower())
             if display_openers:
                 placed_rows.append((sort_key, row))
+                if max_gp > gm_cost:
+                    gm_cost = max_gp
+                    gm_irr = max_irr
+                    gm_item_name = max_item_name
+                    gm_store_name = name
+                    gm_slug = slug
+                    gm_area_rr = area_rr
             else:
                 no_opener_rows.append((sort_key, row))
 
@@ -4610,6 +4625,17 @@ def render_stores_index(db: Db, out: Path) -> None:
         + ". Values shown are per-area instance data (may differ from blueprint defaults).</p>"
     )
     body += _IDX_TABLE_HEAD + "\n".join(r[1] for r in placed_rows) + "</tbody></table>"
+
+    if gm_cost > 0:
+        item_html = (link(f"../items/{gm_irr}.html", gm_item_name)
+                     if gm_irr in db.items else E(gm_item_name))
+        store_html = link(f"{gm_slug}.html", gm_store_name)
+        area_html = link(f"../areas/{gm_area_rr}.html", db.area_name(gm_area_rr))
+        body += (
+            "<h2>Most Valuable Item for Sale</h2>"
+            f"<p>{item_html} — <strong>{gm_cost:,} gp</strong> base value, "
+            f"sold at {store_html} in {area_html}.</p>"
+        )
 
     if no_opener_rows:
         body += (
