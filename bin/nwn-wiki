@@ -3195,6 +3195,9 @@ def render_area_page(db: Db, resref: str, out: Path,
             else:
                 opener_cell = '<em class="muted">unknown</em>'
 
+            max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
+            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
+            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
             rows.append(
                 f"<tr>"
                 f"<td>{name_cell}</td>"
@@ -3203,6 +3206,8 @@ def render_area_page(db: Db, resref: str, out: Path,
                 f"<td>{mu_str}</td>"
                 f"<td>{md_str}</td>"
                 f"<td>{_buy_limit_str(mbp_raw)}</td>"
+                f"<td>{max_gp_str}</td>"
+                f"<td>{avg_gp_str}</td>"
                 f"</tr>"
             )
         sections.append(
@@ -3211,6 +3216,8 @@ def render_area_page(db: Db, resref: str, out: Path,
             '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
             '<th title="Price store pays you for items (% of base)">Buys At</th>'
             '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+            '<th title="Highest base item value in stock (before markup)">Max GP</th>'
+            '<th title="Average base item value in stock (before markup)">Avg GP</th>'
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
@@ -4186,6 +4193,8 @@ _CREATURE_STORES_TABLE_HEAD = (
     '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
     '<th title="Price store pays you for items (% of base)">Buys At</th>'
     '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+    '<th title="Highest base item value in stock (before markup)">Max GP</th>'
+    '<th title="Average base item value in stock (before markup)">Avg GP</th>'
     "</tr></thead><tbody>"
 )
 
@@ -4239,6 +4248,9 @@ def _creature_store_section(db: "Db", creature_resref: str,
             md_str = f"{md_val}%" if md_val is not None else "—"
             mbp_raw = fld(inst, "MaxBuyPrice", None)
 
+            max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
+            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
+            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
             rows.append(
                 f"<tr>"
                 f"<td>{name_cell}</td>"
@@ -4247,6 +4259,8 @@ def _creature_store_section(db: "Db", creature_resref: str,
                 f"<td>{mu_str}</td>"
                 f"<td>{md_str}</td>"
                 f"<td>{_buy_limit_str(mbp_raw)}</td>"
+                f"<td>{max_gp_str}</td>"
+                f"<td>{avg_gp_str}</td>"
                 f"</tr>"
             )
 
@@ -4316,6 +4330,37 @@ def _store_opener_html(db: Db, opener: dict, root_rel: str = "..") -> str:
     return _caller_html(db, opener, root_rel=root_rel)
 
 
+def _store_item_gp_stats(db: "Db", pages: list) -> tuple[int, str, str, float]:
+    """Scan store inventory pages; return (max_cost, max_irr, max_name, avg_cost).
+    Only items with cost > 0 are counted. avg_cost is 0.0 when none qualify."""
+    max_cost = 0
+    max_irr = ""
+    max_name = ""
+    total = 0
+    count = 0
+    for p in pages:
+        for it in list_items(p.get("ItemList")):
+            try:
+                cost = int(fld(it, "Cost", 0) or 0)
+            except (TypeError, ValueError):
+                cost = 0
+            if cost <= 0:
+                continue
+            count += 1
+            total += cost
+            if cost > max_cost:
+                max_cost = cost
+                max_irr = (fld(it, "TemplateResRef", "")
+                           or fld(it, "InventoryRes", "")
+                           or fld(it, "EquippedRes", "") or "")
+                max_name = loc(it.get("LocalizedName")) or ""
+                if not max_name and max_irr in db.items:
+                    max_name = db.item_name(max_irr)
+                if not max_name:
+                    max_name = max_irr or "(unknown)"
+    return max_cost, max_irr, max_name, (total / count if count else 0.0)
+
+
 def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> None:
     """Render a per-placement store page showing the instance's actual inventory."""
     rr = fld(inst, "ResRef", "") or ""
@@ -4348,6 +4393,13 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
     mbp = fld(inst, "MaxBuyPrice", None)
     if mbp is not None:
         meta.append(f"<dt>Max Buy Price</dt><dd>{_buy_limit_str(mbp)}</dd>")
+    inst_pages = list_items(inst.get("StoreList"))
+    max_gp, max_irr, max_name, avg_gp = _store_item_gp_stats(db, inst_pages)
+    if max_gp > 0:
+        max_item_html = (link(f"../items/{max_irr}.html", max_name)
+                         if max_irr in db.items else E(max_name))
+        meta.append(f"<dt>Most Valuable Item</dt><dd>{max_item_html} ({max_gp:,} gp)</dd>")
+        meta.append(f"<dt>Avg Item Value</dt><dd>{avg_gp:,.0f} gp</dd>")
     sections.extend(['<dl class="meta">', *meta, "</dl>"])
 
     # Opened By
@@ -4438,6 +4490,8 @@ def render_stores_index(db: Db, out: Path) -> None:
         '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
         '<th title="Price store pays you for items (% of base)">Buys At</th>'
         '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+        '<th title="Highest base item value in stock (before markup)">Max GP</th>'
+        '<th title="Average base item value in stock (before markup)">Avg GP</th>'
         "</tr></thead><tbody>"
     )
 
@@ -4483,6 +4537,9 @@ def render_stores_index(db: Db, out: Path) -> None:
                 opener_cell = '<em class="muted">unknown</em>'
 
             mbp_raw = fld(inst, 'MaxBuyPrice', None)
+            max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
+            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
+            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
             row = (
                 f"<tr>"
                 f"<td>{name_cell}</td>"
@@ -4494,6 +4551,8 @@ def render_stores_index(db: Db, out: Path) -> None:
                 f"<td>{mu_str}</td>"
                 f"<td>{md_str}</td>"
                 f"<td>{_buy_limit_str(mbp_raw)}</td>"
+                f"<td>{max_gp_str}</td>"
+                f"<td>{avg_gp_str}</td>"
                 f"</tr>"
             )
             mbp_sort = float('inf') if mbp_raw == -1 else (mbp_raw if mbp_raw is not None else 0)
@@ -4520,6 +4579,7 @@ def render_stores_index(db: Db, out: Path) -> None:
         mbp_raw = fld(s, 'MaxBuyPrice', None)
         mbp_sort = float('inf') if mbp_raw == -1 else (mbp_raw if mbp_raw is not None else 0)
         md_sort = md_val if md_val is not None else 0
+        u_max_gp, _, _, u_avg_gp = _store_item_gp_stats(db, pages)
         unplaced_rows.append((
             (-mbp_sort, -md_sort, nwn_text(db.store_name(rr)).lower()),
             f"<tr>"
@@ -4532,6 +4592,8 @@ def render_stores_index(db: Db, out: Path) -> None:
             f"<td>{f'{mu_val}%' if mu_val is not None else '—'}</td>"
             f"<td>{f'{md_val}%' if md_val is not None else '—'}</td>"
             f"<td>{_buy_limit_str(mbp_raw)}</td>"
+            f"<td>{f'{u_max_gp:,}' if u_max_gp > 0 else '—'}</td>"
+            f"<td>{f'{u_avg_gp:,.0f}' if u_avg_gp > 0 else '—'}</td>"
             f"</tr>"
         ))
     unplaced_rows.sort(key=lambda x: x[0])
@@ -4619,7 +4681,14 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
             '— it is not accessible to players.</p>'
         )
 
-    sections.extend([
+    page_names = ["Armor", "Misc", "Potions", "Rings", "Weapons"]
+    pages = list_items(s.get("StoreList"))
+    bp_max_gp, bp_max_irr, bp_max_name, bp_avg_gp = _store_item_gp_stats(db, pages)
+    bp_max_item_html = ""
+    if bp_max_gp > 0:
+        bp_max_item_html = (link(f"../items/{bp_max_irr}.html", bp_max_name)
+                            if bp_max_irr in db.items else E(bp_max_name))
+    bp_meta = [
         "<h2>Blueprint</h2>",
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
@@ -4629,11 +4698,12 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>MaxBuyPrice</dt><dd>{_buy_limit_str(fld(s, 'MaxBuyPrice', None))}</dd>",
         f"<dt>StoreGold</dt><dd>{E(fld(s, 'StoreGold', ''))}</dd>",
         f"<dt>BlackMarket</dt><dd>{E(fld(s, 'BlackMarket', ''))}</dd>",
-        '</dl>',
-    ])
-
-    page_names = ["Armor", "Misc", "Potions", "Rings", "Weapons"]
-    pages = list_items(s.get("StoreList"))
+    ]
+    if bp_max_gp > 0:
+        bp_meta.append(f"<dt>Most Valuable Item</dt><dd>{bp_max_item_html} ({bp_max_gp:,} gp)</dd>")
+        bp_meta.append(f"<dt>Avg Item Value</dt><dd>{bp_avg_gp:,.0f} gp</dd>")
+    bp_meta.append('</dl>')
+    sections.extend(bp_meta)
     for idx, p in enumerate(pages):
         page_label = page_names[idx] if idx < len(page_names) else f"Page {idx}"
         items = list_items(p.get("ItemList"))
