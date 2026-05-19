@@ -3882,6 +3882,10 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(spawn_rows) + "</tbody></table>"
         )
 
+    store_section = _creature_store_section(db, resref, filter_area=None, root_rel="..")
+    if store_section:
+        sections.append(store_section)
+
     sections.extend(_creature_detail_sections(db, c, bp=None, root_rel=".."))
 
     # "Instances" — each placement of this blueprint, with overrides.
@@ -4042,6 +4046,10 @@ def render_creature_instance_page(db: Db, area_rr: str, idx: int, out: Path) -> 
         f'<p>{link(f"../../areas/{area_rr}.html", db.area_name(area_rr))}</p>'
     )
 
+    store_section = _creature_store_section(db, rr, filter_area=area_rr, root_rel="../..")
+    if store_section:
+        sections.append(store_section)
+
     sections.extend(_creature_detail_sections(db, c, bp=bp, root_rel="../.."))
 
     write(out / "creatures" / "instances" / f"{area_rr}-{idx:03d}.html",
@@ -4170,6 +4178,86 @@ def _buy_limit_str(mbp: Any) -> str:
     if mbp == 0:
         return "Won't buy"
     return f"{mbp:,} gp"
+
+
+_CREATURE_STORES_TABLE_HEAD = (
+    '<table class="data"><thead><tr>'
+    "<th>Name</th><th>Items</th><th>Area</th>"
+    '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+    '<th title="Price store pays you for items (% of base)">Buys At</th>'
+    '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+    "</tr></thead><tbody>"
+)
+
+
+def _creature_store_section(db: "Db", creature_resref: str,
+                             filter_area: str | None, root_rel: str) -> str:
+    """Return an HTML <h2>Stores</h2> + table for stores this creature opens,
+    or empty string if none found. filter_area restricts to one area (instance
+    pages); None returns all areas (blueprint pages)."""
+    rows: list[str] = []
+    seen_slugs: set[str] = set()
+
+    for area_rr, store_list in sorted(
+        db.area_stores.items(),
+        key=lambda kv: nwn_text(db.area_name(kv[0])).lower(),
+    ):
+        if filter_area and area_rr != filter_area:
+            continue
+        for inst in store_list:
+            tag = fld(inst, "Tag", "")
+            if not tag:
+                continue
+            openers = db.store_tag_openers.get(tag.lower(), [])
+            matched = any(
+                o.get("resref", "").lower() == creature_resref.lower()
+                and area_rr in (o.get("areas") or (
+                    [o["area"]] if "area" in o else []
+                ))
+                for o in openers
+            )
+            if not matched:
+                continue
+
+            slug = _store_instance_slug(area_rr, inst)
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+
+            rr = fld(inst, "ResRef", "")
+            name = db.store_name(rr) if rr in db.stores else (tag or rr)
+            name_cell = link(f"{root_rel}/stores/{slug}.html", name)
+
+            pages = list_items(inst.get("StoreList"))
+            n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+
+            area_cell = link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
+
+            mu_val = fld(inst, "MarkUp", None)
+            md_val = fld(inst, "MarkDown", None)
+            mu_str = f"{mu_val}%" if mu_val is not None else "—"
+            md_str = f"{md_val}%" if md_val is not None else "—"
+            mbp_raw = fld(inst, "MaxBuyPrice", None)
+
+            rows.append(
+                f"<tr>"
+                f"<td>{name_cell}</td>"
+                f"<td>{n_items}</td>"
+                f"<td>{area_cell}</td>"
+                f"<td>{mu_str}</td>"
+                f"<td>{md_str}</td>"
+                f"<td>{_buy_limit_str(mbp_raw)}</td>"
+                f"</tr>"
+            )
+
+    if not rows:
+        return ""
+    return (
+        "<h2>Stores</h2>"
+        + _CREATURE_STORES_TABLE_HEAD
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
 
 
 _STORE_TABLE_HEAD = (
