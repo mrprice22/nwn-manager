@@ -3123,15 +3123,54 @@ def render_area_page(db: Db, resref: str, out: Path,
     if stores:
         sections.append("<h2>Stores</h2>")
         rows = []
-        for s in stores:
-            rr = fld(s, "ResRef", "") or fld(s, "TemplateResRef", "")
-            sname = db.store_name(rr) or fld(s, "Tag", "") or rr
-            cell = (link(f"../stores/{rr}.html", sname)
-                    if rr in db.stores else nwn_html(sname))
-            rows.append(f"<tr><td>{cell}</td><td>{E(rr)}</td></tr>")
+        for inst in stores:
+            rr = fld(inst, "ResRef", "") or fld(inst, "TemplateResRef", "")
+            tag = fld(inst, "Tag", "")
+            name = db.store_name(rr) if rr in db.stores else (tag or rr)
+            slug = _store_instance_slug(resref, inst)
+            name_cell = link(f"../stores/{slug}.html", name)
+
+            pages = list_items(inst.get("StoreList"))
+            n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+
+            mu_val = fld(inst, "MarkUp", None)
+            md_val = fld(inst, "MarkDown", None)
+            mu_str = f"{mu_val}%" if mu_val is not None else "—"
+            md_str = f"{md_val}%" if md_val is not None else "—"
+            mbp_raw = fld(inst, "MaxBuyPrice", None)
+
+            area_openers = [o for o in db.store_tag_openers.get(tag.lower(), [])
+                            if resref in o.get("areas", []) or o.get("area") == resref]
+            if area_openers:
+                seen_html: set[str] = set()
+                opener_parts = []
+                for o in area_openers[:3]:
+                    h = _store_opener_html(db, o, root_rel="..")
+                    if h not in seen_html:
+                        seen_html.add(h)
+                        opener_parts.append(h)
+                opener_cell = "<br>".join(opener_parts)
+                if len(area_openers) > 3:
+                    opener_cell += f" <em class=\"muted\">(+{len(area_openers)-3} more)</em>"
+            else:
+                opener_cell = '<em class="muted">unknown</em>'
+
+            rows.append(
+                f"<tr>"
+                f"<td>{name_cell}</td>"
+                f"<td>{n_items}</td>"
+                f"<td>{opener_cell}</td>"
+                f"<td>{mu_str}</td>"
+                f"<td>{md_str}</td>"
+                f"<td>{_buy_limit_str(mbp_raw)}</td>"
+                f"</tr>"
+            )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Store</th><th>ResRef</th>"
+            "<th>Name</th><th>Items</th><th>Opened By</th>"
+            '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+            '<th title="Price store pays you for items (% of base)">Buys At</th>'
+            '<th title="Maximum the store will pay for any single item">Max Buy</th>'
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
