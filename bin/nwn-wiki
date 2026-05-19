@@ -987,6 +987,15 @@ class Db:
         self.item_in_container: dict[str, list[dict]] = defaultdict(list)
         # item resref → creatures that carry it: [{"area_rr", "crr", "cname"}]
         self.item_carried_by: dict[str, list[dict]] = defaultdict(list)
+        # script resref → list of item resrefs created via CreateItemOnObject
+        self.script_creates_items: dict[str, list[str]] = defaultdict(list)
+        # scripts that call GenerateTreasure/GenerateHighTreasure/etc. (random loot)
+        self.script_generates_treasure: set[str] = set()
+        # item resref → list of script-source dicts for the item page
+        # {"kind", "script", "label", "areas", "dlg", "crr", "prr"}
+        self.item_from_script: dict[str, list[dict]] = defaultdict(list)
+        # (area_rr, container_idx) pairs for containers with random-treasure OnOpen
+        self.random_treasure_containers: set[tuple[str, int]] = set()
 
     # ---- Loading ----
 
@@ -1401,6 +1410,12 @@ class Db:
     _RE_OPEN_STORE = re.compile(
         r"\b(?:OpenStore|gplotAppraiseOpenStore)\s*\("
     )
+    _RE_CREATE_ITEM = re.compile(
+        r'\bCreateItemOnObject\s*\(\s*"([A-Za-z0-9_]+)"'
+    )
+    _RE_GENERATE_TREASURE = re.compile(
+        r"\bGenerate(?:High|Medium|Low|Boss|Book)?Treasure\s*\("
+    )
 
     def _parse_scripts(self) -> None:
         """One-shot scan of every .nss file. Populates script_dialogs and
@@ -1440,6 +1455,14 @@ class Db:
                         self.script_store_tags[resref].add(m.group(1))
                 else:
                     self.script_bdm_open.add(resref)
+            # CreateItemOnObject with a literal resref string.
+            for m in self._RE_CREATE_ITEM.finditer(text):
+                irr = m.group(1).lower()
+                if irr not in self.script_creates_items[resref]:
+                    self.script_creates_items[resref].append(irr)
+            # Random/procedural treasure generation.
+            if self._RE_GENERATE_TREASURE.search(text):
+                self.script_generates_treasure.add(resref)
 
     def _build_tag_to_area(self) -> None:
         """Tag → area resref index spanning every placement (waypoints,
@@ -1892,6 +1915,175 @@ class Db:
 
         self._build_direct_teleport_transitions()
         self._build_store_openers()
+        self._index_script_item_sources()
+        self._index_random_treasure_containers()
+
+    def _index_script_item_sources(self) -> None:
+        """Trace CreateItemOnObject calls back to their trigger context and
+        populate item_from_script. Sources in WIKI_HIDDEN areas are excluded.
+        Must run after _build_store_openers (index_dialogs fully done)."""
+        if not self.script_creates_items:
+            return
+        scripts_set = set(self.script_creates_items.keys())
+
+        # Inverted dialog_scripts: action-script resref → set of dialog resrefs
+        script_to_dlgs: dict[str, set[str]] = defaultdict(set)
+        for dlg_rr, entries in self.dialog_scripts.items():
+            for e in entries:
+                if e.get("kind") == "action" and e.get("resref") in scripts_set:
+                    script_to_dlgs[e["resref"]].add(dlg_rr)
+
+        # Module events: script resref → human event label.
+        # Skip Mod_OnActvtItem (item activation) — that fires for DM item tools.
+        _SKIP_MOD_FIELDS = {"Mod_OnActvtItem"}
+        script_module_event: dict[str, str] = {}
+        if self.ifo:
+            for field, label in self.MODULE_EVENT_FIELDS.items():
+                if field in _SKIP_MOD_FIELDS:
+                    continue
+                val = (fld(self.ifo, field, "") or "").lower()
+                if val in scripts_set:
+                    script_module_event[val] = label
+
+        # All UTC event fields (superset of CREATURE_EVENT_FIELDS).
+        _ALL_CREATURE_EVENTS: dict[str, str] = {
+            "ScriptDeath": "OnDeath", "ScriptSpawn": "OnSpawn",
+            "ScriptHeartbeat": "OnHeartbeat", "ScriptOnNotice": "OnPerception",
+            "ScriptUserDefine": "OnUserDefined", "ScriptDialogue": "OnConversation",
+            "ScriptAttacked": "OnAttacked", "ScriptDamaged": "OnDamaged",
+            "ScriptDisturbed": "OnDisturbed", "ScriptEndRound": "OnEndCombatRound",
+            "ScriptOnBlocked": "OnBlocked", "ScriptRested": "OnRested",
+            "ScriptSpellAt": "OnSpellCastAt",
+        }
+        # Visible areas per creature blueprint resref.
+        crr_vis: dict[str, set[str]] = defaultdict(set)
+        for area_rr, insts in self.area_creature_instances.items():
+            if area_rr not in self.hidden_areas:
+                for inst in insts:
+                    crr = (fld(inst["c"], "TemplateResRef", "") or "").lower()
+                    if crr:
+                        crr_vis[crr].add(area_rr)
+        for crr, spawns in self.creature_encounter_spawns.items():
+            for sp in spawns:
+                if sp["area"] not in self.hidden_areas:
+                    crr_vis[crr.lower()].add(sp["area"])
+        # script resref → list of {crr, cname, event_label, areas}
+        script_creature_srcs: dict[str, list[dict]] = defaultdict(list)
+        for crr, c in self.creatures.items():
+            vis_areas = crr_vis.get(crr.lower(), set())
+            if not vis_areas:
+                continue
+            for field, ev_label in _ALL_CREATURE_EVENTS.items():
+                val = (fld(c, field, "") or "").lower()
+                if val in scripts_set:
+                    script_creature_srcs[val].append({
+                        "crr": crr, "cname": self.creature_name(crr),
+                        "event_label": ev_label, "areas": sorted(vis_areas),
+                    })
+
+        # Visible areas per placeable blueprint resref.
+        prr_vis: dict[str, set[str]] = defaultdict(set)
+        for area_rr, pls in self.area_placeables.items():
+            if area_rr not in self.hidden_areas:
+                for pl in pls:
+                    prr = (fld(pl, "TemplateResRef", "") or "").lower()
+                    if prr:
+                        prr_vis[prr].add(area_rr)
+        # script resref → list of {prr, pname, event_label, areas}
+        script_placeable_srcs: dict[str, list[dict]] = defaultdict(list)
+        for prr, p in self.placeables.items():
+            vis_areas = prr_vis.get(prr.lower(), set())
+            if not vis_areas:
+                continue
+            pname = loc(p.get("LocName")) or fld(p, "Tag") or prr
+            for field, ev_label in self.PLACEABLE_EVENT_FIELDS.items():
+                val = (fld(p, field, "") or "").lower()
+                if val in scripts_set:
+                    script_placeable_srcs[val].append({
+                        "prr": prr, "pname": pname,
+                        "event_label": ev_label, "areas": sorted(vis_areas),
+                    })
+        # Also catch GIT-instance-level event overrides (no blueprint entry).
+        git_plc_script_areas: dict[str, set[str]] = defaultdict(set)
+        for area_rr, pls in self.area_placeables.items():
+            if area_rr not in self.hidden_areas:
+                for pl in pls:
+                    for field in self.PLACEABLE_EVENT_FIELDS:
+                        val = (fld(pl, field, "") or "").lower()
+                        if val in scripts_set:
+                            git_plc_script_areas[val].add(area_rr)
+        for val, areas in git_plc_script_areas.items():
+            if not script_placeable_srcs[val]:
+                script_placeable_srcs[val].append({
+                    "prr": None, "pname": None,
+                    "event_label": "interaction", "areas": sorted(areas),
+                })
+
+        # Build item_from_script, deduplicating by (irr, kind, dlg-or-crr-or-prr-or-script).
+        seen: set[tuple[str, str, str | None, str]] = set()
+        for script_rr, item_resrefs in self.script_creates_items.items():
+            sources: list[dict] = []
+
+            if script_rr in script_module_event:
+                sources.append({
+                    "kind": "module-event", "script": script_rr,
+                    "label": script_module_event[script_rr],
+                    "areas": [], "dlg": None, "crr": None, "prr": None,
+                })
+            for dlg_rr in sorted(script_to_dlgs.get(script_rr, set())):
+                callers = self.dialog_callers.get(dlg_rr, [])
+                vis: set[str] = set()
+                for caller in callers:
+                    for a in (caller.get("areas") or []):
+                        if a not in self.hidden_areas:
+                            vis.add(a)
+                    if caller.get("area") and caller["area"] not in self.hidden_areas:
+                        vis.add(caller["area"])
+                if callers and not vis:
+                    continue  # every caller in a hidden area
+                sources.append({
+                    "kind": "dialog-action", "script": script_rr,
+                    "label": self.dialog_label(dlg_rr),
+                    "areas": sorted(vis), "dlg": dlg_rr, "crr": None, "prr": None,
+                })
+            for cs in script_creature_srcs.get(script_rr, []):
+                sources.append({
+                    "kind": "creature-event", "script": script_rr,
+                    "label": cs["event_label"], "areas": cs["areas"],
+                    "dlg": None, "crr": cs["crr"], "prr": None,
+                })
+            for ps in script_placeable_srcs.get(script_rr, []):
+                sources.append({
+                    "kind": "placeable-event", "script": script_rr,
+                    "label": ps["event_label"], "areas": ps["areas"],
+                    "dlg": None, "crr": None, "prr": ps["prr"],
+                })
+            if not sources:
+                continue
+            for irr in item_resrefs:
+                if irr not in self.items:
+                    continue
+                for src in sources:
+                    dk = (irr, src["kind"],
+                          src.get("dlg") or src.get("crr") or src.get("prr") or "",
+                          src["script"])
+                    if dk not in seen:
+                        seen.add(dk)
+                        self.item_from_script[irr].append(src)
+
+    def _index_random_treasure_containers(self) -> None:
+        """Mark containers whose OnOpen script generates procedural random treasure.
+        Populates random_treasure_containers. Must run after _parse_scripts."""
+        for area_rr, containers in self.area_containers.items():
+            for c in containers:
+                p = c["p"]
+                idx = c["idx"]
+                on_open = (fld(p, "OnOpen", "") or "").lower()
+                if not on_open:
+                    bp_rr = (fld(p, "TemplateResRef", "") or "").lower()
+                    on_open = (fld(self.placeables.get(bp_rr, {}), "OnOpen", "") or "").lower()
+                if on_open and on_open in self.script_generates_treasure:
+                    self.random_treasure_containers.add((area_rr, idx))
 
     def _build_store_openers(self) -> None:
         """Populate store_tag_openers. Must be called after index_dialogs so
@@ -3566,15 +3758,17 @@ def render_area_page(db: Db, resref: str, out: Path,
             rr = fld(p, "TemplateResRef", "")
             pname = loc(p.get("LocName")) or tag or rr or "(unnamed)"
             n_items = len(list_items(p.get("ItemList")))
+            is_rand = (resref, idx) in db.random_treasure_containers
             x = fld(p, "X", 0.0) or 0.0
             y = fld(p, "Y", 0.0) or 0.0
             z = fld(p, "Z", 0.0) or 0.0
             locked = "yes" if int(fld(p, "Locked", 0) or 0) else "no"
             dc = fld(p, "OpenLockDC", "")
             href = f"../containers/{resref}-{idx:03d}.html"
+            rand_tag = ' <small class="muted">+random</small>' if is_rand else ""
             rows.append(
                 f"<tr><td>{link(href, pname)}</td>"
-                f"<td>{n_items}</td>"
+                f"<td>{n_items}{rand_tag}</td>"
                 f"<td><code>{E(tag)}</code></td>"
                 f"<td>{E(rr)}</td>"
                 f"<td>{x:.1f}, {y:.1f}, {z:.1f}</td>"
@@ -3796,6 +3990,16 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
     desc = loc(p.get("Description"))
     if desc:
         sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
+
+    if (area_resref, idx) in db.random_treasure_containers:
+        on_open = (fld(p, "OnOpen", "") or "").lower()
+        if not on_open:
+            on_open = (fld(db.placeables.get(rr, {}), "OnOpen", "") or "").lower()
+        sections.append(
+            '<p class="muted"><em>This container generates random treasure via '
+            f'script <code>{E(on_open)}</code> when opened. '
+            "Specific items are not predetermined and cannot be listed here.</em></p>"
+        )
 
     if items:
         sections.append(f"<h2>Contents ({len(items)})</h2>")
@@ -4538,6 +4742,7 @@ def render_items_index(db: Db, out: Path) -> None:
                 rr in db.item_sold_at
                 or rr in db.item_in_container
                 or rr in db.item_carried_by
+                or rr in db.item_from_script
             )
             if accessible:
                 buckets[_item_category(i)].append((rr, i))
@@ -4734,8 +4939,9 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     sold_at = db.item_sold_at.get(resref, [])
     in_containers = db.item_in_container.get(resref, [])
     carried_by = db.item_carried_by.get(resref, [])
+    from_script = db.item_from_script.get(resref, [])
 
-    if sold_at or in_containers or carried_by:
+    if sold_at or in_containers or carried_by or from_script:
         sections.append("<h2>Where to find</h2>")
         if sold_at:
             rows = []
@@ -4784,11 +4990,49 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 '<table class="data"><thead><tr><th>Creature</th><th>Area</th></tr></thead>'
                 "<tbody>" + "\n".join(rows) + "</tbody></table>"
             )
+        if from_script:
+            rows = []
+            for src in from_script:
+                kind = src["kind"]
+                script_rr = src["script"]
+                areas = src.get("areas") or []
+                area_cells = ", ".join(
+                    link(f"../areas/{a}.html", db.area_name(a))
+                    for a in areas if a in db.areas
+                ) or "—"
+                if kind == "module-event":
+                    source_cell = E(f"Module event ({src['label']})")
+                elif kind == "dialog-action":
+                    dlg = src.get("dlg") or ""
+                    dlg_label = db.dialog_label(dlg) if dlg else script_rr
+                    source_cell = (link(f"../conversations/{dlg}.html", dlg_label)
+                                   if dlg in db.dialogs else E(dlg_label))
+                elif kind == "creature-event":
+                    crr = src.get("crr") or ""
+                    cname = db.creature_name(crr) if crr else script_rr
+                    creature_html = (link(f"../creatures/{crr}.html", cname)
+                                     if crr in db.creatures else E(cname))
+                    source_cell = f"{creature_html} <small class=\"muted\">({E(src['label'])})</small>"
+                else:  # placeable-event
+                    prr = src.get("prr") or ""
+                    pname = src.get("label") or prr or script_rr
+                    source_cell = E(pname)
+                rows.append(
+                    f"<tr><td>{source_cell}</td>"
+                    f"<td><code>{E(script_rr)}</code></td>"
+                    f"<td>{area_cells}</td></tr>"
+                )
+            sections.append(
+                "<h3>Quest / script rewards</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Source</th><th>Script</th><th>Area(s)</th>"
+                "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
     elif not is_broken:
         sections.append(
             "<h2>Where to find</h2>"
-            '<p class="muted">Not found in any store, container, or creature inventory — '
-            "this item may be inaccessible to players.</p>"
+            '<p class="muted">Not found in any store, container, creature inventory, '
+            "or script reward — this item may be inaccessible to players.</p>"
         )
 
     write(out / "items" / f"{resref}.html",
