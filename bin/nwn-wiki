@@ -3947,25 +3947,116 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
           page(name, "\n".join(sections), root_rel=".."))
 
 
+def _buy_limit_str(mbp: Any) -> str:
+    if mbp is None:
+        return "—"
+    if mbp == -1:
+        return "No limit"
+    if mbp == 0:
+        return "Won't buy"
+    return f"{mbp:,} gp"
+
+
+_STORE_TABLE_HEAD = (
+    '<table class="data"><thead><tr>'
+    "<th>Name</th><th>ResRef</th><th>Tag</th><th>Items</th>"
+    "<th>Area</th>"
+    '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+    '<th title="Price store pays you for items (% of base)">Buys At</th>'
+    '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+    "</tr></thead><tbody>"
+)
+
+
 def render_stores_index(db: Db, out: Path) -> None:
-    rows = []
-    for rr in sorted(db.stores.keys(), key=lambda r: nwn_text(db.store_name(r)).lower()):
+    # The GIT instance is the authoritative source: each placed store can have
+    # different MarkUp/MarkDown/MaxBuyPrice/inventory from the UTM blueprint.
+    # NWN semantics: MarkUp = % of base the store charges you (Sells At, usually >100)
+    #                MarkDown = % of base the store pays you  (Buys At,  usually <100)
+
+    placed_rows: list[tuple[str, str]] = []  # (sort_key, html_row)
+    placed_resrefs: set[str] = set()
+
+    for area_rr in sorted(db.area_stores.keys(),
+                          key=lambda a: nwn_text(db.area_name(a)).lower()):
+        for inst in db.area_stores[area_rr]:
+            rr = fld(inst, "ResRef", "")
+            tag = fld(inst, "Tag", "")
+            placed_resrefs.add(rr)
+
+            name = db.store_name(rr) if rr in db.stores else (tag or rr)
+            name_cell = (link(f"{rr}.html", name) if rr in db.stores
+                         else nwn_html(name))
+
+            pages = list_items(inst.get("StoreList"))
+            n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+
+            mu_val = fld(inst, "MarkUp", None)
+            md_val = fld(inst, "MarkDown", None)
+            mu_str = f"{mu_val}%" if mu_val is not None else "—"
+            md_str = f"{md_val}%" if md_val is not None else "—"
+
+            area_cell = link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+
+            placed_rows.append((
+                nwn_text(name).lower(),
+                f"<tr>"
+                f"<td>{name_cell}</td>"
+                f"<td>{E(rr)}</td>"
+                f"<td>{E(tag)}</td>"
+                f"<td>{n_items}</td>"
+                f"<td>{area_cell}</td>"
+                f"<td>{mu_str}</td>"
+                f"<td>{md_str}</td>"
+                f"<td>{_buy_limit_str(fld(inst, 'MaxBuyPrice', None))}</td>"
+                f"</tr>"
+            ))
+
+    placed_rows.sort(key=lambda x: x[0])
+
+    # UTM blueprints that were never placed in any area
+    unplaced_rows: list[str] = []
+    for rr in sorted(db.stores.keys(),
+                     key=lambda r: nwn_text(db.store_name(r)).lower()):
+        if rr in placed_resrefs:
+            continue
         s = db.stores[rr]
         pages = list_items(s.get("StoreList"))
         n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
-        rows.append(
-            f"<tr><td>{link(f'{rr}.html', db.store_name(rr))}</td>"
+        mu_val = fld(s, "MarkUp", None)
+        md_val = fld(s, "MarkDown", None)
+        unplaced_rows.append(
+            f"<tr>"
+            f"<td>{link(f'{rr}.html', db.store_name(rr))}</td>"
             f"<td>{E(rr)}</td>"
             f"<td>{E(fld(s, 'Tag', ''))}</td>"
-            f"<td>{n_items}</td></tr>"
+            f"<td>{n_items}</td>"
+            f"<td><em>Not placed</em></td>"
+            f"<td>{f'{mu_val}%' if mu_val is not None else '—'}</td>"
+            f"<td>{f'{md_val}%' if md_val is not None else '—'}</td>"
+            f"<td>{_buy_limit_str(fld(s, 'MaxBuyPrice', None))}</td>"
+            f"</tr>"
         )
-    body = (
-        "<h1>Stores</h1>"
-        f"<p>{len(db.stores)} store blueprints.</p>"
-        '<table class="data"><thead><tr>'
-        "<th>Name</th><th>ResRef</th><th>Tag</th><th>Items</th>"
-        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+
+    n_placed = len(placed_rows)
+    body = "<h1>Stores</h1>"
+    body += (
+        f"<p>{n_placed} placed store instance{'s' if n_placed != 1 else ''}"
+        + (f"; {len(unplaced_rows)} unplaced blueprint"
+           f"{'s' if len(unplaced_rows) != 1 else ''} below"
+           if unplaced_rows else "")
+        + ". Values shown are per-area instance data (may differ from blueprint defaults).</p>"
     )
+    body += _STORE_TABLE_HEAD + "\n".join(r[1] for r in placed_rows) + "</tbody></table>"
+
+    if unplaced_rows:
+        body += (
+            "<h2>Unplaced Blueprints</h2>"
+            "<p>These store blueprints exist in the module files but are not placed "
+            "in any area — they are not accessible to players.</p>"
+            + _STORE_TABLE_HEAD + "\n".join(unplaced_rows) + "</tbody></table>"
+        )
+
     write(out / "stores" / "index.html", page("Stores", body, root_rel=".."))
 
 
@@ -3974,24 +4065,70 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
     if not s:
         return
     name = db.store_name(resref)
-    pages = list_items(s.get("StoreList"))
-    page_names = ["Armor", "Misc", "Potions", "Rings", "Weapons"]
-    sections = [
-        f"<h1>{nwn_html(name)}</h1>",
+
+    # Find all placed instances for this blueprint
+    instances: list[tuple[str, Any]] = []
+    for area_rr, store_list in db.area_stores.items():
+        for inst in store_list:
+            if fld(inst, "ResRef", "") == resref:
+                instances.append((area_rr, inst))
+    instances.sort(key=lambda x: nwn_text(db.area_name(x[0])).lower())
+
+    sections = [f"<h1>{nwn_html(name)}</h1>"]
+
+    if instances:
+        inst_rows = []
+        for area_rr, inst in instances:
+            mu = fld(inst, "MarkUp", None)
+            md = fld(inst, "MarkDown", None)
+            pages = list_items(inst.get("StoreList"))
+            n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+            inst_rows.append(
+                f"<tr>"
+                f"<td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                f"<td>{E(fld(inst, 'Tag', ''))}</td>"
+                f"<td>{n_items}</td>"
+                f"<td>{f'{mu}%' if mu is not None else '—'}</td>"
+                f"<td>{f'{md}%' if md is not None else '—'}</td>"
+                f"<td>{_buy_limit_str(fld(inst, 'MaxBuyPrice', None))}</td>"
+                f"</tr>"
+            )
+        sections.append(
+            "<h2>Placed Instances</h2>"
+            '<table class="data"><thead><tr>'
+            '<th>Area</th><th>Tag</th><th>Items</th>'
+            '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+            '<th title="Price store pays you for items (% of base)">Buys At</th>'
+            '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+            "</tr></thead><tbody>" + "\n".join(inst_rows) + "</tbody></table>"
+        )
+    else:
+        sections.append(
+            '<p><strong>Warning:</strong> This blueprint is not placed in any area '
+            '— it is not accessible to players.</p>'
+        )
+
+    sections.extend([
+        "<h2>Blueprint</h2>",
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(s, 'Tag', ''))}</dd>",
-        f"<dt>MarkUp / MarkDown</dt><dd>{E(fld(s, 'MarkUp', ''))} / {E(fld(s, 'MarkDown', ''))}</dd>",
+        f"<dt>Sells At (MarkUp) / Buys At (MarkDown)</dt>"
+        f"<dd>{E(fld(s, 'MarkUp', ''))} / {E(fld(s, 'MarkDown', ''))}</dd>",
+        f"<dt>MaxBuyPrice</dt><dd>{_buy_limit_str(fld(s, 'MaxBuyPrice', None))}</dd>",
         f"<dt>StoreGold</dt><dd>{E(fld(s, 'StoreGold', ''))}</dd>",
         f"<dt>BlackMarket</dt><dd>{E(fld(s, 'BlackMarket', ''))}</dd>",
         '</dl>',
-    ]
+    ])
+
+    page_names = ["Armor", "Misc", "Potions", "Rings", "Weapons"]
+    pages = list_items(s.get("StoreList"))
     for idx, p in enumerate(pages):
         page_label = page_names[idx] if idx < len(page_names) else f"Page {idx}"
         items = list_items(p.get("ItemList"))
         if not items:
             continue
-        sections.append(f"<h2>{E(page_label)}</h2>")
+        sections.append(f"<h2>Blueprint: {E(page_label)}</h2>")
         rows = []
         for it in items:
             irr = fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
