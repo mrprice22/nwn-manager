@@ -4218,7 +4218,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
             page_label = page_names[idx] if idx < len(page_names) else f"Page {idx}"
             rows = []
             for it in items:
-                irr = fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
+                irr = fld(it, "TemplateResRef", "") or fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
                 disp = db.item_name(irr) if irr in db.items else irr
                 cell = (link(f"../items/{irr}.html", disp)
                         if irr in db.items else nwn_html(disp))
@@ -4457,7 +4457,7 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
         sections.append(f"<h2>Blueprint: {E(page_label)}</h2>")
         rows = []
         for it in items:
-            irr = fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
+            irr = fld(it, "TemplateResRef", "") or fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
             disp = db.item_name(irr) if irr in db.items else irr
             cell = (link(f"../items/{irr}.html", disp)
                     if irr in db.items else nwn_html(disp))
