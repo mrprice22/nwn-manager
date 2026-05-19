@@ -372,6 +372,22 @@ svg .convo-node text {
 }
 .featlist li { break-inside: avoid; }
 
+/* Fallback-transition warnings */
+.warn-fallback {
+  color: #b54708;
+  font-size: 0.85em;
+  margin-left: 0.5em;
+  cursor: help;
+}
+.warn-fallback-note {
+  background: #fff8ed;
+  border-left: 3px solid #f0a830;
+  color: #7a4a00;
+  padding: 0.5em 0.75em;
+  margin: 0.5em 0 1em;
+  font-size: 0.9em;
+}
+
 .dlg-node:target {
   outline: 2px solid var(--accent-soft);
   outline-offset: 2px;

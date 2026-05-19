@@ -884,6 +884,10 @@ class Db:
         self.script_teleport_tags: dict[str, set[str]] = defaultdict(set)
         # tag (waypoint, door, trigger, placeable, creature) → area resref.
         self.tag_to_area: dict[str, str] = {}
+        # Tags added via WP_-prefix stripping fallback (see _build_tag_to_area).
+        # Transitions resolved through these tags may not work in-game if the
+        # script uses the short form but the actual waypoint tag has the WP_ prefix.
+        self.fallback_tags: set[str] = set()
         # dlg resref → list of caller descriptors:
         #   {"kind": "creature"|"placeable"|"door", "resref": ..., "areas": [...]}
         #   {"kind": "module-event", "event": "OnPlayerRest", "script": "..."}
@@ -1264,6 +1268,7 @@ class Db:
                     short = tag[3:]
                     if short and short not in self.tag_to_area:
                         self.tag_to_area[short] = area_resref
+                        self.fallback_tags.add(short)
             for d in list_items(git.get("Door List")):
                 tag = fld(d, "Tag")
                 if tag and tag not in self.tag_to_area:
@@ -1311,6 +1316,7 @@ class Db:
                             "dst_tag": tag,
                             "kind": "use",
                             "label": p_tag,
+                            "fallback": tag in self.fallback_tags,
                         })
 
     def _walk_dialog_nodes(self, dlg: dict) -> Iterable[tuple[str, int, dict]]:
@@ -2923,14 +2929,18 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
 _OMIT: object = object()  # sentinel: "no path-from section on this page"
 
 
-def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str]]]:
+def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str, bool]]]:
     """Directed area→area edge graph from door/trigger transitions and conv teleports.
 
     Uses db.conv_transitions (not db.dialog_teleports directly) so that any
     --exclude-conv-option labels (e.g. "[Admin Options]") are already stripped
     out — the same exclusion that applies to the area map SVG edges.
+
+    Each edge is (dst, kind, label, is_fallback) where is_fallback=True means
+    the transition was resolved via a WP_-prefix-stripping fallback and may not
+    work in-game.
     """
-    graph: dict[str, list[tuple[str, str, str]]] = {rr: [] for rr in db.areas}
+    graph: dict[str, list[tuple[str, str, str, bool]]] = {rr: [] for rr in db.areas}
     seen: set[tuple[str, str, str, str]] = set()
     for tr in db.transitions:
         src, dst = tr["src_area"], tr["dst_area"]
@@ -2939,7 +2949,7 @@ def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str]]]:
         key = (src, dst, tr["kind"], tr["label"])
         if key not in seen:
             seen.add(key)
-            graph[src].append((dst, tr["kind"], tr["label"]))
+            graph[src].append((dst, tr["kind"], tr["label"], False))
     for tr in db.conv_transitions:
         src, dst = tr["src"], tr["dst_area"]
         if src not in graph or dst not in graph or src == dst:
@@ -2949,7 +2959,7 @@ def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str]]]:
         key = (src, dst, "talk", label)
         if key not in seen:
             seen.add(key)
-            graph[src].append((dst, "talk", label))
+            graph[src].append((dst, "talk", label, False))
     for tr in db.script_transitions:
         src, dst = tr["src_area"], tr["dst_area"]
         if not dst or src not in graph or dst not in graph or src == dst:
@@ -2957,33 +2967,33 @@ def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str]]]:
         key = (src, dst, tr["kind"], tr["label"])
         if key not in seen:
             seen.add(key)
-            graph[src].append((dst, tr["kind"], tr["label"]))
+            graph[src].append((dst, tr["kind"], tr["label"], tr.get("fallback", False)))
     return graph
 
 
 def bfs_shortest_path(
-    graph: dict[str, list[tuple[str, str, str]]], src: str, dst: str
-) -> list[tuple[str, str, str, str]] | None:
-    """BFS shortest path; returns list of (from, to, kind, label) or None if unreachable."""
+    graph: dict[str, list[tuple[str, str, str, bool]]], src: str, dst: str
+) -> list[tuple[str, str, str, str, bool]] | None:
+    """BFS shortest path; returns list of (from, to, kind, label, is_fallback) or None."""
     if src == dst:
         return []
     came_from: dict[str, str | None] = {src: None}
-    edge_in: dict[str, tuple[str, str]] = {}
+    edge_in: dict[str, tuple[str, str, bool]] = {}
     q: deque[str] = deque([src])
     while q:
         cur = q.popleft()
-        for dest, kind, label in graph.get(cur, []):
+        for dest, kind, label, is_fallback in graph.get(cur, []):
             if dest in came_from:
                 continue
             came_from[dest] = cur
-            edge_in[dest] = (kind, label)
+            edge_in[dest] = (kind, label, is_fallback)
             if dest == dst:
-                steps: list[tuple[str, str, str, str]] = []
+                steps: list[tuple[str, str, str, str, bool]] = []
                 node = dst
                 while came_from[node] is not None:
                     prev = came_from[node]
-                    k, l = edge_in[node]
-                    steps.append((prev, node, k, l))
+                    k, l, fb = edge_in[node]
+                    steps.append((prev, node, k, l, fb))
                     node = prev
                 return list(reversed(steps))
             q.append(dest)
@@ -2991,14 +3001,37 @@ def bfs_shortest_path(
 
 
 def render_areas_index(db: Db, out: Path) -> None:
-    rows = []
-    for resref in sorted(db.areas.keys(), key=lambda r: nwn_text(db.area_name(r)).lower()):
+    # Classify areas by reachability via fallback transitions.
+    # An area is "fallback-only reachable" if every incoming transition that
+    # could lead to it from another area uses a WP_-prefix-stripped fallback tag
+    # (i.e., the script uses "foo" but the waypoint is tagged "WP_foo"), with no
+    # confirmed non-fallback route (door, trigger, conversation, or direct-tag script).
+    has_real_incoming: set[str] = set()
+    has_fallback_incoming: set[str] = set()
+    for tr in db.transitions:
+        if tr["dst_area"]:
+            has_real_incoming.add(tr["dst_area"])
+    for tr in db.conv_transitions:
+        dst = tr.get("dst_area", "")
+        if dst and dst in db.areas:
+            has_real_incoming.add(dst)
+    for tr in db.script_transitions:
+        dst = tr.get("dst_area", "")
+        if not dst or dst not in db.areas:
+            continue
+        if tr.get("fallback"):
+            has_fallback_incoming.add(dst)
+        else:
+            has_real_incoming.add(dst)
+    has_any_fallback = has_fallback_incoming  # areas with at least one fallback route
+
+    def _area_row(resref: str) -> str:
         a = db.areas[resref]
         npc_count = len(db.area_npcs.get(resref, []))
         enc_count = len(db.area_encounters.get(resref, []))
         store_count = len(db.area_stores.get(resref, []))
         cont_count = len(db.area_containers.get(resref, []))
-        rows.append(
+        return (
             f'<tr>'
             f'<td>{link(f"{resref}.html", db.area_name(resref))}</td>'
             f'<td>{E(resref)}</td>'
@@ -3010,14 +3043,41 @@ def render_areas_index(db: Db, out: Path) -> None:
             f'<td>{cont_count}</td>'
             f'</tr>'
         )
-    body = (
-        "<h1>Areas</h1>"
-        f"<p>{len(db.areas)} areas total.</p>"
+
+    sorted_resrefs = sorted(db.areas.keys(), key=lambda r: nwn_text(db.area_name(r)).lower())
+    normal_resrefs = [r for r in sorted_resrefs if r not in has_any_fallback]
+    suspect_resrefs = [r for r in sorted_resrefs if r in has_any_fallback]
+
+    table_head = (
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>ResRef</th><th>Tileset</th><th>Size</th>"
         "<th>NPCs</th><th>Encounters</th><th>Stores</th><th>Containers</th>"
-        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        "</tr></thead><tbody>"
     )
+
+    body_parts = [
+        "<h1>Areas</h1>",
+        f"<p>{len(db.areas)} areas total.</p>",
+        table_head,
+        "\n".join(_area_row(r) for r in normal_resrefs),
+        "</tbody></table>",
+    ]
+
+    if suspect_resrefs:
+        body_parts += [
+            '<h2 id="possibly-inaccessible">Areas with possibly broken routes</h2>',
+            '<p class="warn-fallback-note">&#9888; The areas below have at least one'
+            ' incoming transition resolved via a waypoint-tag fallback — the script'
+            ' references a short tag (e.g. <code>foo</code>) while the actual waypoint'
+            ' is tagged <code>WP_foo</code>. That route may not work in-game and could'
+            ' indicate a typo in a waypoint tag or script. Other routes into these'
+            ' areas may still work normally.</p>',
+            table_head,
+            "\n".join(_area_row(r) for r in suspect_resrefs),
+            "</tbody></table>",
+        ]
+
+    body = "".join(body_parts)
     write(out / "areas" / "index.html", page("Areas", body, root_rel=".."))
 
 
@@ -3064,7 +3124,8 @@ def render_area_page(db: Db, resref: str, out: Path,
             n = len(path_steps)
             hop_word = "hop" if n == 1 else "hops"
             items = []
-            for a, b, kind, label in path_steps:
+            has_fallback_step = False
+            for a, b, kind, label, is_fallback in path_steps:
                 a_link = link(f"{a}.html", db.area_name(a))
                 b_link = link(f"{b}.html", db.area_name(b))
                 if kind == "door":
@@ -3075,13 +3136,30 @@ def render_area_page(db: Db, resref: str, out: Path,
                     via = E(label)
                 else:
                     via = f'{E(kind)}: {E(label)}'
+                if is_fallback:
+                    has_fallback_step = True
+                    warn = (' <span class="warn-fallback" title="This transition was'
+                            ' resolved via a WP_-prefix fallback — the waypoint tag'
+                            ' in the script may not match the actual waypoint tag,'
+                            ' making this transition possibly broken in-game."'
+                            '>&#9888; possibly broken</span>')
+                else:
+                    warn = ""
                 items.append(
                     f"<li>{a_link} &rarr; {b_link}"
-                    f" <em class=\"muted\">[{via}]</em></li>"
+                    f" <em class=\"muted\">[{via}]</em>{warn}</li>"
                 )
+            fallback_note = (
+                '<p class="warn-fallback-note">&#9888; One or more steps use a'
+                ' waypoint-tag fallback and may not work in-game — the script'
+                ' references a short tag (e.g. <code>foo</code>) while the actual'
+                ' waypoint is tagged <code>WP_foo</code>.</p>'
+                if has_fallback_step else ""
+            )
             sections.append(
                 f"<p><strong>{n} {hop_word}</strong></p>"
-                f"<ol>{''.join(items)}</ol>"
+                + fallback_note
+                + f"<ol>{''.join(items)}</ol>"
             )
 
     # Transitions (out)
