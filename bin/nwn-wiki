@@ -926,6 +926,10 @@ class Db:
         # from cluttering map edges while still surfacing them on the
         # conversation page. Set via --exclude-conv-option on the CLI.
         self.exclude_option_texts: list[str] = []
+        # Areas whose Comments field contains "WIKI_HIDDEN" (case-insensitive).
+        # These areas, their stores, and their creature placements are omitted
+        # from all wiki output (map, index pages, cross-references).
+        self.hidden_areas: set[str] = set()
 
     # ---- Loading ----
 
@@ -1121,9 +1125,15 @@ class Db:
                         self.creature_encounter_spawns[crr].append(
                             {"area": area_resref, "encounter_resref": rr}
                         )
+        self.hidden_areas = {
+            rr for rr, a in self.areas.items()
+            if "WIKI_HIDDEN" in (fld(a, "Comments") or "").upper()
+        }
+        hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
+                      if self.hidden_areas else "")
         print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
               f"{len(self.transitions)} transitions, "
-              f"{len(self.creatures)} creatures, {len(self.items)} items")
+              f"{len(self.creatures)} creatures, {len(self.items)} items{hidden_msg}")
 
     # ---- Dialog & script cross-referencing ----
 
@@ -2656,7 +2666,7 @@ def render_index(db: Db, out: Path, module_title: str,
             )
             dests = ", ".join(
                 link(f"areas/{a}.html", db.area_name(a))
-                for a in info["dests"] if a in db.areas)
+                for a in info["dests"] if a in db.areas and a not in db.hidden_areas)
             rows.append(
                 f"<tr><td>{link(f'conversations/{rr}.html', db.dialog_label(rr))}</td>"
                 f"<td><code>{E(rr)}</code></td>"
@@ -3044,7 +3054,10 @@ def render_areas_index(db: Db, out: Path) -> None:
             f'</tr>'
         )
 
-    sorted_resrefs = sorted(db.areas.keys(), key=lambda r: nwn_text(db.area_name(r)).lower())
+    sorted_resrefs = sorted(
+        (r for r in db.areas if r not in db.hidden_areas),
+        key=lambda r: nwn_text(db.area_name(r)).lower(),
+    )
     normal_resrefs = [r for r in sorted_resrefs if r not in has_any_fallback]
     suspect_resrefs = [r for r in sorted_resrefs if r in has_any_fallback]
 
@@ -4038,7 +4051,8 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
     if enc_spawns:
         agg: dict[tuple[str, str], int] = defaultdict(int)
         for s in enc_spawns:
-            agg[(s["area"], s["encounter_resref"])] += 1
+            if s["area"] not in db.hidden_areas:
+                agg[(s["area"], s["encounter_resref"])] += 1
         spawn_rows = []
         for (area_rr, enc_rr) in sorted(
             agg.keys(),
@@ -4071,6 +4085,8 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
     inst_rows = []
     for area_rr in sorted(db.area_creature_instances.keys(),
                           key=lambda r: db.area_name(r).lower()):
+        if area_rr in db.hidden_areas:
+            continue
         for inst in db.area_creature_instances[area_rr]:
             ic = inst["c"]
             if fld(ic, "TemplateResRef", "") != resref:
@@ -4117,6 +4133,8 @@ def render_creature_instances_index(db: Db, out: Path) -> None:
     )
     for area_rr in sorted(db.area_creature_instances.keys(),
                           key=lambda r: db.area_name(r).lower()):
+        if area_rr in db.hidden_areas:
+            continue
         insts = db.area_creature_instances[area_rr]
         if not insts:
             continue
@@ -4384,6 +4402,8 @@ def _creature_store_section(db: "Db", creature_resref: str,
         key=lambda kv: nwn_text(db.area_name(kv[0])).lower(),
     ):
         if filter_area and area_rr != filter_area:
+            continue
+        if area_rr in db.hidden_areas:
             continue
         for inst in store_list:
             tag = fld(inst, "Tag", "")
@@ -4677,6 +4697,8 @@ def render_stores_index(db: Db, out: Path) -> None:
 
     for area_rr in sorted(db.area_stores.keys(),
                           key=lambda a: nwn_text(db.area_name(a)).lower()):
+        if area_rr in db.hidden_areas:
+            continue
         for inst in db.area_stores[area_rr]:
             rr = fld(inst, "ResRef", "")
             tag = fld(inst, "Tag", "")
@@ -4835,12 +4857,16 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
         return
     name = db.store_name(resref)
 
-    # Find all placed instances for this blueprint
-    instances: list[tuple[str, Any]] = []
+    # Find all placed instances for this blueprint, excluding hidden areas.
+    # If every placement is in a hidden area, suppress the blueprint page entirely.
+    all_instances: list[tuple[str, Any]] = []
     for area_rr, store_list in db.area_stores.items():
         for inst in store_list:
             if fld(inst, "ResRef", "") == resref:
-                instances.append((area_rr, inst))
+                all_instances.append((area_rr, inst))
+    instances = [(a, i) for a, i in all_instances if a not in db.hidden_areas]
+    if not instances and all_instances:
+        return  # all placements are in hidden areas
     instances.sort(key=lambda x: nwn_text(db.area_name(x[0])).lower())
 
     sections = [f"<h1>{nwn_html(name)}</h1>"]
@@ -6342,14 +6368,15 @@ def main() -> int:
     # Layout
     print("[nwn-wiki] computing area layout")
     t0 = time.time()
+    visible_areas = {r for r in db.areas if r not in db.hidden_areas}
     edges = []
     for tr in db.transitions:
         a, b = tr["src_area"], tr["dst_area"]
-        if a in db.areas and b in db.areas:
+        if a in visible_areas and b in visible_areas:
             edges.append((a, b))
     for tr in db.script_transitions:
         a, b = tr["src_area"], tr["dst_area"]
-        if a in db.areas and b and b in db.areas:
+        if a in visible_areas and b and b in visible_areas:
             edges.append((a, b))
     # Conversation-teleport edges and the pseudo-nodes that sit at the
     # source of "global" trigger conversations (rest menu, item activators).
@@ -6357,14 +6384,14 @@ def main() -> int:
     for tr in db.conv_transitions:
         s = tr["src"]
         d = tr["dst_area"]
-        # Either both endpoints are areas, or src is a pseudo-node we'll
+        # Either both endpoints are visible areas, or src is a pseudo-node we'll
         # add to node_ids below.
-        if d not in db.areas:
+        if d not in visible_areas:
             continue
-        if s in db.areas or s in db.global_convo_pseudo:
+        if s in visible_areas or s in db.global_convo_pseudo:
             edges.append((s, d))
     positions, sizes = layout_areas(
-        sorted(db.areas.keys()) + pseudo_nodes,
+        sorted(visible_areas) + pseudo_nodes,
         edges,
         db=db,
         seed=args.seed,
@@ -6405,10 +6432,14 @@ def main() -> int:
     render_index(db, out, title, positions, sizes, base_url=args.base_url)
     render_areas_index(db, out)
     for resref in db.areas:
+        if resref in db.hidden_areas:
+            continue
         render_area_page(db, resref, out,
                          path_from_name=path_from_name,
                          path_steps=area_paths.get(resref, _OMIT))
     for resref, conts in db.area_containers.items():
+        if resref in db.hidden_areas:
+            continue
         for c in conts:
             render_container_page(db, resref, c, out)
     render_creatures_index(db, out)
@@ -6416,6 +6447,8 @@ def main() -> int:
         render_creature_page(db, resref, out)
     render_creature_instances_index(db, out)
     for area_rr, insts in db.area_creature_instances.items():
+        if area_rr in db.hidden_areas:
+            continue
         for inst in insts:
             render_creature_instance_page(db, area_rr, inst["idx"], out)
     render_items_index(db, out)
@@ -6423,6 +6456,8 @@ def main() -> int:
         render_item_page(db, resref, out)
     render_stores_index(db, out)
     for area_rr, inst_list in db.area_stores.items():
+        if area_rr in db.hidden_areas:
+            continue
         for inst in inst_list:
             render_store_instance_page(db, area_rr, inst, out)
     for resref in db.stores:

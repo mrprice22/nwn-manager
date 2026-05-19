@@ -265,6 +265,30 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
     --exclude-conv-option "[Admin Options]" \
     --exclude-conv-option "[Options of the Homeless]"
   ```
+
+  **Hiding entire areas from the wiki** — add `WIKI_HIDDEN` anywhere in an
+  area's **Comments** field (the Notes text box in the NWN Toolset's Area
+  Properties dialog, case-insensitive) to remove that area and everything
+  directly tied to it from all wiki output:
+
+  - Area is removed from the index map and the Areas list page; no area
+    page is generated.
+  - Stores placed in the area are removed from the Stores index and get no
+    instance page. If a store blueprint is placed *only* in hidden areas,
+    its blueprint page is suppressed too.
+  - Creature instances placed in the area are removed from the Creature
+    Instances index and get no instance page. Blueprint pages for those
+    creatures still exist, but the hidden placements are omitted from the
+    "Instances" and "Encounter spawns" tables on those pages.
+  - Container (placeable-with-inventory) pages for the area are not
+    generated.
+  - Transitions to/from the area are excluded from the map edges and from
+    the global-trigger conversation destinations table.
+
+  The Comments field is a free-text notes field — any other content in it
+  is unaffected. Adding `WIKI_HIDDEN` to an area leaves the module itself
+  completely unchanged; it only signals the wiki generator.
+
 - `assets/style.css` — bundled stylesheet.
 - `manual/` — rendered hand-written documentation pages (see below).
 
