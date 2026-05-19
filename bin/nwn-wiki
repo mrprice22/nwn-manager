@@ -894,6 +894,11 @@ class Db:
         # dlg resref → list of {"resref": script, "kind": "active"|"action",
         #                       "node_kind": "entry"|"reply", "node_index": int}
         self.dialog_scripts: dict[str, list[dict]] = defaultdict(list)
+        # script resref → set of store tags the script opens via OpenStore().
+        self.script_store_tags: dict[str, set[str]] = defaultdict(set)
+        # store instance tag (lowercase) → list of opener descriptors, same
+        # shape as dialog_callers entries plus optional "via_dialog"/"via_script".
+        self.store_tag_openers: dict[str, list[dict]] = defaultdict(list)
         # Pseudo-map nodes for conversations triggered "globally" (rest menu etc.)
         # that contain teleports. id → {label, conv_resref, dests: [area resrefs]}
         self.global_convo_pseudo: dict[str, dict] = {}
@@ -1190,6 +1195,9 @@ class Db:
     _RE_JUMP = re.compile(
         r"\b(?:Action)?(?:JumpToLocation|JumpToObject)\s*\("
     )
+    _RE_OPEN_STORE = re.compile(
+        r"\b(?:OpenStore|gplotAppraiseOpenStore)\s*\("
+    )
 
     def _parse_scripts(self) -> None:
         """One-shot scan of every .nss file. Populates script_dialogs and
@@ -1216,6 +1224,12 @@ class Db:
             if self._RE_JUMP.search(text):
                 for m in self._RE_GET_TAG.finditer(text):
                     self.script_teleport_tags[resref].add(m.group(1))
+            # Store-opening heuristic: a script that calls OpenStore (or the
+            # HoMERs appraise variant) and resolves an object by tag is assumed
+            # to be opening the store with that tag.
+            if self._RE_OPEN_STORE.search(text):
+                for m in self._RE_GET_TAG.finditer(text):
+                    self.script_store_tags[resref].add(m.group(1))
 
     def _build_tag_to_area(self) -> None:
         """Tag → area resref index spanning every placement (waypoints,
@@ -1625,6 +1639,123 @@ class Db:
         print(f"  dialog xref in {time.time()-t0:.1f}s — {len(self.dialogs)} dialogs, "
               f"{n_callers} callers, {n_glob} global pseudo-nodes, "
               f"{n_conv_edges} conv map edges{excl_msg}")
+
+        self._build_store_openers()
+
+    def _build_store_openers(self) -> None:
+        """Populate store_tag_openers. Must be called after index_dialogs so
+        that dialog_callers and dialog_scripts are fully built."""
+        # 1. Dialog action scripts that open stores: trace caller → dialog → script → store.
+        for dlg_resref, script_list in self.dialog_scripts.items():
+            for s in script_list:
+                if s["kind"] != "action":
+                    continue
+                store_tags = self.script_store_tags.get(s["resref"], set())
+                if not store_tags:
+                    continue
+                for caller in self.dialog_callers.get(dlg_resref, []):
+                    for tag in store_tags:
+                        self.store_tag_openers[tag.lower()].append({
+                            **caller,
+                            "via_script": s["resref"],
+                            "via_dialog": dlg_resref,
+                        })
+
+        # 2. Entity event scripts that directly open stores (trigger OnEnter, etc.).
+        creature_areas: dict[str, set[str]] = defaultdict(set)
+        trigger_areas: dict[str, set[str]] = defaultdict(set)
+        placeable_areas: dict[str, set[str]] = defaultdict(set)
+        for ar, npcs in self.area_npcs.items():
+            for c in npcs:
+                rr = fld(c, "TemplateResRef", "")
+                if rr:
+                    creature_areas[rr].add(ar)
+        for ar, ts in self.area_triggers.items():
+            for t in ts:
+                rr = fld(t, "TemplateResRef", "")
+                if rr:
+                    trigger_areas[rr].add(ar)
+        for ar, ps in self.area_placeables.items():
+            for p in ps:
+                rr = fld(p, "TemplateResRef", "")
+                if rr:
+                    placeable_areas[rr].add(ar)
+
+        def _add_direct(blueprints: dict, fields: dict[str, str],
+                        kind: str, areas_idx: dict[str, set[str]]) -> None:
+            for rr, bp in blueprints.items():
+                for fld_name, label in fields.items():
+                    s = (fld(bp, fld_name, "") or "").lower()
+                    if not s:
+                        continue
+                    for tag in self.script_store_tags.get(s, set()):
+                        self.store_tag_openers[tag.lower()].append({
+                            "kind": kind, "resref": rr, "event": label, "script": s,
+                            "areas": sorted(areas_idx.get(rr, set())),
+                        })
+
+        _add_direct(self.creatures, self.CREATURE_EVENT_FIELDS, "creature-event", creature_areas)
+        _add_direct(self.triggers, self.TRIGGER_EVENT_FIELDS, "trigger-event", trigger_areas)
+        _add_direct(self.placeables, self.PLACEABLE_EVENT_FIELDS, "placeable-event", placeable_areas)
+
+        # 2a. Per-instance trigger overrides.
+        for area_rr, ts in self.area_triggers.items():
+            for idx, inst in enumerate(ts):
+                inst_tag = fld(inst, "Tag", "") or ""
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                for fld_name, label in self.TRIGGER_EVENT_FIELDS.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if not s:
+                        continue
+                    for store_tag in self.script_store_tags.get(s, set()):
+                        self.store_tag_openers[store_tag.lower()].append({
+                            "kind": "trigger-event-instance",
+                            "area": area_rr, "idx": idx, "tag": inst_tag,
+                            "resref": bp_rr, "event": label, "script": s,
+                            "areas": [area_rr],
+                        })
+
+        # Dedupe: prefer instance entries over blueprint entries for the same
+        # NPC+area+dialog combination so each NPC only shows once.
+        for tag, openers in self.store_tag_openers.items():
+            # First pass: collect by exact key
+            exact_seen: set[tuple] = set()
+            exact_uniq = []
+            for o in openers:
+                key = (o.get("kind"), o.get("resref"), o.get("event"),
+                       o.get("script"), o.get("area"), o.get("idx"),
+                       o.get("via_dialog"))
+                if key not in exact_seen:
+                    exact_seen.add(key)
+                    exact_uniq.append(o)
+            # Second pass: drop blueprint-level entries when an instance entry
+            # for the same resref+area+dialog already exists (instance is more precise).
+            instance_keys: set[tuple] = {
+                (o["resref"], o.get("area") or (o.get("areas") or [""])[0],
+                 o.get("via_dialog"))
+                for o in exact_uniq
+                if o.get("kind") in ("creature-instance", "placeable-instance",
+                                     "door-instance", "trigger-event-instance",
+                                     "placeable-event-instance", "door-event-instance")
+            }
+            uniq = []
+            for o in exact_uniq:
+                kind = o.get("kind", "")
+                is_bp = kind in ("creature", "creature-event", "placeable",
+                                 "placeable-event", "door", "door-event",
+                                 "trigger-event")
+                if is_bp:
+                    # Drop if a corresponding instance entry already covers it.
+                    areas = o.get("areas") or []
+                    via_dlg = o.get("via_dialog")
+                    rr = o.get("resref", "")
+                    covered = any(
+                        (rr, a, via_dlg) in instance_keys for a in areas
+                    )
+                    if covered:
+                        continue
+                uniq.append(o)
+            self.store_tag_openers[tag] = uniq
 
     # ---- Convenience getters ----
 
@@ -3968,14 +4099,156 @@ _STORE_TABLE_HEAD = (
 )
 
 
+def _store_instance_slug(area_rr: str, inst: dict) -> str:
+    """Stable URL slug for a placed store instance: area + tag (or resref)."""
+    tag = fld(inst, "Tag", "") or fld(inst, "ResRef", "") or "unknown"
+    return f"{area_rr}_{tag.lower()}"
+
+
+def _store_opener_html(db: Db, opener: dict, root_rel: str = "..") -> str:
+    """Compact one-liner describing what opens a store, for table cells."""
+    kind = opener.get("kind", "")
+    rr = opener.get("resref", "")
+    via_dlg = opener.get("via_dialog", "")
+
+    if kind in ("creature", "creature-instance", "creature-event"):
+        if kind == "creature-instance":
+            area_rr = opener.get("area", "")
+            idx = opener.get("idx", 0)
+            name = db.creature_instance_name(area_rr, idx) or rr or "(NPC)"
+            url = f"{root_rel}/creatures/instances/{area_rr}-{idx:03d}.html"
+            npc_html = f'<a href="{E(url)}">{nwn_html(name)}</a>'
+        else:
+            name = db.creature_name(rr) if rr in db.creatures else (rr or "NPC")
+            npc_html = (link(f"{root_rel}/creatures/{rr}.html", name)
+                        if rr in db.creatures else nwn_html(name))
+        if via_dlg and via_dlg in db.dialogs:
+            conv = link(f"{root_rel}/conversations/{via_dlg}.html", "conversation")
+            return f"NPC {npc_html} (via {conv})"
+        return f"NPC {npc_html}"
+
+    if kind in ("trigger-event", "trigger-event-instance"):
+        inst_tag = opener.get("tag") or rr or "trigger"
+        areas = opener.get("areas", [])
+        area_html = ""
+        if areas and areas[0] in db.areas:
+            area_html = " in " + link(f"{root_rel}/areas/{areas[0]}.html",
+                                      db.area_name(areas[0]))
+        return f'Trigger <code>{E(inst_tag)}</code>{area_html}'
+
+    if kind in ("placeable-event", "placeable-event-instance"):
+        inst_tag = opener.get("tag") or rr or "placeable"
+        return f'Placeable <code>{E(inst_tag)}</code>'
+
+    # Fall back to full caller html for any other kind.
+    return _caller_html(db, opener, root_rel=root_rel)
+
+
+def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> None:
+    """Render a per-placement store page showing the instance's actual inventory."""
+    rr = fld(inst, "ResRef", "") or ""
+    tag = fld(inst, "Tag", "") or rr
+    slug = _store_instance_slug(area_rr, inst)
+
+    bp_name = db.store_name(rr) if rr in db.stores else ""
+    name = bp_name or nwn_text(loc(inst.get("LocName"))) or tag or rr
+
+    sections = [f"<h1>{nwn_html(name)}</h1>"]
+
+    # Location and blueprint metadata
+    area_link = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                 if area_rr in db.areas else E(area_rr))
+    meta = [
+        f"<dt>Area</dt><dd>{area_link}</dd>",
+        f"<dt>Tag</dt><dd><code>{E(tag)}</code></dd>",
+        f"<dt>ResRef (blueprint)</dt><dd>"
+        + (link(f"{rr}.html", rr) if rr in db.stores else E(rr))
+        + "</dd>",
+    ]
+    mu = fld(inst, "MarkUp", None)
+    md = fld(inst, "MarkDown", None)
+    if mu is not None or md is not None:
+        meta.append(
+            f"<dt>Sells At / Buys At</dt><dd>"
+            f"{f'{mu}%' if mu is not None else '—'} / "
+            f"{f'{md}%' if md is not None else '—'}</dd>"
+        )
+    mbp = fld(inst, "MaxBuyPrice", None)
+    if mbp is not None:
+        meta.append(f"<dt>Max Buy Price</dt><dd>{_buy_limit_str(mbp)}</dd>")
+    sections.extend(['<dl class="meta">', *meta, "</dl>"])
+
+    # Opened By
+    openers = db.store_tag_openers.get(tag.lower(), [])
+    # Filter to openers in the same area first, then fall back to all openers.
+    area_openers = [o for o in openers if area_rr in o.get("areas", []) or
+                    o.get("area") == area_rr]
+    display_openers = area_openers or openers
+    if display_openers:
+        sections.append("<h2>Opened by</h2><ul>")
+        seen_html: set[str] = set()
+        for o in display_openers:
+            h = _store_opener_html(db, o, root_rel="..")
+            if h not in seen_html:
+                seen_html.add(h)
+                sections.append(f"<li>{h}</li>")
+        sections.append("</ul>")
+    else:
+        sections.append(
+            "<h2>Opened by</h2>"
+            '<p class="muted">No opener found in static analysis — '
+            "may be opened from a runtime-only code path, or may be inaccessible.</p>"
+        )
+
+    # Instance inventory
+    page_names = ["Armor", "Misc", "Potions", "Rings", "Weapons"]
+    pages = list_items(inst.get("StoreList"))
+    has_items = any(list_items(p.get("ItemList")) for p in pages)
+    if has_items:
+        sections.append("<h2>Inventory</h2>")
+        for idx, p in enumerate(pages):
+            items = list_items(p.get("ItemList"))
+            if not items:
+                continue
+            page_label = page_names[idx] if idx < len(page_names) else f"Page {idx}"
+            rows = []
+            for it in items:
+                irr = fld(it, "InventoryRes", "") or fld(it, "EquippedRes", "")
+                disp = db.item_name(irr) if irr in db.items else irr
+                cell = (link(f"../items/{irr}.html", disp)
+                        if irr in db.items else nwn_html(disp))
+                rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
+            sections.append(
+                f"<h3>{E(page_label)}</h3>"
+                '<table class="data"><thead><tr><th>Item</th><th>ResRef</th>'
+                "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+    else:
+        sections.append("<h2>Inventory</h2><p class=\"muted\">No items in this instance.</p>")
+
+    write(out / "stores" / f"{slug}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
 def render_stores_index(db: Db, out: Path) -> None:
     # The GIT instance is the authoritative source: each placed store can have
     # different MarkUp/MarkDown/MaxBuyPrice/inventory from the UTM blueprint.
     # NWN semantics: MarkUp = % of base the store charges you (Sells At, usually >100)
     #                MarkDown = % of base the store pays you  (Buys At,  usually <100)
 
-    placed_rows: list[tuple[str, str]] = []  # (sort_key, html_row)
+    placed_rows: list[tuple[str, str]] = []      # (sort_key, html_row) — has opener
+    no_opener_rows: list[tuple[str, str]] = []   # (sort_key, html_row) — no opener found
     placed_resrefs: set[str] = set()
+
+    _IDX_TABLE_HEAD = (
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>ResRef</th><th>Tag</th><th>Items</th>"
+        "<th>Area</th><th>Opened By</th>"
+        '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+        '<th title="Price store pays you for items (% of base)">Buys At</th>'
+        '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+        "</tr></thead><tbody>"
+    )
 
     for area_rr in sorted(db.area_stores.keys(),
                           key=lambda a: nwn_text(db.area_name(a)).lower()):
@@ -3985,8 +4258,8 @@ def render_stores_index(db: Db, out: Path) -> None:
             placed_resrefs.add(rr)
 
             name = db.store_name(rr) if rr in db.stores else (tag or rr)
-            name_cell = (link(f"{rr}.html", name) if rr in db.stores
-                         else nwn_html(name))
+            slug = _store_instance_slug(area_rr, inst)
+            name_cell = link(f"{slug}.html", name)
 
             pages = list_items(inst.get("StoreList"))
             n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
@@ -3998,21 +4271,46 @@ def render_stores_index(db: Db, out: Path) -> None:
 
             area_cell = link(f"../areas/{area_rr}.html", db.area_name(area_rr))
 
-            placed_rows.append((
-                nwn_text(name).lower(),
+            # Opener column: prefer openers in the same area, fall back to any.
+            all_openers = db.store_tag_openers.get(tag.lower(), [])
+            area_openers = [o for o in all_openers
+                            if area_rr in o.get("areas", []) or o.get("area") == area_rr]
+            display_openers = area_openers or all_openers
+            if display_openers:
+                seen_html: set[str] = set()
+                opener_parts = []
+                for o in display_openers[:3]:  # cap at 3 in index for readability
+                    h = _store_opener_html(db, o, root_rel="..")
+                    if h not in seen_html:
+                        seen_html.add(h)
+                        opener_parts.append(h)
+                opener_cell = "<br>".join(opener_parts)
+                if len(display_openers) > 3:
+                    opener_cell += f" <em class=\"muted\">(+{len(display_openers)-3} more)</em>"
+            else:
+                opener_cell = '<em class="muted">unknown</em>'
+
+            row = (
                 f"<tr>"
                 f"<td>{name_cell}</td>"
                 f"<td>{E(rr)}</td>"
                 f"<td>{E(tag)}</td>"
                 f"<td>{n_items}</td>"
                 f"<td>{area_cell}</td>"
+                f"<td>{opener_cell}</td>"
                 f"<td>{mu_str}</td>"
                 f"<td>{md_str}</td>"
                 f"<td>{_buy_limit_str(fld(inst, 'MaxBuyPrice', None))}</td>"
                 f"</tr>"
-            ))
+            )
+            sort_key = nwn_text(name).lower()
+            if display_openers:
+                placed_rows.append((sort_key, row))
+            else:
+                no_opener_rows.append((sort_key, row))
 
     placed_rows.sort(key=lambda x: x[0])
+    no_opener_rows.sort(key=lambda x: x[0])
 
     # UTM blueprints that were never placed in any area
     unplaced_rows: list[str] = []
@@ -4032,29 +4330,41 @@ def render_stores_index(db: Db, out: Path) -> None:
             f"<td>{E(fld(s, 'Tag', ''))}</td>"
             f"<td>{n_items}</td>"
             f"<td><em>Not placed</em></td>"
+            f"<td>—</td>"
             f"<td>{f'{mu_val}%' if mu_val is not None else '—'}</td>"
             f"<td>{f'{md_val}%' if md_val is not None else '—'}</td>"
             f"<td>{_buy_limit_str(fld(s, 'MaxBuyPrice', None))}</td>"
             f"</tr>"
         )
 
-    n_placed = len(placed_rows)
+    n_placed = len(placed_rows) + len(no_opener_rows)
     body = "<h1>Stores</h1>"
     body += (
         f"<p>{n_placed} placed store instance{'s' if n_placed != 1 else ''}"
+        + (f"; {len(no_opener_rows)} with no known opener"
+           if no_opener_rows else "")
         + (f"; {len(unplaced_rows)} unplaced blueprint"
-           f"{'s' if len(unplaced_rows) != 1 else ''} below"
+           f"{'s' if len(unplaced_rows) != 1 else ''} at bottom"
            if unplaced_rows else "")
         + ". Values shown are per-area instance data (may differ from blueprint defaults).</p>"
     )
-    body += _STORE_TABLE_HEAD + "\n".join(r[1] for r in placed_rows) + "</tbody></table>"
+    body += _IDX_TABLE_HEAD + "\n".join(r[1] for r in placed_rows) + "</tbody></table>"
+
+    if no_opener_rows:
+        body += (
+            "<h2>Possibly Inaccessible</h2>"
+            "<p>These stores are placed in areas but no NPC conversation or trigger "
+            "was found that opens them. They may be opened by runtime-only code "
+            "(dynamic tag lookup, item scripts) or may be bugged / unreachable.</p>"
+            + _IDX_TABLE_HEAD + "\n".join(r[1] for r in no_opener_rows) + "</tbody></table>"
+        )
 
     if unplaced_rows:
         body += (
             "<h2>Unplaced Blueprints</h2>"
             "<p>These store blueprints exist in the module files but are not placed "
             "in any area — they are not accessible to players.</p>"
-            + _STORE_TABLE_HEAD + "\n".join(unplaced_rows) + "</tbody></table>"
+            + _IDX_TABLE_HEAD + "\n".join(unplaced_rows) + "</tbody></table>"
         )
 
     write(out / "stores" / "index.html", page("Stores", body, root_rel=".."))
@@ -4083,10 +4393,12 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
             md = fld(inst, "MarkDown", None)
             pages = list_items(inst.get("StoreList"))
             n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+            inst_tag = fld(inst, "Tag", "") or ""
+            slug = _store_instance_slug(area_rr, inst)
             inst_rows.append(
                 f"<tr>"
                 f"<td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
-                f"<td>{E(fld(inst, 'Tag', ''))}</td>"
+                f"<td>{link(f'{slug}.html', inst_tag) if inst_tag else '—'}</td>"
                 f"<td>{n_items}</td>"
                 f"<td>{f'{mu}%' if mu is not None else '—'}</td>"
                 f"<td>{f'{md}%' if md is not None else '—'}</td>"
@@ -5620,6 +5932,9 @@ def main() -> int:
     for resref in db.items:
         render_item_page(db, resref, out)
     render_stores_index(db, out)
+    for area_rr, inst_list in db.area_stores.items():
+        for inst in inst_list:
+            render_store_instance_page(db, area_rr, inst, out)
     for resref in db.stores:
         render_store_page(db, resref, out)
     render_conversations_index(db, out)
