@@ -1129,6 +1129,25 @@ class Db:
             rr for rr, a in self.areas.items()
             if "WIKI_HIDDEN" in (fld(a, "Comments") or "").upper()
         }
+
+        # Absorb items embedded inline in store inventories (UTM and GIT) that
+        # have no standalone .uti blueprint. Without this, they are invisible to
+        # the items index and can't be linked from the stores pages.
+        _seen_store_irrs: set[str] = set(self.items.keys())
+        def _absorb_store_pages(pages: list) -> None:
+            for p in pages:
+                for it in list_items(p.get("ItemList")):
+                    irr = (fld(it, "TemplateResRef", "")
+                           or fld(it, "InventoryRes", "") or "").strip()
+                    if irr and irr not in _seen_store_irrs:
+                        _seen_store_irrs.add(irr)
+                        self.items[irr] = it
+        for s in self.stores.values():
+            _absorb_store_pages(list_items(s.get("StoreList")))
+        for inst_list in self.area_stores.values():
+            for inst in inst_list:
+                _absorb_store_pages(list_items(inst.get("StoreList")))
+
         hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
                       if self.hidden_areas else "")
         print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
@@ -4333,7 +4352,7 @@ def render_items_index(db: Db, out: Path) -> None:
         )
     body = (
         "<h1>Items</h1>"
-        f"<p>{len(db.items)} item blueprints. "
+        f"<p>{len(db.items)} items (blueprints and store-embedded items). "
         '<small class="muted">Base item names use the stock NWN '
         "baseitems.2da; CEP and other HAKs frequently override or extend "
         "rows, so the <em>row number</em> shown alongside is authoritative.</small></p>"
