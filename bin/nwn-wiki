@@ -4389,6 +4389,15 @@ def render_creature_instance_page(db: Db, area_rr: str, idx: int, out: Path) -> 
           page(name, "\n".join(sections), root_rel="../.."))
 
 
+def _fmt_cost(raw) -> str:
+    """Format an item Cost value with comma separators; returns '' for missing/zero."""
+    try:
+        v = int(raw)
+        return f"{v:,}" if v else ""
+    except (TypeError, ValueError):
+        return E(str(raw)) if raw not in (None, "") else ""
+
+
 def render_items_index(db: Db, out: Path) -> None:
     _TABLE_HEAD = (
         '<table class="data"><thead><tr>'
@@ -4401,7 +4410,7 @@ def render_items_index(db: Db, out: Path) -> None:
             f"<tr><td>{link(f'{rr}.html', db.item_name(rr))}</td>"
             f"<td>{E(rr)}</td>"
             f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>"
-            f"<td>{E(fld(i, 'Cost', ''))}</td>"
+            f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>"
             f"<td>{E(fld(i, 'StackSize', ''))}</td></tr>"
         )
 
@@ -4470,7 +4479,7 @@ def render_items_index(db: Db, out: Path) -> None:
                 f"<tr><td>{link(f'{rr}.html', rr)}</td>"
                 f"<td>{E(rr)}</td>"
                 f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>"
-                f"<td>{E(fld(i, 'Cost', ''))}</td>"
+                f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>"
                 f"<td>{E(fld(i, 'StackSize', ''))}</td></tr>"
             )
         rows_html = "\n".join(_broken_row(rr, i) for rr, i in broken_sorted)
@@ -4504,7 +4513,8 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
-        f"<dt>Cost</dt><dd>{E(fld(i, 'Cost', ''))}</dd>",
+        f"<dt>Type</dt><dd>{E(dict(_ITEM_CATEGORIES).get(_item_category(i), 'Miscellaneous'))}</dd>",
+        f"<dt>Cost</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
         f"<dt>Cursed</dt><dd>{E(fld(i, 'Cursed', ''))}</dd>",
         f"<dt>Plot</dt><dd>{E(fld(i, 'Plot', ''))}</dd>",
