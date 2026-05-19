@@ -3124,6 +3124,39 @@ def render_areas_index(db: Db, out: Path, *,
             "</tbody></table>",
         ]
 
+    # Unresolved transitions: door/trigger LinkedTo targets that don't match any
+    # waypoint, door, or trigger tag in the module.
+    unresolved: dict[str, list[dict]] = {}
+    for tr in db.transitions:
+        if not tr["dst_area"] and tr.get("dst_tag"):
+            unresolved.setdefault(tr["dst_tag"], []).append(tr)
+    if unresolved:
+        rows = []
+        for tag in sorted(unresolved, key=str.lower):
+            refs = unresolved[tag]
+            for tr in refs:
+                src = tr["src_area"]
+                rows.append(
+                    f"<tr>"
+                    f"<td><code>{E(tag)}</code></td>"
+                    f"<td>{link(f'{src}.html', db.area_name(src))}</td>"
+                    f"<td>{E(tr['kind'])}</td>"
+                    f"<td>{E(tr['label'])}</td>"
+                    f"</tr>"
+                )
+        body_parts += [
+            '<h2 id="unresolved-transitions">Unresolved transition targets</h2>',
+            '<p class="warn-fallback-note">&#9888; The tags below are referenced by'
+            ' door or trigger <code>LinkedTo</code> fields but do not exist as a'
+            ' waypoint, door, or trigger tag in any area. Each likely indicates a'
+            ' missing waypoint, a typo, or unfinished content.</p>',
+            '<table class="data"><thead><tr>'
+            '<th>Target tag</th><th>From area</th><th>Kind</th><th>Label</th>'
+            '</tr></thead><tbody>',
+            "\n".join(rows),
+            "</tbody></table>",
+        ]
+
     body = "".join(body_parts)
     write(out / "areas" / "index.html", page("Areas", body, root_rel=".."))
 
