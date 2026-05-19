@@ -668,7 +668,57 @@ SLOT_NAMES = {
 
 WEAPON_SLOTS = {SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B}
 ARMOR_SLOTS = {SLOT_CHEST, SLOT_LEFT}  # left can hold a shield
-SHIELD_BASEITEMS = {58, 59, 60}  # Small / Large / Tower shields (stock 2da rows)
+SHIELD_BASEITEMS = {14, 56, 57}  # Small / Large / Tower shields (stock 2da rows)
+
+# BaseItem sets for items-index grouping.
+_ARMOR_BASEITEMS:     frozenset[int] = frozenset({16})
+_HELMET_BASEITEMS:    frozenset[int] = frozenset({17})
+_JEWELRY_BASEITEMS:   frozenset[int] = frozenset({19, 21, 26, 36, 52, 78, 80})  # Amulet Belt Boots Gauntlet Ring Bracer Cloak
+_AMMO_BASEITEMS:      frozenset[int] = frozenset({20, 25, 27})                  # Arrow Bolt Bullet
+_CONSUMABLE_BASEITEMS: frozenset[int] = frozenset({46, 49, 75, 81, 104, 105, 106})  # Wand Potion Scroll Grenade etc.
+
+# (key, display label) in the order they appear in the items index.
+_ITEM_CATEGORIES: list[tuple[str, str]] = [
+    ("armor_heavy",  "Heavy Armor"),
+    ("armor_medium", "Medium Armor"),
+    ("armor_light",  "Light Armor"),
+    ("armor_cloth",  "Cloth & Robes"),
+    ("shield",       "Shields"),
+    ("helmet",       "Helmets"),
+    ("weapon",       "Weapons"),
+    ("jewelry",      "Jewelry & Accessories"),
+    ("ammo",         "Ammunition"),
+    ("consumable",   "Consumables"),
+    ("misc",         "Miscellaneous"),
+]
+
+
+def _item_category(item: dict) -> str:
+    """Return the items-index category key for an item dict."""
+    bi = int(fld(item, "BaseItem", -1) or -1)
+    if bi in _ARMOR_BASEITEMS:
+        ac, _ = item_ac_bonus(item)
+        if ac <= 0:
+            return "armor_cloth"
+        if ac <= 4:
+            return "armor_light"
+        if ac <= 6:
+            return "armor_medium"
+        return "armor_heavy"
+    if bi in SHIELD_BASEITEMS:
+        return "shield"
+    if bi in _HELMET_BASEITEMS:
+        return "helmet"
+    if bi in _JEWELRY_BASEITEMS:
+        return "jewelry"
+    if bi in _CONSUMABLE_BASEITEMS:
+        return "consumable"
+    if bi in _AMMO_BASEITEMS:
+        return "ammo"
+    stats = WEAPONS.get(bi)
+    if stats and stats.get("WeaponType", "0") not in ("0", "", None):
+        return "weapon"
+    return "misc"
 
 
 def is_ranged_weapon(base_row: int | None) -> bool:
@@ -4340,26 +4390,101 @@ def render_creature_instance_page(db: Db, area_rr: str, idx: int, out: Path) -> 
 
 
 def render_items_index(db: Db, out: Path) -> None:
-    rows = []
-    for rr in sorted(db.items.keys(), key=lambda r: nwn_text(db.item_name(r)).lower()):
-        i = db.items[rr]
-        rows.append(
+    _TABLE_HEAD = (
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>ResRef</th><th>Base item</th><th>Cost</th><th>Stack</th>"
+        "</tr></thead><tbody>"
+    )
+
+    def _row(rr: str, i: dict) -> str:
+        return (
             f"<tr><td>{link(f'{rr}.html', db.item_name(rr))}</td>"
             f"<td>{E(rr)}</td>"
             f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>"
             f"<td>{E(fld(i, 'Cost', ''))}</td>"
             f"<td>{E(fld(i, 'StackSize', ''))}</td></tr>"
         )
-    body = (
-        "<h1>Items</h1>"
-        f"<p>{len(db.items)} items (blueprints and store-embedded items). "
-        '<small class="muted">Base item names use the stock NWN '
-        "baseitems.2da; CEP and other HAKs frequently override or extend "
-        "rows, so the <em>row number</em> shown alongside is authoritative.</small></p>"
-        '<table class="data"><thead><tr>'
-        "<th>Name</th><th>ResRef</th><th>Base item</th><th>Cost</th><th>Stack</th>"
-        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+
+    # Classify every item; broken = TLK-only or completely unnamed.
+    buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    broken: list[tuple[str, dict]] = []
+
+    for rr in sorted(db.items.keys(), key=lambda r: nwn_text(db.item_name(r)).lower()):
+        i = db.items[rr]
+        name = db.item_name(rr)
+        if name.startswith("[TLK#") or name == rr:
+            broken.append((rr, i))
+        else:
+            buckets[_item_category(i)].append((rr, i))
+
+    total = sum(len(v) for v in buckets.values()) + len(broken)
+
+    # Table of contents
+    toc_parts: list[str] = []
+    for cat_key, cat_label in _ITEM_CATEGORIES:
+        items = buckets.get(cat_key, [])
+        if items:
+            slug = cat_key.replace("_", "-")
+            toc_parts.append(
+                f'<a href="#{E(slug)}">{E(cat_label)}</a>'
+                f' <span class="muted">({len(items)})</span>'
+            )
+    if broken:
+        toc_parts.append(
+            f'<a href="#broken">Potentially Broken</a>'
+            f' <span class="muted">({len(broken)})</span>'
+        )
+
+    body = "<h1>Items</h1>"
+    body += (
+        f"<p>{total} items. "
+        '<small class="muted">Base item names use stock NWN baseitems.2da; '
+        "CEP/HAK overrides are common — the row number shown is authoritative. "
+        "Armor subtypes (Cloth/Light/Medium/Heavy) are based on total AC bonus "
+        "from item properties.</small></p>"
     )
+    body += (
+        '<nav style="margin:0.5em 0 1.5em;line-height:2">'
+        + " &nbsp;·&nbsp; ".join(toc_parts)
+        + "</nav>"
+    )
+
+    for cat_key, cat_label in _ITEM_CATEGORIES:
+        items = buckets.get(cat_key, [])
+        if not items:
+            continue
+        slug = cat_key.replace("_", "-")
+        rows_html = "\n".join(_row(rr, i) for rr, i in items)
+        body += (
+            f'<h2 id="{E(slug)}">{E(cat_label)}'
+            f' <small class="muted">({len(items)})</small></h2>'
+            + _TABLE_HEAD + rows_html + "</tbody></table>"
+        )
+
+    if broken:
+        # Broken items: use the resref as the display name since TLK
+        # placeholders like "[TLK#1550]" are meaningless to readers.
+        broken_sorted = sorted(broken, key=lambda x: x[0].lower())
+        def _broken_row(rr: str, i: dict) -> str:
+            return (
+                f"<tr><td>{link(f'{rr}.html', rr)}</td>"
+                f"<td>{E(rr)}</td>"
+                f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>"
+                f"<td>{E(fld(i, 'Cost', ''))}</td>"
+                f"<td>{E(fld(i, 'StackSize', ''))}</td></tr>"
+            )
+        rows_html = "\n".join(_broken_row(rr, i) for rr, i in broken_sorted)
+        body += (
+            '<h2 id="broken">Potentially Broken'
+            f' <small class="muted">({len(broken)})</small></h2>'
+            '<p class="muted">These items were found only in store inventories '
+            "and their names come from the base game's TLK file, which is not "
+            "loaded. They are typically stock NWN items (nw_*, x0_*, x2_*) "
+            "added directly to store inventories rather than custom module items. "
+            "The ResRef is shown as the name since the TLK string is unavailable.</p>"
+            + _TABLE_HEAD + rows_html + "</tbody></table>"
+        )
+
     write(out / "items" / "index.html", page("Items", body, root_rel=".."))
 
 
@@ -4368,9 +4493,13 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     if not i:
         return
     name = db.item_name(resref)
+    # TLK-placeholder names mean the item's name is not available without the
+    # base game TLK file; show the resref as the page title instead.
+    is_broken = name.startswith("[TLK#") or name == resref
+    display_name = resref if is_broken else name
     props = list_items(i.get("PropertiesList"))
     sections = [
-        f"<h1>{nwn_html(name)}</h1>",
+        f"<h1>{nwn_html(display_name)}</h1>",
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
@@ -4381,6 +4510,13 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Plot</dt><dd>{E(fld(i, 'Plot', ''))}</dd>",
         '</dl>',
     ]
+    if is_broken:
+        sections.append(
+            '<p class="muted"><em>Item name not available: this item\'s name is '
+            "stored in the base game TLK file which is not loaded. It is a stock "
+            "NWN item embedded directly in a store inventory.</em></p>"
+        )
+
     desc = loc(i.get("Description"))
     if desc:
         sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
