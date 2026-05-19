@@ -671,26 +671,45 @@ ARMOR_SLOTS = {SLOT_CHEST, SLOT_LEFT}  # left can hold a shield
 SHIELD_BASEITEMS = {14, 56, 57}  # Small / Large / Tower shields (stock 2da rows)
 
 # BaseItem sets for items-index grouping.
-_ARMOR_BASEITEMS:     frozenset[int] = frozenset({16})
-_HELMET_BASEITEMS:    frozenset[int] = frozenset({17})
-_JEWELRY_BASEITEMS:   frozenset[int] = frozenset({19, 21, 26, 36, 52, 78, 80})  # Amulet Belt Boots Gauntlet Ring Bracer Cloak
-_AMMO_BASEITEMS:      frozenset[int] = frozenset({20, 25, 27})                  # Arrow Bolt Bullet
+_ARMOR_BASEITEMS:      frozenset[int] = frozenset({16})
+_HELMET_BASEITEMS:     frozenset[int] = frozenset({17})
+_AMMO_BASEITEMS:       frozenset[int] = frozenset({20, 25, 27})                   # Arrow Bolt Bullet
 _CONSUMABLE_BASEITEMS: frozenset[int] = frozenset({46, 49, 75, 81, 104, 105, 106})  # Wand Potion Scroll Grenade etc.
 
-# (key, display label) in the order they appear in the items index.
-_ITEM_CATEGORIES: list[tuple[str, str]] = [
-    ("armor_heavy",  "Heavy Armor"),
-    ("armor_medium", "Medium Armor"),
-    ("armor_light",  "Light Armor"),
-    ("armor_cloth",  "Cloth & Robes"),
-    ("shield",       "Shields"),
-    ("helmet",       "Helmets"),
-    ("weapon",       "Weapons"),
-    ("jewelry",      "Jewelry & Accessories"),
-    ("ammo",         "Ammunition"),
-    ("consumable",   "Consumables"),
-    ("misc",         "Miscellaneous"),
-]
+# Maps specific accessory BaseItem rows to category keys.
+# Bracers (78) and Gauntlets (36) share one key per the items index design.
+_ACCESSORY_BASEITEM_MAP: dict[int, str] = {
+    19: "amulet",
+    21: "belt",
+    26: "boots",
+    36: "bracers_gauntlets",
+    52: "ring",
+    78: "bracers_gauntlets",
+    80: "cloak",
+}
+
+# Fixed display labels for non-weapon category keys.
+_CATEGORY_LABELS: dict[str, str] = {
+    "armor_heavy":       "Heavy Armor",
+    "armor_medium":      "Medium Armor",
+    "armor_light":       "Light Armor",
+    "armor_cloth":       "Cloth & Robes",
+    "shield":            "Shields",
+    "helmet":            "Helmets",
+    "amulet":            "Amulets",
+    "belt":              "Belts",
+    "boots":             "Boots",
+    "bracers_gauntlets": "Bracers & Gauntlets",
+    "ring":              "Rings",
+    "cloak":             "Cloaks",
+    "ammo":              "Ammunition",
+    "consumable":        "Consumables",
+    "misc":              "Miscellaneous",
+}
+
+# Fixed ordering for non-weapon sections (weapons are inserted dynamically).
+_FIXED_CATEGORY_ORDER_PRE:  list[str] = ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield", "helmet"]
+_FIXED_CATEGORY_ORDER_POST: list[str] = ["amulet", "belt", "boots", "bracers_gauntlets", "ring", "cloak", "ammo", "consumable", "misc"]
 
 
 def _item_category(item: dict) -> str:
@@ -709,16 +728,28 @@ def _item_category(item: dict) -> str:
         return "shield"
     if bi in _HELMET_BASEITEMS:
         return "helmet"
-    if bi in _JEWELRY_BASEITEMS:
-        return "jewelry"
+    if bi in _ACCESSORY_BASEITEM_MAP:
+        return _ACCESSORY_BASEITEM_MAP[bi]
     if bi in _CONSUMABLE_BASEITEMS:
         return "consumable"
     if bi in _AMMO_BASEITEMS:
         return "ammo"
     stats = WEAPONS.get(bi)
     if stats and stats.get("WeaponType", "0") not in ("0", "", None):
-        return "weapon"
+        return f"weapon_{bi}"
     return "misc"
+
+
+def _item_category_label(key: str) -> str:
+    if key in _CATEGORY_LABELS:
+        return _CATEGORY_LABELS[key]
+    if key.startswith("weapon_"):
+        try:
+            bi = int(key[7:])
+            return baseitem_name(bi) or "Weapon"
+        except ValueError:
+            pass
+    return "Miscellaneous"
 
 
 def is_ranged_weapon(base_row: int | None) -> bool:
@@ -4751,12 +4782,31 @@ def render_items_index(db: Db, out: Path) -> None:
 
     total = sum(len(v) for v in buckets.values()) + len(inaccessible) + len(broken)
 
+    def _item_cost_key(entry: tuple[str, dict]) -> int:
+        try:
+            return int(fld(entry[1], "Cost", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # Build ordered category list: fixed pre-weapon sections, then each weapon
+    # type sorted alphabetically by name, then fixed post-weapon sections.
+    weapon_keys = sorted(
+        (k for k in buckets if k.startswith("weapon_")),
+        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
+    )
+    ordered_cats: list[str] = _FIXED_CATEGORY_ORDER_PRE + weapon_keys + _FIXED_CATEGORY_ORDER_POST
+
+    # Sort each bucket by decreasing GP cost (items with no cost sort last).
+    for key in buckets:
+        buckets[key].sort(key=_item_cost_key, reverse=True)
+
     # Table of contents
     toc_parts: list[str] = []
-    for cat_key, cat_label in _ITEM_CATEGORIES:
+    for cat_key in ordered_cats:
         items = buckets.get(cat_key, [])
         if items:
             slug = cat_key.replace("_", "-")
+            cat_label = _item_category_label(cat_key)
             toc_parts.append(
                 f'<a href="#{E(slug)}">{E(cat_label)}</a>'
                 f' <span class="muted">({len(items)})</span>'
@@ -4786,11 +4836,12 @@ def render_items_index(db: Db, out: Path) -> None:
         + "</nav>"
     )
 
-    for cat_key, cat_label in _ITEM_CATEGORIES:
+    for cat_key in ordered_cats:
         items = buckets.get(cat_key, [])
         if not items:
             continue
         slug = cat_key.replace("_", "-")
+        cat_label = _item_category_label(cat_key)
         rows_html = "\n".join(_row(rr, i) for rr, i in items)
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
@@ -4853,7 +4904,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
-        f"<dt>Type</dt><dd>{E(dict(_ITEM_CATEGORIES).get(_item_category(i), 'Miscellaneous'))}</dd>",
+        f"<dt>Type</dt><dd>{E(_item_category_label(_item_category(i)))}</dd>",
         f"<dt>Cost</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
         f"<dt>Cursed</dt><dd>{E(fld(i, 'Cursed', ''))}</dd>",
