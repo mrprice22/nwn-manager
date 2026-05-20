@@ -584,6 +584,50 @@ def itemprop_oneliner(prop: dict) -> str:
     return " ".join(b for b in bits if b)
 
 
+def _prop_slug(prop_name: str, subtype: str) -> str:
+    s = (prop_name + ("-" + subtype if subtype else "")).lower()
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+
+
+def _prop_value_num(cost_str: str) -> int:
+    m = re.match(r"[+]?(\d+)", cost_str.strip())
+    return int(m.group(1)) if m else 0
+
+
+def _prop_group(prop_name: str) -> str:
+    n = prop_name.lower()
+    if any(w in n for w in ("resistance", "immunity", "vulnerability", "reduction")):
+        return "Resistances & Immunities"
+    if "saving throw" in n:
+        return "Saving Throws"
+    if any(w in n for w in ("ability", "skill")):
+        return "Ability & Skill Bonuses"
+    if any(w in n for w in ("ac bonus", "attack", "enhancement bonus", "damage")):
+        return "AC & Combat"
+    if any(w in n for w in ("spell", "cast")):
+        return "Spell & Magic"
+    return "Other"
+
+
+def _where_snippet(db: "Db", resref: str) -> str:
+    """Short 'where to find' blurb for property/search listing pages."""
+    sources: list[str] = []
+    for s in db.item_sold_at.get(resref, []):
+        sources.append("Sold: " + nwn_text(s["name"]))
+    for c in db.item_carried_by.get(resref, []):
+        sources.append("Carried by: " + nwn_text(c["cname"]))
+    for c in db.item_in_container.get(resref, []):
+        sources.append("Container: " + nwn_text(c["pname"]))
+    for s in db.item_from_script.get(resref, []):
+        sources.append("Script: " + (s.get("label") or s["script"]))
+    if not sources:
+        return '<span class="muted">—</span>'
+    first = E(sources[0])
+    if len(sources) == 1:
+        return first
+    return first + f' <span class="muted">&amp; {len(sources) - 1} more</span>'
+
+
 # ---------------------------------------------------------------------------
 # Combat-stat helpers (creature page)
 # ---------------------------------------------------------------------------
@@ -4841,7 +4885,11 @@ def render_items_index(db: Db, out: Path) -> None:
         buckets[key].sort(key=_item_cost_key, reverse=True)
 
     # Table of contents — grouped under headings.
-    toc_parts: list[str] = []
+    toc_parts: list[str] = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="properties/index.html">Browse by Property</a></div>',
+        '<div><a href="search.html">Search Items</a></div>',
+    ]
     for group_heading, group_cats_tmpl in _TOC_GROUPS:
         entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
         if not entries:
@@ -5164,6 +5212,289 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
 
     write(out / "items" / f"{resref}.html",
           page(name, "\n".join(sections), root_rel=".."))
+
+
+# ---------------------------------------------------------------------------
+# Browse by property pages
+# ---------------------------------------------------------------------------
+
+_PROP_GROUP_ORDER = [
+    "Resistances & Immunities",
+    "Saving Throws",
+    "Ability & Skill Bonuses",
+    "AC & Combat",
+    "Spell & Magic",
+    "Other",
+]
+
+
+def render_items_by_property(db: "Db", out: Path) -> None:
+    prop_index: dict[tuple[str, str], list[tuple[str, str, str, int]]] = defaultdict(list)
+
+    for resref, i in db.items.items():
+        if not (resref in db.item_sold_at or resref in db.item_in_container
+                or resref in db.item_carried_by or resref in db.item_from_script):
+            continue
+        name = db.item_name(resref)
+        if name.startswith("[TLK#") or name == resref:
+            continue
+        for p in list_items(i.get("PropertiesList")):
+            f = itemprop_format(p)
+            pname, subtype, cost_str = f["property"], f["subtype"], f["cost"]
+            if not pname:
+                continue
+            prop_index[(pname, subtype)].append(
+                (resref, name, cost_str, _prop_value_num(cost_str))
+            )
+
+    for key in prop_index:
+        prop_index[key].sort(key=lambda x: (-x[3], nwn_text(x[1]).lower()))
+
+    sorted_keys = sorted(prop_index.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
+
+    groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for pname, subtype in sorted_keys:
+        groups[_prop_group(pname)].append((pname, subtype))
+
+    # --- property index page ---
+    sidebar_parts: list[str] = []
+    for g in _PROP_GROUP_ORDER:
+        if g not in groups:
+            continue
+        anchor = re.sub(r"[^a-z0-9]+", "-", g.lower()).strip("-")
+        sidebar_parts.append(f'<div class="toc-group-heading">{E(g)}</div>')
+        for pname, subtype in groups[g]:
+            slug = _prop_slug(pname, subtype)
+            label = pname + (f": {subtype}" if subtype else "")
+            cnt = len(prop_index[(pname, subtype)])
+            sidebar_parts.append(
+                f'<div><a href="#{E(slug)}">{E(label)}'
+                f' <span class="muted">({cnt})</span></a></div>'
+            )
+    sidebar_parts += [
+        '<div class="toc-group-heading">Browse</div>',
+        '<div><a href="../index.html">← All Items</a></div>',
+        '<div><a href="../search.html">Search Items</a></div>',
+    ]
+    sidebar = '<aside class="items-toc">' + "".join(sidebar_parts) + "</aside>"
+
+    body = (
+        "<h1>Browse by Property</h1>"
+        f"<p>{len(prop_index)} property types across all accessible items.</p>"
+    )
+    for g in _PROP_GROUP_ORDER:
+        if g not in groups:
+            continue
+        anchor = re.sub(r"[^a-z0-9]+", "-", g.lower()).strip("-")
+        body += (
+            f'<h2 id="{E(anchor)}">{E(g)}</h2>'
+            '<table class="data"><thead><tr>'
+            "<th>Property</th><th>Items</th></tr></thead><tbody>"
+        )
+        for pname, subtype in groups[g]:
+            slug = _prop_slug(pname, subtype)
+            label = pname + (f": {subtype}" if subtype else "")
+            cnt = len(prop_index[(pname, subtype)])
+            body += (
+                f"<tr><td>{link(f'{slug}.html', label)}</td>"
+                f"<td>{cnt}</td></tr>"
+            )
+        body += "</tbody></table>"
+
+    layout = (
+        f'<div class="items-layout">{sidebar}'
+        f'<div class="items-content">{body}</div></div>'
+    )
+    write(out / "items" / "properties" / "index.html",
+          page("Browse by Property", layout, root_rel="../.."))
+
+    # --- per-property detail pages ---
+    for (pname, subtype), entries in prop_index.items():
+        slug = _prop_slug(pname, subtype)
+        label = pname + (f": {subtype}" if subtype else "")
+        body = (
+            f'<p><a href="index.html">← Browse by Property</a></p>'
+            f"<h1>{E(label)}</h1>"
+            f"<p>{len(entries)} items.</p>"
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Value</th><th>Where to Find</th>"
+            "</tr></thead><tbody>"
+        )
+        for resref, name, cost_str, _ in entries:
+            body += (
+                f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                f"<td>{E(cost_str)}</td>"
+                f"<td>{_where_snippet(db, resref)}</td></tr>"
+            )
+        body += "</tbody></table>"
+        write(out / "items" / "properties" / f"{slug}.html",
+              page(label, body, root_rel="../.."))
+
+
+# ---------------------------------------------------------------------------
+# Item search page + JSON index
+# ---------------------------------------------------------------------------
+
+_SEARCH_JS = r"""(function(){
+var data=[], form=document.getElementById('sf'),
+    results=document.getElementById('sr'),
+    propSel=document.getElementById('fp'),
+    subSel=document.getElementById('fs');
+
+fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
+  data=d; populateFilters();
+});
+
+function populateFilters(){
+  var bis={},props={},subs={};
+  data.forEach(function(it){
+    bis[it.base_item]=1;
+    it.properties.forEach(function(p){
+      props[p.prop]=1;
+      if(p.subtype){if(!subs[p.prop])subs[p.prop]={};subs[p.prop][p.subtype]=1;}
+    });
+  });
+  window._subs=subs;
+  var biSel=document.getElementById('fb');
+  Object.keys(bis).sort().forEach(function(b){biSel.appendChild(new Option(b,b));});
+  Object.keys(props).sort().forEach(function(p){propSel.appendChild(new Option(p,p));});
+}
+
+propSel.addEventListener('change',function(){
+  var chosen=propSel.value, sub=(window._subs||{})[chosen]||{};
+  subSel.innerHTML='<option value="">— any —</option>';
+  Object.keys(sub).sort().forEach(function(s){subSel.appendChild(new Option(s,s));});
+  subSel.disabled=!chosen||!Object.keys(sub).length;
+});
+
+form.addEventListener('submit',function(e){
+  e.preventDefault();
+  var bi=document.getElementById('fb').value,
+      prop=propSel.value, sub=subSel.value,
+      minv=parseInt(document.getElementById('fv').value,10)||0,
+      sortBy=document.getElementById('fo').value,
+      asc=document.getElementById('fd').value==='asc';
+  var propActive=prop||sub||minv>0, out=[];
+  data.forEach(function(it){
+    if(bi&&it.base_item!==bi)return;
+    var mp=it.properties.filter(function(p){
+      if(prop&&p.prop!==prop)return false;
+      if(sub&&p.subtype!==sub)return false;
+      if(minv>0&&p.value_num<minv)return false;
+      return true;
+    });
+    if(propActive&&!mp.length)return;
+    out.push({it:it,p:mp.length?mp[0]:(it.properties[0]||null)});
+  });
+  out.sort(function(a,b){
+    var v;
+    if(sortBy==='cost')v=a.it.cost-b.it.cost;
+    else if(sortBy==='value')v=(a.p?a.p.value_num:0)-(b.p?b.p.value_num:0);
+    else v=a.it.name.localeCompare(b.it.name);
+    return asc?v:-v;
+  });
+  render(out);
+});
+
+function render(rows){
+  if(!rows.length){results.innerHTML='<p class="muted">No items match.</p>';return;}
+  var html='<p><strong>'+rows.length+'</strong> result'+(rows.length!==1?'s':'')+'</p>'
+    +'<table class="data"><thead><tr>'
+    +'<th>Name</th><th>Base Item</th><th>Property</th><th>Value</th><th>Cost</th>'
+    +'</tr></thead><tbody>';
+  rows.forEach(function(r){
+    var pc=r.p?esc(r.p.prop+(r.p.subtype?': '+r.p.subtype:'')):'—';
+    var vc=r.p?esc(r.p.cost):'—';
+    html+='<tr><td><a href="'+esc(r.it.url)+'">'+esc(r.it.name)+'</a></td>'
+         +'<td>'+esc(r.it.base_item)+'</td><td>'+pc+'</td><td>'+vc+'</td>'
+         +'<td>'+(r.it.cost?r.it.cost.toLocaleString()+' gp':'—')+'</td></tr>';
+  });
+  results.innerHTML=html+'</tbody></table>';
+}
+
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+})();"""
+
+
+def render_items_search(db: "Db", out: Path) -> None:
+    index: list[dict] = []
+    for resref, i in sorted(db.items.items(),
+                            key=lambda kv: nwn_text(db.item_name(kv[0])).lower()):
+        if not (resref in db.item_sold_at or resref in db.item_in_container
+                or resref in db.item_carried_by or resref in db.item_from_script):
+            continue
+        name = db.item_name(resref)
+        if name.startswith("[TLK#") or name == resref:
+            continue
+        bi = int(fld(i, "BaseItem", -1) or -1)
+        try:
+            cost_val = int(fld(i, "Cost", 0) or 0)
+        except (TypeError, ValueError):
+            cost_val = 0
+        props = []
+        for p in list_items(i.get("PropertiesList")):
+            f = itemprop_format(p)
+            pname = f["property"]
+            if not pname:
+                continue
+            props.append({
+                "prop": pname,
+                "subtype": f["subtype"],
+                "cost": f["cost"],
+                "value_num": _prop_value_num(f["cost"]),
+            })
+        index.append({
+            "resref": resref,
+            "name": nwn_text(name),
+            "base_item": baseitem_name(bi) or f"BaseItem #{bi}",
+            "base_item_id": bi,
+            "cost": cost_val,
+            "url": f"{resref}.html",
+            "properties": props,
+        })
+
+    write(out / "items" / "search-index.json",
+          json.dumps(index, ensure_ascii=False, separators=(",", ":")))
+
+    body = (
+        "<h1>Search Items</h1>"
+        "<p>Filter items by type, property, and value. Leave fields blank to match all.</p>"
+        '<form id="sf" class="item-search-form">'
+        '<div class="search-row">'
+        '<label for="fb">Base item</label>'
+        '<select id="fb"><option value="">— all —</option></select>'
+        '<label for="fp">Property</label>'
+        '<select id="fp"><option value="">— all —</option></select>'
+        '</div>'
+        '<div class="search-row">'
+        '<label for="fs">Subtype</label>'
+        '<select id="fs" disabled><option value="">— any —</option></select>'
+        '<label for="fv">Min value</label>'
+        '<input id="fv" type="number" min="0" placeholder="e.g. 10">'
+        '</div>'
+        '<div class="search-row">'
+        '<label for="fo">Sort by</label>'
+        '<select id="fo">'
+        '<option value="name">Name</option>'
+        '<option value="cost">Cost</option>'
+        '<option value="value">Property Value</option>'
+        '</select>'
+        '<label for="fd">Order</label>'
+        '<select id="fd">'
+        '<option value="desc">Descending</option>'
+        '<option value="asc">Ascending</option>'
+        '</select>'
+        '<button type="submit">Search</button>'
+        '</div>'
+        '</form>'
+        '<div id="sr"><p class="muted">Use the filters above and click Search.</p></div>'
+        f"<script>{_SEARCH_JS}</script>"
+    )
+    write(out / "items" / "search.html",
+          page("Search Items", body, root_rel=".."))
 
 
 def _buy_limit_str(mbp: Any) -> str:
@@ -7256,6 +7587,8 @@ def main() -> int:
     render_items_index(db, out)
     for resref in db.items:
         render_item_page(db, resref, out)
+    render_items_by_property(db, out)
+    render_items_search(db, out)
     render_stores_index(db, out)
     for area_rr, inst_list in db.area_stores.items():
         if area_rr in db.hidden_areas:

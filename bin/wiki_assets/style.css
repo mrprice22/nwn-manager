@@ -544,3 +544,47 @@ svg .convo-node text {
     -1px 0 0 #444,  1px 0 0 #444,
      0 -1px 0 #444, 0  1px 0 #444;
 }
+
+/* Item search form */
+.item-search-form {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1em 1.25em;
+  margin-bottom: 1.5em;
+}
+.search-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5em 1em;
+  margin-bottom: 0.75em;
+}
+.search-row:last-child { margin-bottom: 0; }
+.search-row label {
+  font-size: 0.9em;
+  font-weight: 600;
+  min-width: 6.5em;
+  color: var(--muted);
+}
+.search-row select,
+.search-row input[type="number"] {
+  font: inherit;
+  font-size: 0.9em;
+  padding: 0.3em 0.5em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  min-width: 10em;
+}
+.search-row button {
+  font: inherit;
+  padding: 0.35em 1.2em;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-left: auto;
+}
+.search-row button:hover { opacity: 0.85; }
