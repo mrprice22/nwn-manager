@@ -688,6 +688,10 @@ _ACCESSORY_BASEITEM_MAP: dict[int, str] = {
     80: "cloak",
 }
 
+# Base items that are creature-only (not equippable by players).
+_CREATURE_WEAPON_BASEITEMS: frozenset[int] = frozenset({69, 70, 71, 72})
+_CREATURE_ITEM_BASEITEMS:   frozenset[int] = frozenset({73})
+
 # Fixed display labels for non-weapon category keys.
 _CATEGORY_LABELS: dict[str, str] = {
     "armor_heavy":       "Heavy Armor",
@@ -705,11 +709,18 @@ _CATEGORY_LABELS: dict[str, str] = {
     "ammo":              "Ammunition",
     "consumable":        "Consumables",
     "misc":              "Miscellaneous",
+    "creature_item":     "Creature Items",
 }
 
-# Fixed ordering for non-weapon sections (weapons are inserted dynamically).
-_FIXED_CATEGORY_ORDER_PRE:  list[str] = ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield", "helmet"]
-_FIXED_CATEGORY_ORDER_POST: list[str] = ["amulet", "belt", "boots", "bracers_gauntlets", "ring", "cloak", "ammo", "consumable", "misc"]
+# TOC group headings. Sentinels "WEAPONS" and "CREATURE_WEAPONS" expand to
+# dynamically-discovered weapon_* keys at render time.
+_TOC_GROUPS: list[tuple[str, list[str]]] = [
+    ("Weapons",  ["WEAPONS", "ammo"]),
+    ("Armor",    ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield", "helmet"]),
+    ("Gear",     ["amulet", "belt", "boots", "bracers_gauntlets", "ring", "cloak"]),
+    ("Misc.",    ["consumable", "misc"]),
+]
+# Special heading covers creature weapons, creature items, inaccessible, and broken.
 
 
 def _item_category(item: dict) -> str:
@@ -737,6 +748,8 @@ def _item_category(item: dict) -> str:
     stats = WEAPONS.get(bi)
     if stats and stats.get("WeaponType", "0") not in ("0", "", None):
         return f"weapon_{bi}"
+    if bi in _CREATURE_ITEM_BASEITEMS:
+        return "creature_item"
     return "misc"
 
 
@@ -4793,45 +4806,70 @@ def render_items_index(db: Db, out: Path) -> None:
         except (TypeError, ValueError):
             return 0
 
-    # Build ordered category list: fixed pre-weapon sections, then each weapon
-    # type sorted alphabetically by name, then fixed post-weapon sections.
-    weapon_keys = sorted(
+    # Split weapon keys into player weapons and creature-only weapons.
+    all_weapon_keys = sorted(
         (k for k in buckets if k.startswith("weapon_")),
         key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
     )
-    ordered_cats: list[str] = _FIXED_CATEGORY_ORDER_PRE + weapon_keys + _FIXED_CATEGORY_ORDER_POST
+    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
+    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
+
+    def _expand(cats: list[str]) -> list[str]:
+        result: list[str] = []
+        for c in cats:
+            if c == "WEAPONS":
+                result.extend(player_weapon_keys)
+            elif c == "CREATURE_WEAPONS":
+                result.extend(creature_weapon_keys)
+            else:
+                result.append(c)
+        return result
+
+    ordered_cats: list[str] = []
+    for _, group_cats in _TOC_GROUPS:
+        ordered_cats.extend(_expand(group_cats))
+    ordered_cats.extend(creature_weapon_keys + ["creature_item"])
 
     # Sort each bucket by decreasing GP cost (items with no cost sort last).
     for key in buckets:
         buckets[key].sort(key=_item_cost_key, reverse=True)
 
-    # Table of contents
+    # Table of contents — grouped under headings.
     toc_parts: list[str] = []
-    for cat_key in ordered_cats:
-        items = buckets.get(cat_key, [])
-        if items:
+    for group_heading, group_cats_tmpl in _TOC_GROUPS:
+        entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
+        if not entries:
+            continue
+        toc_parts.append(f'<div class="toc-group-heading">{E(group_heading)}</div>')
+        for cat_key, cat_items in entries:
             slug = cat_key.replace("_", "-")
-            cat_label = _item_category_label(cat_key)
             toc_parts.append(
-                f'<a href="#{E(slug)}">{E(cat_label)}'
-                f' <span class="muted">({len(items)})</span></a>'
+                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+                f' <span class="muted">({len(cat_items)})</span></a></div>'
             )
-    if inaccessible:
-        toc_parts.append(
-            f'<a href="#inaccessible">Inaccessible'
-            f' <span class="muted">({len(inaccessible)})</span></a>'
-        )
-    if broken:
-        toc_parts.append(
-            f'<a href="#broken">Potentially Broken'
-            f' <span class="muted">({len(broken)})</span></a>'
-        )
 
-    sidebar = (
-        '<aside class="items-toc">'
-        + "".join(f"<div>{p}</div>" for p in toc_parts)
-        + "</aside>"
-    )
+    special_cat_keys = creature_weapon_keys + (["creature_item"] if buckets.get("creature_item") else [])
+    special_entries  = [(ck, buckets[ck]) for ck in special_cat_keys if buckets.get(ck)]
+    if special_entries or inaccessible or broken:
+        toc_parts.append('<div class="toc-group-heading">Special</div>')
+        for cat_key, cat_items in special_entries:
+            slug = cat_key.replace("_", "-")
+            toc_parts.append(
+                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+                f' <span class="muted">({len(cat_items)})</span></a></div>'
+            )
+        if inaccessible:
+            toc_parts.append(
+                f'<div><a href="#inaccessible">Inaccessible'
+                f' <span class="muted">({len(inaccessible)})</span></a></div>'
+            )
+        if broken:
+            toc_parts.append(
+                f'<div><a href="#broken">Potentially Broken'
+                f' <span class="muted">({len(broken)})</span></a></div>'
+            )
+
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
 
     body = "<h1>Items</h1>"
     body += (
@@ -4907,6 +4945,8 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     props = list_items(i.get("PropertiesList"))
     is_cursed = bool(int(fld(i, "Cursed", 0) or 0))
     is_plot   = bool(int(fld(i, "Plot",   0) or 0))
+    _bi = int(fld(i, "BaseItem", -1) or -1)
+    is_creature_item = _bi in _CREATURE_WEAPON_BASEITEMS or _bi in _CREATURE_ITEM_BASEITEMS
     cursed_tt = (
         "title=\"Cursed items cannot be dropped and will NOT appear as loot "
         "when a creature carrying them is killed.\""
@@ -4940,6 +4980,12 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             '<p class="muted"><em>Item name not available: this item\'s name is '
             "stored in the base game TLK file which is not loaded. It is a stock "
             "NWN item embedded directly in a store inventory.</em></p>"
+        )
+    if is_creature_item:
+        sections.append(
+            '<p class="warn-creature"><strong>Note: this is a Creature-only item.</strong> '
+            "Items with creature base types cannot be equipped or used by player characters — "
+            "they are intended for use by NPCs and monsters only.</p>"
         )
 
     desc = loc(i.get("Description"))

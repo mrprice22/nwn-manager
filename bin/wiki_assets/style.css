@@ -395,6 +395,14 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.95em;
 }
+.warn-creature {
+  background: #fffbf0;
+  border-left: 4px solid #b07820;
+  color: #6b4800;
+  padding: 0.6em 0.9em;
+  margin: 0.5em 0 1em;
+  font-size: 0.95em;
+}
 
 .dlg-node:target {
   outline: 2px solid var(--accent-soft);
@@ -505,6 +513,17 @@ svg .convo-node text {
   text-decoration: none;
 }
 .items-toc .muted { font-size: 0.85em; }
+.items-toc .toc-group-heading {
+  font-weight: 600;
+  margin-top: 0.75em;
+  padding: 0 0.25em 0.15em;
+  font-size: 0.78em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.items-toc .toc-group-heading:first-child { margin-top: 0; }
 .items-content { flex: 1; min-width: 0; }
 
 /* NWN canonical damage / effect text colours.
