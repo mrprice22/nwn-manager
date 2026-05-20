@@ -387,6 +387,14 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.9em;
 }
+.warn-cursed {
+  background: #fff0f0;
+  border-left: 4px solid #c0392b;
+  color: #7a1a0a;
+  padding: 0.6em 0.9em;
+  margin: 0.5em 0 1em;
+  font-size: 0.95em;
+}
 
 .dlg-node:target {
   outline: 2px solid var(--accent-soft);

@@ -4905,6 +4905,16 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     is_broken = name.startswith("[TLK#") or name == resref
     display_name = resref if is_broken else name
     props = list_items(i.get("PropertiesList"))
+    is_cursed = bool(int(fld(i, "Cursed", 0) or 0))
+    is_plot   = bool(int(fld(i, "Plot",   0) or 0))
+    cursed_tt = (
+        "title=\"Cursed items cannot be dropped and will NOT appear as loot "
+        "when a creature carrying them is killed.\""
+    )
+    plot_tt = (
+        "title=\"Plot items cannot be dropped, sold, or stolen, "
+        "and are not lost on death.\""
+    )
     sections = [
         f"<h1>{nwn_html(display_name)}</h1>",
         '<dl class="meta">',
@@ -4914,10 +4924,17 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Type</dt><dd>{E(_item_category_label(_item_category(i)))}</dd>",
         f"<dt>Cost</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
-        f"<dt>Cursed</dt><dd>{E(fld(i, 'Cursed', ''))}</dd>",
-        f"<dt>Plot</dt><dd>{E(fld(i, 'Plot', ''))}</dd>",
+        f"<dt {cursed_tt}>Cursed</dt><dd>{'Yes' if is_cursed else 'No'}</dd>",
+        f"<dt {plot_tt}>Plot</dt><dd>{'Yes' if is_plot else 'No'}</dd>",
         '</dl>',
     ]
+    if is_cursed:
+        sections.append(
+            '<p class="warn-cursed"><strong>Warning: this item is Cursed.</strong> '
+            "Cursed items are non-droppable — they stay permanently in a creature's "
+            "inventory. If a boss carries this item it will <strong>not</strong> appear "
+            "as loot when the boss is killed, no matter how many times you defeat them.</p>"
+        )
     if is_broken:
         sections.append(
             '<p class="muted"><em>Item name not available: this item\'s name is '
