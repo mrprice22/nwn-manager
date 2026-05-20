@@ -467,6 +467,38 @@ svg .convo-node text {
   text-decoration: none;
 }
 
+/* Items index two-pane layout */
+.items-layout {
+  display: flex;
+  gap: 1.5em;
+  align-items: flex-start;
+}
+.items-toc {
+  width: 210px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 1em;
+  max-height: calc(100vh - 3em);
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.6em 0.75em;
+  font-size: 0.9em;
+}
+.items-toc a {
+  display: block;
+  padding: 0.2em 0.25em;
+  border-radius: 3px;
+  line-height: 1.35;
+}
+.items-toc a:hover {
+  background: rgba(107, 58, 28, 0.07);
+  text-decoration: none;
+}
+.items-toc .muted { font-size: 0.85em; }
+.items-content { flex: 1; min-width: 0; }
+
 /* NWN canonical damage / effect text colours.
  * Source: https://nwn.wiki/spaces/NWN1/pages/38177018/Colour+Tokens
  * The hex colours come through inline so the page works without this

@@ -3581,16 +3581,21 @@ def render_area_page(db: Db, resref: str, out: Path,
     on_user = fld(a, "OnUserDefined", "")
 
     sections.append(f"<h1>{nwn_html(name)}</h1>")
+    event_rows = "".join(
+        f'<dt>{label}</dt><dd>{E(val)}</dd>'
+        for label, val in [
+            ("OnEnter", on_enter), ("OnExit", on_exit),
+            ("OnHeartbeat", on_hb), ("OnUserDefined", on_user),
+        ]
+        if val
+    )
     sections.append(
         '<dl class="meta">'
         f'<dt>ResRef</dt><dd>{E(resref)}</dd>'
         f'<dt>Tag</dt><dd>{E(tag)}</dd>'
         f'<dt>Tileset</dt><dd>{tileset_label(tileset)}</dd>'
         f'<dt>Size</dt><dd>{E(width)}×{E(height)} tiles</dd>'
-        f'<dt>OnEnter</dt><dd>{E(on_enter)}</dd>'
-        f'<dt>OnExit</dt><dd>{E(on_exit)}</dd>'
-        f'<dt>OnHeartbeat</dt><dd>{E(on_hb)}</dd>'
-        f'<dt>OnUserDefined</dt><dd>{E(on_user)}</dd>'
+        + event_rows +
         '</dl>'
     )
 
@@ -4822,6 +4827,12 @@ def render_items_index(db: Db, out: Path) -> None:
             f' <span class="muted">({len(broken)})</span>'
         )
 
+    sidebar = (
+        '<aside class="items-toc">'
+        + "".join(f"<div>{p}</div>" for p in toc_parts)
+        + "</aside>"
+    )
+
     body = "<h1>Items</h1>"
     body += (
         f"<p>{total} items. "
@@ -4829,11 +4840,6 @@ def render_items_index(db: Db, out: Path) -> None:
         "CEP/HAK overrides are common — the row number shown is authoritative. "
         "Armor subtypes (Cloth/Light/Medium/Heavy) are based on total AC bonus "
         "from item properties.</small></p>"
-    )
-    body += (
-        '<nav style="margin:0.5em 0 1.5em;line-height:2">'
-        + " &nbsp;·&nbsp; ".join(toc_parts)
-        + "</nav>"
     )
 
     for cat_key in ordered_cats:
@@ -4885,7 +4891,8 @@ def render_items_index(db: Db, out: Path) -> None:
             + _TABLE_HEAD + rows_html + "</tbody></table>"
         )
 
-    write(out / "items" / "index.html", page("Items", body, root_rel=".."))
+    layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
+    write(out / "items" / "index.html", page("Items", layout, root_rel=".."))
 
 
 def render_item_page(db: Db, resref: str, out: Path) -> None:
