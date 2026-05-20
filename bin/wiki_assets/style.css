@@ -525,7 +525,10 @@ svg .convo-node text {
   border-bottom: 1px solid var(--border);
 }
 .items-toc .toc-group-heading:first-child { margin-top: 0; }
+.items-toc--wide { width: 280px; }
 .items-content { flex: 1; min-width: 0; }
+/* Keep anchored rows from hiding under the sticky site header */
+tr[id] { scroll-margin-top: 4em; }
 
 /* NWN canonical damage / effect text colours.
  * Source: https://nwn.wiki/spaces/NWN1/pages/38177018/Colour+Tokens
@@ -575,8 +578,39 @@ svg .convo-node text {
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--bg);
+  color: var(--fg);
   min-width: 10em;
 }
+
+/* Multi-property filter rows */
+.prop-rows { margin-bottom: 0.75em; }
+.prop-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin-bottom: 0.4em;
+  flex-wrap: wrap;
+}
+.prop-row > label {
+  font-size: 0.85em;
+  font-weight: 600;
+  width: 6.5em;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.prop-row select,
+.prop-row input[type="number"] {
+  font: inherit;
+  font-size: 0.9em;
+  padding: 0.3em 0.5em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.prop-row .prop-sel { flex: 2; min-width: 9em; }
+.prop-row .subtype-sel { flex: 1.5; min-width: 7em; }
+.prop-row input[type="number"] { width: 5.5em; }
 .search-row button {
   font: inherit;
   padding: 0.35em 1.2em;

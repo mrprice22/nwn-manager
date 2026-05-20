@@ -628,6 +628,14 @@ def _where_snippet(db: "Db", resref: str) -> str:
     return first + f' <span class="muted">&amp; {len(sources) - 1} more</span>'
 
 
+def _is_raw_subtype(subtype: str) -> bool:
+    """True when subtype is an unresolved numeric fallback (e.g. '37' or 'spells #5').
+    Used to merge property variants that share a name but differ only in a
+    charge count or other numeric parameter the lookup table didn't resolve."""
+    s = subtype.strip()
+    return bool(re.match(r"^\d+$", s) or re.match(r"^[\w\s]+ #\d+$", s))
+
+
 # ---------------------------------------------------------------------------
 # Combat-stat helpers (creature page)
 # ---------------------------------------------------------------------------
@@ -3012,7 +3020,14 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
       <a href="{E(root_rel)}/areas/index.html">Areas</a>
       <a href="{E(root_rel)}/creatures/index.html">Creature Blueprints</a>
       <a href="{E(root_rel)}/creatures/instances/index.html">Creature Instances</a>
-      <a href="{E(root_rel)}/items/index.html">Items</a>
+      <div class="nav-dropdown">
+        <span class="nav-dropdown-label">Items &#9660;</span>
+        <div class="nav-dropdown-menu">
+          <a href="{E(root_rel)}/items/index.html">All Items</a>
+          <a href="{E(root_rel)}/items/properties/index.html">By Property</a>
+          <a href="{E(root_rel)}/items/search.html">Search</a>
+        </div>
+      </div>
       <a href="{E(root_rel)}/stores/index.html">Stores</a>
       <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
       <a href="{E(root_rel)}/factions.html">Factions</a>
@@ -5243,7 +5258,10 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             pname, subtype, cost_str = f["property"], f["subtype"], f["cost"]
             if not pname:
                 continue
-            prop_index[(pname, subtype)].append(
+            # Merge entries whose subtype is an unresolved numeric fallback
+            # (e.g. "True Seeing: 1", "True Seeing: 2" → all under "True Seeing").
+            key_subtype = "" if _is_raw_subtype(subtype) else subtype
+            prop_index[(pname, key_subtype)].append(
                 (resref, name, cost_str, _prop_value_num(cost_str))
             )
 
@@ -5256,50 +5274,83 @@ def render_items_by_property(db: "Db", out: Path) -> None:
     for pname, subtype in sorted_keys:
         groups[_prop_group(pname)].append((pname, subtype))
 
+    # Build ordered lists of unique property names per group and their subtypes.
+    # pname_anchor: stable anchor for each property name (no subtype suffix).
+    def _pname_anchor(pname: str) -> str:
+        return "pn-" + _prop_slug(pname, "")
+
+    # unique_pnames[g] = ordered list of property names, preserving first appearance order
+    unique_pnames: dict[str, list[str]] = {}
+    for g in _PROP_GROUP_ORDER:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for pname, _ in groups.get(g, []):
+            if pname not in seen:
+                seen.add(pname)
+                ordered.append(pname)
+        unique_pnames[g] = ordered
+
+    # subtype_rows[pname] = ordered list of (subtype, slug, cnt)
+    subtype_rows: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+    for pname, subtype in sorted_keys:
+        slug = _prop_slug(pname, subtype)
+        cnt = len(prop_index[(pname, subtype)])
+        subtype_rows[pname].append((subtype, slug, cnt))
+
     # --- property index page ---
+    # Sidebar: one link per property name (not per subtype).
     sidebar_parts: list[str] = []
     for g in _PROP_GROUP_ORDER:
-        if g not in groups:
+        if not unique_pnames.get(g):
             continue
-        anchor = re.sub(r"[^a-z0-9]+", "-", g.lower()).strip("-")
         sidebar_parts.append(f'<div class="toc-group-heading">{E(g)}</div>')
-        for pname, subtype in groups[g]:
-            slug = _prop_slug(pname, subtype)
-            label = pname + (f": {subtype}" if subtype else "")
-            cnt = len(prop_index[(pname, subtype)])
+        for pname in unique_pnames[g]:
+            total = sum(c for _, _, c in subtype_rows[pname])
             sidebar_parts.append(
-                f'<div><a href="#{E(slug)}">{E(label)}'
-                f' <span class="muted">({cnt})</span></a></div>'
+                f'<div><a href="#{E(_pname_anchor(pname))}">{E(pname)}'
+                f' <span class="muted">({total})</span></a></div>'
             )
-    sidebar_parts += [
-        '<div class="toc-group-heading">Browse</div>',
-        '<div><a href="../index.html">← All Items</a></div>',
-        '<div><a href="../search.html">Search Items</a></div>',
-    ]
-    sidebar = '<aside class="items-toc">' + "".join(sidebar_parts) + "</aside>"
+    sidebar = '<aside class="items-toc items-toc--wide">' + "".join(sidebar_parts) + "</aside>"
 
+    total_props = len(prop_index)
     body = (
         "<h1>Browse by Property</h1>"
-        f"<p>{len(prop_index)} property types across all accessible items.</p>"
+        f"<p>{total_props} property types across all accessible items.</p>"
     )
     for g in _PROP_GROUP_ORDER:
-        if g not in groups:
+        if not unique_pnames.get(g):
             continue
         anchor = re.sub(r"[^a-z0-9]+", "-", g.lower()).strip("-")
-        body += (
-            f'<h2 id="{E(anchor)}">{E(g)}</h2>'
-            '<table class="data"><thead><tr>'
-            "<th>Property</th><th>Items</th></tr></thead><tbody>"
-        )
-        for pname, subtype in groups[g]:
-            slug = _prop_slug(pname, subtype)
-            label = pname + (f": {subtype}" if subtype else "")
-            cnt = len(prop_index[(pname, subtype)])
+        body += f'<h2 id="{E(anchor)}">{E(g)}</h2>'
+        for pname in unique_pnames[g]:
+            rows = subtype_rows[pname]
+            total = sum(c for _, _, c in rows)
             body += (
-                f"<tr><td>{link(f'{slug}.html', label)}</td>"
-                f"<td>{cnt}</td></tr>"
+                f'<h3 id="{E(_pname_anchor(pname))}">{E(pname)}'
+                f' <small class="muted">({total})</small></h3>'
             )
-        body += "</tbody></table>"
+            has_subtypes = any(st for st, _, _ in rows)
+            if has_subtypes:
+                body += (
+                    '<table class="data"><thead><tr>'
+                    "<th>Subtype</th><th>Items</th></tr></thead><tbody>"
+                )
+                for subtype, slug, cnt in rows:
+                    label = subtype if subtype else pname
+                    body += (
+                        f'<tr id="{E(slug)}"><td>{link(f"{slug}.html", label)}</td>'
+                        f"<td>{cnt}</td></tr>"
+                    )
+                body += "</tbody></table>"
+            else:
+                # Single no-subtype entry — link directly.
+                _, slug, cnt = rows[0]
+                body += (
+                    '<table class="data"><thead><tr>'
+                    "<th>Property</th><th>Items</th></tr></thead><tbody>"
+                    f'<tr id="{E(slug)}"><td>{link(f"{slug}.html", pname)}</td>'
+                    f"<td>{cnt}</td></tr></tbody></table>"
+                )
 
     layout = (
         f'<div class="items-layout">{sidebar}'
@@ -5331,15 +5382,20 @@ def render_items_by_property(db: "Db", out: Path) -> None:
               page(label, body, root_rel="../.."))
 
 
+
+
 # ---------------------------------------------------------------------------
 # Item search page + JSON index
 # ---------------------------------------------------------------------------
 
 _SEARCH_JS = r"""(function(){
-var data=[], form=document.getElementById('sf'),
-    results=document.getElementById('sr'),
-    propSel=document.getElementById('fp'),
-    subSel=document.getElementById('fs');
+var N=4,data=[],form=document.getElementById('sf'),results=document.getElementById('sr');
+var propSels=[],subSels=[],minVals=[];
+for(var i=1;i<=N;i++){
+  propSels.push(document.getElementById('fp'+i));
+  subSels.push(document.getElementById('fs'+i));
+  minVals.push(document.getElementById('fv'+i));
+}
 
 fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
   data=d; populateFilters();
@@ -5357,57 +5413,77 @@ function populateFilters(){
   window._subs=subs;
   var biSel=document.getElementById('fb');
   Object.keys(bis).sort().forEach(function(b){biSel.appendChild(new Option(b,b));});
-  Object.keys(props).sort().forEach(function(p){propSel.appendChild(new Option(p,p));});
+  var propOpts=Object.keys(props).sort();
+  propSels.forEach(function(sel){
+    propOpts.forEach(function(p){sel.appendChild(new Option(p,p));});
+  });
 }
 
-propSel.addEventListener('change',function(){
-  var chosen=propSel.value, sub=(window._subs||{})[chosen]||{};
-  subSel.innerHTML='<option value="">— any —</option>';
-  Object.keys(sub).sort().forEach(function(s){subSel.appendChild(new Option(s,s));});
-  subSel.disabled=!chosen||!Object.keys(sub).length;
+propSels.forEach(function(sel,idx){
+  sel.addEventListener('change',function(){
+    var chosen=sel.value,sub=(window._subs||{})[chosen]||{};
+    subSels[idx].innerHTML='<option value="">— any —</option>';
+    Object.keys(sub).sort().forEach(function(s){subSels[idx].appendChild(new Option(s,s));});
+    subSels[idx].disabled=!chosen||!Object.keys(sub).length;
+  });
 });
 
 form.addEventListener('submit',function(e){
   e.preventDefault();
-  var bi=document.getElementById('fb').value,
-      prop=propSel.value, sub=subSel.value,
-      minv=parseInt(document.getElementById('fv').value,10)||0,
-      sortBy=document.getElementById('fo').value,
-      asc=document.getElementById('fd').value==='asc';
-  var propActive=prop||sub||minv>0, out=[];
+  var bi=document.getElementById('fb').value;
+  var sortBy=document.getElementById('fo').value;
+  var asc=document.getElementById('fd').value==='asc';
+  var conds=[];
+  for(var i=0;i<N;i++){
+    var prop=propSels[i].value,sub=subSels[i].value;
+    var minv=parseInt(minVals[i].value,10)||0;
+    if(prop||sub||minv>0)conds.push({prop:prop,sub:sub,minv:minv});
+  }
+  var out=[];
   data.forEach(function(it){
     if(bi&&it.base_item!==bi)return;
-    var mp=it.properties.filter(function(p){
-      if(prop&&p.prop!==prop)return false;
-      if(sub&&p.subtype!==sub)return false;
-      if(minv>0&&p.value_num<minv)return false;
+    var matched=[];
+    var ok=!conds.length||conds.every(function(c){
+      var mp=it.properties.filter(function(p){
+        if(c.prop&&p.prop!==c.prop)return false;
+        if(c.sub&&p.subtype!==c.sub)return false;
+        if(c.minv>0&&p.value_num<c.minv)return false;
+        return true;
+      });
+      if(!mp.length)return false;
+      matched.push(mp[0]);
       return true;
     });
-    if(propActive&&!mp.length)return;
-    out.push({it:it,p:mp.length?mp[0]:(it.properties[0]||null)});
+    if(!ok)return;
+    if(!matched.length&&it.properties.length)matched=[it.properties[0]];
+    out.push({it:it,matched:matched});
   });
   out.sort(function(a,b){
     var v;
     if(sortBy==='cost')v=a.it.cost-b.it.cost;
-    else if(sortBy==='value')v=(a.p?a.p.value_num:0)-(b.p?b.p.value_num:0);
+    else if(sortBy==='value')v=(a.matched[0]?a.matched[0].value_num:0)-(b.matched[0]?b.matched[0].value_num:0);
     else v=a.it.name.localeCompare(b.it.name);
     return asc?v:-v;
   });
-  render(out);
+  render(out,!!conds.length);
 });
 
-function render(rows){
+function render(rows,showProps){
   if(!rows.length){results.innerHTML='<p class="muted">No items match.</p>';return;}
+  var cols=showProps
+    ?'<th>Name</th><th>Base Item</th><th>Matched Properties</th><th>Cost</th>'
+    :'<th>Name</th><th>Base Item</th><th>Cost</th>';
   var html='<p><strong>'+rows.length+'</strong> result'+(rows.length!==1?'s':'')+'</p>'
-    +'<table class="data"><thead><tr>'
-    +'<th>Name</th><th>Base Item</th><th>Property</th><th>Value</th><th>Cost</th>'
-    +'</tr></thead><tbody>';
+    +'<table class="data"><thead><tr>'+cols+'</tr></thead><tbody>';
   rows.forEach(function(r){
-    var pc=r.p?esc(r.p.prop+(r.p.subtype?': '+r.p.subtype:'')):'—';
-    var vc=r.p?esc(r.p.cost):'—';
+    var props=r.matched.map(function(p){
+      return '<span>'+esc(p.prop+(p.subtype?': '+p.subtype:''))
+        +(p.cost?' \u2014 '+esc(p.cost):'')+'</span>';
+    }).join('<br>');
     html+='<tr><td><a href="'+esc(r.it.url)+'">'+esc(r.it.name)+'</a></td>'
-         +'<td>'+esc(r.it.base_item)+'</td><td>'+pc+'</td><td>'+vc+'</td>'
-         +'<td>'+(r.it.cost?r.it.cost.toLocaleString()+' gp':'—')+'</td></tr>';
+         +'<td>'+esc(r.it.base_item)+'</td>'
+         +(showProps?'<td>'+props+'</td>':'')
+         +'<td>'+(r.it.cost?r.it.cost.toLocaleString()+' gp':'\u2014')+'</td></tr>';
   });
   results.innerHTML=html+'</tbody></table>';
 }
@@ -5459,36 +5535,39 @@ def render_items_search(db: "Db", out: Path) -> None:
     write(out / "items" / "search-index.json",
           json.dumps(index, ensure_ascii=False, separators=(",", ":")))
 
+    def _prop_row(n: int) -> str:
+        return (
+            f'<div class="prop-row">'
+            f'<label>Property {n}</label>'
+            f'<select id="fp{n}" class="prop-sel"><option value="">— any —</option></select>'
+            f'<select id="fs{n}" class="subtype-sel" disabled>'
+            f'<option value="">— any —</option></select>'
+            f'<input id="fv{n}" type="number" min="0" placeholder="min value">'
+            f'</div>'
+        )
+
+    prop_rows = "".join(_prop_row(n) for n in range(1, 5))
+
     body = (
         "<h1>Search Items</h1>"
-        "<p>Filter items by type, property, and value. Leave fields blank to match all.</p>"
+        "<p>All conditions must be satisfied simultaneously. Leave fields blank to skip.</p>"
         '<form id="sf" class="item-search-form">'
         '<div class="search-row">'
         '<label for="fb">Base item</label>'
         '<select id="fb"><option value="">— all —</option></select>'
-        '<label for="fp">Property</label>'
-        '<select id="fp"><option value="">— all —</option></select>'
-        '</div>'
-        '<div class="search-row">'
-        '<label for="fs">Subtype</label>'
-        '<select id="fs" disabled><option value="">— any —</option></select>'
-        '<label for="fv">Min value</label>'
-        '<input id="fv" type="number" min="0" placeholder="e.g. 10">'
-        '</div>'
-        '<div class="search-row">'
         '<label for="fo">Sort by</label>'
         '<select id="fo">'
         '<option value="name">Name</option>'
         '<option value="cost">Cost</option>'
         '<option value="value">Property Value</option>'
         '</select>'
-        '<label for="fd">Order</label>'
         '<select id="fd">'
         '<option value="desc">Descending</option>'
         '<option value="asc">Ascending</option>'
         '</select>'
         '<button type="submit">Search</button>'
         '</div>'
+        f'<div class="prop-rows">{prop_rows}</div>'
         '</form>'
         '<div id="sr"><p class="muted">Use the filters above and click Search.</p></div>'
         f"<script>{_SEARCH_JS}</script>"
