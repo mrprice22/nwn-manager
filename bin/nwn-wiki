@@ -4826,20 +4826,31 @@ def _fmt_cost(raw) -> str:
 
 
 def render_items_index(db: Db, out: Path) -> None:
-    _TABLE_HEAD = (
-        '<table class="data"><thead><tr>'
-        "<th>Name</th><th>ResRef</th><th>Base item</th><th>Cost</th><th>Stack</th>"
-        "</tr></thead><tbody>"
-    )
+    def _col_flags(items: list[tuple[str, dict]]) -> tuple[bool, bool]:
+        show_base  = len({baseitem_label(fld(i, "BaseItem"))     for _, i in items}) > 1
+        show_stack = len({str(fld(i, "StackSize", "") or "")     for _, i in items}) > 1
+        return show_base, show_stack
 
-    def _row(rr: str, i: dict) -> str:
-        return (
-            f"<tr><td>{link(f'{rr}.html', db.item_name(rr))}</td>"
-            f"<td>{E(rr)}</td>"
-            f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>"
-            f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>"
-            f"<td>{E(fld(i, 'StackSize', ''))}</td></tr>"
-        )
+    def _table_head(show_base: bool, show_stack: bool) -> str:
+        cols = ["<th>Name</th>", "<th>ResRef</th>"]
+        if show_base:
+            cols.append("<th>Base item</th>")
+        cols.append("<th>GP Value</th>")
+        if show_stack:
+            cols.append("<th>Stack</th>")
+        return '<table class="data"><thead><tr>' + "".join(cols) + "</tr></thead><tbody>"
+
+    def _row(rr: str, i: dict, show_base: bool, show_stack: bool) -> str:
+        cells = [
+            f"<td>{link(f'{rr}.html', db.item_name(rr))}</td>",
+            f"<td>{E(rr)}</td>",
+        ]
+        if show_base:
+            cells.append(f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>")
+        cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
+        if show_stack:
+            cells.append(f"<td>{E(fld(i, 'StackSize', ''))}</td>")
+        return "<tr>" + "".join(cells) + "</tr>"
 
     # Classify every item; broken = TLK-only or completely unnamed.
     buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
@@ -4955,38 +4966,44 @@ def render_items_index(db: Db, out: Path) -> None:
             continue
         slug = cat_key.replace("_", "-")
         cat_label = _item_category_label(cat_key)
-        rows_html = "\n".join(_row(rr, i) for rr, i in items)
+        show_base, show_stack = _col_flags(items)
+        rows_html = "\n".join(_row(rr, i, show_base, show_stack) for rr, i in items)
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
             f' <small class="muted">({len(items)})</small></h2>'
-            + _TABLE_HEAD + rows_html + "</tbody></table>"
+            + _table_head(show_base, show_stack) + rows_html + "</tbody></table>"
         )
 
     if inaccessible:
         inaccessible_sorted = sorted(inaccessible, key=lambda x: nwn_text(db.item_name(x[0])).lower())
-        rows_html = "\n".join(_row(rr, i) for rr, i in inaccessible_sorted)
+        show_base, show_stack = _col_flags(inaccessible_sorted)
+        rows_html = "\n".join(_row(rr, i, show_base, show_stack) for rr, i in inaccessible_sorted)
         body += (
             '<h2 id="inaccessible">Inaccessible'
             f' <small class="muted">({len(inaccessible)})</small></h2>'
             '<p class="muted">These items are not found in any store, container, or creature '
             "inventory in the module. They exist as blueprints but appear to have no way for "
             "players to obtain them through normal gameplay.</p>"
-            + _TABLE_HEAD + rows_html + "</tbody></table>"
+            + _table_head(show_base, show_stack) + rows_html + "</tbody></table>"
         )
 
     if broken:
         # Broken items: use the resref as the display name since TLK
         # placeholders like "[TLK#1550]" are meaningless to readers.
         broken_sorted = sorted(broken, key=lambda x: x[0].lower())
-        def _broken_row(rr: str, i: dict) -> str:
-            return (
-                f"<tr><td>{link(f'{rr}.html', rr)}</td>"
-                f"<td>{E(rr)}</td>"
-                f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>"
-                f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>"
-                f"<td>{E(fld(i, 'StackSize', ''))}</td></tr>"
-            )
-        rows_html = "\n".join(_broken_row(rr, i) for rr, i in broken_sorted)
+        def _broken_row(rr: str, i: dict, show_base: bool, show_stack: bool) -> str:
+            cells = [
+                f"<td>{link(f'{rr}.html', rr)}</td>",
+                f"<td>{E(rr)}</td>",
+            ]
+            if show_base:
+                cells.append(f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>")
+            cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
+            if show_stack:
+                cells.append(f"<td>{E(fld(i, 'StackSize', ''))}</td>")
+            return "<tr>" + "".join(cells) + "</tr>"
+        show_base, show_stack = _col_flags(broken_sorted)
+        rows_html = "\n".join(_broken_row(rr, i, show_base, show_stack) for rr, i in broken_sorted)
         body += (
             '<h2 id="broken">Potentially Broken'
             f' <small class="muted">({len(broken)})</small></h2>'
@@ -4995,7 +5012,7 @@ def render_items_index(db: Db, out: Path) -> None:
             "loaded. They are typically stock NWN items (nw_*, x0_*, x2_*) "
             "added directly to store inventories rather than custom module items. "
             "The ResRef is shown as the name since the TLK string is unavailable.</p>"
-            + _TABLE_HEAD + rows_html + "</tbody></table>"
+            + _table_head(show_base, show_stack) + rows_html + "</tbody></table>"
         )
 
     layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
