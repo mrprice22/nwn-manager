@@ -2,13 +2,26 @@
 # Desktop-launcher target: repack Homer's LotR from ./unpacked/ into a .mod
 # and copy it to the install location recorded in .nasher/source.
 #
-# nasher prints alarming "N errored" tallies for the long-standing pile of
-# broken scripts (zep_cr_*, openstore_*, dmw_do_dialog*, godmode, etc.) —
-# all benign, all known, all documented in the bin/ CLAUDE.md. The launcher
-# determines actual success by checking that the .mod was rebuilt with a
-# newer mtime than the script started, and reports that explicitly.
+# nasher reports "N errored" for known-broken scripts (zep_cr_*, openstore_*,
+# dmw_do_dialog*, etc.) — all benign, documented in bin/CLAUDE.md. The script
+# exits on any such errors by default; pass --force to proceed anyway.
+#
+# Options:
+#   --verbose   Show full nasher output (default: quiet % progress only)
+#   --force     Continue despite errors or warnings reported by nasher
 
 set -o pipefail
+
+VERBOSE=0
+FORCE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --verbose) VERBOSE=1 ;;
+    --force)   FORCE=1 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 PROJECT=/var/home/james/GIT/nwn_homers_lotr
 NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
@@ -17,13 +30,55 @@ export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 
 cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
 
-# Force a clean rebuild — nasher otherwise no-ops if it thinks nothing
-# changed since the last pack (see bin/CLAUDE.md L6).
 rm -f homers_lotr_v3.mod
 
 start=$(date +%s)
-nwn-manager repack
-nasher_status=$?
+total_files=$(find unpacked -type f 2>/dev/null | wc -l)
+
+tmpout=$(mktemp)
+trap 'rm -f "$tmpout"' EXIT
+
+if [[ $VERBOSE -eq 1 ]]; then
+  nwn-manager repack 2>&1 | tee "$tmpout"
+  nasher_status="${PIPESTATUS[0]}"
+else
+  nwn-manager repack >"$tmpout" 2>&1 &
+  bg_pid=$!
+  while kill -0 "$bg_pid" 2>/dev/null; do
+    processed=$(grep -cE "^  " "$tmpout" 2>/dev/null || echo 0)
+    if [[ $total_files -gt 0 ]]; then
+      pct=$(( processed * 100 / total_files ))
+      [[ $pct -gt 99 ]] && pct=99
+      printf "\r[repack] %3d%%  (%d / %d)" "$pct" "$processed" "$total_files"
+    else
+      printf "\r[repack] %d files..." "$processed"
+    fi
+    sleep 0.3
+  done
+  wait "$bg_pid"
+  nasher_status=$?
+  processed=$(grep -cE "^  " "$tmpout" 2>/dev/null || echo 0)
+  printf "\r[repack] 100%%  (%d files)                    \n" "$processed"
+fi
+
+# Detect errors/warnings in the captured output
+error_lines=$(grep -E "^[[:space:]]*[0-9]+ errored|^[Ee]rror:" "$tmpout" 2>/dev/null || true)
+
+if [[ $nasher_status -ne 0 || -n "$error_lines" ]]; then
+  if [[ $FORCE -eq 1 ]]; then
+    echo
+    echo "[WARN] nasher reported errors (--force: proceeding anyway):"
+    echo "$error_lines" | sed 's/^/  /'
+  else
+    echo
+    echo "[ERROR] nasher reported errors — aborting."
+    echo "        Re-run with --force to proceed despite errors."
+    [[ -n "$error_lines" ]] && echo "$error_lines" | sed 's/^/  /'
+    echo
+    read -rp "Press Enter to close..."
+    exit 1
+  fi
+fi
 
 echo
 echo "=========================================================================="
@@ -33,14 +88,12 @@ if [[ -f homers_lotr_v3.mod ]]; then
   size_mb=$(( size / 1024 / 1024 ))
   if [[ $built -ge $start ]]; then
     echo "[OK] homers_lotr_v3.mod rebuilt (${size_mb} MB)"
-    echo "     The 'N errored' tally above is pre-existing module noise — see"
-    echo "     /var/home/james/.local/share/Steam/steamapps/common/Neverwinter Nights/bin/CLAUDE.md"
     echo
     # Copy 1: OneDrive modules dir (primary — used by the Unpack pipeline)
     ONEDRIVE_MOD_DIR="$HOME/OneDrive/Games/NWNHomersLOTR"
     ONEDRIVE_MOD_DEST="$ONEDRIVE_MOD_DIR/homers_lotr_v3.mod"
     if [[ -d $ONEDRIVE_MOD_DIR ]]; then
-      cp -v "homers_lotr_v3.mod" "$ONEDRIVE_MOD_DEST"
+      cp "homers_lotr_v3.mod" "$ONEDRIVE_MOD_DEST"
       echo "[install] → $ONEDRIVE_MOD_DEST"
     else
       echo "[install] WARNING: $ONEDRIVE_MOD_DIR not found, skipping OneDrive copy"
@@ -50,7 +103,7 @@ if [[ -f homers_lotr_v3.mod ]]; then
     NWN_MOD_DIR="$HOME/.local/share/Neverwinter Nights/modules"
     NWN_MOD_DEST="$NWN_MOD_DIR/Homer's LOTR VEL v3.mod"
     if [[ -d $NWN_MOD_DIR ]]; then
-      cp -v "homers_lotr_v3.mod" "$NWN_MOD_DEST"
+      cp "homers_lotr_v3.mod" "$NWN_MOD_DEST"
       echo "[install] → $NWN_MOD_DEST"
     else
       echo "[install] WARNING: $NWN_MOD_DIR not found, skipping local NWN copy"
@@ -58,7 +111,7 @@ if [[ -f homers_lotr_v3.mod ]]; then
     echo
     # Copy 3: timestamped archive in project root
     ARCHIVE_DEST="$PROJECT/homers_lotr_v3_$(date +%Y%m%d_%H%M%S).mod"
-    cp -v "homers_lotr_v3.mod" "$ARCHIVE_DEST"
+    cp "homers_lotr_v3.mod" "$ARCHIVE_DEST"
     echo "[archive] → $ARCHIVE_DEST"
     echo
     # Refresh nwsync so connecting EE clients pull the new module's haks/tlk

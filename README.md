@@ -732,6 +732,29 @@ nwn-wiki --src unpacked --out docs
   generator also writes a `docs/.nojekyll` so GitHub Pages serves files
   verbatim instead of running them through Jekyll.
 
+## Homer's LotR launcher scripts
+
+`bin/repack-homers-lotr` and `bin/repack-homers-lotr-clean` are desktop-launcher
+convenience wrappers around `nwn-manager repack` for the Homer's LotR project.
+They handle the full build-and-install pipeline: pack the `.mod`, copy it to
+OneDrive and the local NWN modules dir, archive a timestamped copy, and optionally
+refresh the nwsync manifest.
+
+```sh
+bin/repack-homers-lotr [--verbose] [--force]
+bin/repack-homers-lotr-clean [--verbose] [--force]
+```
+
+| Flag | Behaviour |
+|------|-----------|
+| *(none)* | Quiet mode: shows a live `%` progress counter that overwrites itself in-place instead of scrolling every file. Exits with an error if nasher reports any errors or warnings. |
+| `--verbose` | Passes all nasher output straight through to the terminal (old behaviour). Still exits on errors unless `--force` is also given. |
+| `--force` | Continue with the install copies even when nasher reports errors or warnings. Homer's LotR has a known set of benign compile failures (`zep_cr_*`, `openstore_*`, `dmw_do_dialog*`, etc.) that always appear in the tally; use `--force` to acknowledge them and proceed. |
+
+`repack-homers-lotr-clean` additionally purges `.nasher/tmp/*.ncs` and passes
+`--clean` to nasher before building, forcing a full recompile. Use it when the
+incremental repack produces stale or unexpected output.
+
 ## Out of scope (today)
 
 - Watch mode and auto-repack on save.
