@@ -4813,18 +4813,18 @@ def render_items_index(db: Db, out: Path) -> None:
             slug = cat_key.replace("_", "-")
             cat_label = _item_category_label(cat_key)
             toc_parts.append(
-                f'<a href="#{E(slug)}">{E(cat_label)}</a>'
-                f' <span class="muted">({len(items)})</span>'
+                f'<a href="#{E(slug)}">{E(cat_label)}'
+                f' <span class="muted">({len(items)})</span></a>'
             )
     if inaccessible:
         toc_parts.append(
-            f'<a href="#inaccessible">Inaccessible</a>'
-            f' <span class="muted">({len(inaccessible)})</span>'
+            f'<a href="#inaccessible">Inaccessible'
+            f' <span class="muted">({len(inaccessible)})</span></a>'
         )
     if broken:
         toc_parts.append(
-            f'<a href="#broken">Potentially Broken</a>'
-            f' <span class="muted">({len(broken)})</span>'
+            f'<a href="#broken">Potentially Broken'
+            f' <span class="muted">({len(broken)})</span></a>'
         )
 
     sidebar = (
