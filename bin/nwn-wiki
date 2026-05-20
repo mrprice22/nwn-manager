@@ -552,12 +552,16 @@ def itemprop_format(prop: dict) -> dict[str, str]:
         elif subtype_id != 0:
             subtype_str = str(subtype_id)
 
-    # Cost: indexes a per-property cost table (e.g. +1..+20). Fall back to raw.
+    # Cost: indexes a per-property cost table (e.g. +1..+20).
+    # Only fall back to raw when a cost table is defined but the lookup misses
+    # (e.g. custom HAK rows); when no cost table is configured at all, the raw
+    # CostValue is an internal engine index with no user-visible meaning.
     cost_str = ""
     if cost_value is not None:
         ct_tbl = pdef.get("cost_table")
-        cval = _table_lookup(ct_tbl, cost_value) if ct_tbl else None
-        cost_str = cval if cval is not None else str(cost_value)
+        if ct_tbl:
+            cval = _table_lookup(ct_tbl, cost_value)
+            cost_str = cval if cval is not None else str(cost_value)
 
     # Param1: 255 is the engine "no param" sentinel.
     param_str = ""
@@ -590,8 +594,8 @@ def _prop_slug(prop_name: str, subtype: str) -> str:
 
 
 def _prop_value_num(cost_str: str) -> int:
-    m = re.match(r"[+]?(\d+)", cost_str.strip())
-    return int(m.group(1)) if m else 0
+    m = re.search(r"\d+", cost_str.strip())
+    return int(m.group()) if m else 0
 
 
 def _prop_group(prop_name: str) -> str:
@@ -602,11 +606,39 @@ def _prop_group(prop_name: str) -> str:
         return "Saving Throws"
     if any(w in n for w in ("ability", "skill")):
         return "Ability & Skill Bonuses"
-    if any(w in n for w in ("ac bonus", "attack", "enhancement bonus", "damage")):
+    if any(w in n for w in ("ac bonus", "attack bonus", "enhancement bonus", "damage bonus",
+                             "damage penalty", "decreased damage", "massive criticals",
+                             "extra melee", "extra ranged", "mighty")):
         return "AC & Combat"
-    if any(w in n for w in ("spell", "cast")):
+    if any(w in n for w in ("spell", "cast", "bonus spell")):
         return "Spell & Magic"
     return "Other"
+
+
+def _cost_anchor(cost_str: str) -> str:
+    """Stable URL-fragment for a cost tier (e.g. 'DC 14' → 'dc-14')."""
+    return re.sub(r"[^a-z0-9]+", "-", cost_str.lower()).strip("-")
+
+
+def _cost_tiers(
+    entries: list[tuple[str, str, str, int]],
+) -> list[tuple[str, str, list[tuple[str, str, str, int]]]]:
+    """Group a property's items by cost tier and return sorted (cost_str, anchor, items) triples.
+
+    Tiers are sorted: numeric-descending first (so '+20' before '+1', 'DC 26' before 'DC 14'),
+    then alphabetically for non-numeric tiers.  The empty-string tier (properties with no
+    cost value) is placed last."""
+    from collections import defaultdict as _dd
+    buckets: dict[str, list] = _dd(list)
+    for e in entries:
+        buckets[e[2]].append(e)
+    result = []
+    for cost_str, items in sorted(
+        buckets.items(),
+        key=lambda x: (0 if x[0] else 1, -_prop_value_num(x[0]), x[0].lower()),
+    ):
+        result.append((cost_str, _cost_anchor(cost_str), items))
+    return result
 
 
 def _where_snippet(db: "Db", resref: str) -> str:
@@ -5278,6 +5310,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             # Merge entries whose subtype is an unresolved numeric fallback
             # (e.g. "True Seeing: 1", "True Seeing: 2" → all under "True Seeing").
             key_subtype = "" if _is_raw_subtype(subtype) else subtype
+            # Also merge entries whose cost is an unresolved raw number for
+            # properties that have no cost table (cost stays as the raw digit).
             prop_index[(pname, key_subtype)].append(
                 (resref, name, cost_str, _prop_value_num(cost_str))
             )
@@ -5292,7 +5326,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         groups[_prop_group(pname)].append((pname, subtype))
 
     # Build ordered lists of unique property names per group and their subtypes.
-    # pname_anchor: stable anchor for each property name (no subtype suffix).
+    # _pname_anchor: stable anchor for each property name (no subtype suffix).
     def _pname_anchor(pname: str) -> str:
         return "pn-" + _prop_slug(pname, "")
 
@@ -5307,12 +5341,14 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 ordered.append(pname)
         unique_pnames[g] = ordered
 
-    # subtype_rows[pname] = ordered list of (subtype, slug, cnt)
-    subtype_rows: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+    # subtype_rows[pname] = ordered list of (subtype, slug, cost_tier_list)
+    # cost_tier_list = list of (cost_str, anchor, count) — one row per value tier.
+    subtype_rows: dict[str, list[tuple[str, str, list[tuple[str, str, int]]]]] = defaultdict(list)
     for pname, subtype in sorted_keys:
         slug = _prop_slug(pname, subtype)
-        cnt = len(prop_index[(pname, subtype)])
-        subtype_rows[pname].append((subtype, slug, cnt))
+        entries = prop_index[(pname, subtype)]
+        tiers = [(c, a, len(items)) for c, a, items in _cost_tiers(entries)]
+        subtype_rows[pname].append((subtype, slug, tiers))
 
     # --- property index page ---
     # Sidebar: one link per property name (not per subtype).
@@ -5322,7 +5358,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             continue
         sidebar_parts.append(f'<div class="toc-group-heading">{E(g)}</div>')
         for pname in unique_pnames[g]:
-            total = sum(c for _, _, c in subtype_rows[pname])
+            total = sum(cnt for _, _, tiers in subtype_rows[pname] for _, _, cnt in tiers)
             sidebar_parts.append(
                 f'<div><a href="#{E(_pname_anchor(pname))}">{E(pname)}'
                 f' <span class="muted">({total})</span></a></div>'
@@ -5341,27 +5377,67 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         body += f'<h2 id="{E(anchor)}">{E(g)}</h2>'
         for pname in unique_pnames[g]:
             rows = subtype_rows[pname]
-            total = sum(c for _, _, c in rows)
+            total = sum(cnt for _, _, tiers in rows for _, _, cnt in tiers)
             body += (
                 f'<h3 id="{E(_pname_anchor(pname))}">{E(pname)}'
                 f' <small class="muted">({total})</small></h3>'
             )
             has_subtypes = any(st for st, _, _ in rows)
-            if has_subtypes:
+            # Determine whether any subtype has multiple cost tiers worth showing.
+            any_cost_tiers = any(
+                len(tiers) > 1 or (len(tiers) == 1 and tiers[0][0])
+                for _, _, tiers in rows
+            )
+            if has_subtypes and any_cost_tiers:
+                body += (
+                    '<table class="data"><thead><tr>'
+                    "<th>Subtype</th><th>Value</th><th>Items</th></tr></thead><tbody>"
+                )
+                for subtype, slug, tiers in rows:
+                    label = subtype if subtype else pname
+                    for cost_str, cost_anch, cnt in tiers:
+                        href = f"{slug}.html#{cost_anch}" if cost_anch else f"{slug}.html"
+                        cost_cell = E(cost_str) if cost_str else '<span class="muted">—</span>'
+                        body += (
+                            f'<tr id="{E(slug + ("-" + cost_anch if cost_anch else ""))}">'
+                            f"<td>{link(href, label)}</td>"
+                            f"<td>{cost_cell}</td>"
+                            f"<td>{cnt}</td></tr>"
+                        )
+                body += "</tbody></table>"
+            elif has_subtypes:
                 body += (
                     '<table class="data"><thead><tr>'
                     "<th>Subtype</th><th>Items</th></tr></thead><tbody>"
                 )
-                for subtype, slug, cnt in rows:
+                for subtype, slug, tiers in rows:
                     label = subtype if subtype else pname
+                    cnt = sum(c for _, _, c in tiers)
                     body += (
                         f'<tr id="{E(slug)}"><td>{link(f"{slug}.html", label)}</td>'
                         f"<td>{cnt}</td></tr>"
                     )
                 body += "</tbody></table>"
+            elif any_cost_tiers:
+                # No subtypes but has multiple cost tiers — expand rows.
+                _, slug, tiers = rows[0]
+                body += (
+                    '<table class="data"><thead><tr>'
+                    "<th>Value</th><th>Items</th></tr></thead><tbody>"
+                )
+                for cost_str, cost_anch, cnt in tiers:
+                    href = f"{slug}.html#{cost_anch}" if cost_anch else f"{slug}.html"
+                    label = E(cost_str) if cost_str else E(pname)
+                    body += (
+                        f'<tr id="{E(slug + ("-" + cost_anch if cost_anch else ""))}">'
+                        f"<td>{link(href, label)}</td>"
+                        f"<td>{cnt}</td></tr>"
+                    )
+                body += "</tbody></table>"
             else:
-                # Single no-subtype entry — link directly.
-                _, slug, cnt = rows[0]
+                # Single no-subtype, no-value entry — link directly.
+                _, slug, tiers = rows[0]
+                cnt = sum(c for _, _, c in tiers)
                 body += (
                     '<table class="data"><thead><tr>'
                     "<th>Property</th><th>Items</th></tr></thead><tbody>"
@@ -5380,21 +5456,48 @@ def render_items_by_property(db: "Db", out: Path) -> None:
     for (pname, subtype), entries in prop_index.items():
         slug = _prop_slug(pname, subtype)
         label = pname + (f": {subtype}" if subtype else "")
-        body = (
-            f'<p><a href="index.html">← Browse by Property</a></p>'
-            f"<h1>{E(label)}</h1>"
-            f"<p>{len(entries)} items.</p>"
-            '<table class="data"><thead><tr>'
-            "<th>Name</th><th>Value</th><th>Where to Find</th>"
-            "</tr></thead><tbody>"
-        )
-        for resref, name, cost_str, _ in entries:
+        tiers = _cost_tiers(entries)
+        back_link = f'<p><a href="index.html">← Browse by Property</a></p>'
+        body = back_link + f"<h1>{E(label)}</h1>"
+
+        if len(tiers) <= 1:
+            # Single tier (or no cost) — keep flat table.
+            body += f"<p>{len(entries)} items.</p>"
             body += (
-                f"<tr><td>{link(f'../{resref}.html', name)}</td>"
-                f"<td>{E(cost_str)}</td>"
-                f"<td>{_where_snippet(db, resref)}</td></tr>"
+                '<table class="data"><thead><tr>'
+                "<th>Name</th>"
+                + ("<th>Value</th>" if tiers and tiers[0][0] else "")
+                + "<th>Where to Find</th>"
+                "</tr></thead><tbody>"
             )
-        body += "</tbody></table>"
+            show_cost = bool(tiers and tiers[0][0])
+            for resref, name, cost_str, _ in entries:
+                body += (
+                    f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                    + (f"<td>{E(cost_str)}</td>" if show_cost else "")
+                    + f"<td>{_where_snippet(db, resref)}</td></tr>"
+                )
+            body += "</tbody></table>"
+        else:
+            # Multiple tiers — one sub-table per tier with anchors.
+            body += f"<p>{len(entries)} items across {len(tiers)} value tiers.</p>"
+            for cost_str, cost_anch, tier_entries in tiers:
+                tier_label = E(cost_str) if cost_str else "Other"
+                h_anchor = f' id="{E(cost_anch)}"' if cost_anch else ""
+                body += (
+                    f"<h2{h_anchor}>{tier_label}"
+                    f' <small class="muted">({len(tier_entries)})</small></h2>'
+                    '<table class="data"><thead><tr>'
+                    "<th>Name</th><th>Where to Find</th>"
+                    "</tr></thead><tbody>"
+                )
+                for resref, name, _, _ in tier_entries:
+                    body += (
+                        f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                        f"<td>{_where_snippet(db, resref)}</td></tr>"
+                    )
+                body += "</tbody></table>"
+
         write(out / "items" / "properties" / f"{slug}.html",
               page(label, body, root_rel="../.."))
 

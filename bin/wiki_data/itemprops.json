@@ -1,119 +1,898 @@
 {
   "_comment": "NWN item property metadata. Names from stock itempropdef.2da; subtype/param tables from iprp_*.2da. Used by nwn-wiki to render Property/Subtype/CostTable/CostValue/Param1 in human terms.",
   "properties": {
-    "0":  {"name": "Ability Bonus", "subtype": "iprp_abilities", "cost_table": "iprp_abilcost"},
-    "1":  {"name": "AC Bonus", "cost_table": "iprp_acmodcost"},
-    "2":  {"name": "AC Bonus vs. Alignment Group", "subtype": "iprp_aligngrp", "cost_table": "iprp_acmodcost"},
-    "3":  {"name": "AC Bonus vs. Damage Type", "subtype": "iprp_damagetype", "cost_table": "iprp_acmodcost"},
-    "4":  {"name": "AC Bonus vs. Racial Group", "subtype": "racialtypes", "cost_table": "iprp_acmodcost"},
-    "5":  {"name": "AC Bonus vs. Specific Alignment", "subtype": "iprp_alignment", "cost_table": "iprp_acmodcost"},
-    "6":  {"name": "Enhancement Bonus", "cost_table": "iprp_bonuscost"},
-    "7":  {"name": "Enhancement Bonus vs. Alignment Group", "subtype": "iprp_aligngrp", "cost_table": "iprp_bonuscost"},
-    "8":  {"name": "Enhancement Bonus vs. Racial Group", "subtype": "racialtypes", "cost_table": "iprp_bonuscost"},
-    "9":  {"name": "Enhancement Bonus vs. Specific Alignment", "subtype": "iprp_alignment", "cost_table": "iprp_bonuscost"},
-    "10": {"name": "Decreased Enhancement Modifier", "cost_table": "iprp_neg5cost"},
-    "11": {"name": "Base Item Weight Reduction", "cost_table": "iprp_weightcost"},
-    "12": {"name": "Bonus Feat", "subtype": "iprp_feats"},
-    "13": {"name": "Bonus Spell Slot of Level N", "subtype": "iprp_spellshl", "cost_table": "iprp_chargecost"},
-    "14": {"name": "Boomerang"},
-    "15": {"name": "Cast Spell", "subtype": "iprp_spells", "cost_table": "iprp_chargecost"},
-    "16": {"name": "Damage Bonus", "subtype": "iprp_damagetype", "cost_table": "iprp_damagecost"},
-    "17": {"name": "Damage Bonus vs. Alignment Group", "subtype": "iprp_aligngrp", "cost_table": "iprp_damagecost"},
-    "18": {"name": "Damage Bonus vs. Racial Group", "subtype": "racialtypes", "cost_table": "iprp_damagecost"},
-    "19": {"name": "Damage Bonus vs. Specific Alignment", "subtype": "iprp_alignment", "cost_table": "iprp_damagecost"},
-    "20": {"name": "Decreased Damage", "cost_table": "iprp_neg5cost"},
-    "21": {"name": "Damage Reduction", "subtype": "iprp_reducestype", "cost_table": "iprp_softcost"},
-    "22": {"name": "Damage Resistance", "subtype": "iprp_damagetype", "cost_table": "iprp_damageresist"},
-    "23": {"name": "Damage Vulnerability", "subtype": "iprp_damagetype", "cost_table": "iprp_damagevuln"},
-    "24": {"name": "Decreased Ability Score", "subtype": "iprp_abilities", "cost_table": "iprp_neg5cost"},
-    "25": {"name": "Decreased AC", "subtype": "iprp_acmod", "cost_table": "iprp_neg5cost"},
-    "26": {"name": "Decreased Skill Modifier", "subtype": "skills", "cost_table": "iprp_neg10cost"},
-    "27": {"name": "Enhanced Containment", "cost_table": "iprp_containcost"},
-    "28": {"name": "Extra Melee Damage Type", "subtype": "iprp_meleecost"},
-    "29": {"name": "Extra Ranged Damage Type", "subtype": "iprp_meleecost"},
-    "30": {"name": "Haste"},
-    "31": {"name": "Holy Avenger"},
-    "32": {"name": "Immunity: Damage Type", "subtype": "iprp_damagetype", "cost_table": "iprp_immuncost"},
-    "33": {"name": "Improved Evasion"},
-    "34": {"name": "Spell Resistance", "cost_table": "iprp_srcost"},
-    "35": {"name": "Saving Throw Bonus", "subtype": "iprp_saveelement", "cost_table": "iprp_savingthrow"},
-    "36": {"name": "Saving Throw Bonus: Specific", "subtype": "iprp_savevs", "cost_table": "iprp_savingthrow"},
-    "37": {"name": "Mighty", "cost_table": "iprp_meleecost"},
-    "38": {"name": "Mind Blank"},
-    "39": {"name": "No Damage"},
-    "40": {"name": "On Hit Properties", "subtype": "iprp_onhit", "cost_table": "iprp_onhitcost"},
-    "41": {"name": "Decreased Saving Throws", "subtype": "iprp_saveelement", "cost_table": "iprp_neg5cost"},
-    "42": {"name": "Decreased Saving Throws (Specific)", "subtype": "iprp_savevs", "cost_table": "iprp_neg5cost"},
-    "43": {"name": "Regeneration", "cost_table": "iprp_meleecost"},
-    "44": {"name": "Skill Bonus", "subtype": "skills", "cost_table": "iprp_meleecost"},
-    "45": {"name": "Spell Immunity: Specific Spell", "subtype": "iprp_spells"},
-    "46": {"name": "Spell Immunity: School", "subtype": "iprp_spellshl"},
-    "47": {"name": "Thieves' Tools", "cost_table": "iprp_meleecost"},
-    "48": {"name": "Attack Bonus", "cost_table": "iprp_meleecost"},
-    "49": {"name": "Attack Bonus vs. Alignment Group", "subtype": "iprp_aligngrp", "cost_table": "iprp_meleecost"},
-    "50": {"name": "Attack Bonus vs. Racial Group", "subtype": "racialtypes", "cost_table": "iprp_meleecost"},
-    "51": {"name": "Attack Bonus vs. Specific Alignment", "subtype": "iprp_alignment", "cost_table": "iprp_meleecost"},
-    "52": {"name": "Decreased Attack Modifier", "cost_table": "iprp_neg5cost"},
-    "53": {"name": "Unlimited Ammunition", "subtype": "iprp_ammocost"},
-    "54": {"name": "Use Limitation: Alignment Group", "subtype": "iprp_aligngrp"},
-    "55": {"name": "Use Limitation: Class", "subtype": "classes"},
-    "56": {"name": "Use Limitation: Racial Type", "subtype": "racialtypes"},
-    "57": {"name": "Use Limitation: Specific Alignment", "subtype": "iprp_alignment"},
-    "58": {"name": "Use Limitation: Tileset", "subtype": "iprp_tileset"},
-    "59": {"name": "Use Limitation: Capability"},
-    "60": {"name": "Light", "subtype": "iprp_lightcolor", "cost_table": "iprp_lightcost"},
-    "61": {"name": "Additional"},
-    "62": {"name": "Trap", "subtype": "iprp_trap"},
-    "63": {"name": "True Seeing"},
-    "64": {"name": "On Monster Hit", "subtype": "iprp_onhit"},
-    "65": {"name": "Turn Resistance", "cost_table": "iprp_meleecost"},
-    "66": {"name": "Massive Criticals", "cost_table": "iprp_damagecost"},
-    "67": {"name": "Freedom of Movement"},
-    "68": {"name": "Monster Damage", "cost_table": "iprp_monstcost"},
-    "69": {"name": "Immunity: Spells by Level", "cost_table": "iprp_immunlvl"},
-    "70": {"name": "Special Walk"},
-    "71": {"name": "Healer's Kit", "cost_table": "iprp_healerscost"},
-    "72": {"name": "Weight Increase", "cost_table": "iprp_weightinc"},
-    "73": {"name": "On Hit Cast Spell"},
-    "74": {"name": "Visual Effect", "subtype": "iprp_visualfx"},
-    "75": {"name": "Bonus Hit Points"},
-    "76": {"name": "Cleric Domain", "subtype": "iprp_clericdom"},
-    "77": {"name": "Wizard Specialization", "subtype": "iprp_school"},
-    "78": {"name": "Bonus Use Per Day"},
-    "79": {"name": "Bonus Spell Per Day"},
-    "80": {"name": "Bonus to Saves: Specific Element"}
+    "0": {
+      "name": "Ability Bonus",
+      "subtype": "iprp_abilities",
+      "cost_table": "iprp_abilcost"
+    },
+    "1": {
+      "name": "AC Bonus",
+      "cost_table": "iprp_acmodcost"
+    },
+    "2": {
+      "name": "AC Bonus vs. Alignment Group",
+      "subtype": "iprp_aligngrp",
+      "cost_table": "iprp_acmodcost"
+    },
+    "3": {
+      "name": "AC Bonus vs. Damage Type",
+      "subtype": "iprp_damagetype",
+      "cost_table": "iprp_acmodcost"
+    },
+    "4": {
+      "name": "AC Bonus vs. Racial Group",
+      "subtype": "racialtypes",
+      "cost_table": "iprp_acmodcost"
+    },
+    "5": {
+      "name": "AC Bonus vs. Specific Alignment",
+      "subtype": "iprp_alignment",
+      "cost_table": "iprp_acmodcost"
+    },
+    "6": {
+      "name": "Enhancement Bonus",
+      "cost_table": "iprp_bonuscost"
+    },
+    "7": {
+      "name": "Enhancement Bonus vs. Alignment Group",
+      "subtype": "iprp_aligngrp",
+      "cost_table": "iprp_bonuscost"
+    },
+    "8": {
+      "name": "Enhancement Bonus vs. Racial Group",
+      "subtype": "racialtypes",
+      "cost_table": "iprp_bonuscost"
+    },
+    "9": {
+      "name": "Enhancement Bonus vs. Specific Alignment",
+      "subtype": "iprp_alignment",
+      "cost_table": "iprp_bonuscost"
+    },
+    "10": {
+      "name": "Decreased Enhancement Modifier",
+      "cost_table": "iprp_neg5cost"
+    },
+    "11": {
+      "name": "Base Item Weight Reduction",
+      "cost_table": "iprp_weightcost"
+    },
+    "12": {
+      "name": "Bonus Feat",
+      "subtype": "iprp_feats"
+    },
+    "13": {
+      "name": "Bonus Spell Slot of Level N",
+      "subtype": "classes",
+      "cost_table": "iprp_spelllevel"
+    },
+    "14": {
+      "name": "Boomerang"
+    },
+    "15": {
+      "name": "Cast Spell",
+      "subtype": "iprp_spells",
+      "cost_table": "iprp_chargecost"
+    },
+    "16": {
+      "name": "Damage Bonus",
+      "subtype": "iprp_damagetype",
+      "cost_table": "iprp_damagecost"
+    },
+    "17": {
+      "name": "Damage Bonus vs. Alignment Group",
+      "subtype": "iprp_aligngrp",
+      "cost_table": "iprp_damagecost"
+    },
+    "18": {
+      "name": "Damage Bonus vs. Racial Group",
+      "subtype": "racialtypes",
+      "cost_table": "iprp_damagecost"
+    },
+    "19": {
+      "name": "Damage Bonus vs. Specific Alignment",
+      "subtype": "iprp_alignment",
+      "cost_table": "iprp_damagecost"
+    },
+    "20": {
+      "name": "Immunity: Damage Type",
+      "subtype": "iprp_damagetype",
+      "cost_table": "iprp_immuncost"
+    },
+    "21": {
+      "name": "Decreased Damage",
+      "cost_table": "iprp_neg5cost"
+    },
+    "22": {
+      "name": "Damage Reduction",
+      "subtype": "iprp_reducestype",
+      "cost_table": "iprp_softcost"
+    },
+    "23": {
+      "name": "Damage Resistance",
+      "subtype": "iprp_damagetype",
+      "cost_table": "iprp_damageresist"
+    },
+    "24": {
+      "name": "Damage Vulnerability",
+      "subtype": "iprp_damagetype",
+      "cost_table": "iprp_damagevuln"
+    },
+    "25": {
+      "name": "Dancing"
+    },
+    "26": {
+      "name": "Darkvision"
+    },
+    "27": {
+      "name": "Decreased Ability Score",
+      "subtype": "iprp_abilities",
+      "cost_table": "iprp_neg10cost"
+    },
+    "28": {
+      "name": "Decreased AC",
+      "subtype": "iprp_acmod",
+      "cost_table": "iprp_neg5cost"
+    },
+    "29": {
+      "name": "Decreased Skill Modifier",
+      "subtype": "skills",
+      "cost_table": "iprp_neg10cost"
+    },
+    "30": {
+      "name": "Double Stack"
+    },
+    "31": {
+      "name": "Holy Avenger"
+    },
+    "32": {
+      "name": "Enhanced Containment",
+      "cost_table": "iprp_containcost"
+    },
+    "33": {
+      "name": "Extra Melee Damage Type",
+      "subtype": "iprp_damagetype"
+    },
+    "34": {
+      "name": "Extra Ranged Damage Type",
+      "subtype": "iprp_damagetype"
+    },
+    "35": {
+      "name": "Haste"
+    },
+    "36": {
+      "name": "Holy Avenger"
+    },
+    "37": {
+      "name": "Immunity: Miscellaneous",
+      "subtype": "iprp_immunity"
+    },
+    "38": {
+      "name": "Improved Evasion"
+    },
+    "39": {
+      "name": "Spell Resistance",
+      "cost_table": "iprp_srcost"
+    },
+    "40": {
+      "name": "Saving Throw Bonus",
+      "subtype": "iprp_saveelement",
+      "cost_table": "iprp_acmodcost"
+    },
+    "41": {
+      "name": "Saving Throw Bonus: Specific",
+      "subtype": "iprp_savingthrow",
+      "cost_table": "iprp_acmodcost"
+    },
+    "43": {
+      "name": "Keen"
+    },
+    "44": {
+      "name": "Light",
+      "cost_table": "iprp_lightcost"
+    },
+    "45": {
+      "name": "Mighty",
+      "cost_table": "iprp_acmodcost"
+    },
+    "46": {
+      "name": "Mind Blank"
+    },
+    "47": {
+      "name": "No Combat Damage"
+    },
+    "48": {
+      "name": "On Hit Properties",
+      "subtype": "iprp_onhit",
+      "cost_table": "iprp_onhitcost"
+    },
+    "49": {
+      "name": "Decreased Saving Throws",
+      "subtype": "iprp_saveelement",
+      "cost_table": "iprp_neg5cost"
+    },
+    "50": {
+      "name": "Decreased Saving Throws: Specific",
+      "subtype": "iprp_savingthrow",
+      "cost_table": "iprp_neg5cost"
+    },
+    "51": {
+      "name": "Regeneration",
+      "cost_table": "iprp_acmodcost"
+    },
+    "52": {
+      "name": "Skill Bonus",
+      "subtype": "skills",
+      "cost_table": "iprp_meleecost"
+    },
+    "53": {
+      "name": "Immunity: Specific Spell"
+    },
+    "54": {
+      "name": "Immunity: Spell School",
+      "subtype": "iprp_spellshl"
+    },
+    "55": {
+      "name": "Thieves' Tools",
+      "cost_table": "iprp_meleecost"
+    },
+    "56": {
+      "name": "Attack Bonus",
+      "cost_table": "iprp_acmodcost"
+    },
+    "57": {
+      "name": "Attack Bonus vs. Alignment Group",
+      "subtype": "iprp_aligngrp",
+      "cost_table": "iprp_acmodcost"
+    },
+    "58": {
+      "name": "Attack Bonus vs. Racial Group",
+      "subtype": "racialtypes",
+      "cost_table": "iprp_acmodcost"
+    },
+    "59": {
+      "name": "Attack Bonus vs. Specific Alignment",
+      "subtype": "iprp_alignment",
+      "cost_table": "iprp_acmodcost"
+    },
+    "60": {
+      "name": "Decreased Attack Modifier",
+      "cost_table": "iprp_neg5cost"
+    },
+    "61": {
+      "name": "Unlimited Ammunition",
+      "subtype": "iprp_ammotype",
+      "cost_table": "iprp_ammocost"
+    },
+    "62": {
+      "name": "Use Limitation: Alignment Group",
+      "subtype": "iprp_aligngrp"
+    },
+    "63": {
+      "name": "Use Limitation: Class",
+      "subtype": "classes"
+    },
+    "64": {
+      "name": "Use Limitation: Racial Type",
+      "subtype": "racialtypes"
+    },
+    "65": {
+      "name": "Use Limitation: Specific Alignment",
+      "subtype": "iprp_alignment"
+    },
+    "66": {
+      "name": "Use Limitation: Terrain Type",
+      "subtype": "iprp_terraintype"
+    },
+    "67": {
+      "name": "Regeneration: Vampiric",
+      "cost_table": "iprp_acmodcost"
+    },
+    "70": {
+      "name": "Trap",
+      "subtype": "iprp_traps"
+    },
+    "71": {
+      "name": "True Seeing"
+    },
+    "72": {
+      "name": "On Monster Hit",
+      "subtype": "iprp_onhit"
+    },
+    "73": {
+      "name": "Turn Resistance",
+      "cost_table": "iprp_meleecost"
+    },
+    "74": {
+      "name": "Massive Criticals",
+      "cost_table": "iprp_damagecost"
+    },
+    "75": {
+      "name": "Freedom of Movement"
+    },
+    "76": {
+      "name": "Poison"
+    },
+    "77": {
+      "name": "Monster Damage",
+      "cost_table": "iprp_monstcost"
+    },
+    "78": {
+      "name": "Immunity: Spells by Level",
+      "cost_table": "iprp_immunlvl"
+    },
+    "79": {
+      "name": "Special Walk"
+    },
+    "80": {
+      "name": "Healer's Kit",
+      "cost_table": "iprp_meleecost"
+    },
+    "81": {
+      "name": "Weight Increase"
+    },
+    "82": {
+      "name": "On Hit Cast Spell",
+      "subtype": "iprp_onhitspell",
+      "cost_table": "iprp_casterlvl"
+    },
+    "83": {
+      "name": "Visual Effect",
+      "subtype": "iprp_visualfx"
+    },
+    "84": {
+      "name": "Arcane Spell Failure"
+    },
+    "85": {
+      "name": "Material"
+    },
+    "86": {
+      "name": "Quality"
+    },
+    "87": {
+      "name": "Additional Property"
+    },
+    "150": {
+      "name": "Use Limitation: Gender",
+      "subtype": "iprp_gender"
+    }
   },
   "tables": {
-    "iprp_bonuscost":   {"_format": "+{}"},
-    "iprp_neg5cost":    {"_format": "-{}"},
-    "iprp_neg10cost":   {"_format": "-{}"},
-    "iprp_acmodcost":   {"_format": "+{}"},
-    "iprp_meleecost":   {"_format": "+{}"},
-    "iprp_savingthrow": {"_format": "+{}"},
-    "iprp_abilcost":    {"_format": "+{}"},
-    "iprp_chargecost": {"0": "0 charges", "1": "1 charge", "2": "2 charges", "3": "3 charges", "4": "4 charges", "5": "5 charges", "6": "Unlimited Use", "7": "Single Use", "8": "1/Day", "9": "2/Day", "10": "3/Day", "11": "4/Day", "12": "5/Day"},
-    "iprp_damagecost": {"0": "1d4", "1": "1d6", "2": "1d8", "3": "1d10", "4": "2d6", "5": "2d8", "6": "2d10", "7": "1", "8": "2", "9": "3", "10": "4", "11": "5", "12": "6", "13": "7", "14": "8", "15": "9", "16": "10"},
-    "iprp_softcost": {"0": "5/+1", "1": "5/+2", "2": "5/+3", "3": "5/+4", "4": "5/+5", "5": "10/+1", "6": "10/+2", "7": "10/+3", "8": "10/+4", "9": "10/+5", "10": "15/+1", "11": "15/+2", "12": "15/+3", "13": "15/+4", "14": "15/+5", "15": "20/+1", "16": "20/+2", "17": "20/+3", "18": "20/+4", "19": "20/+5", "20": "25/+1", "21": "25/+2", "22": "25/+3", "23": "25/+4", "24": "25/+5", "25": "30/+1", "26": "30/+2", "27": "30/+3", "28": "30/+4", "29": "30/+5"},
-    "iprp_damageresist": {"0": "5/-", "1": "10/-", "2": "15/-", "3": "20/-", "4": "25/-", "5": "30/-"},
-    "iprp_damagevuln": {"0": "5%", "1": "10%", "2": "15%", "3": "20%", "4": "25%", "5": "50%", "6": "75%", "7": "99%"},
-    "iprp_immuncost": {"0": "5%", "1": "10%", "2": "15%", "3": "20%", "4": "25%", "5": "50%", "6": "75%", "7": "100%"},
-    "iprp_srcost": {"0": "10", "1": "12", "2": "14", "3": "16", "4": "18", "5": "20", "6": "22", "7": "24", "8": "26", "9": "28", "10": "30", "11": "32"},
-    "iprp_lightcost": {"0": "Dim", "1": "Low", "2": "Normal", "3": "Bright"},
-    "iprp_weightcost": {"0": "80% reduction", "1": "60% reduction", "2": "40% reduction", "3": "20% reduction"},
-    "iprp_containcost": {"0": "Universal", "1": "Acid", "2": "Cold", "3": "Electrical", "4": "Fire", "5": "Negative", "6": "Positive", "7": "Sonic"},
-    "iprp_monstcost": {"0": "1d2", "1": "1d3", "2": "1d4", "3": "1d6", "4": "1d8", "5": "1d10", "6": "1d12", "7": "2d4", "8": "2d6", "9": "2d8", "10": "2d10", "11": "2d12", "12": "3d6", "13": "3d8", "14": "3d10", "15": "3d12", "16": "4d6", "17": "4d8", "18": "4d10", "19": "4d12", "20": "5d6", "21": "5d8", "22": "5d10", "23": "5d12", "24": "6d6", "25": "6d8", "26": "6d10", "27": "6d12"},
-    "iprp_immunlvl": {"0": "1st level and below", "1": "2nd level and below", "2": "3rd level and below", "3": "4th level and below", "4": "5th level and below", "5": "6th level and below", "6": "7th level and below", "7": "8th level and below", "8": "9th level and below"},
-    "iprp_healerscost": {"_format": "+{}"},
-    "iprp_weightinc": {"0": "5 lb", "1": "10 lb", "2": "15 lb", "3": "20 lb", "4": "25 lb", "5": "50 lb", "6": "100 lb"},
-    "iprp_abilities": {"0": "Strength", "1": "Dexterity", "2": "Constitution", "3": "Intelligence", "4": "Wisdom", "5": "Charisma"},
-    "iprp_damagetype": {"0": "Bludgeoning", "1": "Piercing", "2": "Slashing", "3": "Subdual", "4": "Physical", "5": "Magical", "6": "Acid", "7": "Cold", "8": "Divine", "9": "Electrical", "10": "Fire", "11": "Negative", "12": "Positive", "13": "Sonic", "14": "Entropy"},
-    "iprp_aligngrp": {"0": "All", "1": "Neutral", "2": "Lawful", "3": "Chaotic", "4": "Good", "5": "Evil"},
-    "iprp_alignment": {"0": "Lawful Good", "1": "Lawful Neutral", "2": "Lawful Evil", "3": "Neutral Good", "4": "True Neutral", "5": "Neutral Evil", "6": "Chaotic Good", "7": "Chaotic Neutral", "8": "Chaotic Evil"},
-    "iprp_acmod": {"0": "Dodge", "1": "Natural", "2": "Armor", "3": "Shield", "4": "Deflection"},
-    "iprp_saveelement": {"0": "Universal", "1": "Acid", "2": "Backstab", "3": "Cold", "4": "Death", "5": "Disease", "6": "Divine", "7": "Electrical", "8": "Fire", "9": "Fear", "10": "Mind-affecting", "11": "Negative", "12": "Poison", "13": "Positive", "14": "Sonic"},
-    "iprp_savevs": {"0": "Acid", "1": "Cold", "2": "Death", "3": "Disease", "4": "Divine", "5": "Electrical", "6": "Fear", "7": "Fire", "8": "Mind Affecting", "9": "Negative", "10": "Poison", "11": "Positive", "12": "Sonic", "13": "All Saves", "14": "Universal"},
-    "iprp_school": {"0": "Abjuration", "1": "Conjuration", "2": "Divination", "3": "Enchantment", "4": "Evocation", "5": "Illusion", "6": "Necromancy", "7": "Transmutation"},
-    "iprp_lightcolor": {"0": "Blue", "1": "Yellow", "2": "Purple", "3": "Red", "4": "Green", "5": "Orange", "6": "White"},
-    "iprp_reducestype": {"0": "+1 Enhancement", "1": "+2 Enhancement", "2": "+3 Enhancement", "3": "+4 Enhancement", "4": "+5 Enhancement", "5": "+6 Enhancement", "6": "+7 Enhancement", "7": "+8 Enhancement", "8": "+9 Enhancement", "9": "+10 Enhancement", "10": "+11 Enhancement", "11": "+12 Enhancement", "12": "+13 Enhancement", "13": "+14 Enhancement", "14": "+15 Enhancement", "15": "+16 Enhancement", "16": "+17 Enhancement", "17": "+18 Enhancement", "18": "+19 Enhancement", "19": "+20 Enhancement"}
+    "iprp_bonuscost": {
+      "_format": "+{}"
+    },
+    "iprp_neg5cost": {
+      "_format": "-{}"
+    },
+    "iprp_neg10cost": {
+      "_format": "-{}"
+    },
+    "iprp_acmodcost": {
+      "_format": "+{}"
+    },
+    "iprp_meleecost": {
+      "_format": "+{}"
+    },
+    "iprp_savingthrow": {
+      "_format": "+{}"
+    },
+    "iprp_abilcost": {
+      "_format": "+{}"
+    },
+    "iprp_chargecost": {
+      "0": "0 charges",
+      "1": "1 charge",
+      "2": "2 charges",
+      "3": "3 charges",
+      "4": "4 charges",
+      "5": "5 charges",
+      "6": "Unlimited Use",
+      "7": "Single Use",
+      "8": "1/Day",
+      "9": "2/Day",
+      "10": "3/Day",
+      "11": "4/Day",
+      "12": "5/Day"
+    },
+    "iprp_damagecost": {
+      "0": "1d4",
+      "1": "1d6",
+      "2": "1d8",
+      "3": "1d10",
+      "4": "2d6",
+      "5": "2d8",
+      "6": "2d10",
+      "7": "1",
+      "8": "2",
+      "9": "3",
+      "10": "4",
+      "11": "5",
+      "12": "6",
+      "13": "7",
+      "14": "8",
+      "15": "9",
+      "16": "10"
+    },
+    "iprp_softcost": {
+      "0": "5/+1",
+      "1": "5/+2",
+      "2": "5/+3",
+      "3": "5/+4",
+      "4": "5/+5",
+      "5": "10/+1",
+      "6": "10/+2",
+      "7": "10/+3",
+      "8": "10/+4",
+      "9": "10/+5",
+      "10": "15/+1",
+      "11": "15/+2",
+      "12": "15/+3",
+      "13": "15/+4",
+      "14": "15/+5",
+      "15": "20/+1",
+      "16": "20/+2",
+      "17": "20/+3",
+      "18": "20/+4",
+      "19": "20/+5",
+      "20": "25/+1",
+      "21": "25/+2",
+      "22": "25/+3",
+      "23": "25/+4",
+      "24": "25/+5",
+      "25": "30/+1",
+      "26": "30/+2",
+      "27": "30/+3",
+      "28": "30/+4",
+      "29": "30/+5"
+    },
+    "iprp_damageresist": {
+      "0": "5/-",
+      "1": "10/-",
+      "2": "15/-",
+      "3": "20/-",
+      "4": "25/-",
+      "5": "30/-"
+    },
+    "iprp_damagevuln": {
+      "0": "5%",
+      "1": "10%",
+      "2": "15%",
+      "3": "20%",
+      "4": "25%",
+      "5": "50%",
+      "6": "75%",
+      "7": "99%"
+    },
+    "iprp_immuncost": {
+      "0": "5%",
+      "1": "10%",
+      "2": "15%",
+      "3": "20%",
+      "4": "25%",
+      "5": "50%",
+      "6": "75%",
+      "7": "100%"
+    },
+    "iprp_srcost": {
+      "0": "10",
+      "1": "12",
+      "2": "14",
+      "3": "16",
+      "4": "18",
+      "5": "20",
+      "6": "22",
+      "7": "24",
+      "8": "26",
+      "9": "28",
+      "10": "30",
+      "11": "32"
+    },
+    "iprp_lightcost": {
+      "0": "Dim",
+      "1": "Low",
+      "2": "Normal",
+      "3": "Bright"
+    },
+    "iprp_weightcost": {
+      "0": "80% reduction",
+      "1": "60% reduction",
+      "2": "40% reduction",
+      "3": "20% reduction"
+    },
+    "iprp_containcost": {
+      "0": "Universal",
+      "1": "Acid",
+      "2": "Cold",
+      "3": "Electrical",
+      "4": "Fire",
+      "5": "Negative",
+      "6": "Positive",
+      "7": "Sonic"
+    },
+    "iprp_monstcost": {
+      "0": "1d2",
+      "1": "1d3",
+      "2": "1d4",
+      "3": "1d6",
+      "4": "1d8",
+      "5": "1d10",
+      "6": "1d12",
+      "7": "2d4",
+      "8": "2d6",
+      "9": "2d8",
+      "10": "2d10",
+      "11": "2d12",
+      "12": "3d6",
+      "13": "3d8",
+      "14": "3d10",
+      "15": "3d12",
+      "16": "4d6",
+      "17": "4d8",
+      "18": "4d10",
+      "19": "4d12",
+      "20": "5d6",
+      "21": "5d8",
+      "22": "5d10",
+      "23": "5d12",
+      "24": "6d6",
+      "25": "6d8",
+      "26": "6d10",
+      "27": "6d12"
+    },
+    "iprp_immunlvl": {
+      "0": "1st level and below",
+      "1": "2nd level and below",
+      "2": "3rd level and below",
+      "3": "4th level and below",
+      "4": "5th level and below",
+      "5": "6th level and below",
+      "6": "7th level and below",
+      "7": "8th level and below",
+      "8": "9th level and below"
+    },
+    "iprp_healerscost": {
+      "_format": "+{}"
+    },
+    "iprp_weightinc": {
+      "0": "5 lb",
+      "1": "10 lb",
+      "2": "15 lb",
+      "3": "20 lb",
+      "4": "25 lb",
+      "5": "50 lb",
+      "6": "100 lb"
+    },
+    "iprp_abilities": {
+      "0": "Strength",
+      "1": "Dexterity",
+      "2": "Constitution",
+      "3": "Intelligence",
+      "4": "Wisdom",
+      "5": "Charisma"
+    },
+    "iprp_damagetype": {
+      "0": "Bludgeoning",
+      "1": "Piercing",
+      "2": "Slashing",
+      "3": "Subdual",
+      "4": "Physical",
+      "5": "Magical",
+      "6": "Acid",
+      "7": "Cold",
+      "8": "Divine",
+      "9": "Electrical",
+      "10": "Fire",
+      "11": "Negative",
+      "12": "Positive",
+      "13": "Sonic",
+      "14": "Entropy"
+    },
+    "iprp_aligngrp": {
+      "0": "All",
+      "1": "Neutral",
+      "2": "Lawful",
+      "3": "Chaotic",
+      "4": "Good",
+      "5": "Evil"
+    },
+    "iprp_alignment": {
+      "0": "Lawful Good",
+      "1": "Lawful Neutral",
+      "2": "Lawful Evil",
+      "3": "Neutral Good",
+      "4": "True Neutral",
+      "5": "Neutral Evil",
+      "6": "Chaotic Good",
+      "7": "Chaotic Neutral",
+      "8": "Chaotic Evil"
+    },
+    "iprp_acmod": {
+      "0": "Dodge",
+      "1": "Natural",
+      "2": "Armor",
+      "3": "Shield",
+      "4": "Deflection"
+    },
+    "iprp_saveelement": {
+      "0": "Universal",
+      "1": "Acid",
+      "2": "Backstab",
+      "3": "Cold",
+      "4": "Death",
+      "5": "Disease",
+      "6": "Divine",
+      "7": "Electrical",
+      "8": "Fear",
+      "9": "Fire",
+      "10": "Illusion",
+      "11": "Mind Affecting",
+      "12": "Negative Energy",
+      "13": "Poison",
+      "14": "Positive Energy",
+      "15": "Sonic",
+      "16": "Traps",
+      "17": "Spells",
+      "18": "Law",
+      "19": "Chaos",
+      "20": "Good",
+      "21": "Evil"
+    },
+    "iprp_savevs": {
+      "0": "Acid",
+      "1": "Cold",
+      "2": "Death",
+      "3": "Disease",
+      "4": "Divine",
+      "5": "Electrical",
+      "6": "Fear",
+      "7": "Fire",
+      "8": "Mind Affecting",
+      "9": "Negative",
+      "10": "Poison",
+      "11": "Positive",
+      "12": "Sonic",
+      "13": "All Saves",
+      "14": "Universal"
+    },
+    "iprp_school": {
+      "0": "Abjuration",
+      "1": "Conjuration",
+      "2": "Divination",
+      "3": "Enchantment",
+      "4": "Evocation",
+      "5": "Illusion",
+      "6": "Necromancy",
+      "7": "Transmutation"
+    },
+    "iprp_lightcolor": {
+      "0": "Blue",
+      "1": "Yellow",
+      "2": "Purple",
+      "3": "Red",
+      "4": "Green",
+      "5": "Orange",
+      "6": "White"
+    },
+    "iprp_reducestype": {
+      "0": "+1 Enhancement",
+      "1": "+2 Enhancement",
+      "2": "+3 Enhancement",
+      "3": "+4 Enhancement",
+      "4": "+5 Enhancement",
+      "5": "+6 Enhancement",
+      "6": "+7 Enhancement",
+      "7": "+8 Enhancement",
+      "8": "+9 Enhancement",
+      "9": "+10 Enhancement",
+      "10": "+11 Enhancement",
+      "11": "+12 Enhancement",
+      "12": "+13 Enhancement",
+      "13": "+14 Enhancement",
+      "14": "+15 Enhancement",
+      "15": "+16 Enhancement",
+      "16": "+17 Enhancement",
+      "17": "+18 Enhancement",
+      "18": "+19 Enhancement",
+      "19": "+20 Enhancement"
+    },
+    "iprp_onhit": {
+      "0": "Sleep",
+      "1": "Stun",
+      "2": "Hold",
+      "3": "Confusion",
+      "5": "Daze",
+      "6": "Doom",
+      "7": "Fear",
+      "8": "Knock",
+      "9": "Slow",
+      "10": "Lesser Dispelling",
+      "11": "Dispel Magic",
+      "12": "Greater Dispelling",
+      "13": "Mordenkainen's Disjunction",
+      "14": "Silence",
+      "15": "Deafness",
+      "16": "Blindness",
+      "17": "Level Drain",
+      "18": "Ability Drain",
+      "19": "Poison",
+      "20": "Disease",
+      "21": "Slay Racial Group",
+      "22": "Slay Alignment Group",
+      "23": "Slay Alignment",
+      "24": "Vorpal",
+      "25": "Wounding"
+    },
+    "iprp_onhitcost": {
+      "0": "DC 14",
+      "1": "DC 16",
+      "2": "DC 18",
+      "3": "DC 20",
+      "4": "DC 22",
+      "5": "DC 24",
+      "6": "DC 26"
+    },
+    "iprp_spelllevel": {
+      "0": "Level 0 (Cantrip)",
+      "1": "Level 1",
+      "2": "Level 2",
+      "3": "Level 3",
+      "4": "Level 4",
+      "5": "Level 5",
+      "6": "Level 6",
+      "7": "Level 7",
+      "8": "Level 8",
+      "9": "Level 9"
+    },
+    "iprp_onhitspell": {
+      "0": "Acid Fog",
+      "1": "Bestow Curse",
+      "3": "Blindness/Deafness",
+      "4": "Call Lightning",
+      "5": "Chain Lightning",
+      "6": "Cloudkill",
+      "7": "Confusion",
+      "8": "Contagion",
+      "9": "Darkness",
+      "10": "Daze",
+      "11": "Delayed Blast Fireball",
+      "12": "Dismissal",
+      "13": "Dispel Magic",
+      "14": "Doom",
+      "15": "Energy Drain",
+      "16": "Enervation",
+      "17": "Entangle",
+      "18": "Fear",
+      "19": "Feeblemind",
+      "20": "Fire Storm",
+      "21": "Fireball",
+      "22": "Flame Lash",
+      "23": "Flame Strike",
+      "24": "Ghoul Touch",
+      "25": "Grease",
+      "26": "Greater Dispelling",
+      "27": "Greater Spell Breach",
+      "28": "Gust of Wind",
+      "29": "Hammer of the Gods",
+      "30": "Harm",
+      "31": "Hold Animal",
+      "32": "Hold Monster",
+      "33": "Hold Person",
+      "34": "Implosion",
+      "35": "Incendiary Cloud",
+      "36": "Lesser Dispel",
+      "38": "Lesser Spell Breach",
+      "40": "Light",
+      "41": "Lightning Bolt",
+      "42": "Magic Missile",
+      "43": "Mass Blindness/Deafness",
+      "44": "Mass Charm",
+      "45": "Melf's Acid Arrow",
+      "46": "Meteor Swarm",
+      "47": "Mind Fog",
+      "49": "Phantasmal Killer",
+      "50": "Poison",
+      "51": "Power Word, Kill",
+      "52": "Power Word, Stun",
+      "54": "Scare",
+      "55": "Searing Light",
+      "56": "Silence",
+      "57": "Slay Living",
+      "58": "Sleep",
+      "59": "Slow",
+      "60": "Sound Burst",
+      "61": "Stinking Cloud",
+      "63": "Storm of Vengeance",
+      "64": "Sunbeam",
+      "65": "Vampiric Touch",
+      "66": "Wail of the Banshee",
+      "67": "Wall of Fire",
+      "68": "Web",
+      "69": "Weird",
+      "70": "Word of Faith",
+      "72": "Creeping Doom",
+      "73": "Destruction",
+      "74": "Horrid Wilting",
+      "75": "Ice Storm",
+      "76": "Negative Energy Burst",
+      "77": "Evard's Black Tentacles",
+      "79": "Flare",
+      "80": "Bombardment",
+      "81": "Acid Splash",
+      "82": "Quillfire",
+      "83": "Earthquake",
+      "84": "Sunburst",
+      "85": "Banishment",
+      "86": "Inflict Minor Wounds",
+      "87": "Inflict Light Wounds",
+      "88": "Inflict Moderate Wounds",
+      "89": "Inflict Serious Wounds",
+      "90": "Inflict Critical Wounds",
+      "91": "Balagarn's Iron Horn",
+      "92": "Drown",
+      "93": "Electric Jolt",
+      "94": "Firebrand",
+      "95": "Wounding Whispers",
+      "96": "Undeath's Eternal Foe",
+      "97": "Inferno",
+      "98": "Isaac's Lesser Missile Storm",
+      "99": "Isaac's Greater Missile Storm",
+      "100": "Bane",
+      "101": "Spike Growth",
+      "102": "Tasha's Hideous Laughter",
+      "103": "Bigby's Interposing Hand",
+      "104": "Bigby's Forceful Hand",
+      "105": "Bigby's Grasping Hand",
+      "106": "Bigby's Clenched Fist",
+      "107": "Bigby's Crushing Hand",
+      "108": "Flesh to Stone",
+      "109": "Stone to Flesh",
+      "110": "Crumble",
+      "111": "Infestation of Maggots",
+      "112": "Great Thunderclap",
+      "113": "Ball Lightning",
+      "114": "Gedlee's Electric Loop",
+      "115": "Horizikaul's Boom",
+      "116": "Mestil's Acid Breath",
+      "117": "Scintillating Sphere",
+      "118": "Undeath to Death",
+      "119": "Stonehold",
+      "121": "Evil Blight",
+      "122": "Teleport Projectile Properties",
+      "123": "Blessed Bolt Properties (Slay Rakshasa)",
+      "124": "Flaming Weapon Properties (Fire Damage)",
+      "125": "Unique Power (OnHit)",
+      "126": "Planar Rift Properties (Black Blade of Disaster)",
+      "127": "Dark Fire (Immolate)",
+      "129": "Flaming Hide",
+      "130": "Chaos Shield (2% chance to strike on attacker)",
+      "132": "Ruin Armor (Bebilith)",
+      "133": "Paralyzing Touch (Demilich)",
+      "134": "Paralyzing Touch (Dracolich)",
+      "135": "Intelligent Weapon",
+      "136": "Paralysis (Gelatinous Cube Poison)",
+      "137": "Deafening Clang (Deafness 5 rounds; Fort Save DC 15 to avoid)",
+      "138": "Knockdown (Monster Only; DC 10 + Casterlevel)",
+      "139": "Freeze (Slow Attacker; Fort Save, DC 10 + Casterlevel)",
+      "140": "Combust"
+    },
+    "iprp_gender": {
+      "0": "Male",
+      "1": "Female"
+    },
+    "iprp_immunity": {
+      "0": "Sneak Attack",
+      "1": "Level/Ability Drain",
+      "2": "Mind-Affecting Spells",
+      "3": "Poison",
+      "4": "Disease",
+      "5": "Fear",
+      "6": "Knockdown",
+      "7": "Paralysis",
+      "8": "Critical Hits",
+      "9": "Death Magic"
+    },
+    "iprp_casterlvl": {
+      "_format": "Caster Level {}"
+    }
   }
 }
