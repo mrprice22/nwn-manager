@@ -36,6 +36,7 @@ header.site, header.site-header {
   color: #fff;
   padding: 0.75em 1.5em;
   border-bottom: 4px solid var(--accent-soft);
+  text-align: center;
 }
 header.site a, header.site-header a { color: #fff; }
 header.site-header .brand {
@@ -46,7 +47,7 @@ header.site-header .brand img.site-header-img {
   height: 40px;
   width: auto;
   vertical-align: middle;
-  display: block;
+  display: inline-block;
 }
 header.site h1 {
   margin: 0;

@@ -698,7 +698,9 @@ _CATEGORY_LABELS: dict[str, str] = {
     "armor_medium":      "Medium Armor",
     "armor_light":       "Light Armor",
     "armor_cloth":       "Cloth & Robes",
-    "shield":            "Shields",
+    "shield_small":      "Small Shields",
+    "shield_large":      "Large Shields",
+    "shield_tower":      "Tower Shields",
     "helmet":            "Helmets",
     "amulet":            "Amulets",
     "belt":              "Belts",
@@ -716,7 +718,7 @@ _CATEGORY_LABELS: dict[str, str] = {
 # dynamically-discovered weapon_* keys at render time.
 _TOC_GROUPS: list[tuple[str, list[str]]] = [
     ("Weapons",  ["WEAPONS", "ammo"]),
-    ("Armor",    ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield", "helmet"]),
+    ("Armor",    ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield_small", "shield_large", "shield_tower", "helmet"]),
     ("Gear",     ["amulet", "belt", "boots", "bracers_gauntlets", "ring", "cloak"]),
     ("Misc.",    ["consumable", "misc"]),
 ]
@@ -735,8 +737,12 @@ def _item_category(item: dict) -> str:
         if ac <= 6:
             return "armor_medium"
         return "armor_heavy"
-    if bi in SHIELD_BASEITEMS:
-        return "shield"
+    if bi == 14:
+        return "shield_small"
+    if bi == 56:
+        return "shield_large"
+    if bi == 57:
+        return "shield_tower"
     if bi in _HELMET_BASEITEMS:
         return "helmet"
     if bi in _ACCESSORY_BASEITEM_MAP:
