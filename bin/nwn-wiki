@@ -482,6 +482,7 @@ _NON_IPRP_SUBTYPES = {
     "racialtypes": lambda i: race_name(i),
     "classes":     lambda i: class_name(i),
     "iprp_feats":  lambda i: IPRP_FEATS.get(int(i)) if i is not None else None,
+    "skills":      lambda i: skill_name(i),
 }
 
 
@@ -5161,10 +5162,37 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         debug_rows = []
         for p in props:
             f = itemprop_format(p)
+            pname, subtype = f["property"], f["subtype"]
+            # Build links into the Browse by Property index/detail pages.
+            # Property cell → index section heading; subtype cell → detail page.
+            # Fall back to plain text when pname is unresolved (e.g. "Property #7").
+            _pname_known = pname and not pname.startswith("Property #")
+            _subtype_real = subtype and not _is_raw_subtype(subtype)
+            cost_str = f["cost"]
+            if _pname_known:
+                _idx_anch = f"properties/index.html#pn-{_prop_slug(pname, '')}"
+                _detail_slug = _prop_slug(pname, subtype if _subtype_real else "")
+                _detail_href = f"properties/{_detail_slug}.html"
+                if _subtype_real:
+                    pname_cell = colorize_damage_words(link(_idx_anch, pname))
+                    subtype_cell = colorize_damage_words(link(_detail_href, subtype))
+                else:
+                    pname_cell = colorize_damage_words(link(_detail_href, pname))
+                    subtype_cell = colorize_damage_words(E(subtype))
+                if cost_str:
+                    _cost_anch = _cost_anchor(cost_str)
+                    _cost_href = f"{_detail_href}#{_cost_anch}" if _cost_anch else _detail_href
+                    cost_cell = link(_cost_href, cost_str)
+                else:
+                    cost_cell = ""
+            else:
+                pname_cell = colorize_damage_words(E(pname))
+                subtype_cell = colorize_damage_words(E(subtype))
+                cost_cell = E(cost_str)
             rows.append(
-                f"<tr><td>{colorize_damage_words(E(f['property']))}</td>"
-                f"<td>{colorize_damage_words(E(f['subtype']))}</td>"
-                f"<td>{E(f['cost'])}</td>"
+                f"<tr><td>{pname_cell}</td>"
+                f"<td>{subtype_cell}</td>"
+                f"<td>{cost_cell}</td>"
                 f"<td>{E(f['param'])}</td>"
                 f"<td>{E(f['chance'])}</td></tr>"
             )
@@ -5551,7 +5579,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     "</tr></thead><tbody>"
                 )
                 for resref, name, _, _, qty in sub_entries:
-                    itype = baseitem_label(fld(db.items[resref], "BaseItem"))
+                    itype = _item_category_label(_item_category(db.items[resref]))
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
                         f"<td>{E(itype)}</td>"
@@ -5574,7 +5602,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 "</tr></thead><tbody>"
             )
             for resref, name, cost_str, _, qty in entries:
-                itype = baseitem_label(fld(db.items[resref], "BaseItem"))
+                itype = _item_category_label(_item_category(db.items[resref]))
                 body += (
                     f"<tr><td>{link(f'../{resref}.html', name)}</td>"
                     f"<td>{E(itype)}</td>"
@@ -5601,7 +5629,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     "</tr></thead><tbody>"
                 )
                 for resref, name, _, _, qty in tier_entries:
-                    itype = baseitem_label(fld(db.items[resref], "BaseItem"))
+                    itype = _item_category_label(_item_category(db.items[resref]))
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
                         f"<td>{E(itype)}</td>"
