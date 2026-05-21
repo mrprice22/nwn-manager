@@ -550,7 +550,7 @@ def itemprop_format(prop: dict) -> dict[str, str]:
             else:
                 short = st_tbl.replace("iprp_", "")
                 subtype_str = f"{short} #{subtype_id}"
-        elif subtype_id != 0:
+        elif int(subtype_id) not in (0, 65535):
             subtype_str = str(subtype_id)
 
     # Cost: indexes a per-property cost table (e.g. +1..+20).
@@ -4191,7 +4191,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>Cost</th>"
+            "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>GP Value</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
@@ -5100,7 +5100,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
         f"<dt>Type</dt><dd>{link('index.html#' + _item_category(i).replace('_', '-'), _item_category_label(_item_category(i)))}</dd>",
-        f"<dt>Cost</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
+        f"<dt>GP Value</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
         f"<dt {cursed_tt}>Cursed</dt><dd>{'Yes' if is_cursed else 'No'}</dd>",
         f"<dt {plot_tt}>Plot</dt><dd>{'Yes' if is_plot else 'No'}</dd>",
@@ -5770,8 +5770,8 @@ form.addEventListener('submit',function(e){
 function render(rows,showProps){
   if(!rows.length){results.innerHTML='<p class="muted">No items match.</p>';return;}
   var cols=showProps
-    ?'<th>Name</th><th>Base Item</th><th>Matched Properties</th><th>Cost</th>'
-    :'<th>Name</th><th>Base Item</th><th>Cost</th>';
+    ?'<th>Name</th><th>Base Item</th><th>Matched Properties</th><th>GP Value</th>'
+    :'<th>Name</th><th>Base Item</th><th>GP Value</th>';
   var html='<p><strong>'+rows.length+'</strong> result'+(rows.length!==1?'s':'')+'</p>'
     +'<table class="data"><thead><tr>'+cols+'</tr></thead><tbody>';
   rows.forEach(function(r){
@@ -5779,8 +5779,12 @@ function render(rows,showProps){
       return '<span>'+esc(p.prop+(p.subtype?': '+p.subtype:''))
         +(p.cost?' \u2014 '+esc(p.cost):'')+'</span>';
     }).join('<br>');
+    var biHref='../index.html#'+esc(r.it.base_item_anchor||'');
+    var biCell=r.it.base_item_anchor
+      ?'<a href="'+biHref+'">'+esc(r.it.base_item)+'</a>'
+      :esc(r.it.base_item);
     html+='<tr><td><a href="'+esc(r.it.url)+'">'+esc(r.it.name)+'</a></td>'
-         +'<td>'+esc(r.it.base_item)+'</td>'
+         +'<td>'+biCell+'</td>'
          +(showProps?'<td>'+props+'</td>':'')
          +'<td>'+(r.it.cost?r.it.cost.toLocaleString()+' gp':'\u2014')+'</td></tr>';
   });
@@ -5815,10 +5819,14 @@ def render_items_search(db: "Db", out: Path) -> None:
             pname = f["property"]
             if not pname:
                 continue
+            subtype = f["subtype"]
+            cost = f["cost"]
+            if pname == "Immunity: Specific Spell" and not subtype and cost:
+                subtype, cost = cost, ""
             props.append({
                 "prop": pname,
-                "subtype": f["subtype"],
-                "cost": f["cost"],
+                "subtype": subtype,
+                "cost": cost,
                 "value_num": _prop_value_num(f["cost"]),
             })
         index.append({
@@ -5826,6 +5834,7 @@ def render_items_search(db: "Db", out: Path) -> None:
             "name": nwn_text(name),
             "base_item": baseitem_name(bi) or f"BaseItem #{bi}",
             "base_item_id": bi,
+            "base_item_anchor": _item_category(i).replace("_", "-"),
             "cost": cost_val,
             "url": f"{resref}.html",
             "properties": props,
@@ -6161,7 +6170,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
             sections.append(
                 f"<h3>{E(page_label)}</h3>"
                 '<table class="data"><thead><tr>'
-                "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>Cost (gp)</th><th>Properties</th>"
+                "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>GP Value</th><th>Properties</th>"
                 "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
             )
     else:
@@ -6466,7 +6475,7 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>Cost (gp)</th><th>Properties</th>"
+            "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>GP Value</th><th>Properties</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
