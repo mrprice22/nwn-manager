@@ -564,9 +564,18 @@ def itemprop_format(prop: dict) -> dict[str, str]:
             cost_str = cval if cval is not None else str(cost_value)
 
     # Param1: 255 is the engine "no param" sentinel.
+    # For certain (property, subtype) combos the Param1Value further qualifies
+    # the subtype — e.g. "Slay Racial Group" becomes "Slay Racial Group: Elf".
     param_str = ""
     if param1 is not None and int(param1) != 255:
-        param_str = f"{param1}/{param1_value if param1_value is not None else 0}"
+        p1_for_sub = pdef.get("param1_for_subtype", {})
+        p1_tbl = p1_for_sub.get(subtype_str) if subtype_str else None
+        if p1_tbl and param1_value is not None:
+            p1_label = _table_lookup(p1_tbl, int(param1_value))
+            if p1_label:
+                subtype_str = f"{subtype_str}: {p1_label}"
+        else:
+            param_str = f"{param1}/{param1_value if param1_value is not None else 0}"
 
     return {
         "property": pname,
@@ -5293,7 +5302,10 @@ _PROP_GROUP_ORDER = [
 
 
 def render_items_by_property(db: "Db", out: Path) -> None:
-    prop_index: dict[tuple[str, str], list[tuple[str, str, str, int]]] = defaultdict(list)
+    # Accumulate per (pname, key_subtype, resref, cost_str) so that an item
+    # granting the same property N times shows up once with qty=N.
+    # Tuple layout: (resref, name, cost_str, value_num, qty)
+    _acc: dict[tuple[str, str, str, str], tuple[str, int, int]] = {}
 
     for resref, i in db.items.items():
         if not (resref in db.item_sold_at or resref in db.item_in_container
@@ -5310,11 +5322,16 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             # Merge entries whose subtype is an unresolved numeric fallback
             # (e.g. "True Seeing: 1", "True Seeing: 2" → all under "True Seeing").
             key_subtype = "" if _is_raw_subtype(subtype) else subtype
-            # Also merge entries whose cost is an unresolved raw number for
-            # properties that have no cost table (cost stays as the raw digit).
-            prop_index[(pname, key_subtype)].append(
-                (resref, name, cost_str, _prop_value_num(cost_str))
-            )
+            acc_key = (pname, key_subtype, resref, cost_str)
+            if acc_key in _acc:
+                n, v, c = _acc[acc_key]
+                _acc[acc_key] = (n, v, c + 1)
+            else:
+                _acc[acc_key] = (name, _prop_value_num(cost_str), 1)
+
+    prop_index: dict[tuple[str, str], list[tuple[str, str, str, int, int]]] = defaultdict(list)
+    for (pname, key_subtype, resref, cost_str), (name, value_num, qty) in _acc.items():
+        prop_index[(pname, key_subtype)].append((resref, name, cost_str, value_num, qty))
 
     for key in prop_index:
         prop_index[key].sort(key=lambda x: (-x[3], nwn_text(x[1]).lower()))
@@ -5324,6 +5341,13 @@ def render_items_by_property(db: "Db", out: Path) -> None:
     groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for pname, subtype in sorted_keys:
         groups[_prop_group(pname)].append((pname, subtype))
+
+    # Properties that want subtype-only rows on the index (no cost-tier expansion).
+    _index_subtype_only = {
+        pdef["name"]
+        for pdef in IPROP_DEFS.values()
+        if pdef.get("index_by_subtype_only")
+    }
 
     # Build ordered lists of unique property names per group and their subtypes.
     # _pname_anchor: stable anchor for each property name (no subtype suffix).
@@ -5388,7 +5412,9 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 len(tiers) > 1 or (len(tiers) == 1 and tiers[0][0])
                 for _, _, tiers in rows
             )
-            if has_subtypes and any_cost_tiers:
+            # Some properties (e.g. On Hit Properties) want one index row per
+            # subtype only — cost-tier breakdown belongs on the detail page.
+            if has_subtypes and any_cost_tiers and pname not in _index_subtype_only:
                 body += (
                     '<table class="data"><thead><tr>'
                     "<th>Subtype</th><th>Value</th><th>Items</th></tr></thead><tbody>"
@@ -5463,18 +5489,21 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         if len(tiers) <= 1:
             # Single tier (or no cost) — keep flat table.
             body += f"<p>{len(entries)} items.</p>"
+            show_cost = bool(tiers and tiers[0][0])
+            has_qty = any(e[4] > 1 for e in entries)
             body += (
                 '<table class="data"><thead><tr>'
                 "<th>Name</th>"
-                + ("<th>Value</th>" if tiers and tiers[0][0] else "")
+                + ("<th>Value</th>" if show_cost else "")
+                + ("<th>Qty</th>" if has_qty else "")
                 + "<th>Where to Find</th>"
                 "</tr></thead><tbody>"
             )
-            show_cost = bool(tiers and tiers[0][0])
-            for resref, name, cost_str, _ in entries:
+            for resref, name, cost_str, _, qty in entries:
                 body += (
                     f"<tr><td>{link(f'../{resref}.html', name)}</td>"
                     + (f"<td>{E(cost_str)}</td>" if show_cost else "")
+                    + (f"<td>{qty}</td>" if has_qty else "")
                     + f"<td>{_where_snippet(db, resref)}</td></tr>"
                 )
             body += "</tbody></table>"
@@ -5482,19 +5511,23 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             # Multiple tiers — one sub-table per tier with anchors.
             body += f"<p>{len(entries)} items across {len(tiers)} value tiers.</p>"
             for cost_str, cost_anch, tier_entries in tiers:
+                has_qty = any(e[4] > 1 for e in tier_entries)
                 tier_label = E(cost_str) if cost_str else "Other"
                 h_anchor = f' id="{E(cost_anch)}"' if cost_anch else ""
                 body += (
                     f"<h2{h_anchor}>{tier_label}"
                     f' <small class="muted">({len(tier_entries)})</small></h2>'
                     '<table class="data"><thead><tr>'
-                    "<th>Name</th><th>Where to Find</th>"
+                    "<th>Name</th>"
+                    + ("<th>Qty</th>" if has_qty else "")
+                    + "<th>Where to Find</th>"
                     "</tr></thead><tbody>"
                 )
-                for resref, name, _, _ in tier_entries:
+                for resref, name, _, _, qty in tier_entries:
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
-                        f"<td>{_where_snippet(db, resref)}</td></tr>"
+                        + (f"<td>{qty}</td>" if has_qty else "")
+                        + f"<td>{_where_snippet(db, resref)}</td></tr>"
                     )
                 body += "</tbody></table>"
 
