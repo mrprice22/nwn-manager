@@ -151,7 +151,9 @@ if [[ -f homers_lotr_v3.mod ]]; then
     if [[ -x "$PROJECT/bin/refresh-nwsync" ]]; then
       echo "--------------------------------------------------------------------------"
       echo "[nwsync] refreshing manifest..."
-      "$PROJECT/bin/refresh-nwsync" || \
+      nwsync_flags=()
+      [[ $VERBOSE -eq 0 ]] && nwsync_flags+=(--silent)
+      "$PROJECT/bin/refresh-nwsync" "${nwsync_flags[@]}" || \
         echo "[nwsync] WARNING: refresh failed; the .mod is fine, but clients won't see the latest CEP snapshot until you re-run bin/refresh-nwsync"
       echo
     fi
