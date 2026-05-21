@@ -641,11 +641,21 @@ def _cost_tiers(
     buckets: dict[str, list] = _dd(list)
     for e in entries:
         buckets[e[2]].append(e)
+    non_empty_keys = [k for k in buckets if k]
+    _is_dr = bool(non_empty_keys) and all(
+        re.match(r"^\d+/\+\d+$", k.strip()) for k in non_empty_keys
+    )
+    def _tier_key(x: tuple) -> tuple:
+        c = x[0]
+        if not c:
+            return (1, 0, 0, "")
+        if _is_dr:
+            m = re.match(r"^(\d+)/\+(\d+)$", c.strip())
+            if m:
+                return (0, -int(m.group(2)), -int(m.group(1)), "")
+        return (0, 0, -_prop_value_num(c), c.lower())
     result = []
-    for cost_str, items in sorted(
-        buckets.items(),
-        key=lambda x: (0 if x[0] else 1, -_prop_value_num(x[0]), x[0].lower()),
-    ):
+    for cost_str, items in sorted(buckets.items(), key=_tier_key):
         result.append((cost_str, _cost_anchor(cost_str), items))
     return result
 

@@ -105,7 +105,6 @@
     },
     "22": {
       "name": "Damage Reduction",
-      "subtype": "iprp_reducestype",
       "cost_table": "iprp_softcost"
     },
     "23": {
