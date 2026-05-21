@@ -63,7 +63,7 @@ else
   nwn-manager repack --clean >"$tmpout" 2>&1 &
   bg_pid=$!
   while kill -0 "$bg_pid" 2>/dev/null; do
-    processed=$(grep -cE "^  " "$tmpout" 2>/dev/null || echo 0)
+    processed=$(grep -cE "^  " "$tmpout" 2>/dev/null) || processed=0
     if [[ $total_files -gt 0 ]]; then
       pct=$(( processed * 100 / total_files ))
       [[ $pct -gt 99 ]] && pct=99
@@ -75,7 +75,7 @@ else
   done
   wait "$bg_pid"
   nasher_status=$?
-  processed=$(grep -cE "^  " "$tmpout" 2>/dev/null || echo 0)
+  processed=$(grep -cE "^  " "$tmpout" 2>/dev/null) || processed=0
   printf "\r[repack] 100%%  (%d files)                    \n" "$processed"
 fi
 
