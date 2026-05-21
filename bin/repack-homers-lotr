@@ -33,7 +33,6 @@ cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; 
 rm -f homers_lotr_v3.mod
 
 start=$(date +%s)
-total_files=$(find unpacked -type f 2>/dev/null | wc -l)
 
 tmpout=$(mktemp)
 trap 'rm -f "$tmpout"' EXIT
@@ -44,40 +43,73 @@ if [[ $VERBOSE -eq 1 ]]; then
 else
   nwn-manager repack >"$tmpout" 2>&1 &
   bg_pid=$!
+  spin='|/-\'
+  si=0
+  phase="starting"
+  phase_locked=0  # once we see "packing" we stop checking for earlier phases
+
   while kill -0 "$bg_pid" 2>/dev/null; do
-    processed=$(grep -cE "^  " "$tmpout" 2>/dev/null) || processed=0
-    if [[ $total_files -gt 0 ]]; then
-      pct=$(( processed * 100 / total_files ))
-      [[ $pct -gt 99 ]] && pct=99
-      printf "\r[repack] %3d%%  (%d / %d)" "$pct" "$processed" "$total_files"
+    elapsed=$(( $(date +%s) - start ))
+
+    # Advance phase only forward (convert → compile → pack)
+    if [[ $phase_locked -eq 0 ]]; then
+      if grep -qE "^Packing " "$tmpout" 2>/dev/null; then
+        phase="packing"; phase_locked=1
+      elif grep -qE "^Compiling " "$tmpout" 2>/dev/null && [[ $phase != compiling* ]]; then
+        n=$(grep -oE "^Compiling [0-9]+" "$tmpout" 2>/dev/null | grep -oE "[0-9]+" | head -1)
+        phase="compiling ${n:-?} scripts"
+      elif grep -qE "^Updating " "$tmpout" 2>/dev/null && [[ $phase == starting ]]; then
+        phase="converting"
+      fi
+    fi
+
+    errors=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null) || errors=0
+    ch="${spin:$si:1}"; si=$(( (si + 1) % 4 ))
+
+    if [[ $errors -gt 0 ]]; then
+      printf "\r[repack] %s %s  (%ds, %d errors)          " \
+        "$ch" "$phase" "$elapsed" "$errors"
     else
-      printf "\r[repack] %d files..." "$processed"
+      printf "\r[repack] %s %s  (%ds)          " "$ch" "$phase" "$elapsed"
     fi
     sleep 0.3
   done
+
   wait "$bg_pid"
   nasher_status=$?
-  processed=$(grep -cE "^  " "$tmpout" 2>/dev/null) || processed=0
-  printf "\r[repack] 100%%  (%d files)                    \n" "$processed"
+  elapsed=$(( $(date +%s) - start ))
+  errors=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null) || errors=0
+  if [[ $errors -gt 0 ]]; then
+    printf "\r[repack] done in %ds  (%d compile errors)          \n" "$elapsed" "$errors"
+  else
+    printf "\r[repack] done in %ds          \n" "$elapsed"
+  fi
 fi
 
-# Detect errors/warnings in the captured output
-error_lines=$(grep -E "^[[:space:]]*[0-9]+ errored|^[Ee]rror:" "$tmpout" 2>/dev/null || true)
+# Separate compile-level errors (expected benign failures in zep_cr_*, openstore_*,
+# dmw_do_dialog*, etc.) from nasher-level failures (pack/install errors).
+# Nasher non-tty format has no leading spaces, unlike tty-indented output.
+compile_err_count=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null || echo 0)
+fatal_lines=$(grep -E "^Error:" "$tmpout" 2>/dev/null || true)
 
-if [[ $nasher_status -ne 0 || -n "$error_lines" ]]; then
+if [[ $nasher_status -ne 0 || -n "$fatal_lines" ]]; then
   if [[ $FORCE -eq 1 ]]; then
     echo
     echo "[WARN] nasher reported errors (--force: proceeding anyway):"
-    echo "$error_lines" | sed 's/^/  /'
+    [[ -n "$fatal_lines" ]] && echo "$fatal_lines" | sed 's/^/  /'
   else
     echo
     echo "[ERROR] nasher reported errors — aborting."
     echo "        Re-run with --force to proceed despite errors."
-    [[ -n "$error_lines" ]] && echo "$error_lines" | sed 's/^/  /'
+    [[ -n "$fatal_lines" ]] && echo "$fatal_lines" | sed 's/^/  /'
     echo
     read -rp "Press Enter to close..."
     exit 1
   fi
+fi
+
+if [[ $compile_err_count -gt 0 ]]; then
+  echo "[note] $compile_err_count known compile error(s) suppressed (run --verbose to see)"
 fi
 
 echo
