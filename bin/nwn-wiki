@@ -5579,10 +5579,11 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     "</tr></thead><tbody>"
                 )
                 for resref, name, _, _, qty in sub_entries:
-                    itype = _item_category_label(_item_category(db.items[resref]))
+                    _icat = _item_category(db.items[resref])
+                    itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
-                        f"<td>{E(itype)}</td>"
+                        f"<td>{itype_link}</td>"
                         + (f"<td>{qty}</td>" if has_qty else "")
                         + f"<td>{_where_snippet(db, resref)}</td></tr>"
                     )
@@ -5602,10 +5603,11 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 "</tr></thead><tbody>"
             )
             for resref, name, cost_str, _, qty in entries:
-                itype = _item_category_label(_item_category(db.items[resref]))
+                _icat = _item_category(db.items[resref])
+                itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
                 body += (
                     f"<tr><td>{link(f'../{resref}.html', name)}</td>"
-                    f"<td>{E(itype)}</td>"
+                    f"<td>{itype_link}</td>"
                     + (f"<td>{E(cost_str)}</td>" if show_cost else "")
                     + (f"<td>{qty}</td>" if has_qty else "")
                     + f"<td>{_where_snippet(db, resref)}</td></tr>"
@@ -5629,10 +5631,11 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     "</tr></thead><tbody>"
                 )
                 for resref, name, _, _, qty in tier_entries:
-                    itype = _item_category_label(_item_category(db.items[resref]))
+                    _icat = _item_category(db.items[resref])
+                    itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
-                        f"<td>{E(itype)}</td>"
+                        f"<td>{itype_link}</td>"
                         + (f"<td>{qty}</td>" if has_qty else "")
                         + f"<td>{_where_snippet(db, resref)}</td></tr>"
                     )
