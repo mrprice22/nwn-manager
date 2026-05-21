@@ -5776,10 +5776,22 @@ function render(rows,showProps){
     +'<table class="data"><thead><tr>'+cols+'</tr></thead><tbody>';
   rows.forEach(function(r){
     var props=r.matched.map(function(p){
-      return '<span>'+esc(p.prop+(p.subtype?': '+p.subtype:''))
-        +(p.cost?' \u2014 '+esc(p.cost):'')+'</span>';
+      var pIdxHref='properties/index.html#'+p.prop_idx_anchor;
+      var propLink='<a href="'+esc(pIdxHref)+'">'+esc(p.prop)+'</a>';
+      var detail='';
+      if(p.subtype||p.cost){
+        var dHref='properties/'+p.detail_slug+'.html'+(p.cost_anchor?'#'+p.cost_anchor:'');
+        if(p.subtype&&p.cost){
+          detail=': <a href="'+esc(dHref)+'">'+esc(p.subtype)+' \u2014 '+esc(p.cost)+'</a>';
+        }else if(p.subtype){
+          detail=': <a href="'+esc(dHref)+'">'+esc(p.subtype)+'</a>';
+        }else{
+          detail=' \u2014 <a href="'+esc(dHref)+'">'+esc(p.cost)+'</a>';
+        }
+      }
+      return '<span>'+propLink+detail+'</span>';
     }).join('<br>');
-    var biHref='../index.html#'+esc(r.it.base_item_anchor||'');
+    var biHref='index.html#'+esc(r.it.base_item_anchor||'');
     var biCell=r.it.base_item_anchor
       ?'<a href="'+biHref+'">'+esc(r.it.base_item)+'</a>'
       :esc(r.it.base_item);
@@ -5821,6 +5833,10 @@ def render_items_search(db: "Db", out: Path) -> None:
                 continue
             subtype = f["subtype"]
             cost = f["cost"]
+            # detail_slug / cost_anchor use original f values (before any swap)
+            prop_idx_anchor = "pn-" + _prop_slug(pname, "")
+            detail_slug = _prop_slug(pname, f["subtype"])
+            cost_anchor = _cost_anchor(f["cost"]) if f["cost"] else ""
             if pname == "Immunity: Specific Spell" and not subtype and cost:
                 subtype, cost = cost, ""
             props.append({
@@ -5828,6 +5844,9 @@ def render_items_search(db: "Db", out: Path) -> None:
                 "subtype": subtype,
                 "cost": cost,
                 "value_num": _prop_value_num(f["cost"]),
+                "prop_idx_anchor": prop_idx_anchor,
+                "detail_slug": detail_slug,
+                "cost_anchor": cost_anchor,
             })
         index.append({
             "resref": resref,
