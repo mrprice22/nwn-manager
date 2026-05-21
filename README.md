@@ -417,8 +417,18 @@ SVG's own `.area-node rect` — and the page stylesheet wins:
 
 ```css
 .map-wrap svg { background: #0e0c0a !important; }
-.map-wrap svg .area-node rect { fill: #1a1710; stroke: var(--accent); }
+.map-wrap svg .area-node rect  { fill: #1a1710; stroke: var(--accent); }
+.map-wrap svg .area-label       { fill: var(--fg); }       /* area name text */
+.map-wrap svg .convo-label      { fill: #c090f0; }         /* conversation pseudo-node text */
+.map-wrap svg .convo-node polygon { fill: #150e20; stroke: #9b4dca; }
 ```
+
+Area labels use `class="area-label"` and area boxes use `class="area-node"`.
+If an area name contains a NWN colour-code token the colour is emitted as an
+inline `style="fill:…"`, which overrides the CSS class — so custom-coloured
+area names stay coloured even in a dark theme. All other labels fall through
+to the CSS class, so setting `.area-label { fill: … }` in `theme.css` is
+the correct way to control text colour on a dark background.
 
 The `wiki-theme/` folder is optional and ignored if absent.
 

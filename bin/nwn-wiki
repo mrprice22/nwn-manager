@@ -3533,7 +3533,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         raw = db.area_name(nid)
         name = nwn_text(raw)
         fill = nwn_first_color(raw)
-        fill_attr = f' fill="{fill}"' if fill else ""
+        fill_attr = f' style="fill:{fill}"' if fill else ""
         href = url_prefix + f"areas/{nid}.html"
         # Box fill + hover area
         layer_boxes.append(
@@ -3549,7 +3549,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             text_el = (
                 f'<text x="{cx:.1f}" y="{cy:.1f}" '
                 f'text-anchor="middle" dominant-baseline="middle" '
-                f'font-size="{font_size:.0f}"{fill_attr}>{E(lines[0])}</text>'
+                f'font-size="{font_size:.0f}" class="area-label"{fill_attr}>{E(lines[0])}</text>'
             )
         else:
             lh = font_size * 1.3
@@ -3560,7 +3560,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             )
             text_el = (
                 f'<text text-anchor="middle" '
-                f'font-size="{font_size:.0f}"{fill_attr}>{tspans}</text>'
+                f'font-size="{font_size:.0f}" class="area-label"{fill_attr}>{tspans}</text>'
             )
         layer_labels.append(f'<a href="{E(href)}">{text_el}</a>')
 
