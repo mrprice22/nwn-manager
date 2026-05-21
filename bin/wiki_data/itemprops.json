@@ -4,7 +4,8 @@
     "0": {
       "name": "Ability Bonus",
       "subtype": "iprp_abilities",
-      "cost_table": "iprp_abilcost"
+      "cost_table": "iprp_abilcost",
+      "index_by_subtype_only": true
     },
     "1": {
       "name": "AC Bonus",
@@ -13,22 +14,26 @@
     "2": {
       "name": "AC Bonus vs. Alignment Group",
       "subtype": "iprp_aligngrp",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "3": {
       "name": "AC Bonus vs. Damage Type",
       "subtype": "iprp_damagetype",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "4": {
       "name": "AC Bonus vs. Racial Group",
       "subtype": "racialtypes",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "5": {
       "name": "AC Bonus vs. Specific Alignment",
       "subtype": "iprp_alignment",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "6": {
       "name": "Enhancement Bonus",
@@ -37,17 +42,20 @@
     "7": {
       "name": "Enhancement Bonus vs. Alignment Group",
       "subtype": "iprp_aligngrp",
-      "cost_table": "iprp_bonuscost"
+      "cost_table": "iprp_bonuscost",
+      "index_by_subtype_only": true
     },
     "8": {
       "name": "Enhancement Bonus vs. Racial Group",
       "subtype": "racialtypes",
-      "cost_table": "iprp_bonuscost"
+      "cost_table": "iprp_bonuscost",
+      "index_by_subtype_only": true
     },
     "9": {
       "name": "Enhancement Bonus vs. Specific Alignment",
       "subtype": "iprp_alignment",
-      "cost_table": "iprp_bonuscost"
+      "cost_table": "iprp_bonuscost",
+      "index_by_subtype_only": true
     },
     "10": {
       "name": "Decreased Enhancement Modifier",
@@ -59,12 +67,14 @@
     },
     "12": {
       "name": "Bonus Feat",
-      "subtype": "iprp_feats"
+      "subtype": "iprp_feats",
+      "subtype_prefix_groups": ["Sneak Attack"]
     },
     "13": {
       "name": "Bonus Spell Slot of Level N",
       "subtype": "classes",
-      "cost_table": "iprp_spelllevel"
+      "cost_table": "iprp_spelllevel",
+      "index_by_subtype_only": true
     },
     "14": {
       "name": "Boomerang"
@@ -72,32 +82,38 @@
     "15": {
       "name": "Cast Spell",
       "subtype": "iprp_spells",
-      "cost_table": "iprp_chargecost"
+      "cost_table": "iprp_chargecost",
+      "index_by_subtype_only": true
     },
     "16": {
       "name": "Damage Bonus",
       "subtype": "iprp_damagetype",
-      "cost_table": "iprp_damagecost"
+      "cost_table": "iprp_damagecost",
+      "index_by_subtype_only": true
     },
     "17": {
       "name": "Damage Bonus vs. Alignment Group",
       "subtype": "iprp_aligngrp",
-      "cost_table": "iprp_damagecost"
+      "cost_table": "iprp_damagecost",
+      "index_by_subtype_only": true
     },
     "18": {
       "name": "Damage Bonus vs. Racial Group",
       "subtype": "racialtypes",
-      "cost_table": "iprp_damagecost"
+      "cost_table": "iprp_damagecost",
+      "index_by_subtype_only": true
     },
     "19": {
       "name": "Damage Bonus vs. Specific Alignment",
       "subtype": "iprp_alignment",
-      "cost_table": "iprp_damagecost"
+      "cost_table": "iprp_damagecost",
+      "index_by_subtype_only": true
     },
     "20": {
       "name": "Immunity: Damage Type",
       "subtype": "iprp_damagetype",
-      "cost_table": "iprp_immuncost"
+      "cost_table": "iprp_immuncost",
+      "index_by_subtype_only": true
     },
     "21": {
       "name": "Decreased Damage",
@@ -110,12 +126,14 @@
     "23": {
       "name": "Damage Resistance",
       "subtype": "iprp_damagetype",
-      "cost_table": "iprp_damageresist"
+      "cost_table": "iprp_damageresist",
+      "index_by_subtype_only": true
     },
     "24": {
       "name": "Damage Vulnerability",
       "subtype": "iprp_damagetype",
-      "cost_table": "iprp_damagevuln"
+      "cost_table": "iprp_damagevuln",
+      "index_by_subtype_only": true
     },
     "25": {
       "name": "Dancing"
@@ -126,17 +144,20 @@
     "27": {
       "name": "Decreased Ability Score",
       "subtype": "iprp_abilities",
-      "cost_table": "iprp_neg10cost"
+      "cost_table": "iprp_neg10cost",
+      "index_by_subtype_only": true
     },
     "28": {
       "name": "Decreased AC",
       "subtype": "iprp_acmod",
-      "cost_table": "iprp_neg5cost"
+      "cost_table": "iprp_neg5cost",
+      "index_by_subtype_only": true
     },
     "29": {
       "name": "Decreased Skill Modifier",
       "subtype": "skills",
-      "cost_table": "iprp_neg10cost"
+      "cost_table": "iprp_neg10cost",
+      "index_by_subtype_only": true
     },
     "30": {
       "name": "Double Stack"
@@ -176,12 +197,14 @@
     "40": {
       "name": "Saving Throw Bonus",
       "subtype": "iprp_saveelement",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "41": {
       "name": "Saving Throw Bonus: Specific",
       "subtype": "iprp_savingthrow",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "43": {
       "name": "Keen"
@@ -214,12 +237,14 @@
     "49": {
       "name": "Decreased Saving Throws",
       "subtype": "iprp_saveelement",
-      "cost_table": "iprp_neg5cost"
+      "cost_table": "iprp_neg5cost",
+      "index_by_subtype_only": true
     },
     "50": {
       "name": "Decreased Saving Throws: Specific",
       "subtype": "iprp_savingthrow",
-      "cost_table": "iprp_neg5cost"
+      "cost_table": "iprp_neg5cost",
+      "index_by_subtype_only": true
     },
     "51": {
       "name": "Regeneration",
@@ -228,7 +253,8 @@
     "52": {
       "name": "Skill Bonus",
       "subtype": "skills",
-      "cost_table": "iprp_meleecost"
+      "cost_table": "iprp_meleecost",
+      "index_by_subtype_only": true
     },
     "53": {
       "name": "Immunity: Specific Spell",
@@ -249,17 +275,20 @@
     "57": {
       "name": "Attack Bonus vs. Alignment Group",
       "subtype": "iprp_aligngrp",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "58": {
       "name": "Attack Bonus vs. Racial Group",
       "subtype": "racialtypes",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "59": {
       "name": "Attack Bonus vs. Specific Alignment",
       "subtype": "iprp_alignment",
-      "cost_table": "iprp_acmodcost"
+      "cost_table": "iprp_acmodcost",
+      "index_by_subtype_only": true
     },
     "60": {
       "name": "Decreased Attack Modifier",
@@ -268,7 +297,8 @@
     "61": {
       "name": "Unlimited Ammunition",
       "subtype": "iprp_ammotype",
-      "cost_table": "iprp_ammocost"
+      "cost_table": "iprp_ammocost",
+      "index_by_subtype_only": true
     },
     "62": {
       "name": "Use Limitation: Alignment Group",
@@ -340,7 +370,8 @@
     "82": {
       "name": "On Hit Cast Spell",
       "subtype": "iprp_onhitspell",
-      "cost_table": "iprp_casterlvl"
+      "cost_table": "iprp_casterlvl",
+      "index_by_subtype_only": true
     },
     "83": {
       "name": "Visual Effect",

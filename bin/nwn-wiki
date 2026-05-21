@@ -5312,10 +5312,27 @@ _PROP_GROUP_ORDER = [
 
 
 def render_items_by_property(db: "Db", out: Path) -> None:
+    # Map from property name → list of subtype prefix groups.
+    # Subtypes matching a prefix (e.g. "Sneak Attack (+1d6)") are grouped under
+    # the prefix key on the index page and shown as sub-sections on the detail page.
+    _pname_subtype_groups: dict[str, list[str]] = {
+        pdef["name"]: pdef["subtype_prefix_groups"]
+        for pdef in IPROP_DEFS.values()
+        if pdef.get("subtype_prefix_groups")
+    }
+
+    def _group_subtype(pname: str, subtype: str) -> str:
+        for prefix in _pname_subtype_groups.get(pname, []):
+            if subtype == prefix or subtype.startswith(prefix + " ("):
+                return prefix
+        return subtype
+
     # Accumulate per (pname, key_subtype, resref, cost_str) so that an item
     # granting the same property N times shows up once with qty=N.
     # Tuple layout: (resref, name, cost_str, value_num, qty)
     _acc: dict[tuple[str, str, str, str], tuple[str, int, int]] = {}
+    # Separate accumulator for prefix-group variants (tracks actual subtype).
+    _prefix_acc: dict[tuple[str, str, str, str, str], tuple[str, int, int]] = {}
 
     for resref, i in db.items.items():
         if not (resref in db.item_sold_at or resref in db.item_in_container
@@ -5331,13 +5348,22 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 continue
             # Merge entries whose subtype is an unresolved numeric fallback
             # (e.g. "True Seeing: 1", "True Seeing: 2" → all under "True Seeing").
-            key_subtype = "" if _is_raw_subtype(subtype) else subtype
+            key_subtype = "" if _is_raw_subtype(subtype) else _group_subtype(pname, subtype)
             acc_key = (pname, key_subtype, resref, cost_str)
             if acc_key in _acc:
                 n, v, c = _acc[acc_key]
                 _acc[acc_key] = (n, v, c + 1)
             else:
                 _acc[acc_key] = (name, _prop_value_num(cost_str), 1)
+            # When a subtype was grouped under a prefix key, also track the
+            # actual subtype so the detail page can break out sub-sections.
+            if key_subtype and key_subtype != subtype:
+                p_key = (pname, key_subtype, subtype, resref, cost_str)
+                if p_key in _prefix_acc:
+                    n2, v2, c2 = _prefix_acc[p_key]
+                    _prefix_acc[p_key] = (n2, v2, c2 + 1)
+                else:
+                    _prefix_acc[p_key] = (name, _prop_value_num(cost_str), 1)
 
     prop_index: dict[tuple[str, str], list[tuple[str, str, str, int, int]]] = defaultdict(list)
     for (pname, key_subtype, resref, cost_str), (name, value_num, qty) in _acc.items():
@@ -5488,15 +5514,52 @@ def render_items_by_property(db: "Db", out: Path) -> None:
     write(out / "items" / "properties" / "index.html",
           page("Browse by Property", layout, root_rel="../.."))
 
+    # Build prefix-group detail structure:
+    # (pname, group_key) → [(actual_subtype, resref, name, cost_str, value_num, qty)]
+    _prefix_detail: dict[tuple[str, str], list] = defaultdict(list)
+    for (pname, group_key, actual_sub, resref, cost_str), (name, value_num, qty) in _prefix_acc.items():
+        _prefix_detail[(pname, group_key)].append((actual_sub, resref, name, cost_str, value_num, qty))
+    for key in _prefix_detail:
+        _prefix_detail[key].sort(key=lambda x: (x[0], -x[4], nwn_text(x[1]).lower()))
+
     # --- per-property detail pages ---
     for (pname, subtype), entries in prop_index.items():
         slug = _prop_slug(pname, subtype)
         label = pname + (f": {subtype}" if subtype else "")
         tiers = _cost_tiers(entries)
-        back_link = f'<p><a href="index.html">← Browse by Property</a></p>'
-        body = back_link + f"<h1>{E(label)}</h1>"
+        body = f"<h1>{E(label)}</h1>"
 
-        if len(tiers) <= 1:
+        detail_key = (pname, subtype)
+        if detail_key in _prefix_detail:
+            # Prefix-group page: sub-sections per actual subtype variant.
+            sub_groups: dict[str, list] = defaultdict(list)
+            for actual_sub, resref, name, cost_str, value_num, qty in _prefix_detail[detail_key]:
+                sub_groups[actual_sub].append((resref, name, cost_str, value_num, qty))
+            body += f"<p>{len(entries)} items across {len(sub_groups)} variants.</p>"
+            for actual_sub in sorted(sub_groups.keys()):
+                sub_entries = sub_groups[actual_sub]
+                sub_anchor = _cost_anchor(actual_sub)
+                has_qty = any(e[4] > 1 for e in sub_entries)
+                body += (
+                    f'<h2 id="{E(sub_anchor)}">{E(actual_sub)}'
+                    f' <small class="muted">({len(sub_entries)})</small></h2>'
+                    '<table class="data"><thead><tr>'
+                    "<th>Name</th>"
+                    "<th>Type</th>"
+                    + ("<th>Qty</th>" if has_qty else "")
+                    + "<th>Where to Find</th>"
+                    "</tr></thead><tbody>"
+                )
+                for resref, name, _, _, qty in sub_entries:
+                    itype = baseitem_label(fld(db.items[resref], "BaseItem"))
+                    body += (
+                        f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                        f"<td>{E(itype)}</td>"
+                        + (f"<td>{qty}</td>" if has_qty else "")
+                        + f"<td>{_where_snippet(db, resref)}</td></tr>"
+                    )
+                body += "</tbody></table>"
+        elif len(tiers) <= 1:
             # Single tier (or no cost) — keep flat table.
             body += f"<p>{len(entries)} items.</p>"
             show_cost = bool(tiers and tiers[0][0])
@@ -5504,14 +5567,17 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             body += (
                 '<table class="data"><thead><tr>'
                 "<th>Name</th>"
+                "<th>Type</th>"
                 + ("<th>Value</th>" if show_cost else "")
                 + ("<th>Qty</th>" if has_qty else "")
                 + "<th>Where to Find</th>"
                 "</tr></thead><tbody>"
             )
             for resref, name, cost_str, _, qty in entries:
+                itype = baseitem_label(fld(db.items[resref], "BaseItem"))
                 body += (
                     f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                    f"<td>{E(itype)}</td>"
                     + (f"<td>{E(cost_str)}</td>" if show_cost else "")
                     + (f"<td>{qty}</td>" if has_qty else "")
                     + f"<td>{_where_snippet(db, resref)}</td></tr>"
@@ -5529,20 +5595,59 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     f' <small class="muted">({len(tier_entries)})</small></h2>'
                     '<table class="data"><thead><tr>'
                     "<th>Name</th>"
+                    "<th>Type</th>"
                     + ("<th>Qty</th>" if has_qty else "")
                     + "<th>Where to Find</th>"
                     "</tr></thead><tbody>"
                 )
                 for resref, name, _, _, qty in tier_entries:
+                    itype = baseitem_label(fld(db.items[resref], "BaseItem"))
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                        f"<td>{E(itype)}</td>"
                         + (f"<td>{qty}</td>" if has_qty else "")
                         + f"<td>{_where_snippet(db, resref)}</td></tr>"
                     )
                 body += "</tbody></table>"
 
+        # Build floating sidebar for the detail page.
+        sibling_rows = subtype_rows.get(pname, [])
+        toc_parts: list[str] = []
+        if len(sibling_rows) > 1:
+            toc_parts.append(f'<div class="toc-group-heading">{E(pname)}</div>')
+            for sib_sub, sib_slug, sib_tiers in sibling_rows:
+                sib_label = sib_sub if sib_sub else pname
+                sib_count = sum(c for _, _, c in sib_tiers)
+                cls = ' class="toc-current"' if sib_slug == slug else ''
+                toc_parts.append(
+                    f'<div><a href="{sib_slug}.html"{cls}>{E(sib_label)}'
+                    f' <span class="muted">({sib_count})</span></a></div>'
+                )
+        if detail_key in _prefix_detail:
+            seen_subs: set[str] = set()
+            toc_sub_parts: list[str] = []
+            for actual_sub, *_ in _prefix_detail[detail_key]:
+                if actual_sub not in seen_subs:
+                    seen_subs.add(actual_sub)
+                    toc_sub_parts.append(
+                        f'<div><a href="#{_cost_anchor(actual_sub)}">{E(actual_sub)}</a></div>'
+                    )
+            if toc_sub_parts:
+                toc_parts.append('<div class="toc-group-heading">On This Page</div>')
+                toc_parts.extend(toc_sub_parts)
+        elif len(tiers) > 1:
+            toc_parts.append('<div class="toc-group-heading">On This Page</div>')
+            for cost_str, cost_anch, tier_entries in tiers:
+                tier_label = cost_str if cost_str else "Other"
+                toc_parts.append(
+                    f'<div><a href="#{cost_anch}">{E(tier_label)}'
+                    f' <span class="muted">({len(tier_entries)})</span></a></div>'
+                )
+        back = f'<div><a href="index.html#{E(_pname_anchor(pname))}">← Browse by Property</a></div>'
+        detail_sidebar = '<aside class="items-toc">' + back + "".join(toc_parts) + '</aside>'
+        layout = f'<div class="items-layout">{detail_sidebar}<div class="items-content">{body}</div></div>'
         write(out / "items" / "properties" / f"{slug}.html",
-              page(label, body, root_rel="../.."))
+              page(label, layout, root_rel="../.."))
 
 
 
