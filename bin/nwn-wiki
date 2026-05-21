@@ -5851,7 +5851,7 @@ def render_items_search(db: "Db", out: Path) -> None:
         index.append({
             "resref": resref,
             "name": nwn_text(name),
-            "base_item": baseitem_name(bi) or f"BaseItem #{bi}",
+            "base_item": _item_category_label(_item_category(i)) if bi in _ARMOR_BASEITEMS else baseitem_name(bi) or f"BaseItem #{bi}",
             "base_item_id": bi,
             "base_item_anchor": _item_category(i).replace("_", "-"),
             "cost": cost_val,
