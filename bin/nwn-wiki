@@ -5099,7 +5099,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
-        f"<dt>Type</dt><dd>{E(_item_category_label(_item_category(i)))}</dd>",
+        f"<dt>Type</dt><dd>{link('index.html#' + _item_category(i).replace('_', '-'), _item_category_label(_item_category(i)))}</dd>",
         f"<dt>Cost</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
         f"<dt {cursed_tt}>Cursed</dt><dd>{'Yes' if is_cursed else 'No'}</dd>",
