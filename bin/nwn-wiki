@@ -2540,10 +2540,9 @@ def layout_areas(
         return {}, {}
     rng = random.Random(seed)
 
-    # Box size in tile units. We deliberately oversize boxes (2× the area's
-    # tile dims) so labels have room to breathe; the layout below packs them
-    # tightly enough that the extra size doesn't waste map area.
-    box_scale = 2.0
+    # Box size in tile units. 1.5× the area's tile dims gives enough room for
+    # text labels while keeping boxes visually proportionate on the map.
+    box_scale = 1.5
     sizes: dict[str, tuple[float, float]] = {}
     for nid in node_ids:
         a = db.areas.get(nid, {}) if db else {}
@@ -3460,10 +3459,43 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             f'</g>'
         )
 
-    # Nodes — boxes sized by area's tile dimensions. Label sizing trades off
-    # against legibility at default zoom and the page's natural width.
+    # Nodes — rendered in three ordered layers so edges always appear over box
+    # fills but text labels appear over edges.
+    # layer_boxes : the rect/polygon fills + hover hit-area (behind edges)
+    # layer_labels: text labels + click anchors             (in front of edges)
     font_size = 44.0
-    node_g = []
+
+    def _label_lines(name: str, pw: float, ph: float) -> list[str]:
+        """Word-wrap name to fit pw, returning 1-3 lines.  Single words that
+        exceed pw are allowed to overflow rather than being mangled."""
+        char_w = font_size * 0.55
+        line_h = font_size * 1.3
+        max_ln = max(1, int(ph / line_h))
+        cpl = max(3, int(pw / char_w))  # chars per line
+        if len(name) <= cpl:
+            return [name]
+        words = name.split()
+        lines: list[str] = []
+        cur = ""
+        for word in words:
+            cand = (cur + " " + word).strip() if cur else word
+            if len(cand) <= cpl:
+                cur = cand
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = word
+                if len(lines) >= max_ln - 1 and cur:
+                    # Last allowed line — truncate if still too long
+                    if len(cur) > cpl:
+                        cur = cur[: cpl - 1] + "…"
+                    break
+        if cur:
+            lines.append(cur)
+        return lines[:max_ln] or [name]
+
+    layer_boxes: list[str] = []
+    layer_labels: list[str] = []
     for nid, (x, y) in positions.items():
         w, h = sizes[nid]
         px = (x - w / 2) * scale
@@ -3473,50 +3505,64 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         cx = x * scale
         cy = y * scale
         if nid in db.global_convo_pseudo:
-            # Pseudo-node: octagon, links to the conversation page. The
-            # shape itself is what tells the reader "this isn't an area".
             info = db.global_convo_pseudo[nid]
             label = info["label"]
             href = url_prefix + f"conversations/{info['conv_resref']}.html"
             r = min(pw, ph) * 0.45
-            # Regular octagon centred on (cx, cy).
             pts = []
             for k in range(8):
                 ang = math.pi / 8 + k * math.pi / 4
                 pts.append(f"{cx + r * math.cos(ang):.1f},{cy + r * math.sin(ang):.1f}")
-            node_g.append(
+            layer_boxes.append(
                 f'<a href="{E(href)}"><g class="convo-node">'
                 f'<polygon points="{" ".join(pts)}" />'
-                f'<text x="{cx:.1f}" y="{cy:.1f}" '
-                f'text-anchor="middle" dominant-baseline="middle" '
-                f'font-size="{font_size * 0.7:.0f}">{E(label)}</text>'
                 f'<title>Conversation: {E(info["conv_resref"])} '
                 f'({E(label)} — global trigger)</title>'
                 f'</g></a>'
             )
+            layer_labels.append(
+                f'<a href="{E(href)}">'
+                f'<text x="{cx:.1f}" y="{cy:.1f}" '
+                f'text-anchor="middle" dominant-baseline="middle" '
+                f'font-size="{font_size * 0.7:.0f}" class="convo-label">{E(label)}</text>'
+                f'</a>'
+            )
             continue
         # SVG <text> can't render mid-string colour changes without <tspan>s,
-        # so collapse to the first colour token (good enough for area names
-        # that almost always use a single uniform colour) and strip the rest.
+        # so collapse to the first colour token and strip the rest.
         raw = db.area_name(nid)
         name = nwn_text(raw)
         fill = nwn_first_color(raw)
         fill_attr = f' fill="{fill}"' if fill else ""
-        # Use the box width to decide truncation: roughly font_size*0.55 px
-        # per character at this font.
-        max_chars = max(6, int(pw / (font_size * 0.55)))
-        label = name if len(name) <= max_chars else name[: max_chars - 1] + "…"
         href = url_prefix + f"areas/{nid}.html"
-        node_g.append(
+        # Box fill + hover area
+        layer_boxes.append(
             f'<a href="{E(href)}"><g class="area-node">'
             f'<rect x="{px:.1f}" y="{py:.1f}" '
             f'width="{pw:.1f}" height="{ph:.1f}" rx="6"/>'
-            f'<text x="{cx:.1f}" y="{cy:.1f}" '
-            f'text-anchor="middle" dominant-baseline="middle" '
-            f'font-size="{font_size:.0f}"{fill_attr}>{E(label)}</text>'
             f'<title>{E(name)} ({E(nid)}, {int(w)}×{int(h)})</title>'
             f'</g></a>'
         )
+        # Text label: word-wrapped, allowed to overflow the box horizontally
+        lines = _label_lines(name, pw, ph)
+        if len(lines) == 1:
+            text_el = (
+                f'<text x="{cx:.1f}" y="{cy:.1f}" '
+                f'text-anchor="middle" dominant-baseline="middle" '
+                f'font-size="{font_size:.0f}"{fill_attr}>{E(lines[0])}</text>'
+            )
+        else:
+            lh = font_size * 1.3
+            ty0 = cy - lh * (len(lines) - 1) / 2
+            tspans = "".join(
+                f'<tspan x="{cx:.1f}" y="{ty0 + i * lh:.1f}">{E(ln)}</tspan>'
+                for i, ln in enumerate(lines)
+            )
+            text_el = (
+                f'<text text-anchor="middle" '
+                f'font-size="{font_size:.0f}"{fill_attr}>{tspans}</text>'
+            )
+        layer_labels.append(f'<a href="{E(href)}">{text_el}</a>')
 
     # Cap the rendered *width* so the map fits a normal screen horizontally
     # at default browser zoom; height scales proportionally so aspect ratio
@@ -3541,16 +3587,16 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         'svg{background:#fff;font-family:"Iowan Old Style",Georgia,serif}'
         '.area-node rect{fill:#fff;stroke:#3a5a8a;stroke-width:2.4}'
         '.area-node:hover rect{fill:#e6efff}'
-        '.area-node text{fill:#222;pointer-events:none}'
-        '.edge-trigger{stroke:#6b3a1c;stroke-width:2.5;opacity:0.55;fill:none}'
-        '.edge-door{stroke:#2d6a3a;stroke-width:2.5;opacity:0.55;fill:none}'
-        '.edge-convo{stroke:#9b4dca;stroke-width:2.5;opacity:0.7;fill:none;'
-        'stroke-dasharray:6,4}'
+        '.area-label{fill:#222;pointer-events:none}'
+        '.edge-trigger{stroke:#6b3a1c;stroke-width:3;opacity:0.8;fill:none}'
+        '.edge-door{stroke:#2d6a3a;stroke-width:3;opacity:0.8;fill:none}'
+        '.edge-convo{stroke:#9b4dca;stroke-width:3;opacity:0.85;fill:none;'
+        'stroke-dasharray:8,5}'
         '.edge-hit{stroke:transparent;stroke-width:30;fill:none;'
         'pointer-events:stroke;cursor:help}'
         '.convo-node polygon{fill:#f3e8ff;stroke:#9b4dca;stroke-width:2.4}'
         '.convo-node:hover polygon{fill:#e3c9ff}'
-        '.convo-node text{fill:#5a2b78;pointer-events:none}'
+        '.convo-label{fill:#5a2b78;pointer-events:none}'
     )
     defs = (
         '<defs>'
@@ -3561,8 +3607,26 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         '</marker>'
         '</defs>'
     )
+    # Three-layer SVG: box fills → edges → text labels.
+    # Edges are drawn over box fills so connections are always visible even at
+    # box boundaries, and text is drawn last so it's never obscured by edges.
+    svg_body = (
+        "\n".join(layer_boxes)   # layer 1: rect/polygon fills
+        + "\n"
+        + "\n".join(edge_lines)  # layer 2: edges on top of fills
+        + "\n"
+        + "\n".join(layer_labels)  # layer 3: text labels on top of edges
+    )
     return (
         '<div class="map-toolbar">'
+        '<span class="map-zoom-controls">'
+        '<button type="button" class="map-zoom-btn" id="area-map-zoom-out" '
+        'title="Zoom out">−</button>'
+        '<button type="button" class="map-zoom-btn" id="area-map-zoom-reset" '
+        'title="Reset zoom">1:1</button>'
+        '<button type="button" class="map-zoom-btn" id="area-map-zoom-in" '
+        'title="Zoom in">+</button>'
+        '</span>'
         '<button type="button" id="area-map-download" '
         'onclick="downloadAreaMap()">Download SVG</button>'
         '</div>'
@@ -3574,16 +3638,41 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         + f'viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
         + f'preserveAspectRatio="xMidYMid meet">'
         + defs
-        + "\n".join(edge_lines)
-        + "\n"
-        + "\n".join(node_g)
+        + svg_body
         + '</svg></div>'
-        + '<script>(function(){var w=document.getElementById("area-map-wrap");'
-          'if(w){w.scrollLeft=(w.scrollWidth-w.clientWidth)/2;'
-          'w.scrollTop=(w.scrollHeight-w.clientHeight)/2;}})();'
-          'window.downloadAreaMap=function(){'
+        + '<script>(function(){'
+          'var wrap=document.getElementById("area-map-wrap");'
           'var svg=document.getElementById("area-map-svg");'
-          'if(!svg)return;'
+          'if(!wrap||!svg)return;'
+          'wrap.scrollLeft=(wrap.scrollWidth-wrap.clientWidth)/2;'
+          'wrap.scrollTop=(wrap.scrollHeight-wrap.clientHeight)/2;'
+          # Zoom
+          'var baseW=parseFloat(svg.getAttribute("width"));'
+          'var baseH=parseFloat(svg.getAttribute("height"));'
+          'var zoom=1;'
+          'function applyZoom(z,px,py){'
+            'z=Math.max(0.2,Math.min(5,z));'
+            'if(z===zoom)return;'
+            'px=px!==undefined?px:wrap.clientWidth/2;'
+            'py=py!==undefined?py:wrap.clientHeight/2;'
+            'var fx=(wrap.scrollLeft+px)/(baseW*zoom);'
+            'var fy=(wrap.scrollTop+py)/(baseH*zoom);'
+            'zoom=z;'
+            'svg.setAttribute("width",Math.round(baseW*zoom));'
+            'svg.setAttribute("height",Math.round(baseH*zoom));'
+            'wrap.scrollLeft=fx*baseW*zoom-px;'
+            'wrap.scrollTop=fy*baseH*zoom-py;'
+          '}'
+          'document.getElementById("area-map-zoom-in").onclick=function(){applyZoom(zoom*1.25);};'
+          'document.getElementById("area-map-zoom-out").onclick=function(){applyZoom(zoom/1.25);};'
+          'document.getElementById("area-map-zoom-reset").onclick=function(){applyZoom(1);};'
+          'wrap.addEventListener("wheel",function(e){'
+            'e.preventDefault();'
+            'var r=wrap.getBoundingClientRect();'
+            'applyZoom(e.deltaY<0?zoom*1.12:zoom/1.12,e.clientX-r.left,e.clientY-r.top);'
+          '},{passive:false});'
+          # Download
+          'window.downloadAreaMap=function(){'
           'var src=new XMLSerializer().serializeToString(svg);'
           'if(!src.match(/^<\\?xml/))src=\'<?xml version="1.0" encoding="UTF-8"?>\\n\'+src;'
           'var blob=new Blob([src],{type:"image/svg+xml;charset=utf-8"});'
@@ -3593,7 +3682,8 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
           'document.body.appendChild(a);a.click();'
           'document.body.removeChild(a);'
           'setTimeout(function(){URL.revokeObjectURL(url);},100);'
-          '};</script>'
+          '};'
+          '})();</script>'
     )
 
 
