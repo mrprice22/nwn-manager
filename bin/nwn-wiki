@@ -314,6 +314,61 @@ def _load_weapons() -> dict[int, dict[str, str]]:
 WEAPONS = _load_weapons()
 
 
+def _load_parts_chest() -> dict[int, int]:
+    """Load parts_chest.2da → {torso_id: base_ac}.
+    ACBONUS values may be fractional (CEP encodes model subtype in decimals);
+    we take the integer part as the game-effective base AC.
+    '****' rows (undefined model) map to 0 (treated as cloth)."""
+    p = DATA_DIR / "parts_chest.2da"
+    if not p.exists():
+        return {}
+    result: dict[int, int] = {}
+    header_done = False
+    acbonus_col: int | None = None
+    for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("2DA"):
+            continue
+        parts = line.split()
+        if not header_done:
+            # Header row has no leading row-id token; find ACBONUS position.
+            # Data rows prepend a row-id token, so data col = header_idx + 1.
+            try:
+                acbonus_col = parts.index("ACBONUS") + 1
+            except ValueError:
+                return {}
+            header_done = True
+            continue
+        if acbonus_col is None or len(parts) <= acbonus_col:
+            continue
+        try:
+            row_id = int(parts[0])
+        except ValueError:
+            continue
+        raw_val = parts[acbonus_col]
+        if raw_val == "****":
+            result[row_id] = 0
+        else:
+            try:
+                result[row_id] = int(float(raw_val))
+            except ValueError:
+                result[row_id] = 0
+    return result
+
+
+PARTS_CHEST_AC: dict[int, int] = _load_parts_chest()
+
+
+def _torso_base_ac(item: dict | None) -> int:
+    """Return the base AC for an armor item from its ArmorPart_Torso model."""
+    if item is None:
+        return 0
+    torso = fld(item, "ArmorPart_Torso")
+    if torso is None:
+        return 0
+    return PARTS_CHEST_AC.get(int(torso), 0)
+
+
 def _load_itemprops() -> dict:
     p = DATA_DIR / "itemprops.json"
     if not p.exists():
@@ -1002,7 +1057,7 @@ def _item_category(item: dict) -> str:
     """Return the items-index category key for an item dict."""
     bi = int(fld(item, "BaseItem", -1) or -1)
     if bi in _ARMOR_BASEITEMS:
-        ac, _ = item_ac_bonus(item)
+        ac = _torso_base_ac(item)
         if ac <= 0:
             return "armor_cloth"
         if ac <= 4:
@@ -4773,14 +4828,7 @@ def _creature_detail_sections(
                 cprop_dodge_ac.append(_ccv)
 
     armor_item = _equipped_item(SLOT_CHEST)
-    armor_base_ac = 0
-    if armor_item is not None:
-        a_stats = WEAPONS.get(int(fld(armor_item, "BaseItem", -1) or -1))
-        if a_stats:
-            try:
-                armor_base_ac = int(a_stats.get("BaseAC", "0") or 0)
-            except ValueError:
-                armor_base_ac = 0
+    armor_base_ac = _torso_base_ac(armor_item)
     shield_item = None
     left = equip_by_slot.get(SLOT_LEFT)
     if left:
@@ -4853,10 +4901,8 @@ def _creature_detail_sections(
         if int(fld(cl, "Class", -1) or -1) == _MONK_CLASS_ID
     )
     _monk_wis_ac = 0
-    # Cloth armor / robes (ArmorBonus base AC == 0) don't block the monk WIS
-    # bonus; only items with an explicit non-zero ArmorBonus count as real armor.
-    _armor_base_ac = int(fld(armor_item, "ArmorBonus") or 0) if armor_item else 0
-    if _monk_levels >= 1 and _armor_base_ac == 0 and shield_item is None:
+    # Cloth/robe (torso base AC == 0) doesn't block the monk WIS bonus.
+    if _monk_levels >= 1 and armor_base_ac == 0 and shield_item is None:
         _monk_wis_ac = max(wis_mod, 0)
         if _monk_wis_ac:
             ac_total += _monk_wis_ac
@@ -5866,9 +5912,10 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
         f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i)))}</dd>",
         *(
-            (lambda _bac: [f"<dt>Base AC</dt><dd>{_bac}</dd>"] if _bac else [])(
-                int(fld(i, "ArmorBonus") or 0) or item_ac_bonus(i)[0]
-            )
+            (lambda _ac: [
+                f"<dt>Base AC</dt><dd>{_ac}</dd>",
+                f"<dt>Material</dt><dd>{'Non-metal (Druid-friendly)' if _ac <= 3 else 'Metal'}</dd>",
+            ])(_torso_base_ac(i))
             if _bi in _ARMOR_BASEITEMS
             else [f"<dt>Base AC</dt><dd>{int((WEAPONS.get(_bi) or {}).get('BaseAC', 0) or 0)}</dd>"]
             if _bi in SHIELD_BASEITEMS
