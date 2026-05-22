@@ -94,6 +94,144 @@ def read_tlk(path: Path) -> dict[int, str]:
     return out
 
 
+STOCK_ITEM_NAMES: dict[str, str] = {}  # resref → resolved name from stock blueprint TLK
+
+_NWN_UTI_RESTYPE = 2025
+
+
+def _parse_nwn_key(key_path: Path) -> dict[str, tuple[Path, int]]:
+    """Parse NWN KEY V1 file → {resref_lower: (absolute_bif_path, var_resource_id)}.
+    Only returns entries for UTI files (resource type 2025)."""
+    key_dir = key_path.parent
+    try:
+        data = key_path.read_bytes()
+    except OSError:
+        return {}
+    if data[:4] != b'KEY ':
+        return {}
+
+    n_bif, n_key = struct.unpack_from('<II', data, 8)
+    ofs_bif, ofs_key = struct.unpack_from('<II', data, 16)
+
+    bif_paths: list[Path] = []
+    for i in range(n_bif):
+        e = ofs_bif + i * 12
+        _fsize, name_off, name_len, _drives = struct.unpack_from('<IIHH', data, e)
+        raw = data[name_off:name_off + name_len].rstrip(b'\x00')
+        rel = raw.decode('latin-1').replace('\\', os.sep)
+        bif_paths.append(key_dir / rel)
+
+    result: dict[str, tuple[Path, int]] = {}
+    for i in range(n_key):
+        e = ofs_key + i * 22
+        resref = data[e:e + 16].rstrip(b'\x00').decode('latin-1').lower()
+        res_type = struct.unpack_from('<H', data, e + 16)[0]
+        res_id = struct.unpack_from('<I', data, e + 18)[0]
+        if res_type != _NWN_UTI_RESTYPE:
+            continue
+        bif_idx = (res_id >> 20) & 0xFFF
+        var_idx = res_id & 0xFFFFF
+        if bif_idx < len(bif_paths):
+            result[resref] = (bif_paths[bif_idx], var_idx)
+    return result
+
+
+def _read_bif_entry(bif_path: Path, var_idx: int) -> bytes:
+    """Extract raw resource bytes from a NWN BIF V1 file by variable resource ID."""
+    try:
+        data = bif_path.read_bytes()
+    except OSError:
+        return b''
+    if data[:4] != b'BIFF':
+        return b''
+    n_var, _n_fixed, ofs_var = struct.unpack_from('<III', data, 8)
+    for i in range(n_var):
+        e = ofs_var + i * 16
+        entry_id, offset, size, _res_type = struct.unpack_from('<IIII', data, e)
+        if (entry_id & 0xFFFFF) == var_idx:
+            return data[offset:offset + size]
+    return b''
+
+
+def _gff_locname_strref(gff_bytes: bytes) -> int | None:
+    """Minimal GFF V3.2 parser: return the TLK StrRef from LocalizedName, or None.
+    Returns None if LocalizedName has an inline string (no TLK lookup needed by caller)."""
+    if len(gff_bytes) < 56:
+        return None
+    (struct_offset, _sc, field_offset, _fc,
+     label_offset, label_count, field_data_offset, _fdc,
+     field_indices_offset, _fic, _lio, _lic) = struct.unpack_from('<12I', gff_bytes, 8)
+
+    # Find "LocalizedName" label index
+    ln_idx: int | None = None
+    for i in range(label_count):
+        base = label_offset + i * 16
+        lab = gff_bytes[base:base + 16].rstrip(b'\x00')
+        if lab == b'LocalizedName':
+            ln_idx = i
+            break
+    if ln_idx is None:
+        return None
+
+    # Top-level struct (struct 0): type(4), data_or_offset(4), field_count(4)
+    s_data, s_field_count = struct.unpack_from('<II', gff_bytes, struct_offset + 4)
+
+    if s_field_count == 0:
+        return None
+    if s_field_count == 1:
+        field_indices = [s_data]
+    else:
+        fi_base = field_indices_offset + s_data
+        field_indices = [
+            struct.unpack_from('<I', gff_bytes, fi_base + j * 4)[0]
+            for j in range(s_field_count)
+        ]
+
+    CExoLocString = 12
+    for fi in field_indices:
+        f_type, f_label, f_data = struct.unpack_from('<III', gff_bytes, field_offset + fi * 12)
+        if f_label != ln_idx or f_type != CExoLocString:
+            continue
+        # CExoLocString field data: total_size(4) + strref(4) + str_count(4) + ...
+        fd = field_data_offset + f_data
+        if fd + 8 > len(gff_bytes):
+            return None
+        strref = struct.unpack_from('<I', gff_bytes, fd + 4)[0]
+        return None if strref == 0xFFFFFFFF else strref
+    return None
+
+
+def load_stock_item_names(nwn_install: Path) -> None:
+    """Populate STOCK_ITEM_NAMES from the NWN install's KEY/BIF archives.
+    Only runs when BASE_TLK is loaded (--dialog-tlk was provided).
+    Silently skips if the key file or BIFs are missing."""
+    if not BASE_TLK:
+        return
+    key_path = nwn_install / "data" / "nwn_base.key"
+    if not key_path.is_file():
+        return
+    t0 = time.time()
+    index = _parse_nwn_key(key_path)
+    if not index:
+        return
+    loaded = 0
+    for resref, (bif_path, var_idx) in index.items():
+        if not bif_path.is_file():
+            continue
+        raw = _read_bif_entry(bif_path, var_idx)
+        if not raw:
+            continue
+        strref = _gff_locname_strref(raw)
+        if strref is None:
+            continue
+        name = BASE_TLK.get(strref)
+        if name:
+            STOCK_ITEM_NAMES[resref] = name
+            loaded += 1
+    print(f"[nwn-wiki] loaded {loaded} stock item names from NWN install"
+          f" ({time.time() - t0:.1f}s)")
+
+
 def loc(node: Any, lang: int = 0) -> str:
     """Resolve a cexolocstring. Falls back to TLK tables for ID-only refs;
     if the StrRef can't be resolved, yields a `[TLK#N]` placeholder."""
@@ -1147,6 +1285,8 @@ class Db:
         self.script_creates_items: dict[str, list[str]] = defaultdict(list)
         # scripts that call GenerateTreasure/GenerateHighTreasure/etc. (random loot)
         self.script_generates_treasure: set[str] = set()
+        # custom token number → set of script resrefs that call SetCustomToken(N, ...)
+        self.token_setters: dict[int, set[str]] = defaultdict(set)
         # item resref → list of script-source dicts for the item page
         # {"kind", "script", "label", "areas", "dlg", "crr", "prr"}
         self.item_from_script: dict[str, list[dict]] = defaultdict(list)
@@ -1574,6 +1714,7 @@ class Db:
     _RE_GENERATE_TREASURE = re.compile(
         r"\bGenerate(?:High|Medium|Low|Boss|Book)?Treasure\s*\("
     )
+    _RE_SET_TOKEN = re.compile(r"\bSetCustomToken\s*\(\s*(\d+)\s*,")
 
     def _parse_scripts(self) -> None:
         """One-shot scan of every .nss file. Populates script_dialogs and
@@ -1621,6 +1762,9 @@ class Db:
             # Random/procedural treasure generation.
             if self._RE_GENERATE_TREASURE.search(text):
                 self.script_generates_treasure.add(resref)
+            # SetCustomToken(N, ...) — track which scripts set which custom tokens.
+            for m in self._RE_SET_TOKEN.finditer(text):
+                self.token_setters[int(m.group(1))].add(resref)
 
     def _build_tag_to_area(self) -> None:
         """Tag → area resref index spanning every placement (waypoints,
@@ -2407,8 +2551,8 @@ class Db:
     def item_name(self, resref: str) -> str:
         i = self.items.get(resref)
         if not i:
-            return resref
-        return loc(i.get("LocalizedName")) or resref
+            return STOCK_ITEM_NAMES.get(resref, resref)
+        return loc(i.get("LocalizedName")) or STOCK_ITEM_NAMES.get(resref) or resref
 
     def store_name(self, resref: str) -> str:
         s = self.stores.get(resref)
@@ -5545,9 +5689,10 @@ def render_items_index(db: Db, out: Path) -> None:
         rows_html = "\n".join(_broken_row(rr, i, show_base, show_stack) for rr, i in broken_sorted)
         if BASE_TLK:
             broken_desc = (
-                "These items have unresolvable names — their LocalizedName matches "
-                "their ResRef, or references a base game TLK entry that was not found "
-                "in the loaded TLK file. They may be test items, placeholders, or "
+                "These items have unresolvable names even with the base game TLK loaded "
+                "— their LocalizedName matches their ResRef, their blueprint was not "
+                "found in the NWN install’s BIF archives, or they reference a TLK entry "
+                "that could not be resolved. They may be test items, placeholders, or "
                 "incomplete module entries. The ResRef is shown as the name."
             )
         else:
@@ -7237,6 +7382,34 @@ def _dialog_text_preview(node: dict, max_len: int = 80) -> str:
     return line
 
 
+_RE_CUSTOM_TOKEN = re.compile(r"&lt;CUSTOM(\d+)&gt;")
+
+
+def _annotate_custom_tokens(escaped_html: str,
+                             token_setters: dict[int, set[str]],
+                             db: "Db", root_rel: str) -> str:
+    """Replace HTML-escaped <CUSTOMn> tokens with annotated spans that link to
+    the scripts that call SetCustomToken(n, ...). If no setter is found,
+    the token is wrapped in a muted span so it's visually distinct."""
+    def replace(m: re.Match) -> str:
+        n = int(m.group(1))
+        setters = sorted(token_setters.get(n, set()))
+        raw = m.group(0)  # &lt;CUSTOMn&gt;
+        if setters:
+            links = ", ".join(_script_link(db, s, root_rel) for s in setters)
+            return (f'<span class="custom-token" '
+                    f'title="SetCustomToken({n}, ...) called in: '
+                    + ", ".join(setters) + f'">'
+                    f'{raw}'
+                    f'<sup class="token-setters">[{links}]</sup>'
+                    f'</span>')
+        else:
+            return (f'<span class="custom-token custom-token-unknown" '
+                    f'title="SetCustomToken({n}, ...) — no setter found in static analysis">'
+                    f'{raw}</span>')
+    return _RE_CUSTOM_TOKEN.sub(replace, escaped_html)
+
+
 def _render_dialog_node_refs(db: Db, refs_field: list[dict],
                              tgt_kind: str,
                              tgt_nodes: list[dict] | None = None) -> str:
@@ -7550,6 +7723,35 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
+    # ---- Custom tokens summary (non-z-dialog only) ----
+    if not zdlg_handler:
+        all_tokens: set[int] = set()
+        for node in entries + replies:
+            text = loc(node.get("Text"))
+            if text:
+                for m in re.finditer(r'<CUSTOM(\d+)>', text):
+                    all_tokens.add(int(m.group(1)))
+
+        if all_tokens:
+            token_rows = []
+            for n in sorted(all_tokens):
+                setters = sorted(db.token_setters.get(n, set()))
+                setter_html = (", ".join(_script_link(db, s, "..") for s in setters)
+                               if setters else '<em class="muted">not found in static analysis</em>')
+                token_rows.append(
+                    f"<tr><td><code>&lt;CUSTOM{n}&gt;</code></td>"
+                    f"<td>{setter_html}</td></tr>"
+                )
+            sections.append(
+                "<h2>Custom tokens</h2>"
+                '<p class="muted">These runtime tokens are filled by NWScript via '
+                '<code>SetCustomToken(N, text)</code>. The scripts listed set each token; '
+                'the actual value depends on game state at runtime.</p>'
+                '<table class="data"><thead><tr>'
+                "<th>Token</th><th>Set by script(s)</th>"
+                "</tr></thead><tbody>" + "\n".join(token_rows) + "</tbody></table>"
+            )
+
     # ---- Starting entries ----
     if starts:
         sections.append("<h2>Starting entries</h2><ul>")
@@ -7596,7 +7798,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             + (f' <span class="dlg-speaker">[{E(speaker)}]</span>' if speaker else "")
             + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
             + '</div>'
-            f'<div class="dlg-text">{nwn_html(text) or "<em>(no text)</em>"}</div>'
+            f'<div class="dlg-text">{_annotate_custom_tokens(nwn_html(text), db.token_setters, db, "..") or "<em>(no text)</em>"}</div>'
             + _render_dialog_node_refs(db, list_items(e.get("RepliesList")),
                                        "reply", tgt_nodes=replies)
             + '</div>'
@@ -7613,7 +7815,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             f'<div class="dlg-head"><span class="dlg-id">reply #{i}</span>'
             + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
             + '</div>'
-            f'<div class="dlg-text">{nwn_html(text) or "<em>(no text)</em>"}</div>'
+            f'<div class="dlg-text">{_annotate_custom_tokens(nwn_html(text), db.token_setters, db, "..") or "<em>(no text)</em>"}</div>'
             + _render_dialog_node_refs(db, list_items(r.get("EntriesList")),
                                        "entry", tgt_nodes=entries)
             + '</div>'
@@ -8314,6 +8516,9 @@ def main() -> int:
     ap.add_argument("--dialog-tlk", default=None,
                     help="path to base-game dialog.tlk for resolving "
                          "StrRef references (id < 16777216).")
+    ap.add_argument("--nwn-install", default=None,
+                    help="path to NWN install directory (used to resolve stock item "
+                         "blueprint names from BIF archives when --dialog-tlk is also set).")
     ap.add_argument("--custom-tlk", default=None,
                     help="path to the module's custom TLK (named in module.ifo "
                          "Mod_CustomTlk) for resolving StrRefs >= 16777216.")
@@ -8379,6 +8584,19 @@ def main() -> int:
         else:
             print(f"warn: --custom-tlk {p} not found; custom StrRefs will show as [TLK#N]",
                   file=sys.stderr)
+
+    if args.nwn_install:
+        load_stock_item_names(Path(args.nwn_install).resolve())
+    elif BASE_TLK:
+        # Auto-detect common Linux NWN install paths
+        for _cand in (
+            Path.home() / ".local/share/Steam/steamapps/common/Neverwinter Nights",
+            Path("/var/home") / os.environ.get("USER", "") /
+                ".local/share/Steam/steamapps/common/Neverwinter Nights",
+        ):
+            if (_cand / "data" / "nwn_base.key").is_file():
+                load_stock_item_names(_cand)
+                break
 
     print(f"[nwn-wiki] reading {src}")
     db = Db(src)
