@@ -840,6 +840,16 @@ def _is_raw_subtype(subtype: str) -> bool:
     return bool(re.match(r"^\d+$", s) or re.match(r"^[\w\s]+ #\d+$", s))
 
 
+def _fmt_hp(val: Any) -> str:
+    """Format HP with comma separators; returns '' for missing values."""
+    if val in (None, ''):
+        return ''
+    try:
+        return f"{int(val):,}"
+    except (TypeError, ValueError):
+        return str(val)
+
+
 # ---------------------------------------------------------------------------
 # Combat-stat helpers (creature page)
 # ---------------------------------------------------------------------------
@@ -4658,6 +4668,18 @@ def _creature_detail_sections(
         "</tr></table>",
     ]
 
+    if classes:
+        cls_rows = "".join(
+            f"<tr><td>{E(class_name(fld(cl, 'Class')))}</td>"
+            f"<td>{E(fld(cl, 'ClassLevel', ''))}</td></tr>"
+            for cl in classes
+        )
+        sections.append(
+            "<h2>Classes</h2>"
+            '<table class="data"><thead><tr><th>Class</th><th>Level</th></tr></thead>'
+            f"<tbody>{cls_rows}</tbody></table>"
+        )
+
     desc = loc(c.get("Description"))
     if not desc and bp is not None:
         desc = loc(bp.get("Description"))
@@ -4815,19 +4837,66 @@ def _creature_detail_sections(
     ref  = ref  + _iprp_save_univ + _iprp_save_ref
     will = will + _iprp_save_univ + _iprp_save_will
 
+    # Monk Wisdom AC bonus: applies when creature has ≥1 monk level and wears
+    # neither armor nor a shield (NWN rules).
+    _MONK_CLASS_ID = 5
+    _monk_levels = sum(
+        int(fld(cl, "ClassLevel", 0) or 0)
+        for cl in classes
+        if int(fld(cl, "Class", -1) or -1) == _MONK_CLASS_ID
+    )
+    _monk_wis_ac = 0
+    if _monk_levels >= 1 and armor_item is None and shield_item is None:
+        _monk_wis_ac = max(wis_mod, 0)
+        if _monk_wis_ac:
+            ac_total += _monk_wis_ac
+            ac_breakdown.append(f"+{_monk_wis_ac} Wis (monk)")
+
+    # Spell resistance: take max across all sources (they don't stack).
+    # Improved Spell Resistance I–X are feat IDs 699–708 → SR 12, 14, …, 30.
+    # Diamond Soul (feat 215) grants SR = 10 + monk level.
+    feat_ids = [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
+    _ISR_FEAT_BASE = 699
+    _feat_sr = max(
+        (12 + 2 * (fid - _ISR_FEAT_BASE) for fid in feat_ids
+         if _ISR_FEAT_BASE <= fid <= _ISR_FEAT_BASE + 9),
+        default=0,
+    )
+    _diamond_soul_sr = (10 + _monk_levels) if 215 in feat_ids else 0
+    _item_sr = max((cv for _, cv in cprop_by_pid.get(39, [])), default=0)
+    sr_total = max(_feat_sr, _diamond_soul_sr, _item_sr)
+
+    _hp_display = _fmt_hp(_f('MaxHitPoints', _f('HitPoints', '')))
+
     sections.append("<h2>Combat</h2>")
-    sections.append(
-        '<table class="data"><tr>'
-        f"<th>HP</th><td>{E(_f('MaxHitPoints', _f('HitPoints', '')))}</td>"
+    _combat_rows = (
+        '<tr>'
+        f"<th>HP</th><td>{E(_hp_display)}</td>"
         f"<th>AC</th><td>{ac_total} <small class=\"muted\">"
         f"({E(' + '.join(ac_breakdown))})</small></td>"
         f"<th>BAB</th><td>+{bab}</td>"
-        "</tr><tr>"
+        '</tr><tr>'
         f"<th>Fort</th><td>{fort:+d}</td>"
         f"<th>Ref</th><td>{ref:+d}</td>"
         f"<th>Will</th><td>{will:+d}</td>"
-        "</tr></table>"
+        '</tr>'
     )
+    if sr_total:
+        _sr_sources: list[str] = []
+        if _feat_sr:
+            _sr_sources.append(f"feats ({_feat_sr})")
+        if _diamond_soul_sr:
+            _sr_sources.append(f"Diamond Soul ({_diamond_soul_sr})")
+        if _item_sr:
+            _sr_sources.append(f"items ({_item_sr})")
+        _sr_note = f" <small class=\"muted\">(max of: {E(', '.join(_sr_sources))})</small>" if len(_sr_sources) > 1 else ""
+        _combat_rows += (
+            '<tr>'
+            f"<th>Spell Resistance</th><td>{sr_total}{_sr_note}</td>"
+            '<td></td><td></td>'
+            '</tr>'
+        )
+    sections.append(f'<table class="data">{_combat_rows}</table>')
     if ac_extra:
         sections.append(f"<p class=\"muted\">AC extras: {E(', '.join(ac_extra))}</p>")
     # Saves caveat — class-progression bonuses (good-save tables) are added
@@ -4836,18 +4905,6 @@ def _creature_detail_sections(
                     'Saves shown = stored bonus + ability mod + item bonuses '
                     '(Saving Throw Bonus: Specific); class-table progression '
                     'and feat bonuses (Great Fortitude, etc.) are applied at runtime.</p>')
-
-    # Magic resistance — NWN doesn't expose SR on the UTC; it's granted by
-    # feats / items. Surface any SR-flavored feats so the reader knows.
-    feat_ids = [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
-    sr_feat_lines = [feat_name(fid) for fid in feat_ids
-                     if "spell resistance" in feat_name(fid).lower()
-                     or "magic resistance" in feat_name(fid).lower()]
-    if sr_feat_lines:
-        sections.append(
-            "<p><strong>Spell resistance:</strong> "
-            f"granted by feats: {E(', '.join(sr_feat_lines))}</p>"
-        )
 
     # ----- Combined equipment combat properties display ----------------------
     # (cprop_by_pid and cprop_dodge_ac are built earlier, before ac_total.)
@@ -4914,11 +4971,6 @@ def _creature_detail_sections(
         if 37 in cprop_by_pid:
             _misc = sorted({_pf["subtype"] or "?" for _pf, _ in cprop_by_pid[37]})
             cprop_rows.append(f"<tr><th>Misc Immunity</th><td>{E(', '.join(_misc))}</td></tr>")
-
-        # Spell Resistance (ID 39) — max
-        if 39 in cprop_by_pid:
-            _sr = max(cv for _, cv in cprop_by_pid[39])
-            cprop_rows.append(f"<tr><th>Spell Resistance</th><td>{_sr}</td></tr>")
 
         # Regeneration (ID 51) — stacks without limit
         if 51 in cprop_by_pid:
@@ -5049,13 +5101,25 @@ def _creature_detail_sections(
                    fld(it, "EquippedRes", ""))
             if irr in db.items:
                 iname = db.item_name(irr)
+                iobj = db.items[irr]
+                cat_key = _item_category(iobj)
+                cat_label = _item_category_label(cat_key)
+                cat_slug = cat_key.replace("_", "-")
+                type_cell = link(f"{items_dir}/index.html#{E(cat_slug)}", cat_label)
             else:
                 iname = loc(it.get("LocalizedName")) or irr or "(unknown)"
+                type_cell = ""
             cell = (link(f"{items_dir}/{irr}.html", iname)
                     if irr in db.items else nwn_html(iname))
-            rows.append(f"<tr><td>{cell}</td><td>{E(irr)}</td></tr>")
+            droppable = bool(int(fld(it, "Dropable", 0) or 0))
+            loot_cell = "Yes" if droppable else "No"
+            rows.append(
+                f"<tr><td>{cell}</td><td>{type_cell}</td><td>{loot_cell}</td></tr>"
+            )
         sections.append(
-            '<table class="data"><thead><tr><th>Item</th><th>ResRef</th></tr></thead>'
+            '<table class="data"><thead><tr>'
+            '<th>Item</th><th>Item Type</th><th>Lootable</th>'
+            '</tr></thead>'
             "<tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
@@ -5202,7 +5266,7 @@ def render_creature_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Race</dt><dd>{E(race_name(fld(c, 'Race')))}</dd>",
         f"<dt>Appearance</dt><dd>{E(appearance_name(fld(c, 'Appearance_Type')))}</dd>",
         f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
-        f"<dt>HP</dt><dd>{E(fld(c, 'MaxHitPoints', fld(c, 'HitPoints', '')))}</dd>",
+        f"<dt>HP</dt><dd>{E(_fmt_hp(fld(c, 'MaxHitPoints', fld(c, 'HitPoints', ''))))}</dd>",
         f"<dt>CR</dt><dd>{E(fld(c, 'ChallengeRating', ''))}</dd>",
         f"<dt>Faction</dt><dd>{_faction_dd(db, fld(c, 'FactionID', ''), root_rel='..')}</dd>",
         f"<dt>Conversation</dt><dd>{_conv_link(db, fld(c, 'Conversation', ''), root_rel='..')}</dd>",
@@ -5390,7 +5454,7 @@ def render_creature_instance_page(db: Db, area_rr: str, idx: int, out: Path) -> 
         f"<dt>Race</dt><dd>{E(race_name(_meta('Race')))}</dd>",
         f"<dt>Appearance</dt><dd>{E(appearance_name(_meta('Appearance_Type')))}</dd>",
         f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
-        f"<dt>HP</dt><dd>{E(_meta('MaxHitPoints', _meta('HitPoints', '')))}</dd>",
+        f"<dt>HP</dt><dd>{E(_fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
         f"<dt>CR</dt><dd>{E(_meta('ChallengeRating', ''))}</dd>",
         f"<dt>Faction</dt><dd>{_faction_dd(db, _meta('FactionID', ''), root_rel='../..')}</dd>",
         f"<dt>Conversation</dt><dd>{_conv_link(db, inst_conv, root_rel='../..') if inst_conv else (_conv_link(db, bp_conv, root_rel='../..') if bp_conv else '—')}</dd>",
