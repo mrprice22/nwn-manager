@@ -4630,6 +4630,122 @@ def _creature_detail_sections(
             f"granted by feats: {E(', '.join(sr_feat_lines))}</p>"
         )
 
+    # ----- Combined equipment combat properties ------------------------------
+    # Collect all item properties from every equipped item, then apply NWN
+    # stacking rules: dodge AC stacks (cap +20); all other same-type bonuses
+    # do not stack (only max shown); regeneration stacks without limit.
+    cprop_by_pid: dict[int, list[tuple[dict, int]]] = {}
+    for _ce in equip:
+        _ci = _equip_item(_ce)
+        if _ci is None:
+            continue
+        for _cp in list_items(_ci.get("PropertiesList")):
+            _cpid_raw = fld(_cp, "PropertyName")
+            if _cpid_raw is None:
+                continue
+            _cpid = int(_cpid_raw)
+            _cpf = itemprop_format(_cp)
+            _ccv = _prop_value_num(_cpf["cost"]) if _cpf["cost"] else 0
+            if _cpid not in cprop_by_pid:
+                cprop_by_pid[_cpid] = []
+            cprop_by_pid[_cpid].append((_cpf, _ccv))
+
+    cprop_rows: list[str] = []
+    if cprop_by_pid:
+        # AC Bonus (ID 1) — Dodge type, stacks, cap +20
+        if 1 in cprop_by_pid:
+            _sum = sum(cv for _, cv in cprop_by_pid[1])
+            _eff = min(_sum, 20)
+            _cap = f" (capped from +{_sum})" if _sum > 20 else ""
+            cprop_rows.append(f"<tr><th>AC Bonus (Dodge)</th><td>+{_eff}{E(_cap)}</td></tr>")
+
+        # Saving Throw Bonus (IDs 40, 41) — max per subtype
+        _st_max: dict[str, int] = {}
+        for _stpid in (40, 41):
+            for _pf, _cv in cprop_by_pid.get(_stpid, []):
+                _sub = _pf["subtype"] or "All"
+                _st_max[_sub] = max(_st_max.get(_sub, 0), _cv)
+        for _sub, _val in sorted(_st_max.items()):
+            _lbl = f"Save vs. {_sub}" if _sub != "All" else "Saving Throw (all)"
+            cprop_rows.append(f"<tr><th>{E(_lbl)}</th><td>+{_val}</td></tr>")
+
+        # Ability Bonus (ID 0) — max per ability (enhancement doesn't stack)
+        if 0 in cprop_by_pid:
+            _ab_max: dict[str, int] = {}
+            for _pf, _cv in cprop_by_pid[0]:
+                _sub = _pf["subtype"] or "?"
+                _ab_max[_sub] = max(_ab_max.get(_sub, 0), _cv)
+            for _sub, _val in sorted(_ab_max.items()):
+                cprop_rows.append(f"<tr><th>{E(_sub)} Bonus</th><td>+{_val}</td></tr>")
+
+        # Skill Bonus (ID 52) — max per skill
+        if 52 in cprop_by_pid:
+            _sk_max: dict[str, int] = {}
+            for _pf, _cv in cprop_by_pid[52]:
+                _sub = _pf["subtype"] or "?"
+                _sk_max[_sub] = max(_sk_max.get(_sub, 0), _cv)
+            for _sub, _val in sorted(_sk_max.items()):
+                cprop_rows.append(f"<tr><th>Skill: {E(_sub)}</th><td>+{_val}</td></tr>")
+
+        # Damage Resistance (ID 23) — max per damage type
+        if 23 in cprop_by_pid:
+            _dr_max: dict[str, tuple[int, str]] = {}
+            for _pf, _cv in cprop_by_pid[23]:
+                _sub = _pf["subtype"] or "?"
+                _cstr = _pf["cost"] or str(_cv)
+                if _sub not in _dr_max or _cv > _dr_max[_sub][0]:
+                    _dr_max[_sub] = (_cv, _cstr)
+            for _sub, (_val, _cstr) in sorted(_dr_max.items()):
+                cprop_rows.append(f"<tr><th>Damage Resistance: {E(_sub)}</th><td>{E(_cstr)}</td></tr>")
+
+        # Immunity: Damage Type (ID 20) — list unique types
+        if 20 in cprop_by_pid:
+            _imm = sorted({_pf["subtype"] or "?" for _pf, _ in cprop_by_pid[20]})
+            cprop_rows.append(f"<tr><th>Damage Immunity</th><td>{E(', '.join(_imm))}</td></tr>")
+
+        # Immunity: Miscellaneous (ID 37) — list unique
+        if 37 in cprop_by_pid:
+            _misc = sorted({_pf["subtype"] or "?" for _pf, _ in cprop_by_pid[37]})
+            cprop_rows.append(f"<tr><th>Misc Immunity</th><td>{E(', '.join(_misc))}</td></tr>")
+
+        # Spell Resistance (ID 39) — max
+        if 39 in cprop_by_pid:
+            _sr = max(cv for _, cv in cprop_by_pid[39])
+            cprop_rows.append(f"<tr><th>Spell Resistance</th><td>{_sr}</td></tr>")
+
+        # Regeneration (ID 51) — stacks without limit
+        if 51 in cprop_by_pid:
+            _regen = sum(cv for _, cv in cprop_by_pid[51])
+            cprop_rows.append(f"<tr><th>Regeneration</th><td>+{_regen} HP/round</td></tr>")
+
+        # Vampiric Regeneration (ID 67) — stacks without limit
+        if 67 in cprop_by_pid:
+            _vregen = sum(cv for _, cv in cprop_by_pid[67])
+            cprop_rows.append(f"<tr><th>Regen: Vampiric</th><td>+{_vregen} HP/hit</td></tr>")
+
+        # Turn Resistance (ID 73) — stacks
+        if 73 in cprop_by_pid:
+            _tr = sum(cv for _, cv in cprop_by_pid[73])
+            cprop_rows.append(f"<tr><th>Turn Resistance</th><td>+{_tr}</td></tr>")
+
+        # Flag properties — present/absent
+        for _fp_id, _fp_name in (
+            (35, "Haste"), (75, "Freedom of Movement"),
+            (71, "True Seeing"), (26, "Darkvision"),
+        ):
+            if _fp_id in cprop_by_pid:
+                cprop_rows.append(f"<tr><th>{E(_fp_name)}</th><td>Yes</td></tr>")
+
+    if cprop_rows:
+        sections.append(
+            "<h3>Equipment combat properties (combined)</h3>"
+            '<table class="data"><tbody>' + "\n".join(cprop_rows) + "</tbody></table>"
+            '<p class="muted">Dodge AC stacks (cap +20); all other same-type '
+            'bonuses do not — only the highest is shown. '
+            'Damage resistance: highest per type. '
+            'Regeneration stacks without limit.</p>'
+        )
+
     # ----- Weapons / attack schedule ----------------------------------------
     weapon_rows: list[str] = []
     for slot in (SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B):
@@ -4707,9 +4823,11 @@ def _creature_detail_sections(
                 cell = nwn_html(disp)
             slot = fld(e, "__struct_id", "")
             slot_label = SLOT_NAMES.get(int(slot), str(slot)) if isinstance(slot, int) else str(slot)
-            rows.append(f"<tr><td>{E(slot_label)}</td><td>{cell}</td></tr>")
+            droppable = bool(int(fld(e, "Dropable", 0) or 0))
+            loot_cell = "Yes" if droppable else "No"
+            rows.append(f"<tr><td>{E(slot_label)}</td><td>{cell}</td><td>{loot_cell}</td></tr>")
         sections.append(
-            '<table class="data"><thead><tr><th>Slot</th><th>Item</th></tr></thead>'
+            '<table class="data"><thead><tr><th>Slot</th><th>Item</th><th>Lootable</th></tr></thead>'
             "<tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
