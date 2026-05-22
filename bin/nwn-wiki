@@ -4698,10 +4698,16 @@ def _creature_detail_sections(
             for _sub, (_val, _cstr) in sorted(_dr_max.items()):
                 cprop_rows.append(f"<tr><th>Damage Resistance: {E(_sub)}</th><td>{E(_cstr)}</td></tr>")
 
-        # Immunity: Damage Type (ID 20) — list unique types
+        # Immunity: Damage Type (ID 20) — max % per damage type
         if 20 in cprop_by_pid:
-            _imm = sorted({_pf["subtype"] or "?" for _pf, _ in cprop_by_pid[20]})
-            cprop_rows.append(f"<tr><th>Damage Immunity</th><td>{E(', '.join(_imm))}</td></tr>")
+            _imm_max: dict[str, tuple[int, str]] = {}
+            for _pf, _cv in cprop_by_pid[20]:
+                _sub = _pf["subtype"] or "?"
+                _cstr = _pf["cost"] or str(_cv)
+                if _sub not in _imm_max or _cv > _imm_max[_sub][0]:
+                    _imm_max[_sub] = (_cv, _cstr)
+            _imm_parts = [f"{_sub} ({_cstr})" for _sub, (_, _cstr) in sorted(_imm_max.items())]
+            cprop_rows.append(f"<tr><th>Damage Immunity</th><td>{E(', '.join(_imm_parts))}</td></tr>")
 
         # Immunity: Miscellaneous (ID 37) — list unique
         if 37 in cprop_by_pid:
