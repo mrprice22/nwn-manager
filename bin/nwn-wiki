@@ -943,6 +943,15 @@ WEAPON_SLOTS = {SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B}
 ARMOR_SLOTS = {SLOT_CHEST, SLOT_LEFT}  # left can hold a shield
 SHIELD_BASEITEMS = {14, 56, 57}  # Small / Large / Tower shields (stock 2da rows)
 
+# Names containing these words are treated as cloth/robes regardless of magical
+# AC bonus, since many custom modules store all AC as item properties rather than
+# the ArmorBonus (base AC) field — making the magical AC bonus an unreliable
+# indicator of armor category.
+_CLOTH_NAME_RE = re.compile(
+    r"\b(robe|cloth|garb|gown|tunic|outfit|wrap|shroud|shaw|veil|vestment)\b",
+    re.IGNORECASE,
+)
+
 # BaseItem sets for items-index grouping.
 _ARMOR_BASEITEMS:      frozenset[int] = frozenset({16})
 _HELMET_BASEITEMS:     frozenset[int] = frozenset({17})
@@ -1002,6 +1011,23 @@ def _item_category(item: dict) -> str:
     """Return the items-index category key for an item dict."""
     bi = int(fld(item, "BaseItem", -1) or -1)
     if bi in _ARMOR_BASEITEMS:
+        # Use ArmorBonus (base AC) when explicitly stored on the item.  Many
+        # custom modules omit this field (default = 0) and put all AC into
+        # magical properties instead.
+        base_ac_raw = fld(item, "ArmorBonus")
+        if base_ac_raw is not None:
+            base_ac = int(base_ac_raw)
+            if base_ac <= 0:
+                return "armor_cloth"
+            if base_ac <= 4:
+                return "armor_light"
+            if base_ac <= 6:
+                return "armor_medium"
+            return "armor_heavy"
+        # No ArmorBonus stored: classify by name keywords first so that
+        # enchanted robes/cloth items are not miscategorised as heavy armor.
+        if _CLOTH_NAME_RE.search(loc(item.get("LocalizedName"))):
+            return "armor_cloth"
         ac, _ = item_ac_bonus(item)
         if ac <= 0:
             return "armor_cloth"
@@ -5738,7 +5764,9 @@ def render_items_index(db: Db, out: Path) -> None:
         "found in containers, dropped by creatures, or granted by scripts. "
         '<small class="muted">Base item names use stock NWN baseitems.2da; '
         "CEP/HAK overrides are common — the row number shown is authoritative. "
-        "Armor subtypes (Cloth/Light/Medium/Heavy) are based on total AC bonus "
+        "Armor subtypes (Cloth/Light/Medium/Heavy) use the item's base AC "
+        "(ArmorBonus field) when set; otherwise cloth/robe items are detected "
+        "by name keywords, with remaining items classified by magical AC bonus "
         "from item properties.</small></p>"
     )
 
