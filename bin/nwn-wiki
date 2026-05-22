@@ -5866,7 +5866,9 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
         f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i)))}</dd>",
         *(
-            [f"<dt>Base AC</dt><dd>{int(fld(i, 'ArmorBonus') or 0)}</dd>"]
+            (lambda _bac: [f"<dt>Base AC</dt><dd>{_bac}</dd>"] if _bac else [])(
+                int(fld(i, "ArmorBonus") or 0) or item_ac_bonus(i)[0]
+            )
             if _bi in _ARMOR_BASEITEMS
             else [f"<dt>Base AC</dt><dd>{int((WEAPONS.get(_bi) or {}).get('BaseAC', 0) or 0)}</dd>"]
             if _bi in SHIELD_BASEITEMS
