@@ -93,15 +93,19 @@ compile_err_count=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null) || compile
 fatal_lines=$(grep -E "^Error:" "$tmpout" 2>/dev/null || true)
 
 if [[ $nasher_status -ne 0 || -n "$fatal_lines" ]]; then
+  # Always show full nasher output on error; in verbose mode it was already
+  # streamed live, so only dump it here for the quiet (default) path.
+  if [[ $VERBOSE -eq 0 ]]; then
+    echo
+    cat "$tmpout"
+  fi
   if [[ $FORCE -eq 1 ]]; then
     echo
-    echo "[WARN] nasher reported errors (--force: proceeding anyway):"
-    [[ -n "$fatal_lines" ]] && echo "$fatal_lines" | sed 's/^/  /'
+    echo "[WARN] nasher reported errors (--force: proceeding anyway)"
   else
     echo
     echo "[ERROR] nasher reported errors — aborting."
     echo "        Re-run with --force to proceed despite errors."
-    [[ -n "$fatal_lines" ]] && echo "$fatal_lines" | sed 's/^/  /'
     echo
     read -rp "Press Enter to close..."
     exit 1
