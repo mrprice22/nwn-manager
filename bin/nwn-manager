@@ -503,6 +503,18 @@ cmd_wiki() {
   local tlk_args=()
   if [[ -f tlk/dialog.tlk ]]; then
     tlk_args+=(--dialog-tlk tlk/dialog.tlk)
+  else
+    local install
+    install=$(detect_nwn_install || true)
+    if [[ -n $install ]]; then
+      for _cand in "$install/lang/en/data/dialog.tlk" "$install/data/tlk/dialog.tlk"; do
+        if [[ -f $_cand ]]; then
+          tlk_args+=(--dialog-tlk "$_cand")
+          echo "[$PROG] using dialog.tlk from $_cand"
+          break
+        fi
+      done
+    fi
   fi
   local custom=""
   for f in tlk/*.tlk; do
