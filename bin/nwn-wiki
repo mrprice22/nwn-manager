@@ -1139,7 +1139,9 @@ class Db:
         self.item_sold_at: dict[str, list[dict]] = defaultdict(list)
         # item resref → containers that hold it: [{"area_rr", "idx", "pname", "locked", "dc"}]
         self.item_in_container: dict[str, list[dict]] = defaultdict(list)
-        # item resref → creatures that carry it: [{"area_rr", "crr", "cname"}]
+        # item resref → creatures that carry it: [{"area_rr", "crr", "cname", "dropable"}]
+        # dropable=True means Dropable=1 on that item's equip/inventory entry — it will
+        # appear in the loot bag when the creature dies.
         self.item_carried_by: dict[str, list[dict]] = defaultdict(list)
         # script resref → list of item resrefs created via CreateItemOnObject
         self.script_creates_items: dict[str, list[str]] = defaultdict(list)
@@ -1426,48 +1428,50 @@ class Db:
                     irr = (fld(e, "EquippedRes", "")
                            or fld(e, "TemplateResRef", "") or "").strip()
                     if irr:
+                        dropable = bool(int(fld(e, "Dropable", 0) or 0))
                         key = (irr, area_rr, crr)
                         if key not in _seen_carrier:
                             _seen_carrier.add(key)
                             self.item_carried_by[irr].append(
-                                {"area_rr": area_rr, "crr": crr, "cname": cname}
+                                {"area_rr": area_rr, "crr": crr, "cname": cname, "dropable": dropable}
                             )
                 for it in list_items(c.get("ItemList")):
                     irr = (fld(it, "InventoryRes", "")
                            or fld(it, "TemplateResRef", "") or "").strip()
                     if irr:
+                        dropable = bool(int(fld(it, "Dropable", 0) or 0))
                         key = (irr, area_rr, crr)
                         if key not in _seen_carrier:
                             _seen_carrier.add(key)
                             self.item_carried_by[irr].append(
-                                {"area_rr": area_rr, "crr": crr, "cname": cname}
+                                {"area_rr": area_rr, "crr": crr, "cname": cname, "dropable": dropable}
                             )
         for crr, spawns in self.creature_encounter_spawns.items():
             bp = self.creatures.get(crr, {})
             if not bp:
                 continue
             cname = self.creature_name(crr)
-            item_irrs: list[str] = []
+            item_entries: list[tuple[str, bool]] = []  # (irr, dropable)
             for e in list_items(bp.get("Equip_ItemList")):
                 irr = (fld(e, "EquippedRes", "")
                        or fld(e, "TemplateResRef", "") or "").strip()
                 if irr:
-                    item_irrs.append(irr)
+                    item_entries.append((irr, bool(int(fld(e, "Dropable", 0) or 0))))
             for it in list_items(bp.get("ItemList")):
                 irr = (fld(it, "InventoryRes", "")
                        or fld(it, "TemplateResRef", "") or "").strip()
                 if irr:
-                    item_irrs.append(irr)
+                    item_entries.append((irr, bool(int(fld(it, "Dropable", 0) or 0))))
             for spawn in spawns:
                 area_rr = spawn["area"]
                 if area_rr in self.hidden_areas:
                     continue
-                for irr in item_irrs:
+                for irr, dropable in item_entries:
                     key = (irr, area_rr, crr)
                     if key not in _seen_carrier:
                         _seen_carrier.add(key)
                         self.item_carried_by[irr].append(
-                            {"area_rr": area_rr, "crr": crr, "cname": cname}
+                            {"area_rr": area_rr, "crr": crr, "cname": cname, "dropable": dropable}
                         )
 
         hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
@@ -5138,7 +5142,7 @@ def render_items_index(db: Db, out: Path) -> None:
             accessible = (
                 rr in db.item_sold_at
                 or rr in db.item_in_container
-                or rr in db.item_carried_by
+                or any(e.get("dropable") for e in db.item_carried_by.get(rr, []))
                 or rr in db.item_from_script
             )
             if accessible:
@@ -5305,14 +5309,28 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     is_plot   = bool(int(fld(i, "Plot",   0) or 0))
     _bi = int(fld(i, "BaseItem", -1) or -1)
     is_creature_item = _bi in _CREATURE_WEAPON_BASEITEMS or _bi in _CREATURE_ITEM_BASEITEMS
-    cursed_tt = (
-        "title=\"Cursed items cannot be dropped and will NOT appear as loot "
-        "when a creature carrying them is killed.\""
-    )
-    plot_tt = (
-        "title=\"Plot items cannot be dropped, sold, or stolen, "
-        "and are not lost on death.\""
-    )
+    _carriers = db.item_carried_by.get(resref, [])
+    _any_droppable = any(e.get("dropable") for e in _carriers)
+    if is_plot:
+        _drop_label = "No"
+        _drop_reason = " — plot item"
+        _drop_tt = "title=\"Plot items cannot be dropped, sold, or stolen by any creature.\""
+    elif is_cursed:
+        _drop_label = "No"
+        _drop_reason = " — cursed"
+        _drop_tt = "title=\"Cursed items are stuck in a creature&#39;s inventory and will not appear as loot.\""
+    elif not _carriers:
+        _drop_label = "—"
+        _drop_reason = ""
+        _drop_tt = "title=\"This item is not carried by any creature in the module.\""
+    elif _any_droppable:
+        _drop_label = "Yes"
+        _drop_reason = ""
+        _drop_tt = "title=\"At least one creature carrying this item has it flagged as droppable (Dropable=1).\""
+    else:
+        _drop_label = "No"
+        _drop_reason = " — not flagged droppable"
+        _drop_tt = "title=\"No creature carrying this item has it flagged as droppable. It will not appear in any loot bag.\""
     sections = [
         f"<h1>{nwn_html(display_name)}</h1>",
         '<dl class="meta">',
@@ -5322,16 +5340,14 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Type</dt><dd>{link('index.html#' + _item_category(i).replace('_', '-'), _item_category_label(_item_category(i)))}</dd>",
         f"<dt>GP Value</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
-        f"<dt {cursed_tt}>Cursed</dt><dd>{'Yes' if is_cursed else 'No'}</dd>",
-        f"<dt {plot_tt}>Plot</dt><dd>{'Yes' if is_plot else 'No'}</dd>",
+        f"<dt {_drop_tt}>Drops on death</dt><dd>{_drop_label}"
+        f"{'<small class=\"muted\">' + _drop_reason + '</small>' if _drop_reason else ''}</dd>",
         '</dl>',
     ]
     if is_cursed:
         sections.append(
             '<p class="warn-cursed"><strong>Warning: this item is Cursed.</strong> '
-            "Cursed items are non-droppable — they stay permanently in a creature's "
-            "inventory. If a boss carries this item it will <strong>not</strong> appear "
-            "as loot when the boss is killed, no matter how many times you defeat them.</p>"
+            "If a player acquires this item, it cannot be unequipped, dropped, or sold.</p>"
         )
     if is_broken:
         sections.append(
@@ -5344,6 +5360,12 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             '<p class="warn-creature"><strong>Note: this is a Creature-only item.</strong> '
             "Items with creature base types cannot be equipped or used by player characters — "
             "they are intended for use by NPCs and monsters only.</p>"
+        )
+    if _carriers and not _any_droppable and not is_plot and not is_cursed:
+        sections.append(
+            '<p class="warn-no-drop"><strong>Note: this item does not drop on death.</strong> '
+            "It is carried by creatures, but none of them have it flagged as droppable "
+            "(Dropable=1 on the item instance). It will not appear in any loot bag.</p>"
         )
 
     desc = loc(i.get("Description"))
@@ -5490,10 +5512,15 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 crr = c["crr"]
                 creature_cell = (link(f"../creatures/{crr}.html", c["cname"])
                                  if crr in db.creatures else E(c["cname"]))
-                rows.append(f"<tr><td>{creature_cell}</td><td>{area_cell}</td></tr>")
+                drops = c.get("dropable", False)
+                drop_cell = "Yes" if drops else '<span class="muted">No</span>'
+                rows.append(f"<tr><td>{creature_cell}</td><td>{area_cell}</td><td>{drop_cell}</td></tr>")
             sections.append(
                 "<h3>Carried by</h3>"
-                '<table class="data"><thead><tr><th>Creature</th><th>Area</th></tr></thead>'
+                '<table class="data"><thead><tr>'
+                '<th>Creature</th><th>Area</th>'
+                '<th title="Whether this item appears in the loot bag when the creature is killed (Dropable=1 on the item instance)">Drops on death</th>'
+                "</tr></thead>"
                 "<tbody>" + "\n".join(rows) + "</tbody></table>"
             )
         if from_script:
@@ -5584,7 +5611,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
 
     for resref, i in db.items.items():
         if not (resref in db.item_sold_at or resref in db.item_in_container
-                or resref in db.item_carried_by or resref in db.item_from_script):
+                or any(e.get("dropable") for e in db.item_carried_by.get(resref, []))
+                or resref in db.item_from_script):
             continue
         name = db.item_name(resref)
         if name.startswith("[TLK#") or name == resref:
@@ -5952,6 +5980,7 @@ form.addEventListener('submit',function(e){
   var bi=document.getElementById('fb').value;
   var sortBy=document.getElementById('fo').value;
   var asc=document.getElementById('fd').value==='asc';
+  var inclNonDrop=document.getElementById('fnd').checked;
   var conds=[];
   for(var i=0;i<N;i++){
     var prop=propSels[i].value,sub=subSels[i].value;
@@ -5960,6 +5989,7 @@ form.addEventListener('submit',function(e){
   }
   var out=[];
   data.forEach(function(it){
+    if(!it.accessible&&!inclNonDrop)return;
     if(bi&&it.base_item!==bi)return;
     var matched=[];
     var ok=!conds.length||conds.every(function(c){
@@ -6015,7 +6045,8 @@ function render(rows,showProps){
     var biCell=r.it.base_item_anchor
       ?'<a href="'+biHref+'">'+esc(r.it.base_item)+'</a>'
       :esc(r.it.base_item);
-    html+='<tr><td><a href="'+esc(r.it.url)+'">'+esc(r.it.name)+'</a></td>'
+    var dropBadge=r.it.accessible?'':' <span class="badge-no-drop" title="Carried by NPCs but not flagged as droppable \u2014 cannot be looted">no drop</span>';
+    html+='<tr><td><a href="'+esc(r.it.url)+'">'+esc(r.it.name)+'</a>'+dropBadge+'</td>'
          +'<td>'+biCell+'</td>'
          +(showProps?'<td>'+props+'</td>':'')
          +'<td>'+(r.it.cost?r.it.cost.toLocaleString()+' gp':'\u2014')+'</td></tr>';
@@ -6034,8 +6065,14 @@ def render_items_search(db: "Db", out: Path) -> None:
     index: list[dict] = []
     for resref, i in sorted(db.items.items(),
                             key=lambda kv: nwn_text(db.item_name(kv[0])).lower()):
-        if not (resref in db.item_sold_at or resref in db.item_in_container
-                or resref in db.item_carried_by or resref in db.item_from_script):
+        carriers = db.item_carried_by.get(resref, [])
+        accessible = (
+            resref in db.item_sold_at
+            or resref in db.item_in_container
+            or any(e.get("dropable") for e in carriers)
+            or resref in db.item_from_script
+        )
+        if not accessible and not carriers:
             continue
         name = db.item_name(resref)
         if name.startswith("[TLK#") or name == resref:
@@ -6077,6 +6114,7 @@ def render_items_search(db: "Db", out: Path) -> None:
             "cost": cost_val,
             "url": f"{resref}.html",
             "properties": props,
+            "accessible": accessible,
         })
 
     write(out / "items" / "search-index.json",
@@ -6112,6 +6150,9 @@ def render_items_search(db: "Db", out: Path) -> None:
         '<option value="desc">Descending</option>'
         '<option value="asc">Ascending</option>'
         '</select>'
+        '<label class="checkbox-label" title="Include items carried by NPCs that have no Dropable=1 flag — they exist in the module but cannot be looted">'
+        '<input type="checkbox" id="fnd"> Include non-droppable items'
+        '</label>'
         '<button type="submit">Search</button>'
         '</div>'
         f'<div class="prop-rows">{prop_rows}</div>'

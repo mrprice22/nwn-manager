@@ -404,6 +404,31 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.95em;
 }
+.warn-no-drop {
+  background: #f0f4ff;
+  border-left: 4px solid #5070c0;
+  color: #1a2a60;
+  padding: 0.6em 0.9em;
+  margin: 0.5em 0 1em;
+  font-size: 0.95em;
+}
+.badge-no-drop {
+  background: #dde3f5;
+  color: #3a4a80;
+  border-radius: 3px;
+  font-size: 0.75em;
+  padding: 0.1em 0.4em;
+  margin-left: 0.4em;
+  vertical-align: middle;
+  cursor: help;
+}
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  font-size: 0.9em;
+  cursor: pointer;
+}
 
 .dlg-node:target {
   outline: 2px solid var(--accent-soft);
