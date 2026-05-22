@@ -89,7 +89,7 @@ fi
 # Separate compile-level errors (expected benign failures in zep_cr_*, openstore_*,
 # dmw_do_dialog*, etc.) from nasher-level failures (pack/install errors).
 # Nasher non-tty format has no leading spaces, unlike tty-indented output.
-compile_err_count=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null || echo 0)
+compile_err_count=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null) || compile_err_count=0
 fatal_lines=$(grep -E "^Error:" "$tmpout" 2>/dev/null || true)
 
 if [[ $nasher_status -ne 0 || -n "$fatal_lines" ]]; then
