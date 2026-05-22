@@ -113,13 +113,22 @@ def _parse_nwn_key(key_path: Path) -> dict[str, tuple[Path, int]]:
     n_bif, n_key = struct.unpack_from('<II', data, 8)
     ofs_bif, ofs_key = struct.unpack_from('<II', data, 16)
 
+    # BIF paths in NWN KEY files are relative to the game root (parent of the
+    # data/ directory where the KEY lives in NWN EE).  Try game_root/rel first,
+    # then key_dir/rel (bare filename), then key_dir/basename as final fallback.
+    game_root = key_dir.parent
     bif_paths: list[Path] = []
     for i in range(n_bif):
         e = ofs_bif + i * 12
         _fsize, name_off, name_len, _drives = struct.unpack_from('<IIHH', data, e)
         raw = data[name_off:name_off + name_len].rstrip(b'\x00')
         rel = raw.decode('latin-1').replace('\\', os.sep)
-        bif_paths.append(key_dir / rel)
+        for cand in (game_root / rel, key_dir / rel, key_dir / Path(rel).name):
+            if cand.is_file():
+                bif_paths.append(cand)
+                break
+        else:
+            bif_paths.append(game_root / rel)  # keep slot even if missing
 
     result: dict[str, tuple[Path, int]] = {}
     for i in range(n_key):
@@ -213,7 +222,12 @@ def load_stock_item_names(nwn_install: Path) -> None:
     t0 = time.time()
     index = _parse_nwn_key(key_path)
     if not index:
+        print(f"[nwn-wiki] warn: no UTI entries found in {key_path}", file=sys.stderr)
         return
+    missing_bifs = {str(bp) for _, (bp, _) in index.items() if not bp.is_file()}
+    if missing_bifs:
+        print(f"[nwn-wiki] warn: {len(missing_bifs)} BIF(s) not found, e.g. "
+              f"{sorted(missing_bifs)[0]}", file=sys.stderr)
     loaded = 0
     for resref, (bif_path, var_idx) in index.items():
         if not bif_path.is_file():
@@ -7481,7 +7495,8 @@ def _render_dialog_tree(db: Db, entries: list[dict], replies: list[dict],
         e = entries[idx]
         speaker = fld(e, "Speaker", "")
         action = fld(e, "Script", "")
-        text_html = nwn_html(loc(e.get("Text"))) or "<em>(no text)</em>"
+        text_html = _annotate_custom_tokens(
+            nwn_html(loc(e.get("Text"))), db.token_setters, db, "..") or "<em>(no text)</em>"
         head = (f'<span class="dlg-id">entry #{idx}</span>'
                 + (f' <span class="dlg-speaker">[{E(speaker)}]</span>' if speaker else "")
                 + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
@@ -7521,7 +7536,8 @@ def _render_dialog_tree(db: Db, entries: list[dict], replies: list[dict],
         visited_r.add(idx)
         r = replies[idx]
         action = fld(r, "Script", "")
-        text_html = nwn_html(loc(r.get("Text"))) or "<em>(no text)</em>"
+        text_html = _annotate_custom_tokens(
+            nwn_html(loc(r.get("Text"))), db.token_setters, db, "..") or "<em>(no text)</em>"
         head = (f'<span class="dlg-id">reply #{idx}</span>'
                 + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
                 + cond_html(ref_active))
