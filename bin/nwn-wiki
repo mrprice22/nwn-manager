@@ -850,6 +850,13 @@ def _fmt_hp(val: Any) -> str:
         return str(val)
 
 
+def _yn(flag: bool) -> str:
+    """Color-coded Yes/No span for boolean flags in tables."""
+    if flag:
+        return '<span style="color:#4a8;font-weight:bold">Yes</span>'
+    return '<span style="color:#888">No</span>'
+
+
 # ---------------------------------------------------------------------------
 # Combat-stat helpers (creature page)
 # ---------------------------------------------------------------------------
@@ -4846,7 +4853,8 @@ def _creature_detail_sections(
         if int(fld(cl, "Class", -1) or -1) == _MONK_CLASS_ID
     )
     _monk_wis_ac = 0
-    if _monk_levels >= 1 and armor_item is None and shield_item is None:
+    # Cloth armor / robes (armor_ac_bonus == 0) don't block the monk WIS bonus.
+    if _monk_levels >= 1 and armor_ac_bonus == 0 and shield_item is None:
         _monk_wis_ac = max(wis_mod, 0)
         if _monk_wis_ac:
             ac_total += _monk_wis_ac
@@ -5084,8 +5092,7 @@ def _creature_detail_sections(
             slot = fld(e, "__struct_id", "")
             slot_label = SLOT_NAMES.get(int(slot), str(slot)) if isinstance(slot, int) else str(slot)
             droppable = bool(int(fld(e, "Dropable", 0) or 0))
-            loot_cell = "Yes" if droppable else "No"
-            rows.append(f"<tr><td>{E(slot_label)}</td><td>{cell}</td><td>{loot_cell}</td></tr>")
+            rows.append(f"<tr><td>{E(slot_label)}</td><td>{cell}</td><td>{_yn(droppable)}</td></tr>")
         sections.append(
             '<table class="data"><thead><tr><th>Slot</th><th>Item</th><th>Lootable</th></tr></thead>'
             "<tbody>" + "\n".join(rows) + "</tbody></table>"
@@ -5112,13 +5119,14 @@ def _creature_detail_sections(
             cell = (link(f"{items_dir}/{irr}.html", iname)
                     if irr in db.items else nwn_html(iname))
             droppable = bool(int(fld(it, "Dropable", 0) or 0))
-            loot_cell = "Yes" if droppable else "No"
+            pickpocketable = bool(int(fld(it, "Pickpocketable", 0) or 0))
             rows.append(
-                f"<tr><td>{cell}</td><td>{type_cell}</td><td>{loot_cell}</td></tr>"
+                f"<tr><td>{cell}</td><td>{type_cell}</td>"
+                f"<td>{_yn(droppable)}</td><td>{_yn(pickpocketable)}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            '<th>Item</th><th>Item Type</th><th>Lootable</th>'
+            '<th>Item</th><th>Item Type</th><th>Lootable</th><th>Pickpocketable</th>'
             '</tr></thead>'
             "<tbody>" + "\n".join(rows) + "</tbody></table>"
         )
