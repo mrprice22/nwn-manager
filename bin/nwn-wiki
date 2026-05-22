@@ -94,156 +94,16 @@ def read_tlk(path: Path) -> dict[int, str]:
     return out
 
 
-STOCK_ITEM_NAMES: dict[str, str] = {}  # resref → resolved name from stock blueprint TLK
-
-_NWN_UTI_RESTYPE = 2025
-
-
-def _parse_nwn_key(key_path: Path) -> dict[str, tuple[Path, int]]:
-    """Parse NWN KEY V1 file → {resref_lower: (absolute_bif_path, var_resource_id)}.
-    Only returns entries for UTI files (resource type 2025)."""
-    key_dir = key_path.parent
-    try:
-        data = key_path.read_bytes()
-    except OSError:
+def _load_stock_item_names() -> dict[str, str]:
+    p = DATA_DIR / "stock_item_names.json"
+    if not p.exists():
         return {}
-    if data[:4] != b'KEY ':
-        return {}
-
-    n_bif, n_key = struct.unpack_from('<II', data, 8)
-    ofs_bif, ofs_key = struct.unpack_from('<II', data, 16)
-
-    # BIF paths in NWN KEY files are relative to the game root (parent of the
-    # data/ directory where the KEY lives in NWN EE).  Try game_root/rel first,
-    # then key_dir/rel (bare filename), then key_dir/basename as final fallback.
-    game_root = key_dir.parent
-    bif_paths: list[Path] = []
-    for i in range(n_bif):
-        e = ofs_bif + i * 12
-        _fsize, name_off, name_len, _drives = struct.unpack_from('<IIHH', data, e)
-        raw = data[name_off:name_off + name_len].rstrip(b'\x00')
-        rel = raw.decode('latin-1').replace('\\', os.sep)
-        for cand in (game_root / rel, key_dir / rel, key_dir / Path(rel).name):
-            if cand.is_file():
-                bif_paths.append(cand)
-                break
-        else:
-            bif_paths.append(game_root / rel)  # keep slot even if missing
-
-    result: dict[str, tuple[Path, int]] = {}
-    for i in range(n_key):
-        e = ofs_key + i * 22
-        resref = data[e:e + 16].rstrip(b'\x00').decode('latin-1').lower()
-        res_type = struct.unpack_from('<H', data, e + 16)[0]
-        res_id = struct.unpack_from('<I', data, e + 18)[0]
-        if res_type != _NWN_UTI_RESTYPE:
-            continue
-        bif_idx = (res_id >> 20) & 0xFFF
-        var_idx = res_id & 0xFFFFF
-        if bif_idx < len(bif_paths):
-            result[resref] = (bif_paths[bif_idx], var_idx)
-    return result
+    raw = json.loads(p.read_text())
+    return {k: v["name"] for k, v in raw.items()
+            if not k.startswith("_") and isinstance(v, dict) and "name" in v}
 
 
-def _read_bif_entry(bif_path: Path, var_idx: int) -> bytes:
-    """Extract raw resource bytes from a NWN BIF V1 file by variable resource ID."""
-    try:
-        data = bif_path.read_bytes()
-    except OSError:
-        return b''
-    if data[:4] != b'BIFF':
-        return b''
-    n_var, _n_fixed, ofs_var = struct.unpack_from('<III', data, 8)
-    for i in range(n_var):
-        e = ofs_var + i * 16
-        entry_id, offset, size, _res_type = struct.unpack_from('<IIII', data, e)
-        if (entry_id & 0xFFFFF) == var_idx:
-            return data[offset:offset + size]
-    return b''
-
-
-def _gff_locname_strref(gff_bytes: bytes) -> int | None:
-    """Minimal GFF V3.2 parser: return the TLK StrRef from LocalizedName, or None.
-    Returns None if LocalizedName has an inline string (no TLK lookup needed by caller)."""
-    if len(gff_bytes) < 56:
-        return None
-    (struct_offset, _sc, field_offset, _fc,
-     label_offset, label_count, field_data_offset, _fdc,
-     field_indices_offset, _fic, _lio, _lic) = struct.unpack_from('<12I', gff_bytes, 8)
-
-    # Find "LocalizedName" label index
-    ln_idx: int | None = None
-    for i in range(label_count):
-        base = label_offset + i * 16
-        lab = gff_bytes[base:base + 16].rstrip(b'\x00')
-        if lab == b'LocalizedName':
-            ln_idx = i
-            break
-    if ln_idx is None:
-        return None
-
-    # Top-level struct (struct 0): type(4), data_or_offset(4), field_count(4)
-    s_data, s_field_count = struct.unpack_from('<II', gff_bytes, struct_offset + 4)
-
-    if s_field_count == 0:
-        return None
-    if s_field_count == 1:
-        field_indices = [s_data]
-    else:
-        fi_base = field_indices_offset + s_data
-        field_indices = [
-            struct.unpack_from('<I', gff_bytes, fi_base + j * 4)[0]
-            for j in range(s_field_count)
-        ]
-
-    CExoLocString = 12
-    for fi in field_indices:
-        f_type, f_label, f_data = struct.unpack_from('<III', gff_bytes, field_offset + fi * 12)
-        if f_label != ln_idx or f_type != CExoLocString:
-            continue
-        # CExoLocString field data: total_size(4) + strref(4) + str_count(4) + ...
-        fd = field_data_offset + f_data
-        if fd + 8 > len(gff_bytes):
-            return None
-        strref = struct.unpack_from('<I', gff_bytes, fd + 4)[0]
-        return None if strref == 0xFFFFFFFF else strref
-    return None
-
-
-def load_stock_item_names(nwn_install: Path) -> None:
-    """Populate STOCK_ITEM_NAMES from the NWN install's KEY/BIF archives.
-    Only runs when BASE_TLK is loaded (--dialog-tlk was provided).
-    Silently skips if the key file or BIFs are missing."""
-    if not BASE_TLK:
-        return
-    key_path = nwn_install / "data" / "nwn_base.key"
-    if not key_path.is_file():
-        return
-    t0 = time.time()
-    index = _parse_nwn_key(key_path)
-    if not index:
-        print(f"[nwn-wiki] warn: no UTI entries found in {key_path}", file=sys.stderr)
-        return
-    missing_bifs = {str(bp) for _, (bp, _) in index.items() if not bp.is_file()}
-    if missing_bifs:
-        print(f"[nwn-wiki] warn: {len(missing_bifs)} BIF(s) not found, e.g. "
-              f"{sorted(missing_bifs)[0]}", file=sys.stderr)
-    loaded = 0
-    for resref, (bif_path, var_idx) in index.items():
-        if not bif_path.is_file():
-            continue
-        raw = _read_bif_entry(bif_path, var_idx)
-        if not raw:
-            continue
-        strref = _gff_locname_strref(raw)
-        if strref is None:
-            continue
-        name = BASE_TLK.get(strref)
-        if name:
-            STOCK_ITEM_NAMES[resref] = name
-            loaded += 1
-    print(f"[nwn-wiki] loaded {loaded} stock item names from NWN install"
-          f" ({time.time() - t0:.1f}s)")
+STOCK_ITEM_NAMES: dict[str, str] = _load_stock_item_names()
 
 
 def loc(node: Any, lang: int = 0) -> str:
@@ -8663,8 +8523,8 @@ def main() -> int:
                     help="path to base-game dialog.tlk for resolving "
                          "StrRef references (id < 16777216).")
     ap.add_argument("--nwn-install", default=None,
-                    help="path to NWN install directory (used to resolve stock item "
-                         "blueprint names from BIF archives when --dialog-tlk is also set).")
+                    help="(ignored — stock item names are now pre-cached in "
+                         "wiki_data/stock_item_names.json; see bin/refresh-nwn-stock-items)")
     ap.add_argument("--custom-tlk", default=None,
                     help="path to the module's custom TLK (named in module.ifo "
                          "Mod_CustomTlk) for resolving StrRefs >= 16777216.")
@@ -8732,17 +8592,9 @@ def main() -> int:
                   file=sys.stderr)
 
     if args.nwn_install:
-        load_stock_item_names(Path(args.nwn_install).resolve())
-    elif BASE_TLK:
-        # Auto-detect common Linux NWN install paths
-        for _cand in (
-            Path.home() / ".local/share/Steam/steamapps/common/Neverwinter Nights",
-            Path("/var/home") / os.environ.get("USER", "") /
-                ".local/share/Steam/steamapps/common/Neverwinter Nights",
-        ):
-            if (_cand / "data" / "nwn_base.key").is_file():
-                load_stock_item_names(_cand)
-                break
+        print("[nwn-wiki] --nwn-install is ignored; stock item names are pre-cached in "
+              "wiki_data/stock_item_names.json (run bin/refresh-nwn-stock-items to rebuild)",
+              file=sys.stderr)
 
     print(f"[nwn-wiki] reading {src}")
     db = Db(src)
