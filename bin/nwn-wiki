@@ -5865,6 +5865,13 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
         f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i)))}</dd>",
+        *(
+            [f"<dt>Base AC</dt><dd>{int(fld(i, 'ArmorBonus') or 0)}</dd>"]
+            if _bi in _ARMOR_BASEITEMS
+            else [f"<dt>Base AC</dt><dd>{int((WEAPONS.get(_bi) or {}).get('BaseAC', 0) or 0)}</dd>"]
+            if _bi in SHIELD_BASEITEMS
+            else []
+        ),
         f"<dt>GP Value</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
         f"<dt {_drop_tt}>Drops on death</dt><dd>{_drop_label}"
