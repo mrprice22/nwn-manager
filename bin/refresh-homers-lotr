@@ -3,8 +3,20 @@
 # tree. Selects the most recently modified .mod from the git project directory
 # or the OneDrive modules directory.
 # Wiki regeneration is a separate step — use "Regenerate Homer's LotR Wiki".
+#
+# Options:
+#   --verbose   Show full nwn-manager output (default: spinner + summary only)
 
 set -o pipefail
+
+VERBOSE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --verbose) VERBOSE=1 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 PROJECT=/var/home/james/GIT/nwn_homers_lotr
 NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
@@ -30,8 +42,52 @@ fi
 echo "[unpack] reading: $MOD"
 echo "[unpack] into:    $PROJECT/unpacked/"
 echo
-nwn-manager unpack "$MOD"
-status=$?
+
+start=$(date +%s)
+
+if [[ $VERBOSE -eq 1 ]]; then
+  nwn-manager unpack "$MOD"
+  status=$?
+else
+  tmpout=$(mktemp)
+  trap 'rm -f "$tmpout"' EXIT
+
+  nwn-manager unpack "$MOD" >"$tmpout" 2>&1 &
+  bg_pid=$!
+  spin='|/-\'
+  si=0
+  phase="starting"
+  phase_order=0  # 0=starting 1=unpacking 2=converting 3=copying
+
+  while kill -0 "$bg_pid" 2>/dev/null; do
+    elapsed=$(( $(date +%s) - start ))
+
+    if [[ $phase_order -lt 3 ]] && grep -qE "^\[nwn-manager\] copied" "$tmpout" 2>/dev/null; then
+      phase="copying tlk"; phase_order=3
+    elif [[ $phase_order -lt 2 ]] && grep -qE "^Converting " "$tmpout" 2>/dev/null; then
+      n=$(grep -oE "Converting [0-9]+" "$tmpout" 2>/dev/null | grep -oE "[0-9]+" | head -1)
+      phase="converting ${n:-?} files"; phase_order=2
+    elif [[ $phase_order -lt 1 ]] && grep -qE "^\[nwn-manager\] unpacking" "$tmpout" 2>/dev/null; then
+      phase="unpacking"; phase_order=1
+    fi
+
+    ch="${spin:$si:1}"; si=$(( (si + 1) % 4 ))
+    printf "\r[unpack] %s %s  (%ds)          " "$ch" "$phase" "$elapsed"
+    sleep 0.3
+  done
+
+  wait "$bg_pid"
+  status=$?
+  elapsed=$(( $(date +%s) - start ))
+  printf "\r[unpack] done in %ds          \n" "$elapsed"
+
+  if [[ $status -ne 0 ]]; then
+    echo
+    cat "$tmpout"
+  else
+    sed -n '/^\[nwn-manager\] unpacked\/ summary:/,$ p' "$tmpout"
+  fi
+fi
 
 echo
 if [[ $status -eq 0 ]]; then

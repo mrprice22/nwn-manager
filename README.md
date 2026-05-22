@@ -763,6 +763,24 @@ nwn-wiki --src unpacked --out docs
 
 ## Homer's LotR launcher scripts
 
+### Unpack
+
+`bin/refresh-homers-lotr` is a desktop-launcher convenience wrapper around
+`nwn-manager unpack` for the Homer's LotR project. It auto-selects the most
+recently modified `.mod` from the project directory or OneDrive, unpacks it
+into `unpacked/`, and refreshes the `tlk/` cache.
+
+```sh
+bin/refresh-homers-lotr [--verbose]
+```
+
+| Flag | Behaviour |
+|------|-----------|
+| *(none)* | Quiet mode: prints the source `.mod` and destination paths, then shows a live spinner with phase labels (`unpacking` → `converting N files` → `copying tlk`) while the process runs. Afterwards prints only the `unpacked/ summary` block. The per-file "Prompt: X not found — re-added?" lines, the "Converting N new or updated files" line, and the TLK copy messages are suppressed. On error, full output is dumped. |
+| `--verbose` | Streams all `nwn-manager` output straight to the terminal. |
+
+### Repack
+
 `bin/repack-homers-lotr` and `bin/repack-homers-lotr-clean` are desktop-launcher
 convenience wrappers around `nwn-manager repack` for the Homer's LotR project.
 They handle the full build-and-install pipeline: pack the `.mod`, copy it to
