@@ -4548,6 +4548,42 @@ def _creature_detail_sections(
         e = equip_by_slot.get(slot)
         return _equip_item(e) if e else None
 
+    # ----- Combined equipment combat properties (built here; data used for AC/saves) -----
+    # Creature weapons (R/L/bite) share the same item blueprint; skip duplicates
+    # to avoid triple-counting properties (e.g. vampiric regen).
+    # AC Bonus (ID 1) on armor/shield slots = armor/shield type (handled separately
+    # below); on all other slots it is dodge-type and tracked in cprop_dodge_ac.
+    _seen_cweap_resrefs: set[str] = set()
+    _CWEAP_SLOTS = frozenset({SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B})
+    _ARMOR_SHIELD_SLOTS = frozenset({SLOT_CHEST, SLOT_LEFT})
+    cprop_by_pid: dict[int, list[tuple[dict, int]]] = {}
+    cprop_dodge_ac: list[int] = []
+
+    for _ce in equip:
+        _cslot = fld(_ce, "__struct_id")
+        if isinstance(_cslot, int) and _cslot in _CWEAP_SLOTS:
+            _cirr = _equip_resref(_ce)
+            if _cirr in _seen_cweap_resrefs:
+                continue
+            if _cirr:
+                _seen_cweap_resrefs.add(_cirr)
+        _ci = _equip_item(_ce)
+        if _ci is None:
+            continue
+        _is_armor_shield = isinstance(_cslot, int) and _cslot in _ARMOR_SHIELD_SLOTS
+        for _cp in list_items(_ci.get("PropertiesList")):
+            _cpid_raw = fld(_cp, "PropertyName")
+            if _cpid_raw is None:
+                continue
+            _cpid = int(_cpid_raw)
+            _cpf = itemprop_format(_cp)
+            _ccv = _prop_value_num(_cpf["cost"]) if _cpf["cost"] else 0
+            if _cpid not in cprop_by_pid:
+                cprop_by_pid[_cpid] = []
+            cprop_by_pid[_cpid].append((_cpf, _ccv))
+            if _cpid == 1 and not _is_armor_shield:
+                cprop_dodge_ac.append(_ccv)
+
     armor_item = _equipped_item(SLOT_CHEST)
     armor_base_ac = 0
     if armor_item is not None:
@@ -4576,12 +4612,17 @@ def _creature_detail_sections(
     armor_ac_bonus, armor_notes = item_ac_bonus(armor_item)
     shield_ac_bonus, shield_notes = item_ac_bonus(shield_item)
     natural_ac = _f("NaturalAC", 0) or 0
+    # Non-armor/non-shield accessories give dodge-type AC (ID 1); capped at +20.
+    # Haste grants +4 dodge that stacks with item dodge (separate per NWN rules).
+    _item_dodge = min(sum(cprop_dodge_ac), 20) if cprop_dodge_ac else 0
+    _haste_ac = 4 if 35 in cprop_by_pid else 0
     ac_total = (10 + dex_mod + int(natural_ac)
                 + armor_base_ac + armor_ac_bonus
-                + shield_base_ac + shield_ac_bonus)
+                + shield_base_ac + shield_ac_bonus
+                + _item_dodge + _haste_ac)
 
     ac_breakdown = [
-        f"10 base",
+        "10 base",
         f"{dex_mod:+d} Dex",
     ]
     if natural_ac:
@@ -4594,7 +4635,26 @@ def _creature_detail_sections(
         ac_breakdown.append(f"+{shield_base_ac} shield")
     if shield_ac_bonus:
         ac_breakdown.append(f"+{shield_ac_bonus} shield enchant")
+    if _item_dodge:
+        ac_breakdown.append(f"+{_item_dodge} dodge (items)")
+    if _haste_ac:
+        ac_breakdown.append(f"+{_haste_ac} dodge (haste)")
     ac_extra = armor_notes + shield_notes
+
+    # Item saving throw bonuses (ID 41 = Saving Throw Bonus: Specific).
+    # Universal applies to all saves; Fort/Ref/Will add to the specific save.
+    # Same-type bonuses don't stack — take max per save type.
+    _iprp_save_univ = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                           if not _pf["subtype"] or _pf["subtype"] == "Universal"), default=0)
+    _iprp_save_fort = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                           if _pf["subtype"] == "Fortitude"), default=0)
+    _iprp_save_ref  = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                           if _pf["subtype"] == "Reflex"), default=0)
+    _iprp_save_will = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                           if _pf["subtype"] == "Will"), default=0)
+    fort = fort + _iprp_save_univ + _iprp_save_fort
+    ref  = ref  + _iprp_save_univ + _iprp_save_ref
+    will = will + _iprp_save_univ + _iprp_save_will
 
     sections.append("<h2>Combat</h2>")
     sections.append(
@@ -4614,9 +4674,9 @@ def _creature_detail_sections(
     # Saves caveat — class-progression bonuses (good-save tables) are added
     # by the engine at load time, so the wiki can't reproduce them exactly.
     sections.append('<p class="muted">'
-                    'Saves shown = stored bonus + ability mod; class-table '
-                    'progression and feat bonuses (Great Fortitude, etc.) '
-                    'are applied at runtime.</p>')
+                    'Saves shown = stored bonus + ability mod + item bonuses '
+                    '(Saving Throw Bonus: Specific); class-table progression '
+                    'and feat bonuses (Great Fortitude, etc.) are applied at runtime.</p>')
 
     # Magic resistance — NWN doesn't expose SR on the UTC; it's granted by
     # feats / items. Surface any SR-flavored feats so the reader knows.
@@ -4630,34 +4690,16 @@ def _creature_detail_sections(
             f"granted by feats: {E(', '.join(sr_feat_lines))}</p>"
         )
 
-    # ----- Combined equipment combat properties ------------------------------
-    # Collect all item properties from every equipped item, then apply NWN
-    # stacking rules: dodge AC stacks (cap +20); all other same-type bonuses
-    # do not stack (only max shown); regeneration stacks without limit.
-    cprop_by_pid: dict[int, list[tuple[dict, int]]] = {}
-    for _ce in equip:
-        _ci = _equip_item(_ce)
-        if _ci is None:
-            continue
-        for _cp in list_items(_ci.get("PropertiesList")):
-            _cpid_raw = fld(_cp, "PropertyName")
-            if _cpid_raw is None:
-                continue
-            _cpid = int(_cpid_raw)
-            _cpf = itemprop_format(_cp)
-            _ccv = _prop_value_num(_cpf["cost"]) if _cpf["cost"] else 0
-            if _cpid not in cprop_by_pid:
-                cprop_by_pid[_cpid] = []
-            cprop_by_pid[_cpid].append((_cpf, _ccv))
-
+    # ----- Combined equipment combat properties display ----------------------
+    # (cprop_by_pid and cprop_dodge_ac are built earlier, before ac_total.)
     cprop_rows: list[str] = []
     if cprop_by_pid:
-        # AC Bonus (ID 1) — Dodge type, stacks, cap +20
-        if 1 in cprop_by_pid:
-            _sum = sum(cv for _, cv in cprop_by_pid[1])
-            _eff = min(_sum, 20)
-            _cap = f" (capped from +{_sum})" if _sum > 20 else ""
-            cprop_rows.append(f"<tr><th>AC Bonus (Dodge)</th><td>+{_eff}{E(_cap)}</td></tr>")
+        # Dodge AC from non-armor/non-shield accessories (already in main AC above).
+        if cprop_dodge_ac:
+            _dodge_sum = sum(cprop_dodge_ac)
+            _dodge_eff = min(_dodge_sum, 20)
+            _dodge_cap = f" (capped from +{_dodge_sum})" if _dodge_sum > 20 else ""
+            cprop_rows.append(f"<tr><th>AC Bonus (Dodge, items)</th><td>+{_dodge_eff}{E(_dodge_cap)}</td></tr>")
 
         # Saving Throw Bonus (IDs 40, 41) — max per subtype
         _st_max: dict[str, int] = {}
@@ -4735,9 +4777,10 @@ def _creature_detail_sections(
             cprop_rows.append(f"<tr><th>Turn Resistance</th><td>+{_tr}</td></tr>")
 
         # Flag properties — present/absent
+        if 35 in cprop_by_pid:
+            cprop_rows.append("<tr><th>Haste</th><td>Yes (+4 dodge AC, stacks; factored into main AC)</td></tr>")
         for _fp_id, _fp_name in (
-            (35, "Haste"), (75, "Freedom of Movement"),
-            (71, "True Seeing"), (26, "Darkvision"),
+            (75, "Freedom of Movement"), (71, "True Seeing"), (26, "Darkvision"),
         ):
             if _fp_id in cprop_by_pid:
                 cprop_rows.append(f"<tr><th>{E(_fp_name)}</th><td>Yes</td></tr>")
@@ -4746,9 +4789,9 @@ def _creature_detail_sections(
         sections.append(
             "<h3>Equipment combat properties (combined)</h3>"
             '<table class="data"><tbody>' + "\n".join(cprop_rows) + "</tbody></table>"
-            '<p class="muted">Dodge AC stacks (cap +20); all other same-type '
-            'bonuses do not — only the highest is shown. '
-            'Damage resistance: highest per type. '
+            '<p class="muted">Dodge AC and save bonuses are factored into the main '
+            'combat stats above. Dodge AC stacks (cap +20); haste adds +4 more (separate). '
+            'All other same-type bonuses do not stack — only the highest is shown. '
             'Regeneration stacks without limit.</p>'
         )
 
