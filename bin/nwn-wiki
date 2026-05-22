@@ -3208,7 +3208,7 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
       <div class="nav-dropdown">
         <span class="nav-dropdown-label">Items &#9660;</span>
         <div class="nav-dropdown-menu">
-          <a href="{E(root_rel)}/items/index.html">All Items</a>
+          <a href="{E(root_rel)}/items/index.html">Accessible</a>
           <a href="{E(root_rel)}/items/inaccessible/index.html">Inaccessible</a>
           <a href="{E(root_rel)}/items/properties/index.html">By Property</a>
           <a href="{E(root_rel)}/items/search.html">Search</a>
@@ -5342,7 +5342,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
 
     toc_parts: list[str] = [
         '<div class="toc-group-heading">Views</div>',
-        '<div><a href="../index.html">← All Items</a></div>',
+        '<div><a href="../index.html">← Accessible Items</a></div>',
         '<div><a href="../properties/index.html">Browse by Property</a></div>',
         '<div><a href="../search.html">Search Items</a></div>',
     ]
@@ -5425,7 +5425,7 @@ def render_items_index(db: Db, out: Path) -> None:
             else:
                 inaccessible.append((rr, i))
 
-    total = sum(len(v) for v in buckets.values()) + len(inaccessible) + len(broken)
+    total = sum(len(v) for v in buckets.values()) + len(broken)
 
     def _item_cost_key(entry: tuple[str, dict]) -> int:
         try:
@@ -5502,9 +5502,10 @@ def render_items_index(db: Db, out: Path) -> None:
 
     sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
 
-    body = "<h1>Items</h1>"
+    body = "<h1>Accessible Items</h1>"
     body += (
-        f"<p>{total} items. "
+        f"<p>{total} items obtainable through normal gameplay — sold in stores, "
+        "found in containers, dropped by creatures, or granted by scripts. "
         '<small class="muted">Base item names use stock NWN baseitems.2da; '
         "CEP/HAK overrides are common — the row number shown is authoritative. "
         "Armor subtypes (Cloth/Light/Medium/Heavy) are based on total AC bonus "
@@ -5566,7 +5567,7 @@ def render_items_index(db: Db, out: Path) -> None:
         )
 
     layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
-    write(out / "items" / "index.html", page("Items", layout, root_rel=".."))
+    write(out / "items" / "index.html", page("Accessible Items", layout, root_rel=".."))
 
     # Render the inaccessible items on their own page.
     render_inaccessible_index(db, inaccessible, out)
