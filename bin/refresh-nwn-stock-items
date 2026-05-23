@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Rebuild bin/wiki_data/stock_item_names.json from a local NWN install.
+#
+# Run this once after install, and again after any Beamdog EE patch that changes
+# item blueprints.  nwn-wiki reads the committed JSON at startup instead of
+# scanning BIF archives live (which took ~6 minutes per wiki rebuild).
+#
+# Usage:
+#   bin/refresh-nwn-stock-items [--nwn /path/to/nwn] [--tlk /path/to/dialog.tlk]
+#
+# All arguments are forwarded to build_stock_item_names.py; run with --help for
+# the full option list.  Default --nwn is the Steam install path.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+exec python3 "$SCRIPT_DIR/wiki_data/build_stock_item_names.py" "$@"

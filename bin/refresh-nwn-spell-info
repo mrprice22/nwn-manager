@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Rebuild bin/wiki_data/spell_info.json from a local NWN install.
+#
+# Run this once to generate spell level / caster class data for the wiki's
+# Scroll tables and Cast Spell / On Hit Cast Spell property pages.
+# Re-run after any Beamdog EE patch that changes spell or item property tables.
+#
+# Usage:
+#   bin/refresh-nwn-spell-info [--nwn /path/to/nwn]
+#
+# All arguments are forwarded to build_spell_info.py.
+# Default --nwn is the Steam install path.
+#
+# NOTE: nwn_resman_extract (from the neverwinter.nim toolchain) scans all NWN
+# resource archives and can take several minutes to run. This is expected.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="$HOME/.nimble/bin:$PATH"
+
+exec python3 "$SCRIPT_DIR/wiki_data/build_spell_info.py" "$@"

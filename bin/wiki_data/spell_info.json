@@ -1,0 +1,4375 @@
+{
+  "_source": "stock NWN :: iprp_spells.2da + iprp_onhitspell.2da + spells.2da",
+  "iprp_spells": {
+    "0": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "1": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Cleric": 2,
+        "Paladin": 2,
+        "Ranger": 3
+      }
+    },
+    "2": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3,
+        "Wiz/Sorc": 5
+      }
+    },
+    "3": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Cleric": 3,
+        "Wiz/Sorc": 5
+      }
+    },
+    "4": {
+      "innate_level": 3,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 3,
+        "Wiz/Sorc": 5
+      }
+    },
+    "5": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "6": {
+      "innate_level": 2,
+      "caster_level": 6,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "7": {
+      "innate_level": 2,
+      "caster_level": 12,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "8": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "9": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Cleric": 6
+      }
+    },
+    "10": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 6
+      }
+    },
+    "11": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Cleric": 1,
+        "Paladin": 1
+      }
+    },
+    "12": {
+      "innate_level": 1,
+      "caster_level": 3
+    },
+    "13": {
+      "innate_level": 1,
+      "caster_level": 10
+    },
+    "14": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 3,
+        "Wiz/Sorc": 2
+      }
+    },
+    "15": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 2,
+        "Paladin": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "16": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 2,
+        "Paladin": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "17": {
+      "innate_level": 2,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 2,
+        "Paladin": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "18": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "19": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "20": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "21": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "22": {},
+    "23": {},
+    "24": {},
+    "25": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Ranger": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "26": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 2,
+        "Ranger": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "27": {
+      "innate_level": 2,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 2,
+        "Ranger": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "28": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "29": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "30": {
+      "innate_level": 6,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "31": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "32": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "33": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "34": {
+      "innate_level": 1,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "35": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "36": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "37": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "38": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "39": {
+      "innate_level": 6,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "40": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 5
+      }
+    },
+    "41": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 5
+      }
+    },
+    "42": {
+      "innate_level": 5,
+      "caster_level": 20,
+      "class_levels": {
+        "Cleric": 5
+      }
+    },
+    "43": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "44": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "45": {
+      "innate_level": 3,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "46": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "47": {},
+    "48": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "49": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "50": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "51": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "52": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "53": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "54": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3,
+        "Druid": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "55": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 7
+      }
+    },
+    "56": {
+      "innate_level": 7,
+      "caster_level": 20,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 7
+      }
+    },
+    "57": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 8
+      }
+    },
+    "58": {
+      "innate_level": 8,
+      "caster_level": 16,
+      "class_levels": {
+        "Cleric": 8
+      }
+    },
+    "59": {
+      "innate_level": 8,
+      "caster_level": 18,
+      "class_levels": {
+        "Cleric": 8
+      }
+    },
+    "60": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 8
+      }
+    },
+    "61": {
+      "innate_level": 6,
+      "caster_level": 14,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 8
+      }
+    },
+    "62": {
+      "innate_level": 6,
+      "caster_level": 16,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 8
+      }
+    },
+    "63": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Druid": 5
+      }
+    },
+    "64": {
+      "innate_level": 4,
+      "caster_level": 12,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Druid": 5
+      }
+    },
+    "65": {
+      "innate_level": 4,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Druid": 5
+      }
+    },
+    "66": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Druid": 1,
+        "Paladin": 1,
+        "Ranger": 1
+      }
+    },
+    "67": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Druid": 1,
+        "Paladin": 1,
+        "Ranger": 1
+      }
+    },
+    "68": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Bard": 0,
+        "Cleric": 0,
+        "Druid": 0
+      }
+    },
+    "69": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 3,
+        "Paladin": 3,
+        "Ranger": 3
+      }
+    },
+    "70": {
+      "innate_level": 2,
+      "caster_level": 6,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 3,
+        "Paladin": 3,
+        "Ranger": 3
+      }
+    },
+    "71": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 3,
+        "Paladin": 3,
+        "Ranger": 3
+      }
+    },
+    "72": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Druid": 4,
+        "Paladin": 4,
+        "Ranger": 4
+      }
+    },
+    "73": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Druid": 4,
+        "Paladin": 4,
+        "Ranger": 4
+      }
+    },
+    "74": {
+      "innate_level": 3,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Druid": 4,
+        "Paladin": 4,
+        "Ranger": 4
+      }
+    },
+    "75": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "76": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Bard": 0,
+        "Wiz/Sorc": 0
+      }
+    },
+    "77": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 4,
+        "Druid": 5,
+        "Paladin": 4
+      }
+    },
+    "78": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "79": {
+      "innate_level": 7,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "80": {
+      "innate_level": 7,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "81": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Wiz/Sorc": 5
+      }
+    },
+    "82": {
+      "innate_level": 4,
+      "caster_level": 12,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Wiz/Sorc": 5
+      }
+    },
+    "83": {
+      "innate_level": 4,
+      "caster_level": 18,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Wiz/Sorc": 5
+      }
+    },
+    "84": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Druid": 4,
+        "Paladin": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "85": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Druid": 4,
+        "Paladin": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "86": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 4
+      }
+    },
+    "87": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "88": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "89": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 4,
+        "Wiz/Sorc": 5
+      }
+    },
+    "90": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "91": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "92": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "93": {
+      "innate_level": 4,
+      "caster_level": 12,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "94": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Druid": 9
+      }
+    },
+    "95": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "96": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "97": {
+      "innate_level": 2,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "98": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Cleric": 1,
+        "Druid": 1,
+        "Paladin": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "99": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Cleric": 9,
+        "Wiz/Sorc": 9
+      }
+    },
+    "100": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "101": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Druid": 1,
+        "Ranger": 1
+      }
+    },
+    "102": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Druid": 1,
+        "Ranger": 1
+      }
+    },
+    "103": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "104": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "105": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Druid": 8,
+        "Wiz/Sorc": 7
+      }
+    },
+    "106": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 7
+      }
+    },
+    "107": {
+      "innate_level": 7,
+      "caster_level": 18,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 7
+      }
+    },
+    "108": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "109": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "110": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "111": {
+      "innate_level": 3,
+      "caster_level": 12,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "112": {
+      "innate_level": 3,
+      "caster_level": 18,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "113": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "114": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "115": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 4
+      }
+    },
+    "116": {
+      "innate_level": 4,
+      "caster_level": 12,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 4
+      }
+    },
+    "117": {
+      "innate_level": 4,
+      "caster_level": 18,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 4
+      }
+    },
+    "118": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 4,
+        "Druid": 4,
+        "Paladin": 4,
+        "Ranger": 4
+      }
+    },
+    "119": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Cleric": 9,
+        "Wiz/Sorc": 9
+      }
+    },
+    "120": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "121": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "122": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Druid": 1,
+        "Ranger": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "123": {
+      "innate_level": 5,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 5,
+        "Cleric": 6,
+        "Druid": 6,
+        "Wiz/Sorc": 6
+      }
+    },
+    "124": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 5,
+        "Cleric": 6,
+        "Druid": 6,
+        "Wiz/Sorc": 6
+      }
+    },
+    "125": {
+      "innate_level": 3,
+      "caster_level": 5
+    },
+    "126": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "127": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 7
+      }
+    },
+    "128": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "129": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "130": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "131": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Druid": 6,
+        "Wiz/Sorc": 6
+      }
+    },
+    "132": {},
+    "133": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 4
+      }
+    },
+    "134": {
+      "innate_level": 4,
+      "caster_level": 12,
+      "class_levels": {
+        "Cleric": 4
+      }
+    },
+    "135": {
+      "innate_level": 4,
+      "caster_level": 20,
+      "class_levels": {
+        "Cleric": 4
+      }
+    },
+    "136": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Cleric": 6,
+        "Druid": 7
+      }
+    },
+    "137": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "138": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "139": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Cleric": 6,
+        "Druid": 7
+      }
+    },
+    "140": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Bard": 5,
+        "Cleric": 5,
+        "Druid": 6
+      }
+    },
+    "141": {
+      "innate_level": 5,
+      "caster_level": 16,
+      "class_levels": {
+        "Bard": 5,
+        "Cleric": 5,
+        "Druid": 6
+      }
+    },
+    "142": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Druid": 2,
+        "Ranger": 2
+      }
+    },
+    "143": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 4,
+        "Druid": 4,
+        "Wiz/Sorc": 5
+      }
+    },
+    "144": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 3
+      }
+    },
+    "145": {},
+    "146": {},
+    "147": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "148": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Cleric": 9
+      }
+    },
+    "149": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 4,
+        "Wiz/Sorc": 4
+      }
+    },
+    "150": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "151": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "152": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3,
+        "Ranger": 3
+      }
+    },
+    "153": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "154": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "155": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 2,
+        "Druid": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "156": {
+      "innate_level": 2,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 2,
+        "Druid": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "157": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "158": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "159": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Cleric": 2,
+        "Druid": 2
+      }
+    },
+    "160": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "161": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "162": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Bard": 0,
+        "Cleric": 0,
+        "Druid": 0,
+        "Wiz/Sorc": 0
+      }
+    },
+    "163": {
+      "innate_level": 0,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 0,
+        "Cleric": 0,
+        "Druid": 0,
+        "Wiz/Sorc": 0
+      }
+    },
+    "164": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "165": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "166": {},
+    "167": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "168": {},
+    "169": {},
+    "170": {},
+    "171": {},
+    "172": {
+      "innate_level": 1,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "173": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "174": {
+      "innate_level": 1,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "175": {},
+    "176": {},
+    "177": {},
+    "178": {},
+    "179": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "180": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "181": {},
+    "182": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Bard": 6,
+        "Wiz/Sorc": 6
+      }
+    },
+    "183": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 9
+      }
+    },
+    "184": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "185": {
+      "innate_level": 2,
+      "caster_level": 6,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "186": {
+      "innate_level": 2,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "187": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "188": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "189": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Bard": 5,
+        "Wiz/Sorc": 5
+      }
+    },
+    "190": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "191": {
+      "innate_level": 4,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "192": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "193": {
+      "innate_level": 2,
+      "caster_level": 9,
+      "class_levels": {
+        "Bard": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "194": {
+      "innate_level": 2,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "195": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Bard": 5,
+        "Wiz/Sorc": 6
+      }
+    },
+    "196": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 5,
+        "Wiz/Sorc": 6
+      }
+    },
+    "197": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "198": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "199": {
+      "innate_level": 7,
+      "caster_level": 18,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "200": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Druid": 8
+      }
+    },
+    "201": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "202": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "203": {
+      "innate_level": 3,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "204": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Druid": 3,
+        "Paladin": 4,
+        "Ranger": 3
+      }
+    },
+    "205": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "206": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "207": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 4,
+        "Druid": 3
+      }
+    },
+    "208": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Ranger": 4,
+        "Wiz/Sorc": 4
+      }
+    },
+    "209": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "210": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "211": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3,
+        "Paladin": 3
+      }
+    },
+    "212": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Druid": 8,
+        "Wiz/Sorc": 8
+      }
+    },
+    "213": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "214": {},
+    "215": {},
+    "216": {
+      "innate_level": 3,
+      "caster_level": 3,
+      "class_levels": {
+        "Cleric": 3,
+        "Druid": 3,
+        "Ranger": 2,
+        "Wiz/Sorc": 3
+      }
+    },
+    "217": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Cleric": 3,
+        "Druid": 3,
+        "Ranger": 2,
+        "Wiz/Sorc": 3
+      }
+    },
+    "218": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "219": {
+      "innate_level": 1,
+      "caster_level": 10
+    },
+    "220": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "221": {
+      "innate_level": 1,
+      "caster_level": 10
+    },
+    "222": {},
+    "223": {},
+    "224": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "225": {
+      "innate_level": 7,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "226": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 5
+      }
+    },
+    "227": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "228": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Wiz/Sorc": 0
+      }
+    },
+    "229": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3,
+        "Paladin": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "230": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "231": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Druid": 3,
+        "Ranger": 3
+      }
+    },
+    "232": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "233": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Cleric": 2,
+        "Paladin": 2
+      }
+    },
+    "234": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Cleric": 2,
+        "Druid": 2,
+        "Paladin": 2,
+        "Ranger": 1,
+        "Wiz/Sorc": 2
+      }
+    },
+    "235": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Cleric": 2,
+        "Druid": 2,
+        "Paladin": 2,
+        "Ranger": 1,
+        "Wiz/Sorc": 2
+      }
+    },
+    "236": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 0,
+        "Cleric": 0,
+        "Druid": 0,
+        "Paladin": 1,
+        "Wiz/Sorc": 0
+      }
+    },
+    "237": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 0,
+        "Cleric": 0,
+        "Druid": 0,
+        "Paladin": 1,
+        "Wiz/Sorc": 0
+      }
+    },
+    "238": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 4
+      }
+    },
+    "239": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 7
+      }
+    },
+    "240": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "241": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "242": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "243": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "244": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "245": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "246": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "247": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Druid": 9,
+        "Wiz/Sorc": 9
+      }
+    },
+    "248": {},
+    "249": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2
+      }
+    },
+    "250": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 5
+      }
+    },
+    "251": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Druid": 1,
+        "Ranger": 2,
+        "Wiz/Sorc": 1
+      }
+    },
+    "252": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 1,
+        "Druid": 1,
+        "Ranger": 2,
+        "Wiz/Sorc": 1
+      }
+    },
+    "253": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "254": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2
+      }
+    },
+    "255": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 5
+      }
+    },
+    "256": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 5
+      }
+    },
+    "257": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "258": {},
+    "259": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "260": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Druid": 4,
+        "Wiz/Sorc": 4
+      }
+    },
+    "261": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Cleric": 9,
+        "Druid": 9
+      }
+    },
+    "262": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Druid": 1,
+        "Ranger": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "263": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Druid": 1,
+        "Ranger": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "264": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 2,
+        "Ranger": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "265": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Druid": 3,
+        "Ranger": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "266": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Druid": 4,
+        "Ranger": 4,
+        "Wiz/Sorc": 4
+      }
+    },
+    "267": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Cleric": 9,
+        "Druid": 9,
+        "Wiz/Sorc": 9
+      }
+    },
+    "268": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Bard": 5,
+        "Cleric": 5,
+        "Druid": 5,
+        "Wiz/Sorc": 5
+      }
+    },
+    "269": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Bard": 6,
+        "Cleric": 6,
+        "Druid": 6,
+        "Wiz/Sorc": 6
+      }
+    },
+    "270": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 7,
+        "Druid": 7,
+        "Wiz/Sorc": 7
+      }
+    },
+    "271": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 8,
+        "Wiz/Sorc": 8
+      }
+    },
+    "272": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 8
+      }
+    },
+    "273": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "274": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "275": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 7,
+        "Wiz/Sorc": 6
+      }
+    },
+    "276": {},
+    "277": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "278": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Cleric": 0,
+        "Druid": 0,
+        "Paladin": 1
+      }
+    },
+    "279": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "280": {
+      "innate_level": 4,
+      "caster_level": 9,
+      "class_levels": {
+        "Druid": 5,
+        "Wiz/Sorc": 4
+      }
+    },
+    "281": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "282": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "283": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 7
+      }
+    },
+    "284": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Paladin": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "285": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Paladin": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "286": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Paladin": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "287": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 8
+      }
+    },
+    "288": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Paladin": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "289": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Paladin": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "290": {
+      "innate_level": 2,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Paladin": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "291": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "292": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "293": {
+      "innate_level": 2,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "294": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "295": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "296": {
+      "innate_level": 2,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "297": {
+      "innate_level": 6,
+      "caster_level": 11
+    },
+    "298": {
+      "innate_level": 6,
+      "caster_level": 11
+    },
+    "299": {
+      "innate_level": 6,
+      "caster_level": 11
+    },
+    "300": {
+      "innate_level": 6,
+      "caster_level": 11
+    },
+    "301": {
+      "innate_level": 6,
+      "caster_level": 11
+    },
+    "302": {
+      "innate_level": 6,
+      "caster_level": 11
+    },
+    "303": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Druid": 5
+      }
+    },
+    "304": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Druid": 7
+      }
+    },
+    "305": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 1,
+        "Ranger": 1,
+        "Wiz/Sorc": 2
+      }
+    },
+    "306": {
+      "innate_level": 2,
+      "caster_level": 6,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Druid": 1,
+        "Ranger": 1,
+        "Wiz/Sorc": 2
+      }
+    },
+    "307": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 7
+      }
+    },
+    "308": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "309": {
+      "innate_level": 8,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "310": {
+      "innate_level": 4,
+      "caster_level": 9,
+      "class_levels": {
+        "Bard": 6,
+        "Druid": 5,
+        "Wiz/Sorc": 4
+      }
+    },
+    "311": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Bard": 6,
+        "Druid": 6,
+        "Wiz/Sorc": 5
+      }
+    },
+    "312": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 6,
+        "Druid": 6,
+        "Wiz/Sorc": 5
+      }
+    },
+    "313": {
+      "innate_level": 6,
+      "caster_level": 20,
+      "class_levels": {
+        "Bard": 6,
+        "Druid": 6,
+        "Wiz/Sorc": 5
+      }
+    },
+    "314": {
+      "innate_level": 5,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "315": {
+      "innate_level": 5,
+      "caster_level": 10,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "316": {
+      "innate_level": 1,
+      "caster_level": 1,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 1
+      }
+    },
+    "317": {
+      "innate_level": 1,
+      "caster_level": 3,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 1
+      }
+    },
+    "318": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 1
+      }
+    },
+    "319": {
+      "innate_level": 1,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 1
+      }
+    },
+    "320": {
+      "innate_level": 1,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 1
+      }
+    },
+    "321": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Druid": 7
+      }
+    },
+    "322": {
+      "innate_level": 3,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 4
+      }
+    },
+    "323": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Cleric": 7,
+        "Druid": 6
+      }
+    },
+    "324": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "325": {
+      "innate_level": 4,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "326": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 4,
+        "Wiz/Sorc": 6
+      }
+    },
+    "327": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 2,
+        "Wiz/Sorc": 3
+      }
+    },
+    "328": {
+      "innate_level": 3,
+      "caster_level": 3
+    },
+    "329": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "330": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "331": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "332": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "333": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "334": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "335": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "336": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "337": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "338": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "339": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "340": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "341": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "342": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "343": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "344": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "345": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 1,
+        "Paladin": 1
+      }
+    },
+    "346": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "347": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Bard": 0,
+        "Druid": 0,
+        "Wiz/Sorc": 0
+      }
+    },
+    "348": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "349": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "350": {
+      "innate_level": 2,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 3,
+        "Wiz/Sorc": 2
+      }
+    },
+    "351": {
+      "innate_level": 2,
+      "caster_level": 7,
+      "class_levels": {
+        "Druid": 2,
+        "Ranger": 2
+      }
+    },
+    "352": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Druid": 1,
+        "Ranger": 1
+      }
+    },
+    "353": {
+      "innate_level": 2,
+      "caster_level": 7,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "354": {
+      "innate_level": 8,
+      "caster_level": 20,
+      "class_levels": {
+        "Druid": 8
+      }
+    },
+    "355": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Wiz/Sorc": 0
+      }
+    },
+    "356": {
+      "innate_level": 3,
+      "caster_level": 8,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "357": {
+      "innate_level": 8,
+      "caster_level": 20,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 9
+      }
+    },
+    "358": {
+      "innate_level": 8,
+      "caster_level": 20,
+      "class_levels": {
+        "Druid": 8,
+        "Wiz/Sorc": 8
+      }
+    },
+    "359": {
+      "innate_level": 1,
+      "caster_level": 5
+    },
+    "360": {
+      "innate_level": 2,
+      "caster_level": 7,
+      "class_levels": {
+        "Paladin": 2
+      }
+    },
+    "361": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 7
+      }
+    },
+    "362": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Cleric": 0
+      }
+    },
+    "363": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "364": {
+      "innate_level": 2,
+      "caster_level": 7,
+      "class_levels": {
+        "Cleric": 2
+      }
+    },
+    "365": {
+      "innate_level": 3,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "366": {
+      "innate_level": 4,
+      "caster_level": 12,
+      "class_levels": {
+        "Cleric": 4
+      }
+    },
+    "367": {
+      "innate_level": 2,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 1,
+        "Wiz/Sorc": 2
+      }
+    },
+    "368": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Druid": 6
+      }
+    },
+    "369": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Druid": 5
+      }
+    },
+    "370": {
+      "innate_level": 0,
+      "caster_level": 1,
+      "class_levels": {
+        "Wiz/Sorc": 0
+      }
+    },
+    "371": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "372": {
+      "innate_level": 3,
+      "caster_level": 9,
+      "class_levels": {
+        "Bard": 3
+      }
+    },
+    "373": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 1
+      }
+    },
+    "374": {
+      "innate_level": 7,
+      "caster_level": 18,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 8
+      }
+    },
+    "375": {
+      "innate_level": 9,
+      "caster_level": 20,
+      "class_levels": {
+        "Cleric": 9
+      }
+    },
+    "376": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 6
+      }
+    },
+    "377": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Druid": 5
+      }
+    },
+    "378": {
+      "innate_level": 4,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "379": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "380": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "381": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "382": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Cleric": 6
+      }
+    },
+    "383": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Druid": 1,
+        "Ranger": 1
+      }
+    },
+    "384": {
+      "innate_level": 3,
+      "caster_level": 9,
+      "class_levels": {
+        "Druid": 3,
+        "Ranger": 3
+      }
+    },
+    "385": {
+      "innate_level": 3,
+      "caster_level": 9,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "386": {
+      "innate_level": 4,
+      "caster_level": 13,
+      "class_levels": {
+        "Druid": 4,
+        "Ranger": 4
+      }
+    },
+    "387": {
+      "innate_level": 1,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "388": {
+      "innate_level": 2,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "389": {
+      "innate_level": 3,
+      "caster_level": 9,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "390": {
+      "innate_level": 5,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "391": {
+      "innate_level": 6,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "392": {
+      "innate_level": 7,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "393": {
+      "innate_level": 8,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "394": {
+      "innate_level": 9,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "395": {
+      "innate_level": 1,
+      "caster_level": 5
+    },
+    "396": {
+      "innate_level": 1,
+      "caster_level": 5
+    },
+    "397": {
+      "innate_level": 1,
+      "caster_level": 5
+    },
+    "398": {
+      "innate_level": 6,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "399": {
+      "innate_level": 6,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "400": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "401": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "402": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "403": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "404": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "405": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "406": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "407": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "408": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "409": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "410": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "411": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "412": {
+      "innate_level": 1,
+      "caster_level": 2
+    },
+    "413": {
+      "innate_level": 1,
+      "caster_level": 3
+    },
+    "414": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "415": {},
+    "416": {},
+    "417": {},
+    "418": {
+      "innate_level": 1,
+      "caster_level": 5
+    },
+    "419": {
+      "innate_level": 1,
+      "caster_level": 6
+    },
+    "420": {
+      "innate_level": 1,
+      "caster_level": 7
+    },
+    "421": {
+      "innate_level": 1,
+      "caster_level": 8
+    },
+    "422": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "423": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "424": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "425": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "426": {
+      "innate_level": 9,
+      "caster_level": 17
+    },
+    "427": {
+      "innate_level": 3,
+      "caster_level": 5
+    },
+    "428": {
+      "innate_level": 6,
+      "caster_level": 12
+    },
+    "429": {
+      "innate_level": 4,
+      "caster_level": 7,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Druid": 5
+      }
+    },
+    "430": {
+      "innate_level": 4,
+      "caster_level": 7
+    },
+    "431": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "432": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "433": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "434": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "435": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "436": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "437": {
+      "innate_level": 3,
+      "caster_level": 10
+    },
+    "438": {
+      "innate_level": 2,
+      "caster_level": 7
+    },
+    "439": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "440": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "441": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "442": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "443": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "444": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "445": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "446": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "447": {},
+    "448": {},
+    "449": {},
+    "450": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Druid": 6
+      }
+    },
+    "451": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "452": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "453": {
+      "innate_level": 7,
+      "caster_level": 13,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "454": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "455": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 5
+      }
+    },
+    "456": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "457": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "458": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "459": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "460": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "461": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "462": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "463": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 5
+      }
+    },
+    "464": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "465": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "466": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 6
+      }
+    },
+    "467": {
+      "innate_level": 5,
+      "caster_level": 9,
+      "class_levels": {
+        "Druid": 5
+      }
+    },
+    "468": {
+      "innate_level": 9,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "469": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "470": {
+      "innate_level": 3,
+      "caster_level": 12,
+      "class_levels": {
+        "Ranger": 3
+      }
+    },
+    "471": {
+      "innate_level": 1,
+      "caster_level": 6,
+      "class_levels": {
+        "Paladin": 1
+      }
+    },
+    "472": {
+      "innate_level": 1,
+      "caster_level": 6,
+      "class_levels": {
+        "Paladin": 1
+      }
+    },
+    "473": {
+      "innate_level": 4,
+      "caster_level": 15,
+      "class_levels": {
+        "Paladin": 4
+      }
+    },
+    "474": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "475": {},
+    "476": {
+      "innate_level": 8,
+      "caster_level": 15,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "477": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "478": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "479": {
+      "innate_level": 1,
+      "caster_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Paladin": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "480": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 4,
+        "Paladin": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "481": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "482": {
+      "innate_level": 6,
+      "caster_level": 11,
+      "class_levels": {
+        "Druid": 6
+      }
+    },
+    "483": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "484": {
+      "innate_level": 3,
+      "caster_level": 5,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "485": {},
+    "486": {
+      "innate_level": 2,
+      "caster_level": 3,
+      "class_levels": {
+        "Bard": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "487": {},
+    "488": {},
+    "489": {},
+    "490": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "491": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "492": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "493": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "494": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "495": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "496": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "497": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "498": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "499": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "500": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "501": {},
+    "502": {},
+    "503": {},
+    "504": {},
+    "505": {},
+    "506": {},
+    "507": {},
+    "508": {},
+    "509": {},
+    "510": {},
+    "511": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 4,
+        "Paladin": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "512": {
+      "innate_level": 3,
+      "caster_level": 15,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 4,
+        "Paladin": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "513": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "514": {
+      "innate_level": 2,
+      "caster_level": 10,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "515": {
+      "innate_level": 2,
+      "caster_level": 17,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "516": {
+      "innate_level": 1,
+      "caster_level": 10,
+      "class_levels": {
+        "Paladin": 1
+      }
+    },
+    "517": {
+      "innate_level": 1,
+      "caster_level": 17,
+      "class_levels": {
+        "Paladin": 1
+      }
+    },
+    "518": {
+      "innate_level": 4,
+      "caster_level": 17,
+      "class_levels": {
+        "Paladin": 4
+      }
+    },
+    "519": {
+      "innate_level": 3,
+      "caster_level": 10,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "520": {
+      "innate_level": 3,
+      "caster_level": 17,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "521": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "522": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "523": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "524": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "525": {
+      "innate_level": 7,
+      "caster_level": 18
+    },
+    "526": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "527": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "528": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "529": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "530": {
+      "innate_level": 9,
+      "caster_level": 30
+    },
+    "531": {
+      "innate_level": 9,
+      "caster_level": 25
+    },
+    "532": {
+      "innate_level": 9,
+      "caster_level": 25
+    },
+    "533": {
+      "innate_level": 9,
+      "caster_level": 25
+    },
+    "534": {
+      "innate_level": 9,
+      "caster_level": 25
+    },
+    "535": {
+      "innate_level": 9,
+      "caster_level": 30
+    },
+    "536": {
+      "innate_level": 1,
+      "caster_level": 0
+    },
+    "537": {
+      "innate_level": 1,
+      "caster_level": 1
+    },
+    "538": {
+      "innate_level": 5,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "539": {
+      "innate_level": 3,
+      "caster_level": 20,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    }
+  },
+  "iprp_onhitspell": {
+    "0": {
+      "innate_level": 6,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "1": {
+      "innate_level": 3,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "2": {},
+    "3": {
+      "innate_level": 2,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 3,
+        "Wiz/Sorc": 2
+      }
+    },
+    "4": {
+      "innate_level": 3,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "5": {
+      "innate_level": 6,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "6": {
+      "innate_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "7": {
+      "innate_level": 3,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "8": {
+      "innate_level": 3,
+      "class_levels": {
+        "Cleric": 3,
+        "Druid": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "9": {
+      "innate_level": 2,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "10": {
+      "innate_level": 0,
+      "class_levels": {
+        "Bard": 0,
+        "Wiz/Sorc": 0
+      }
+    },
+    "11": {
+      "innate_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "12": {
+      "innate_level": 4,
+      "class_levels": {
+        "Bard": 4,
+        "Cleric": 4,
+        "Wiz/Sorc": 5
+      }
+    },
+    "13": {
+      "innate_level": 3,
+      "class_levels": {
+        "Bard": 3,
+        "Cleric": 3,
+        "Druid": 4,
+        "Paladin": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "14": {
+      "innate_level": 1,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "15": {
+      "innate_level": 9,
+      "class_levels": {
+        "Cleric": 9,
+        "Wiz/Sorc": 9
+      }
+    },
+    "16": {
+      "innate_level": 4,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "17": {
+      "innate_level": 1,
+      "class_levels": {
+        "Druid": 1,
+        "Ranger": 1
+      }
+    },
+    "18": {
+      "innate_level": 3,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 4
+      }
+    },
+    "19": {
+      "innate_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "20": {
+      "innate_level": 7,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 7
+      }
+    },
+    "21": {
+      "innate_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "22": {
+      "innate_level": 2,
+      "class_levels": {
+        "Druid": 2
+      }
+    },
+    "23": {
+      "innate_level": 4,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 4
+      }
+    },
+    "24": {
+      "innate_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "25": {
+      "innate_level": 1,
+      "class_levels": {
+        "Bard": 1,
+        "Druid": 1,
+        "Ranger": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "26": {
+      "innate_level": 5,
+      "class_levels": {
+        "Bard": 5,
+        "Cleric": 6,
+        "Druid": 6,
+        "Wiz/Sorc": 6
+      }
+    },
+    "27": {
+      "innate_level": 6,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "28": {
+      "innate_level": 3,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "29": {
+      "innate_level": 4,
+      "class_levels": {
+        "Cleric": 4
+      }
+    },
+    "30": {
+      "innate_level": 6,
+      "class_levels": {
+        "Cleric": 6,
+        "Druid": 7
+      }
+    },
+    "31": {
+      "innate_level": 2,
+      "class_levels": {
+        "Druid": 2,
+        "Ranger": 2
+      }
+    },
+    "32": {
+      "innate_level": 4,
+      "class_levels": {
+        "Bard": 4,
+        "Druid": 4,
+        "Wiz/Sorc": 5
+      }
+    },
+    "33": {
+      "innate_level": 2,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2,
+        "Wiz/Sorc": 3
+      }
+    },
+    "34": {
+      "innate_level": 9,
+      "class_levels": {
+        "Cleric": 9
+      }
+    },
+    "35": {
+      "innate_level": 8,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "36": {
+      "innate_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 2,
+        "Druid": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "37": {},
+    "38": {
+      "innate_level": 4,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "39": {},
+    "40": {
+      "innate_level": 0,
+      "class_levels": {
+        "Bard": 0,
+        "Cleric": 0,
+        "Druid": 0,
+        "Wiz/Sorc": 0
+      }
+    },
+    "41": {
+      "innate_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "42": {
+      "innate_level": 1,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "43": {
+      "innate_level": 8,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "44": {
+      "innate_level": 8,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "45": {
+      "innate_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "46": {
+      "innate_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "47": {
+      "innate_level": 5,
+      "class_levels": {
+        "Bard": 5,
+        "Wiz/Sorc": 5
+      }
+    },
+    "48": {},
+    "49": {
+      "innate_level": 4,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "50": {
+      "innate_level": 3,
+      "class_levels": {
+        "Cleric": 4,
+        "Druid": 3
+      }
+    },
+    "51": {
+      "innate_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "52": {
+      "innate_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "53": {
+      "innate_level": 1,
+      "class_levels": {
+        "Bard": 0,
+        "Cleric": 0,
+        "Druid": 0,
+        "Paladin": 1,
+        "Wiz/Sorc": 0
+      }
+    },
+    "54": {
+      "innate_level": 1,
+      "class_levels": {
+        "Bard": 1,
+        "Cleric": 1,
+        "Wiz/Sorc": 1
+      }
+    },
+    "55": {
+      "innate_level": 3,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "56": {
+      "innate_level": 2,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2
+      }
+    },
+    "57": {
+      "innate_level": 5,
+      "class_levels": {
+        "Cleric": 5,
+        "Druid": 5
+      }
+    },
+    "58": {
+      "innate_level": 1,
+      "class_levels": {
+        "Bard": 1,
+        "Druid": 1,
+        "Ranger": 2,
+        "Wiz/Sorc": 1
+      }
+    },
+    "59": {
+      "innate_level": 3,
+      "class_levels": {
+        "Bard": 3,
+        "Wiz/Sorc": 3
+      }
+    },
+    "60": {
+      "innate_level": 2,
+      "class_levels": {
+        "Bard": 2,
+        "Cleric": 2
+      }
+    },
+    "61": {
+      "innate_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "62": {
+      "innate_level": 4,
+      "class_levels": {
+        "Druid": 4,
+        "Wiz/Sorc": 4
+      }
+    },
+    "63": {
+      "innate_level": 9,
+      "class_levels": {
+        "Cleric": 9,
+        "Druid": 9
+      }
+    },
+    "64": {
+      "innate_level": 7,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 8
+      }
+    },
+    "65": {
+      "innate_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "66": {
+      "innate_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "67": {},
+    "68": {
+      "innate_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "69": {
+      "innate_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "70": {
+      "innate_level": 7,
+      "class_levels": {
+        "Cleric": 7
+      }
+    },
+    "71": {},
+    "72": {
+      "innate_level": 7,
+      "class_levels": {
+        "Druid": 7
+      }
+    },
+    "73": {
+      "innate_level": 7,
+      "class_levels": {
+        "Cleric": 7
+      }
+    },
+    "74": {
+      "innate_level": 8,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "75": {
+      "innate_level": 4,
+      "class_levels": {
+        "Bard": 6,
+        "Druid": 5,
+        "Wiz/Sorc": 4
+      }
+    },
+    "76": {
+      "innate_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "77": {
+      "innate_level": 4,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "78": {
+      "innate_level": 1
+    },
+    "79": {
+      "innate_level": 0,
+      "class_levels": {
+        "Bard": 0,
+        "Druid": 0,
+        "Wiz/Sorc": 0
+      }
+    },
+    "80": {
+      "innate_level": 8,
+      "class_levels": {
+        "Druid": 8
+      }
+    },
+    "81": {
+      "innate_level": 0,
+      "class_levels": {
+        "Wiz/Sorc": 0
+      }
+    },
+    "82": {
+      "innate_level": 3,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "83": {
+      "innate_level": 8,
+      "class_levels": {
+        "Cleric": 8,
+        "Druid": 9
+      }
+    },
+    "84": {
+      "innate_level": 8,
+      "class_levels": {
+        "Druid": 8,
+        "Wiz/Sorc": 8
+      }
+    },
+    "85": {
+      "innate_level": 6,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 7
+      }
+    },
+    "86": {
+      "innate_level": 0,
+      "class_levels": {
+        "Cleric": 0
+      }
+    },
+    "87": {
+      "innate_level": 1,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "88": {
+      "innate_level": 2,
+      "class_levels": {
+        "Cleric": 2
+      }
+    },
+    "89": {
+      "innate_level": 3,
+      "class_levels": {
+        "Cleric": 3
+      }
+    },
+    "90": {
+      "innate_level": 4,
+      "class_levels": {
+        "Cleric": 4
+      }
+    },
+    "91": {
+      "innate_level": 2,
+      "class_levels": {
+        "Bard": 1,
+        "Wiz/Sorc": 2
+      }
+    },
+    "92": {
+      "innate_level": 6,
+      "class_levels": {
+        "Druid": 6
+      }
+    },
+    "93": {
+      "innate_level": 0,
+      "class_levels": {
+        "Wiz/Sorc": 0
+      }
+    },
+    "94": {
+      "innate_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "95": {
+      "innate_level": 3,
+      "class_levels": {
+        "Bard": 3
+      }
+    },
+    "96": {
+      "innate_level": 9,
+      "class_levels": {
+        "Cleric": 9
+      }
+    },
+    "97": {
+      "innate_level": 5,
+      "class_levels": {
+        "Druid": 5
+      }
+    },
+    "98": {
+      "innate_level": 4,
+      "class_levels": {
+        "Wiz/Sorc": 4
+      }
+    },
+    "99": {
+      "innate_level": 6,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "100": {
+      "innate_level": 1,
+      "class_levels": {
+        "Cleric": 1
+      }
+    },
+    "101": {
+      "innate_level": 3,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "102": {
+      "innate_level": 2,
+      "class_levels": {
+        "Bard": 2,
+        "Wiz/Sorc": 2
+      }
+    },
+    "103": {
+      "innate_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "104": {
+      "innate_level": 6,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "105": {
+      "innate_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "106": {
+      "innate_level": 8,
+      "class_levels": {
+        "Wiz/Sorc": 8
+      }
+    },
+    "107": {
+      "innate_level": 9,
+      "class_levels": {
+        "Wiz/Sorc": 9
+      }
+    },
+    "108": {
+      "innate_level": 6,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "109": {
+      "innate_level": 6,
+      "class_levels": {
+        "Wiz/Sorc": 6
+      }
+    },
+    "110": {
+      "innate_level": 6,
+      "class_levels": {
+        "Druid": 6
+      }
+    },
+    "111": {
+      "innate_level": 3,
+      "class_levels": {
+        "Druid": 3
+      }
+    },
+    "112": {
+      "innate_level": 7,
+      "class_levels": {
+        "Wiz/Sorc": 7
+      }
+    },
+    "113": {
+      "innate_level": 5,
+      "class_levels": {
+        "Wiz/Sorc": 5
+      }
+    },
+    "114": {
+      "innate_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    },
+    "115": {
+      "innate_level": 1,
+      "class_levels": {
+        "Wiz/Sorc": 1
+      }
+    },
+    "116": {
+      "innate_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "117": {
+      "innate_level": 3,
+      "class_levels": {
+        "Wiz/Sorc": 3
+      }
+    },
+    "118": {
+      "innate_level": 6,
+      "class_levels": {
+        "Cleric": 6,
+        "Wiz/Sorc": 6
+      }
+    },
+    "119": {
+      "innate_level": 6,
+      "class_levels": {
+        "Druid": 6
+      }
+    },
+    "120": {},
+    "121": {
+      "innate_level": 5
+    },
+    "122": {},
+    "123": {},
+    "124": {
+      "innate_level": 3
+    },
+    "125": {
+      "innate_level": 1
+    },
+    "126": {
+      "innate_level": 3
+    },
+    "127": {
+      "innate_level": 3
+    },
+    "128": {},
+    "129": {
+      "innate_level": 1
+    },
+    "130": {},
+    "131": {},
+    "132": {
+      "innate_level": 1
+    },
+    "133": {
+      "innate_level": 1
+    },
+    "134": {
+      "innate_level": 1
+    },
+    "135": {
+      "innate_level": 1
+    },
+    "136": {
+      "innate_level": 1
+    },
+    "137": {
+      "innate_level": 1
+    },
+    "138": {
+      "innate_level": 1
+    },
+    "139": {
+      "innate_level": 1
+    },
+    "140": {
+      "innate_level": 2,
+      "class_levels": {
+        "Wiz/Sorc": 2
+      }
+    }
+  }
+}
