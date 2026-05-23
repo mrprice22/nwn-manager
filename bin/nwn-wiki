@@ -5413,12 +5413,12 @@ def _items_col_flags(items: list[tuple[str, dict]]) -> tuple[bool, bool]:
     return show_base, show_stack
 
 
-def _items_table_head(show_base: bool, show_stack: bool, show_material: bool = False) -> str:
+def _items_table_head(show_base: bool, show_stack: bool, show_ac: bool = False) -> str:
     cols = ["<th>Name</th>", "<th>ResRef</th>"]
     if show_base:
         cols.append("<th>Base item</th>")
-    if show_material:
-        cols.append("<th>Material</th>")
+    if show_ac:
+        cols.append("<th>Base AC</th>")
     cols.append("<th>GP Value</th>")
     if show_stack:
         cols.append("<th>Stack</th>")
@@ -5426,16 +5426,16 @@ def _items_table_head(show_base: bool, show_stack: bool, show_material: bool = F
 
 
 def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
-               prefix: str = "", show_material: bool = False) -> str:
+               prefix: str = "", show_ac: bool = False) -> str:
     cells = [
         f"<td>{link(f'{prefix}{rr}.html', db.item_name(rr))}</td>",
         f"<td>{E(rr)}</td>",
     ]
     if show_base:
         cells.append(f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>")
-    if show_material:
+    if show_ac:
         _mac = _torso_base_ac(i)
-        cells.append(f"<td>{'Leather' if _mac <= 3 else 'Metal'}</td>")
+        cells.append(f"<td>{_mac if _mac is not None else ''}</td>")
     cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
     if show_stack:
         cells.append(f"<td>{E(fld(i, 'StackSize', ''))}</td>")
@@ -5529,14 +5529,15 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
         slug = cat_key.replace("_", "-")
         cat_label = _item_category_label(cat_key)
         show_base, show_stack = _items_col_flags(items)
+        show_ac = cat_key.startswith("armor_")
         rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, prefix="../")
+            _items_row(rr, i, db, show_base, show_stack, prefix="../", show_ac=show_ac)
             for rr, i in items
         )
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
             f' <small class="muted">({len(items)})</small></h2>'
-            + _items_table_head(show_base, show_stack) + rows_html + "</tbody></table>"
+            + _items_table_head(show_base, show_stack, show_ac) + rows_html + "</tbody></table>"
         )
 
     layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
@@ -5662,15 +5663,15 @@ def render_items_index(db: Db, out: Path) -> None:
         slug = cat_key.replace("_", "-")
         cat_label = _item_category_label(cat_key)
         show_base, show_stack = _items_col_flags(items)
-        show_material = cat_key == "armor_medium"
+        show_ac = cat_key.startswith("armor_")
         rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, show_material=show_material)
+            _items_row(rr, i, db, show_base, show_stack, show_ac=show_ac)
             for rr, i in items
         )
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
             f' <small class="muted">({len(items)})</small></h2>'
-            + _items_table_head(show_base, show_stack, show_material) + rows_html + "</tbody></table>"
+            + _items_table_head(show_base, show_stack, show_ac) + rows_html + "</tbody></table>"
         )
 
     if broken:
@@ -5783,7 +5784,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         *(
             (lambda _ac: [
                 f"<dt>Base AC</dt><dd>{_ac}</dd>",
-                f"<dt>Material</dt><dd>{'Non-metal (Druid-friendly)' if _ac <= 3 else 'Metal'}</dd>",
+                f"<dt>Material</dt><dd>{'Cloth' if _ac <= 0 else 'Leather' if _ac <= 3 else 'Metal'}</dd>",
             ])(_torso_base_ac(i))
             if _bi in _ARMOR_BASEITEMS
             else [f"<dt>Base AC</dt><dd>{int((WEAPONS.get(_bi) or {}).get('BaseAC', 0) or 0)}</dd>"]
@@ -6418,27 +6419,21 @@ var _FIXED_VALS={
   'Heavy Armor':1,'Medium Armor':1,'Light Armor':1,'Cloth & Robes':1,
   'Small Shields':1,'Large Shields':1,'Tower Shields':1,'Helmets':1,
   'Amulets':1,'Belts':1,'Boots':1,'Bracers & Gauntlets':1,'Rings':1,'Cloaks':1,
-  'Ammunition':1,'Consumables':1,'Miscellaneous':1
+  'Ammunition':1,'Consumables':1,'Miscellaneous':1,'Creature Items':1
 };
 
-function _addOpts(grp,opts,bisSet,medMats){
+function _addOpts(grp,opts,bisSet){
   var added=0;
   opts.forEach(function(o){
-    var show;
-    if(o.v==='Medium Armor')show=!!bisSet['Medium Armor'];
-    else if(o.v==='Medium Armor (Leather)')show=!!bisSet['Medium Armor']&&!!medMats['non-metal'];
-    else if(o.v==='Medium Armor (Metal)')show=!!bisSet['Medium Armor']&&!!medMats['metal'];
-    else show=!!bisSet[o.v];
-    if(show){grp.appendChild(new Option(o.l,o.v));added++;}
+    if(bisSet[o.v]){grp.appendChild(new Option(o.l,o.v));added++;}
   });
   return added;
 }
 
 function populateFilters(){
-  var bisSet={},medMats={},props={},subs={};
+  var bisSet={},props={},subs={};
   data.forEach(function(it){
     bisSet[it.base_item]=1;
-    if(it.base_item==='Medium Armor'&&it.armor_material)medMats[it.armor_material]=1;
     it.properties.forEach(function(p){
       props[p.prop]=1;
       if(p.subtype){if(!subs[p.prop])subs[p.prop]={};subs[p.prop][p.subtype]=1;}
@@ -6450,9 +6445,7 @@ function populateFilters(){
   var GROUPS=[
     {label:'Armor',opts:[
       {l:'Heavy Armor',v:'Heavy Armor'},
-      {l:'Medium Armor (all)',v:'Medium Armor'},
-      {l:'Medium Armor (Leather)',v:'Medium Armor (Leather)'},
-      {l:'Medium Armor (Metal)',v:'Medium Armor (Metal)'},
+      {l:'Medium Armor',v:'Medium Armor'},
       {l:'Light Armor',v:'Light Armor'},
       {l:'Cloth & Robes',v:'Cloth & Robes'},
       {l:'Small Shields',v:'Small Shields'},
@@ -6471,7 +6464,8 @@ function populateFilters(){
     ]},
     {label:'Misc.',opts:[
       {l:'Consumables',v:'Consumables'},
-      {l:'Miscellaneous',v:'Miscellaneous'}
+      {l:'Miscellaneous',v:'Miscellaneous'},
+      {l:'Creature Items',v:'Creature Items'}
     ]}
   ];
 
@@ -6485,7 +6479,7 @@ function populateFilters(){
       dynWeps.forEach(function(v){grp.appendChild(new Option(v,v));added++;});
       (g.extra||[]).forEach(function(o){if(bisSet[o.v]){grp.appendChild(new Option(o.l,o.v));added++;}});
     } else {
-      added=_addOpts(grp,g.opts,bisSet,medMats);
+      added=_addOpts(grp,g.opts,bisSet);
     }
     if(added>0)biSel.appendChild(grp);
   });
@@ -6521,9 +6515,7 @@ form.addEventListener('submit',function(e){
   data.forEach(function(it){
     if(!it.accessible&&!inclNonDrop)return;
     if(bi){
-      if(bi==='Medium Armor (Leather)'){if(it.base_item!=='Medium Armor'||it.armor_material!=='non-metal')return;}
-      else if(bi==='Medium Armor (Metal)'){if(it.base_item!=='Medium Armor'||it.armor_material!=='metal')return;}
-      else if(it.base_item!==bi)return;
+      if(it.base_item!==bi)return;
     }
     var matched=[];
     var ok=!conds.length||conds.every(function(c){
@@ -6645,14 +6637,12 @@ def render_items_search(db: "Db", out: Path) -> None:
                 "cost_anchor": cost_anchor,
             })
         _cat = _item_category(i)
-        _ac = _torso_base_ac(i) if bi in _ARMOR_BASEITEMS else None
         index.append({
             "resref": resref,
             "name": nwn_text(name),
-            "base_item": _item_category_label(_cat) if bi in _ARMOR_BASEITEMS else baseitem_name(bi) or f"BaseItem #{bi}",
+            "base_item": (baseitem_name(bi) or f"BaseItem #{bi}") if _cat.startswith("weapon_") else _item_category_label(_cat),
             "base_item_id": bi,
             "base_item_anchor": _cat.replace("_", "-"),
-            "armor_material": ("non-metal" if _ac <= 3 else "metal") if _ac is not None else None,
             "cost": cost_val,
             "url": f"{resref}.html",
             "properties": props,
