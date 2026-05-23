@@ -920,9 +920,9 @@ def _item_category(item: dict) -> str:
         ac = _torso_base_ac(item)
         if ac <= 0:
             return "armor_cloth"
-        if ac <= 4:
+        if ac <= 3:
             return "armor_light"
-        if ac <= 6:
+        if ac <= 5:
             return "armor_medium"
         return "armor_heavy"
     if bi == 14:
@@ -5413,10 +5413,12 @@ def _items_col_flags(items: list[tuple[str, dict]]) -> tuple[bool, bool]:
     return show_base, show_stack
 
 
-def _items_table_head(show_base: bool, show_stack: bool) -> str:
+def _items_table_head(show_base: bool, show_stack: bool, show_material: bool = False) -> str:
     cols = ["<th>Name</th>", "<th>ResRef</th>"]
     if show_base:
         cols.append("<th>Base item</th>")
+    if show_material:
+        cols.append("<th>Material</th>")
     cols.append("<th>GP Value</th>")
     if show_stack:
         cols.append("<th>Stack</th>")
@@ -5424,13 +5426,16 @@ def _items_table_head(show_base: bool, show_stack: bool) -> str:
 
 
 def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
-               prefix: str = "") -> str:
+               prefix: str = "", show_material: bool = False) -> str:
     cells = [
         f"<td>{link(f'{prefix}{rr}.html', db.item_name(rr))}</td>",
         f"<td>{E(rr)}</td>",
     ]
     if show_base:
         cells.append(f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>")
+    if show_material:
+        _mac = _torso_base_ac(i)
+        cells.append(f"<td>{'Leather' if _mac <= 3 else 'Metal'}</td>")
     cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
     if show_stack:
         cells.append(f"<td>{E(fld(i, 'StackSize', ''))}</td>")
@@ -5657,11 +5662,15 @@ def render_items_index(db: Db, out: Path) -> None:
         slug = cat_key.replace("_", "-")
         cat_label = _item_category_label(cat_key)
         show_base, show_stack = _items_col_flags(items)
-        rows_html = "\n".join(_items_row(rr, i, db, show_base, show_stack) for rr, i in items)
+        show_material = cat_key == "armor_medium"
+        rows_html = "\n".join(
+            _items_row(rr, i, db, show_base, show_stack, show_material=show_material)
+            for rr, i in items
+        )
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
             f' <small class="muted">({len(items)})</small></h2>'
-            + _items_table_head(show_base, show_stack) + rows_html + "</tbody></table>"
+            + _items_table_head(show_base, show_stack, show_material) + rows_html + "</tbody></table>"
         )
 
     if broken:
@@ -6405,10 +6414,31 @@ fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
   data=d; populateFilters();
 });
 
+var _FIXED_VALS={
+  'Heavy Armor':1,'Medium Armor':1,'Light Armor':1,'Cloth & Robes':1,
+  'Small Shields':1,'Large Shields':1,'Tower Shields':1,'Helmets':1,
+  'Amulets':1,'Belts':1,'Boots':1,'Bracers & Gauntlets':1,'Rings':1,'Cloaks':1,
+  'Ammunition':1,'Consumables':1,'Miscellaneous':1
+};
+
+function _addOpts(grp,opts,bisSet,medMats){
+  var added=0;
+  opts.forEach(function(o){
+    var show;
+    if(o.v==='Medium Armor')show=!!bisSet['Medium Armor'];
+    else if(o.v==='Medium Armor (Leather)')show=!!bisSet['Medium Armor']&&!!medMats['non-metal'];
+    else if(o.v==='Medium Armor (Metal)')show=!!bisSet['Medium Armor']&&!!medMats['metal'];
+    else show=!!bisSet[o.v];
+    if(show){grp.appendChild(new Option(o.l,o.v));added++;}
+  });
+  return added;
+}
+
 function populateFilters(){
-  var bis={},props={},subs={};
+  var bisSet={},medMats={},props={},subs={};
   data.forEach(function(it){
-    bis[it.base_item]=1;
+    bisSet[it.base_item]=1;
+    if(it.base_item==='Medium Armor'&&it.armor_material)medMats[it.armor_material]=1;
     it.properties.forEach(function(p){
       props[p.prop]=1;
       if(p.subtype){if(!subs[p.prop])subs[p.prop]={};subs[p.prop][p.subtype]=1;}
@@ -6416,7 +6446,50 @@ function populateFilters(){
   });
   window._subs=subs;
   var biSel=document.getElementById('fb');
-  Object.keys(bis).sort().forEach(function(b){biSel.appendChild(new Option(b,b));});
+
+  var GROUPS=[
+    {label:'Armor',opts:[
+      {l:'Heavy Armor',v:'Heavy Armor'},
+      {l:'Medium Armor (all)',v:'Medium Armor'},
+      {l:'Medium Armor (Leather)',v:'Medium Armor (Leather)'},
+      {l:'Medium Armor (Metal)',v:'Medium Armor (Metal)'},
+      {l:'Light Armor',v:'Light Armor'},
+      {l:'Cloth & Robes',v:'Cloth & Robes'},
+      {l:'Small Shields',v:'Small Shields'},
+      {l:'Large Shields',v:'Large Shields'},
+      {l:'Tower Shields',v:'Tower Shields'},
+      {l:'Helmets',v:'Helmets'}
+    ]},
+    {label:'Weapons',dyn:true,extra:[{l:'Ammunition',v:'Ammunition'}]},
+    {label:'Gear',opts:[
+      {l:'Amulets',v:'Amulets'},
+      {l:'Belts',v:'Belts'},
+      {l:'Boots',v:'Boots'},
+      {l:'Bracers & Gauntlets',v:'Bracers & Gauntlets'},
+      {l:'Rings',v:'Rings'},
+      {l:'Cloaks',v:'Cloaks'}
+    ]},
+    {label:'Misc.',opts:[
+      {l:'Consumables',v:'Consumables'},
+      {l:'Miscellaneous',v:'Miscellaneous'}
+    ]}
+  ];
+
+  var dynWeps=Object.keys(bisSet).filter(function(b){return !_FIXED_VALS[b];}).sort();
+
+  GROUPS.forEach(function(g){
+    var grp=document.createElement('optgroup');
+    grp.label=g.label;
+    var added=0;
+    if(g.dyn){
+      dynWeps.forEach(function(v){grp.appendChild(new Option(v,v));added++;});
+      (g.extra||[]).forEach(function(o){if(bisSet[o.v]){grp.appendChild(new Option(o.l,o.v));added++;}});
+    } else {
+      added=_addOpts(grp,g.opts,bisSet,medMats);
+    }
+    if(added>0)biSel.appendChild(grp);
+  });
+
   var propOpts=Object.keys(props).sort();
   propSels.forEach(function(sel){
     propOpts.forEach(function(p){sel.appendChild(new Option(p,p));});
@@ -6447,7 +6520,11 @@ form.addEventListener('submit',function(e){
   var out=[];
   data.forEach(function(it){
     if(!it.accessible&&!inclNonDrop)return;
-    if(bi&&it.base_item!==bi)return;
+    if(bi){
+      if(bi==='Medium Armor (Leather)'){if(it.base_item!=='Medium Armor'||it.armor_material!=='non-metal')return;}
+      else if(bi==='Medium Armor (Metal)'){if(it.base_item!=='Medium Armor'||it.armor_material!=='metal')return;}
+      else if(it.base_item!==bi)return;
+    }
     var matched=[];
     var ok=!conds.length||conds.every(function(c){
       var mp=it.properties.filter(function(p){
@@ -6567,12 +6644,15 @@ def render_items_search(db: "Db", out: Path) -> None:
                 "detail_slug": detail_slug,
                 "cost_anchor": cost_anchor,
             })
+        _cat = _item_category(i)
+        _ac = _torso_base_ac(i) if bi in _ARMOR_BASEITEMS else None
         index.append({
             "resref": resref,
             "name": nwn_text(name),
-            "base_item": _item_category_label(_item_category(i)) if bi in _ARMOR_BASEITEMS else baseitem_name(bi) or f"BaseItem #{bi}",
+            "base_item": _item_category_label(_cat) if bi in _ARMOR_BASEITEMS else baseitem_name(bi) or f"BaseItem #{bi}",
             "base_item_id": bi,
-            "base_item_anchor": _item_category(i).replace("_", "-"),
+            "base_item_anchor": _cat.replace("_", "-"),
+            "armor_material": ("non-metal" if _ac <= 3 else "metal") if _ac is not None else None,
             "cost": cost_val,
             "url": f"{resref}.html",
             "properties": props,
