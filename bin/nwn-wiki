@@ -537,8 +537,9 @@ def spell_name(row: int | None) -> str:
 _CAST_SPELL_PROP_ID = 15
 # Maps property name → iprp table name for properties that carry spell data.
 _SPELL_PROP_TABLES: dict[str, str] = {
-    "Cast Spell":        "iprp_spells",
-    "On Hit Cast Spell": "iprp_onhitspell",
+    "Cast Spell":               "iprp_spells",
+    "On Hit Cast Spell":        "iprp_onhitspell",
+    "Immunity: Specific Spell": "iprp_spells",
 }
 
 
@@ -557,7 +558,7 @@ def _spell_level_classes(info: dict | None) -> tuple[str, str]:
         return ("", "")
     lvl = info.get("innate_level")
     classes = info.get("class_levels", {})
-    level_str = str(lvl) if lvl is not None else ""
+    level_str = "Cantrip" if lvl == 0 else (str(lvl) if lvl is not None else "")
     classes_str = ", ".join(classes.keys()) if classes else "N/A"
     return (level_str, classes_str)
 
@@ -584,9 +585,9 @@ def _scroll_spell_sort_key(entry: tuple[str, dict]) -> tuple[int, str]:
             subtype = fld(p, "Subtype")
             if subtype is not None:
                 sname = _table_lookup("iprp_spells", int(subtype)) or ""
-                return (lvl if lvl is not None else 999, sname.lower())
+                return (-(lvl) if lvl is not None else 999, sname.lower())
             break
-    return (lvl if lvl is not None else 999, "")
+    return (-(lvl) if lvl is not None else 999, "")
 
 
 def _iprp_name_spell_info(tbl_name: str, spell_name_str: str) -> dict | None:
@@ -6319,6 +6320,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             pname, subtype, cost_str = f["property"], f["subtype"], f["cost"]
             if not pname:
                 continue
+            if pname == "Immunity: Specific Spell" and not subtype and cost_str:
+                subtype, cost_str = cost_str, ""
             # Merge entries whose subtype is an unresolved numeric fallback
             # (e.g. "True Seeing: 1", "True Seeing: 2" → all under "True Seeing").
             key_subtype = "" if _is_raw_subtype(subtype) else _group_subtype(pname, subtype)
@@ -6383,7 +6386,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         tiers = [(c, a, len(items)) for c, a, items in _cost_tiers(entries)]
         subtype_rows[pname].append((subtype, slug, tiers))
 
-    # Re-sort Cast Spell and On Hit Cast Spell subtypes by (innate_level, name)
+    # Re-sort spell-property subtypes by (innate_level desc, name asc)
     # instead of the default alphabetical order from sorted_keys.
     for pname, tbl_name in _SPELL_PROP_TABLES.items():
         if pname not in subtype_rows:
@@ -6393,7 +6396,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 subtype, slug, tiers = row
                 si = _iprp_name_spell_info(tbl, subtype) if subtype else None
                 lvl = si.get("innate_level") if si else None
-                return (lvl if lvl is not None else 999, subtype.lower())
+                return (-(lvl) if lvl is not None else 999, subtype.lower())
             return key
         subtype_rows[pname].sort(key=_make_spell_sort_key(tbl_name))
 
@@ -6629,15 +6632,37 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         sibling_rows = subtype_rows.get(pname, [])
         toc_parts: list[str] = []
         if len(sibling_rows) > 1:
-            toc_parts.append(f'<div class="toc-group-heading">{E(pname)}</div>')
-            for sib_sub, sib_slug, sib_tiers in sibling_rows:
-                sib_label = sib_sub if sib_sub else pname
-                sib_count = sum(c for _, _, c in sib_tiers)
-                cls = ' class="toc-current"' if sib_slug == slug else ''
-                toc_parts.append(
-                    f'<div><a href="{sib_slug}.html"{cls}>{E(sib_label)}'
-                    f' <span class="muted">({sib_count})</span></a></div>'
-                )
+            _sib_spell_tbl = _SPELL_PROP_TABLES.get(pname)
+            _sib_has_spell_info = _sib_spell_tbl and any(
+                v for v in SPELL_INFO.get(_sib_spell_tbl, {}).values() if v
+            )
+            if _sib_has_spell_info:
+                _cur_lvl_heading: object = object()  # sentinel
+                for sib_sub, sib_slug, sib_tiers in sibling_rows:
+                    _ssi = _iprp_name_spell_info(_sib_spell_tbl, sib_sub) if sib_sub else None
+                    _slvl = _ssi.get("innate_level") if _ssi else None
+                    lvl_heading = "Cantrip" if _slvl == 0 else (f"Level {_slvl}" if _slvl is not None else "")
+                    if lvl_heading != _cur_lvl_heading:
+                        _cur_lvl_heading = lvl_heading
+                        if lvl_heading:
+                            toc_parts.append(f'<div class="toc-group-heading">{E(lvl_heading)}</div>')
+                    sib_label = sib_sub if sib_sub else pname
+                    sib_count = sum(c for _, _, c in sib_tiers)
+                    cls = ' class="toc-current"' if sib_slug == slug else ''
+                    toc_parts.append(
+                        f'<div><a href="{sib_slug}.html"{cls}>{E(sib_label)}'
+                        f' <span class="muted">({sib_count})</span></a></div>'
+                    )
+            else:
+                toc_parts.append(f'<div class="toc-group-heading">{E(pname)}</div>')
+                for sib_sub, sib_slug, sib_tiers in sibling_rows:
+                    sib_label = sib_sub if sib_sub else pname
+                    sib_count = sum(c for _, _, c in sib_tiers)
+                    cls = ' class="toc-current"' if sib_slug == slug else ''
+                    toc_parts.append(
+                        f'<div><a href="{sib_slug}.html"{cls}>{E(sib_label)}'
+                        f' <span class="muted">({sib_count})</span></a></div>'
+                    )
         if detail_key in _prefix_detail:
             seen_subs: set[str] = set()
             toc_sub_parts: list[str] = []
@@ -9039,6 +9064,39 @@ def main() -> int:
         print("[nwn-wiki] --nwn-install is ignored; stock item names are pre-cached in "
               "wiki_data/stock_item_names.json (run bin/refresh-nwn-stock-items to rebuild)",
               file=sys.stderr)
+
+    # --- wiki_data pre-flight: confirm all data files are present ---
+    _DATA_AUDIT: list[tuple[str, Any, str]] = [
+        ("baseitems.json",        lambda: len(BASEITEMS),                              "bin/wiki_data/_build_stock.py"),
+        ("classes.json",          lambda: len(CLASSES),                               "bin/wiki_data/_build_stock.py"),
+        ("racialtypes.json",      lambda: len(RACES),                                 "bin/wiki_data/_build_stock.py"),
+        ("appearance.json",       lambda: len(APPEARANCE),                            "bin/wiki_data/_build_stock.py"),
+        ("feat.json",             lambda: len(FEATS),                                 "bin/wiki_data/_build_stock.py"),
+        ("iprp_feats.json",       lambda: len(IPRP_FEATS),                            "bin/wiki_data/_build_stock.py"),
+        ("skills.json",           lambda: len(SKILLS),                                "bin/wiki_data/_build_stock.py"),
+        ("spells.json",           lambda: len(SPELLS),                                "bin/wiki_data/_build_stock.py"),
+        ("weapons.json",          lambda: len(WEAPONS),                               "bin/wiki_data/_build_stock.py"),
+        ("itemprops.json",        lambda: len(IPROP_DEFS),                            "committed — restore from git"),
+        ("parts_chest.2da",       lambda: len(PARTS_CHEST_AC),                        "committed — restore from git"),
+        ("stock_item_names.json", lambda: len(STOCK_ITEM_NAMES),                      "bin/refresh-nwn-stock-items"),
+        ("spell_info.json",       lambda: sum(len(v) for v in SPELL_INFO.values()),   "bin/refresh-nwn-spell-info"),
+    ]
+    _missing_data: list[tuple[str, str]] = []
+    for _fname, _count_fn, _refresh in _DATA_AUDIT:
+        _p = DATA_DIR / _fname
+        if _p.exists():
+            print(f"[nwn-wiki] data: {_fname:<25} ok ({_count_fn()})")
+        else:
+            print(f"[nwn-wiki] data: {_fname:<25} MISSING", file=sys.stderr)
+            _missing_data.append((_fname, _refresh))
+    if _missing_data:
+        _by_cmd: dict[str, list[str]] = {}
+        for _fname, _refresh in _missing_data:
+            _by_cmd.setdefault(_refresh, []).append(_fname)
+        print("error: required wiki_data files are missing:", file=sys.stderr)
+        for _cmd, _files in _by_cmd.items():
+            print(f"  {_cmd}  ({', '.join(_files)})", file=sys.stderr)
+        return 1
 
     print(f"[nwn-wiki] reading {src}")
     db = Db(src)
