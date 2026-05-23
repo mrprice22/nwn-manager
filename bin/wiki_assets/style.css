@@ -673,3 +673,23 @@ tr[id] { scroll-margin-top: 4em; }
   margin-left: 2px;
   font-family: sans-serif;
 }
+
+/* Light item-property colour styles (NWN iprp_lightcolor table).
+ * Applied to the colour name wherever Light properties appear: property detail
+ * page tables, individual item pages, and search result rows.
+ * To override in a module theme, redefine any of these in wiki-theme/theme.css. */
+.nwn-light-blue   { color: #2255cc; font-weight: 600; }
+.nwn-light-yellow { color: #997700; font-weight: 600; }
+.nwn-light-purple { color: #882299; font-weight: 600; }
+.nwn-light-red    { color: #bb2222; font-weight: 600; }
+.nwn-light-green  { color: #228833; font-weight: 600; }
+.nwn-light-orange { color: #cc5500; font-weight: 600; }
+/* White light is invisible on the wiki's light background; a pill gives it presence. */
+.nwn-light-white  {
+  color: #555;
+  font-weight: 600;
+  background: #f0f0ec;
+  border: 1px solid #ccc;
+  padding: 0.05em 0.35em;
+  border-radius: 3px;
+}

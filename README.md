@@ -430,6 +430,31 @@ area names stay coloured even in a dark theme. All other labels fall through
 to the CSS class, so setting `.area-label { fill: … }` in `theme.css` is
 the correct way to control text colour on a dark background.
 
+**Light property colour classes** — Wherever a Light item property appears
+(the property detail page, individual item pages, and search results), the
+colour name is rendered with a styled class so it reads as its actual hue.
+Seven classes cover the stock `iprp_lightcolor` table:
+
+| Class | Colour |
+|-------|--------|
+| `.nwn-light-blue`   | Blue   |
+| `.nwn-light-yellow` | Yellow |
+| `.nwn-light-purple` | Purple |
+| `.nwn-light-red`    | Red    |
+| `.nwn-light-green`  | Green  |
+| `.nwn-light-orange` | Orange |
+| `.nwn-light-white`  | White (pill background — white text is invisible on the default light page) |
+
+All classes also carry `nwn-light-color` as a shared selector. To override
+any colour or the white pill treatment in your theme:
+
+```css
+/* wiki-theme/theme.css */
+.nwn-light-blue  { color: #5599ee; }
+/* Dark theme — white is now readable, remove the pill */
+.nwn-light-white { color: #e8e8e8; background: transparent; border: none; padding: 0; }
+```
+
 The `wiki-theme/` folder is optional and ignored if absent.
 
 #### Player activity charts

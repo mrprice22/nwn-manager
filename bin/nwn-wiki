@@ -6173,11 +6173,17 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 pname_cell = colorize_damage_words(E(pname))
                 subtype_cell = colorize_damage_words(E(subtype))
                 cost_cell = E(cost_str)
+            _param_raw = f["param"]
+            if f["property"] == "Light" and _param_raw:
+                _pcls = f"nwn-light-color nwn-light-{_param_raw.lower()}"
+                param_cell = f'<span class="{_pcls}">{E(_param_raw)}</span>'
+            else:
+                param_cell = E(_param_raw)
             rows.append(
                 f"<tr><td>{pname_cell}</td>"
                 f"<td>{subtype_cell}</td>"
                 f"<td>{cost_cell}</td>"
-                f"<td>{E(f['param'])}</td>"
+                f"<td>{param_cell}</td>"
                 f"<td>{E(f['chance'])}</td></tr>"
             )
             debug_rows.append(
@@ -6350,6 +6356,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
     _acc: dict[tuple[str, str, str, str], tuple[str, int, int]] = {}
     # Separate accumulator for prefix-group variants (tracks actual subtype).
     _prefix_acc: dict[tuple[str, str, str, str, str], tuple[str, int, int]] = {}
+    # Light property: track param1 color per (resref, cost_str/brightness).
+    _light_param: dict[tuple[str, str], str] = {}
 
     for resref, i in db.items.items():
         if not (resref in db.item_sold_at or resref in db.item_in_container
@@ -6375,6 +6383,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 _acc[acc_key] = (n, v, c + 1)
             else:
                 _acc[acc_key] = (name, _prop_value_num(cost_str), 1)
+            if pname == "Light" and f["param"]:
+                _light_param[(resref, cost_str)] = f["param"]
             # When a subtype was grouped under a prefix key, also track the
             # actual subtype so the detail page can break out sub-sections.
             if key_subtype and key_subtype != subtype:
@@ -6650,6 +6660,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             body += "</tbody></table>"
         else:
             # Multiple tiers — one sub-table per tier with anchors.
+            _is_light = (pname == "Light" and not subtype)
             body += f"<p>{len(entries)} items across {len(tiers)} value tiers.</p>"
             for cost_str, cost_anch, tier_entries in tiers:
                 has_qty = any(e[4] > 1 for e in tier_entries)
@@ -6661,6 +6672,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     '<table class="data"><thead><tr>'
                     "<th>Name</th>"
                     "<th>Type</th>"
+                    + ("<th>Color</th>" if _is_light else "")
                     + ("<th>Qty</th>" if has_qty else "")
                     + "<th>Where to Find</th>"
                     "</tr></thead><tbody>"
@@ -6668,9 +6680,18 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 for resref, name, _, _, qty in tier_entries:
                     _icat = _item_category(db.items[resref], nwn_text(name))
                     itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
+                    _color_cell = ""
+                    if _is_light:
+                        _color = _light_param.get((resref, cost_str), "")
+                        if _color:
+                            _ccls = f"nwn-light-color nwn-light-{_color.lower()}"
+                            _color_cell = f'<td><span class="{_ccls}">{E(_color)}</span></td>'
+                        else:
+                            _color_cell = '<td><span class="muted">—</span></td>'
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
                         f"<td>{itype_link}</td>"
+                        + _color_cell
                         + (f"<td>{qty}</td>" if has_qty else "")
                         + f"<td>{_where_snippet(db, resref)}</td></tr>"
                     )
@@ -7005,6 +7026,10 @@ function render(rows,showProps,showAccess){
           detail=' \u2014 <a href="'+esc(dHref)+'">'+esc(p.cost)+'</a>';
         }
       }
+      if(p.param){
+        var cCls='nwn-light-color nwn-light-'+p.param.toLowerCase();
+        detail+=' \u2014 <span class="'+cCls+'">'+esc(p.param)+'</span>';
+      }
       return '<span>'+propLink+detail+'</span>';
     }).join('<br>');
     var idxBase=r.it.accessible?'index.html':'inaccessible/index.html';
@@ -7072,10 +7097,12 @@ def render_items_search(db: "Db", out: Path) -> None:
                 detail_href = ""
             if pname == "Immunity: Specific Spell" and not subtype and cost:
                 subtype, cost = cost, ""
+            _srch_param = f["param"] if pname == "Light" else ""
             props.append({
                 "prop": pname,
                 "subtype": subtype,
                 "cost": cost,
+                **({"param": _srch_param} if _srch_param else {}),
                 "value_num": _prop_value_num(f["cost"]),
                 "prop_idx_anchor": prop_idx_anchor,
                 "detail_slug": detail_slug,
