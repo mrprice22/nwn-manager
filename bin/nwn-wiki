@@ -176,6 +176,34 @@ SKILLS = _load_lookup("skills")
 SPELLS = _load_lookup("spells")
 
 
+def _load_spell_info() -> dict[str, dict[int, dict]]:
+    """Load spell_info.json — {table_name: {row_id: {innate_level, caster_level, class_levels}}}.
+
+    Both iprp_spells and iprp_onhitspell are stored under their table names
+    to keep their independent row-ID spaces separate."""
+    p = DATA_DIR / "spell_info.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    result: dict[str, dict[int, dict]] = {}
+    for k, v in raw.items():
+        if k.startswith("_") or not isinstance(v, dict):
+            continue
+        # Top-level keys are table names ("iprp_spells", "iprp_onhitspell").
+        tbl: dict[int, dict] = {}
+        for rk, rv in v.items():
+            if isinstance(rv, dict):
+                try:
+                    tbl[int(rk)] = rv
+                except ValueError:
+                    pass
+        result[k] = tbl
+    return result
+
+
+SPELL_INFO: dict[str, dict[int, dict]] = _load_spell_info()
+
+
 def _load_weapons() -> dict[int, dict[str, str]]:
     p = DATA_DIR / "weapons.json"
     if not p.exists():
@@ -503,6 +531,68 @@ def spell_name(row: int | None) -> str:
     if row is None:
         return ""
     return SPELLS.get(int(row), f"Spell #{row}")
+
+
+# PropertyName id for the Cast Spell item property.
+_CAST_SPELL_PROP_ID = 15
+# Maps property name → iprp table name for properties that carry spell data.
+_SPELL_PROP_TABLES: dict[str, str] = {
+    "Cast Spell":        "iprp_spells",
+    "On Hit Cast Spell": "iprp_onhitspell",
+}
+
+
+def _iprp_spell_info(tbl_name: str, row_id: int | None) -> dict | None:
+    """Return spell info dict for a given iprp table row, or None if unavailable."""
+    if row_id is None or not SPELL_INFO:
+        return None
+    return SPELL_INFO.get(tbl_name, {}).get(row_id)
+
+
+def _spell_level_classes(info: dict | None) -> tuple[str, str]:
+    """Return (level_str, classes_str) for a spell info dict.
+
+    classes_str is 'N/A' when the spell is not castable by any PC class."""
+    if not info:
+        return ("", "")
+    lvl = info.get("innate_level")
+    classes = info.get("class_levels", {})
+    level_str = str(lvl) if lvl is not None else ""
+    classes_str = ", ".join(classes.keys()) if classes else "N/A"
+    return (level_str, classes_str)
+
+
+def _scroll_cast_spell_info(item: dict) -> dict | None:
+    """Return the SPELL_INFO entry for a scroll item's Cast Spell property subtype."""
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is not None and int(pname_id) == _CAST_SPELL_PROP_ID:
+            subtype = fld(p, "Subtype")
+            if subtype is not None:
+                return _iprp_spell_info("iprp_spells", int(subtype))
+    return None
+
+
+def _iprp_name_spell_info(tbl_name: str, spell_name_str: str) -> dict | None:
+    """Resolve spell info by matching a spell name in an iprp_spells-type table.
+
+    Scans IPROP_TABLES[tbl_name] for the first row whose resolved name equals
+    spell_name_str, then returns the corresponding SPELL_INFO entry."""
+    if not SPELL_INFO:
+        return None
+    tbl = SPELL_INFO.get(tbl_name, {})
+    iprp_names = IPROP_TABLES.get(tbl_name, {})
+    for k, name in iprp_names.items():
+        if k.startswith("_") or name != spell_name_str:
+            continue
+        try:
+            row_id = int(k)
+        except ValueError:
+            continue
+        info = tbl.get(row_id)
+        if info:
+            return info
+    return None
 
 
 # Stock NWN1 tileset resrefs → human-readable names. The Aurora Toolset
@@ -5491,12 +5581,15 @@ def _items_col_flags(items: list[tuple[str, dict]]) -> tuple[bool, bool]:
 
 
 def _items_table_head(show_base: bool, show_stack: bool, show_ac: bool = False,
-                      show_reason: bool = False) -> str:
+                      show_reason: bool = False, show_spell_info: bool = False) -> str:
     cols = ["<th>Name</th>", "<th>ResRef</th>"]
     if show_base:
         cols.append("<th>Base item</th>")
     if show_ac:
         cols.append("<th>Base AC</th>")
+    if show_spell_info:
+        cols.append("<th>Level</th>")
+        cols.append("<th>Classes</th>")
     cols.append("<th>GP Value</th>")
     if show_stack:
         cols.append("<th>Stack</th>")
@@ -5506,7 +5599,8 @@ def _items_table_head(show_base: bool, show_stack: bool, show_ac: bool = False,
 
 
 def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
-               prefix: str = "", show_ac: bool = False, reason: str | None = None) -> str:
+               prefix: str = "", show_ac: bool = False, reason: str | None = None,
+               show_spell_info: bool = False) -> str:
     cells = [
         f"<td>{link(f'{prefix}{rr}.html', db.item_name(rr))}</td>",
         f"<td>{E(rr)}</td>",
@@ -5516,6 +5610,10 @@ def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
     if show_ac:
         _mac = _torso_base_ac(i)
         cells.append(f"<td>{_mac if _mac is not None else ''}</td>")
+    if show_spell_info:
+        _lvl, _cls = _spell_level_classes(_scroll_cast_spell_info(i))
+        cells.append(f"<td>{E(_lvl)}</td>")
+        cells.append(f"<td>{E(_cls)}</td>")
     cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
     if show_stack:
         cells.append(f"<td>{E(fld(i, 'StackSize', ''))}</td>")
@@ -5618,15 +5716,20 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
         cat_label = _item_category_label(cat_key)
         show_base, show_stack = _items_col_flags(items)
         show_ac = cat_key.startswith("armor_")
+        show_spell_info = cat_key == "scroll" and any(
+            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
+        )
         rows_html = "\n".join(
             _items_row(rr, i, db, show_base, show_stack, prefix="../", show_ac=show_ac,
-                       reason=_inaccessible_reason_html(rr, db))
+                       reason=_inaccessible_reason_html(rr, db),
+                       show_spell_info=show_spell_info)
             for rr, i in items
         )
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
             f' <small class="muted">({len(items)})</small></h2>'
-            + _items_table_head(show_base, show_stack, show_ac, show_reason=True) + rows_html + "</tbody></table>"
+            + _items_table_head(show_base, show_stack, show_ac, show_reason=True,
+                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
         )
 
     layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
@@ -5753,14 +5856,19 @@ def render_items_index(db: Db, out: Path) -> None:
         cat_label = _item_category_label(cat_key)
         show_base, show_stack = _items_col_flags(items)
         show_ac = cat_key.startswith("armor_")
+        show_spell_info = cat_key == "scroll" and any(
+            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
+        )
         rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, show_ac=show_ac)
+            _items_row(rr, i, db, show_base, show_stack, show_ac=show_ac,
+                       show_spell_info=show_spell_info)
             for rr, i in items
         )
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
             f' <small class="muted">({len(items)})</small></h2>'
-            + _items_table_head(show_base, show_stack, show_ac) + rows_html + "</tbody></table>"
+            + _items_table_head(show_base, show_stack, show_ac,
+                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
         )
 
     if broken:
@@ -5864,12 +5972,22 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         _type_href = f"inaccessible/index.html#{_cat_slug}"
     else:
         _type_href = f"index.html#{_cat_slug}"
+    _is_scroll = _bi in _SCROLL_BASEITEMS
+    _scroll_spell_lvl, _scroll_spell_cls = (
+        _spell_level_classes(_scroll_cast_spell_info(i)) if _is_scroll else ("", "")
+    )
     sections = [
         f"<h1>{nwn_html(display_name)}</h1>",
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
+        *(
+            [
+                f"<dt>Spell Level</dt><dd>{E(_scroll_spell_lvl)}</dd>",
+                f"<dt>Caster Classes</dt><dd>{E(_scroll_spell_cls)}</dd>",
+            ] if _is_scroll and (_scroll_spell_lvl or _scroll_spell_cls) else []
+        ),
         f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i, nwn_text(display_name))))}</dd>",
         *(
             (lambda _ac: [
@@ -6301,16 +6419,26 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                         )
                 body += "</tbody></table>"
             elif has_subtypes:
+                _spell_tbl = _SPELL_PROP_TABLES.get(pname)
+                _show_spell_cols = _spell_tbl is not None and any(
+                    v for v in SPELL_INFO.get(_spell_tbl, {}).values() if v
+                )
+                _spell_head = "<th>Level</th><th>Classes</th>" if _show_spell_cols else ""
                 body += (
                     '<table class="data"><thead><tr>'
-                    "<th>Subtype</th><th>Items</th></tr></thead><tbody>"
+                    f"<th>Subtype</th>{_spell_head}<th>Items</th></tr></thead><tbody>"
                 )
                 for subtype, slug, tiers in rows:
                     label = subtype if subtype else pname
                     cnt = sum(c for _, _, c in tiers)
+                    _spell_cells = ""
+                    if _show_spell_cols:
+                        _si = _iprp_name_spell_info(_spell_tbl, subtype) if subtype else None
+                        _lvl, _cls = _spell_level_classes(_si)
+                        _spell_cells = f"<td>{E(_lvl)}</td><td>{E(_cls)}</td>"
                     body += (
                         f'<tr id="{E(slug)}"><td>{link(f"{slug}.html", label)}</td>'
-                        f"<td>{cnt}</td></tr>"
+                        f"{_spell_cells}<td>{cnt}</td></tr>"
                     )
                 body += "</tbody></table>"
             elif any_cost_tiers:
@@ -6361,6 +6489,21 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         label = pname + (f": {subtype}" if subtype else "")
         tiers = _cost_tiers(entries)
         body = f"<h1>{E(label)}</h1>"
+
+        # Spell level / class info block for Cast Spell and On Hit Cast Spell pages.
+        _detail_spell_tbl = _SPELL_PROP_TABLES.get(pname)
+        if _detail_spell_tbl and subtype and any(
+            v for v in SPELL_INFO.get(_detail_spell_tbl, {}).values() if v
+        ):
+            _dsi = _iprp_name_spell_info(_detail_spell_tbl, subtype)
+            _dlvl, _dcls = _spell_level_classes(_dsi)
+            if _dlvl or _dcls:
+                body += '<dl class="meta">'
+                if _dlvl:
+                    body += f"<dt>Spell Level</dt><dd>{E(_dlvl)}</dd>"
+                if _dcls:
+                    body += f"<dt>Caster Classes</dt><dd>{E(_dcls)}</dd>"
+                body += "</dl>"
 
         detail_key = (pname, subtype)
         if detail_key in _prefix_detail:
@@ -7022,13 +7165,18 @@ def _store_inventory_html(db: "Db", pages: list, item_prefix: str = "../items/")
         cat_label = _item_category_label(cat_key)
         show_base, show_stack = _items_col_flags(items)
         show_ac = cat_key.startswith("armor_")
+        show_spell_info = cat_key == "scroll" and any(
+            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
+        )
         rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, prefix=item_prefix, show_ac=show_ac)
+            _items_row(rr, i, db, show_base, show_stack, prefix=item_prefix, show_ac=show_ac,
+                       show_spell_info=show_spell_info)
             for rr, i in items
         )
         parts.append(
             f'<h3>{E(cat_label)} <small class="muted">({len(items)})</small></h3>'
-            + _items_table_head(show_base, show_stack, show_ac) + rows_html + "</tbody></table>"
+            + _items_table_head(show_base, show_stack, show_ac,
+                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
         )
 
     return "\n".join(parts)
