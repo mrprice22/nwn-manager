@@ -573,6 +573,22 @@ def _scroll_cast_spell_info(item: dict) -> dict | None:
     return None
 
 
+def _scroll_spell_sort_key(entry: tuple[str, dict]) -> tuple[int, str]:
+    """Sort key for scrolls: (innate_level, spell_name_lower)."""
+    rr, i = entry
+    info = _scroll_cast_spell_info(i)
+    lvl = info.get("innate_level") if info else None
+    for p in list_items(i.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is not None and int(pname_id) == _CAST_SPELL_PROP_ID:
+            subtype = fld(p, "Subtype")
+            if subtype is not None:
+                sname = _table_lookup("iprp_spells", int(subtype)) or ""
+                return (lvl if lvl is not None else 999, sname.lower())
+            break
+    return (lvl if lvl is not None else 999, "")
+
+
 def _iprp_name_spell_info(tbl_name: str, spell_name_str: str) -> dict | None:
     """Resolve spell info by matching a spell name in an iprp_spells-type table.
 
@@ -2665,7 +2681,10 @@ class Db:
         i = self.items.get(resref)
         if not i:
             return STOCK_ITEM_NAMES.get(resref, resref)
-        return loc(i.get("LocalizedName")) or STOCK_ITEM_NAMES.get(resref) or resref
+        resolved = loc(i.get("LocalizedName"))
+        if not resolved or resolved.startswith("[TLK#"):
+            return STOCK_ITEM_NAMES.get(resref) or resolved or resref
+        return resolved
 
     def store_name(self, resref: str) -> str:
         s = self.stores.get(resref)
@@ -5793,9 +5812,12 @@ def render_items_index(db: Db, out: Path) -> None:
         ordered_cats.extend(_expand(group_cats))
     ordered_cats.extend(creature_weapon_keys + ["creature_item"])
 
-    # Sort each bucket by decreasing GP cost (items with no cost sort last).
+    # Sort each bucket: scrolls by (innate_level, spell_name), others by decreasing GP cost.
     for key in buckets:
-        buckets[key].sort(key=_item_cost_key, reverse=True)
+        if key == "scroll":
+            buckets[key].sort(key=_scroll_spell_sort_key)
+        else:
+            buckets[key].sort(key=_item_cost_key, reverse=True)
 
     # Table of contents — grouped under headings.
     toc_parts: list[str] = [
@@ -6360,6 +6382,20 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         entries = prop_index[(pname, subtype)]
         tiers = [(c, a, len(items)) for c, a, items in _cost_tiers(entries)]
         subtype_rows[pname].append((subtype, slug, tiers))
+
+    # Re-sort Cast Spell and On Hit Cast Spell subtypes by (innate_level, name)
+    # instead of the default alphabetical order from sorted_keys.
+    for pname, tbl_name in _SPELL_PROP_TABLES.items():
+        if pname not in subtype_rows:
+            continue
+        def _make_spell_sort_key(tbl: str):
+            def key(row: tuple) -> tuple[int, str]:
+                subtype, slug, tiers = row
+                si = _iprp_name_spell_info(tbl, subtype) if subtype else None
+                lvl = si.get("innate_level") if si else None
+                return (lvl if lvl is not None else 999, subtype.lower())
+            return key
+        subtype_rows[pname].sort(key=_make_spell_sort_key(tbl_name))
 
     # --- property index page ---
     # Sidebar: one link per property name (not per subtype).
