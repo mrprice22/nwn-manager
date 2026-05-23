@@ -546,6 +546,13 @@ _SPELL_PROP_TABLES: dict[str, str] = {
     "Immunity: Specific Spell": "iprp_spells",
 }
 
+# Properties whose subtypes are all rendered on a single combined page instead
+# of individual per-subtype files.  Key = property name, value = page slug
+# (filename without .html).
+_COMBINED_PROP_PAGES: dict[str, str] = {
+    "Cast Spell": "cast-spell",
+}
+
 
 def _iprp_spell_info(tbl_name: str, row_id: int | None) -> dict | None:
     """Return spell info dict for a given iprp table row, or None if unavailable."""
@@ -763,7 +770,14 @@ def itemprop_format(prop: dict) -> dict[str, str]:
         ct_tbl = pdef.get("cost_table")
         if ct_tbl:
             cval = _table_lookup(ct_tbl, cost_value)
-            cost_str = cval if cval is not None else str(cost_value)
+            if cval is not None:
+                cost_str = cval
+            elif ct_tbl == "iprp_chargecost":
+                # Standard table ends at row 12 (5/Day); extend the /Day pattern.
+                n = int(cost_value)
+                cost_str = f"{n - 7}/Day" if n >= 8 else f"{n} charges"
+            else:
+                cost_str = str(cost_value)
 
     # Param1: 255 is the engine "no param" sentinel.
     # For certain (property, subtype) combos the Param1Value further qualifies
@@ -6135,19 +6149,26 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             if _pname_known:
                 _idx_anch = f"properties/index.html#pn-{_prop_slug(pname, '')}"
                 _detail_slug = _prop_slug(pname, subtype if _subtype_real else "")
-                _detail_href = f"properties/{_detail_slug}.html"
+                _combined_page = _COMBINED_PROP_PAGES.get(pname)
+                if _combined_page:
+                    _spell_frag = f"#{_detail_slug}" if _subtype_real else ""
+                    _detail_href = f"properties/{_combined_page}.html{_spell_frag}"
+                    # Cost links to the same spell section (no tier-based anchor).
+                    cost_cell = link(_detail_href, cost_str) if cost_str else ""
+                else:
+                    _detail_href = f"properties/{_detail_slug}.html"
+                    if cost_str:
+                        _cost_anch = _cost_anchor(cost_str)
+                        _cost_href = f"{_detail_href}#{_cost_anch}" if _cost_anch else _detail_href
+                        cost_cell = link(_cost_href, cost_str)
+                    else:
+                        cost_cell = ""
                 if _subtype_real:
                     pname_cell = colorize_damage_words(link(_idx_anch, pname))
                     subtype_cell = colorize_damage_words(link(_detail_href, subtype))
                 else:
                     pname_cell = colorize_damage_words(link(_detail_href, pname))
                     subtype_cell = colorize_damage_words(E(subtype))
-                if cost_str:
-                    _cost_anch = _cost_anchor(cost_str)
-                    _cost_href = f"{_detail_href}#{_cost_anch}" if _cost_anch else _detail_href
-                    cost_cell = link(_cost_href, cost_str)
-                else:
-                    cost_cell = ""
             else:
                 pname_cell = colorize_damage_words(E(pname))
                 subtype_cell = colorize_damage_words(E(subtype))
@@ -6498,8 +6519,10 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                         _si = _iprp_name_spell_info(_spell_tbl, subtype) if subtype else None
                         _lvl, _cls = _spell_level_classes(_si)
                         _spell_cells = f"<td>{E(_lvl)}</td><td>{E(_cls)}</td>"
+                    _comb = _COMBINED_PROP_PAGES.get(pname)
+                    href = f"{_comb}.html#{slug}" if _comb else f"{slug}.html"
                     body += (
-                        f'<tr id="{E(slug)}"><td>{link(f"{slug}.html", label)}</td>'
+                        f'<tr id="{E(slug)}"><td>{link(href, label)}</td>'
                         f"{_spell_cells}<td>{cnt}</td></tr>"
                     )
                 body += "</tbody></table>"
@@ -6547,6 +6570,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
 
     # --- per-property detail pages ---
     for (pname, subtype), entries in prop_index.items():
+        if pname in _COMBINED_PROP_PAGES:
+            continue  # rendered as a single combined page below
         slug = _prop_slug(pname, subtype)
         label = pname + (f": {subtype}" if subtype else "")
         tiers = _cost_tiers(entries)
@@ -6712,7 +6737,91 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         write(out / "items" / "properties" / f"{slug}.html",
               page(label, layout, root_rel="../.."))
 
+    # --- combined property pages (one page per property, all subtypes together) ---
+    for pname, combined_slug in _COMBINED_PROP_PAGES.items():
+        if pname not in subtype_rows:
+            continue
+        _comb_rows = subtype_rows[pname]  # [(subtype, slug, tiers)], sorted level desc
+        _spell_tbl = _SPELL_PROP_TABLES.get(pname)
+        _has_spell_info = bool(_spell_tbl and any(
+            v for v in SPELL_INFO.get(_spell_tbl, {}).values() if v
+        ))
 
+        total_items = sum(sum(c for _, _, c in tiers) for _, _, tiers in _comb_rows)
+
+        # Sidebar ToC: spell level group headings + per-spell anchor links.
+        toc_parts: list[str] = []
+        toc_parts.append(f'<div><a href="index.html#{E(_pname_anchor(pname))}">← Browse by Property</a></div>')
+        _cur_toc_lvl: object = object()
+        for sib_sub, sib_slug, sib_tiers in _comb_rows:
+            _ssi = _iprp_name_spell_info(_spell_tbl, sib_sub) if _has_spell_info and sib_sub else None
+            _slvl = _ssi.get("innate_level") if _ssi else None
+            lvl_heading = "Cantrip" if _slvl == 0 else (f"Level {_slvl}" if _slvl is not None else "")
+            if lvl_heading != _cur_toc_lvl:
+                _cur_toc_lvl = lvl_heading
+                if lvl_heading:
+                    toc_parts.append(f'<div class="toc-group-heading">{E(lvl_heading)}</div>')
+            sib_label = sib_sub if sib_sub else pname
+            sib_count = sum(c for _, _, c in sib_tiers)
+            toc_parts.append(
+                f'<div><a href="#{E(sib_slug)}">{E(sib_label)}'
+                f' <span class="muted">({sib_count})</span></a></div>'
+            )
+
+        # Main content: h2 per spell level, h3 + flat table per spell.
+        body = f"<h1>{E(pname)}</h1>"
+        body += f"<p>{total_items} items across {len(_comb_rows)} spells.</p>"
+        _cur_body_lvl: object = object()
+        for subtype, slug, tiers in _comb_rows:
+            _si = _iprp_name_spell_info(_spell_tbl, subtype) if _has_spell_info and subtype else None
+            _lvl = _si.get("innate_level") if _si else None
+            _dlvl, _dcls = _spell_level_classes(_si)
+
+            lvl_heading = "Cantrip" if _lvl == 0 else (f"Level {_lvl}" if _lvl is not None else "")
+            if lvl_heading != _cur_body_lvl:
+                _cur_body_lvl = lvl_heading
+                if lvl_heading:
+                    lvl_anchor = re.sub(r"[^a-z0-9]+", "-", lvl_heading.lower()).strip("-")
+                    body += f'<h2 id="{E(lvl_anchor)}">{E(lvl_heading)}</h2>'
+
+            entries = prop_index.get((pname, subtype), [])
+            cnt = sum(c for _, _, c in tiers)
+            label = subtype if subtype else pname
+
+            body += f'<h3 id="{E(slug)}">{E(label)} <small class="muted">({cnt})</small></h3>'
+            if _has_spell_info and (_dlvl or _dcls):
+                body += '<dl class="meta">'
+                if _dlvl:
+                    body += f"<dt>Spell Level</dt><dd>{E(_dlvl)}</dd>"
+                if _dcls:
+                    body += f"<dt>Caster Classes</dt><dd>{E(_dcls)}</dd>"
+                body += "</dl>"
+
+            has_qty = any(e[4] > 1 for e in entries)
+            body += (
+                '<table class="data"><thead><tr>'
+                "<th>Name</th><th>Type</th><th>Uses</th>"
+                + ("<th>Qty</th>" if has_qty else "")
+                + "<th>Where to Find</th>"
+                "</tr></thead><tbody>"
+            )
+            for resref, name, cost_str, _, qty in entries:
+                _icat = _item_category(db.items[resref], nwn_text(name))
+                itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
+                uses_cell = E(cost_str) if cost_str else '<span class="muted">—</span>'
+                body += (
+                    f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                    f"<td>{itype_link}</td>"
+                    f"<td>{uses_cell}</td>"
+                    + (f"<td>{qty}</td>" if has_qty else "")
+                    + f"<td>{_where_snippet(db, resref)}</td></tr>"
+                )
+            body += "</tbody></table>"
+
+        combined_sidebar = '<aside class="items-toc">' + "".join(toc_parts) + '</aside>'
+        layout = f'<div class="items-layout">{combined_sidebar}<div class="items-content">{body}</div></div>'
+        write(out / "items" / "properties" / f"{combined_slug}.html",
+              page(pname, layout, root_rel="../.."))
 
 
 # ---------------------------------------------------------------------------
@@ -6887,7 +6996,7 @@ function render(rows,showProps,showAccess){
       var propLink='<a href="'+esc(pIdxHref)+'">'+esc(p.prop)+'</a>';
       var detail='';
       if(p.subtype||p.cost){
-        var dHref='properties/'+p.detail_slug+'.html'+(p.cost_anchor?'#'+p.cost_anchor:'');
+        var dHref=p.detail_href?'properties/'+p.detail_href:'properties/'+p.detail_slug+'.html'+(p.cost_anchor?'#'+p.cost_anchor:'');
         if(p.subtype&&p.cost){
           detail=': <a href="'+esc(dHref)+'">'+esc(p.subtype)+' \u2014 '+esc(p.cost)+'</a>';
         }else if(p.subtype){
@@ -6955,6 +7064,12 @@ def render_items_search(db: "Db", out: Path) -> None:
             prop_idx_anchor = "pn-" + _prop_slug(pname, "")
             detail_slug = _prop_slug(pname, f["subtype"])
             cost_anchor = _cost_anchor(f["cost"]) if f["cost"] else ""
+            _is_raw_sub = _is_raw_subtype(f["subtype"]) if f["subtype"] else False
+            _comb_pg = _COMBINED_PROP_PAGES.get(pname)
+            if _comb_pg and f["subtype"] and not _is_raw_sub:
+                detail_href = f"{_comb_pg}.html#{detail_slug}"
+            else:
+                detail_href = ""
             if pname == "Immunity: Specific Spell" and not subtype and cost:
                 subtype, cost = cost, ""
             props.append({
@@ -6965,6 +7080,7 @@ def render_items_search(db: "Db", out: Path) -> None:
                 "prop_idx_anchor": prop_idx_anchor,
                 "detail_slug": detail_slug,
                 "cost_anchor": cost_anchor,
+                "detail_href": detail_href,
             })
         _cat = _item_category(i, nwn_text(name))
         index.append({
