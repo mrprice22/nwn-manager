@@ -5490,7 +5490,8 @@ def _items_col_flags(items: list[tuple[str, dict]]) -> tuple[bool, bool]:
     return show_base, show_stack
 
 
-def _items_table_head(show_base: bool, show_stack: bool, show_ac: bool = False) -> str:
+def _items_table_head(show_base: bool, show_stack: bool, show_ac: bool = False,
+                      show_reason: bool = False) -> str:
     cols = ["<th>Name</th>", "<th>ResRef</th>"]
     if show_base:
         cols.append("<th>Base item</th>")
@@ -5499,11 +5500,13 @@ def _items_table_head(show_base: bool, show_stack: bool, show_ac: bool = False) 
     cols.append("<th>GP Value</th>")
     if show_stack:
         cols.append("<th>Stack</th>")
+    if show_reason:
+        cols.append("<th>Reason</th>")
     return '<table class="data"><thead><tr>' + "".join(cols) + "</tr></thead><tbody>"
 
 
 def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
-               prefix: str = "", show_ac: bool = False) -> str:
+               prefix: str = "", show_ac: bool = False, reason: str | None = None) -> str:
     cells = [
         f"<td>{link(f'{prefix}{rr}.html', db.item_name(rr))}</td>",
         f"<td>{E(rr)}</td>",
@@ -5516,7 +5519,15 @@ def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
     cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
     if show_stack:
         cells.append(f"<td>{E(fld(i, 'StackSize', ''))}</td>")
+    if reason is not None:
+        cells.append(f"<td>{reason}</td>")
     return "<tr>" + "".join(cells) + "</tr>"
+
+
+def _inaccessible_reason_html(rr: str, db: "Db") -> str:
+    if db.item_carried_by.get(rr):
+        return '<span class="reason-undroppable">Undroppable / Cursed / Plot</span>'
+    return '<span class="reason-missing">Not found anywhere</span>'
 
 
 def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out: Path) -> None:
@@ -5608,13 +5619,14 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
         show_base, show_stack = _items_col_flags(items)
         show_ac = cat_key.startswith("armor_")
         rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, prefix="../", show_ac=show_ac)
+            _items_row(rr, i, db, show_base, show_stack, prefix="../", show_ac=show_ac,
+                       reason=_inaccessible_reason_html(rr, db))
             for rr, i in items
         )
         body += (
             f'<h2 id="{E(slug)}">{E(cat_label)}'
             f' <small class="muted">({len(items)})</small></h2>'
-            + _items_table_head(show_base, show_stack, show_ac) + rows_html + "</tbody></table>"
+            + _items_table_head(show_base, show_stack, show_ac, show_reason=True) + rows_html + "</tbody></table>"
         )
 
     layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'

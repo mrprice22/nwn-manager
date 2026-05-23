@@ -412,6 +412,8 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.95em;
 }
+.reason-missing     { color: #888; font-size: 0.9em; }
+.reason-undroppable { color: #b07820; font-size: 0.9em; font-style: italic; }
 .badge-no-drop {
   background: #dde3f5;
   color: #3a4a80;
