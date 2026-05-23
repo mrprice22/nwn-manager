@@ -211,7 +211,8 @@
     },
     "44": {
       "name": "Light",
-      "cost_table": "iprp_lightcost"
+      "cost_table": "iprp_lightcost",
+      "param1_table": "iprp_lightcolor"
     },
     "45": {
       "name": "Mighty",
@@ -528,16 +529,17 @@
       "11": "32"
     },
     "iprp_lightcost": {
-      "0": "Dim",
-      "1": "Low",
-      "2": "Normal",
-      "3": "Bright"
+      "1": "Dim",
+      "2": "Low",
+      "3": "Normal",
+      "4": "Bright"
     },
     "iprp_weightcost": {
-      "0": "80% reduction",
-      "1": "60% reduction",
-      "2": "40% reduction",
-      "3": "20% reduction"
+      "1": "80% reduction",
+      "2": "60% reduction",
+      "3": "40% reduction",
+      "4": "20% reduction",
+      "5": "10% reduction"
     },
     "iprp_containcost": {
       "0": "Universal",
@@ -597,10 +599,9 @@
       "0": "5 lb",
       "1": "10 lb",
       "2": "15 lb",
-      "3": "20 lb",
-      "4": "25 lb",
-      "5": "50 lb",
-      "6": "100 lb"
+      "3": "30 lb",
+      "4": "50 lb",
+      "5": "100 lb"
     },
     "iprp_abilities": {
       "0": "Strength",

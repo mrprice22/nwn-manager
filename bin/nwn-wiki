@@ -648,6 +648,8 @@ def itemprop_format(prop: dict) -> dict[str, str]:
     # Param1: 255 is the engine "no param" sentinel.
     # For certain (property, subtype) combos the Param1Value further qualifies
     # the subtype — e.g. "Slay Racial Group" becomes "Slay Racial Group: Elf".
+    # For properties with a direct param1_table (e.g. Light → iprp_lightcolor),
+    # the param column shows the resolved label (e.g. "Green") instead of "9/4".
     param_str = ""
     if param1 is not None and int(param1) != 255:
         p1_for_sub = pdef.get("param1_for_subtype", {})
@@ -657,7 +659,12 @@ def itemprop_format(prop: dict) -> dict[str, str]:
             if p1_label:
                 subtype_str = f"{subtype_str}: {p1_label}"
         else:
-            param_str = f"{param1}/{param1_value if param1_value is not None else 0}"
+            direct_p1_tbl = pdef.get("param1_table")
+            if direct_p1_tbl and param1_value is not None:
+                p1_label = _table_lookup(direct_p1_tbl, int(param1_value))
+                param_str = p1_label if p1_label is not None else f"{param1}/{param1_value}"
+            else:
+                param_str = f"{param1}/{param1_value if param1_value is not None else 0}"
 
     return {
         "property": pname,
