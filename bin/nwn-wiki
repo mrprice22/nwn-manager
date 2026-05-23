@@ -861,8 +861,11 @@ SHIELD_BASEITEMS = {14, 56, 57}  # Small / Large / Tower shields (stock 2da rows
 # BaseItem sets for items-index grouping.
 _ARMOR_BASEITEMS:      frozenset[int] = frozenset({16})
 _HELMET_BASEITEMS:     frozenset[int] = frozenset({17})
-_AMMO_BASEITEMS:       frozenset[int] = frozenset({20, 25, 27})                   # Arrow Bolt Bullet
-_CONSUMABLE_BASEITEMS: frozenset[int] = frozenset({46, 49, 75, 81, 104, 105, 106})  # Wand Potion Scroll Grenade etc.
+_AMMO_BASEITEMS:       frozenset[int] = frozenset({20, 25, 27})   # Arrow Bolt Bullet
+_WAND_BASEITEMS:       frozenset[int] = frozenset({46, 106})      # Magic Wand, Crafted Wand
+_POTION_BASEITEMS:     frozenset[int] = frozenset({49, 104})      # Potion, Brewed Potion
+_SCROLL_BASEITEMS:     frozenset[int] = frozenset({75, 105})      # Scroll, Enchanted Scroll
+_GRENADE_BASEITEMS:    frozenset[int] = frozenset({81})           # Grenadelike
 
 # Maps specific accessory BaseItem rows to category keys.
 # Bracers (78) and Gauntlets (36) share one key per the items index design.
@@ -879,6 +882,23 @@ _ACCESSORY_BASEITEM_MAP: dict[int, str] = {
 # Base items that are creature-only (not equippable by players).
 _CREATURE_WEAPON_BASEITEMS: frozenset[int] = frozenset({69, 70, 71, 72})
 _CREATURE_ITEM_BASEITEMS:   frozenset[int] = frozenset({73})
+
+# Named misc subtypes matched by base item ID.
+_MISC_TYPE_MAP: dict[int, str] = {
+    44: "magic_rod",
+    45: "magic_staff",
+    74: "book",
+    77: "gem",
+}
+
+# Miscellaneous-subtype base items that get name-based sub-categorization.
+_MISC_LIKE_BASEITEMS: frozenset[int] = frozenset({24, 29, 34, 79, 83, 84, 85, 86, 307, 311})
+
+# CEP weapon base item IDs not present in weapons.json (stock IDs only cover 0–112).
+_CEP_WEAPON_BASEITEMS: frozenset[int] = frozenset({
+    300, 301, 302, 303, 304, 305, 308, 309, 310,
+    312, 313, 316, 317, 318, 319, 320, 321, 322, 323, 324,
+})
 
 # Fixed display labels for non-weapon category keys.
 _CATEGORY_LABELS: dict[str, str] = {
@@ -897,7 +917,16 @@ _CATEGORY_LABELS: dict[str, str] = {
     "ring":              "Rings",
     "cloak":             "Cloaks",
     "ammo":              "Ammunition",
-    "consumable":        "Consumables",
+    "wand":              "Wands",
+    "potion":            "Potions",
+    "scroll":            "Scrolls",
+    "grenade":           "Grenades",
+    "book":              "Books",
+    "magic_rod":         "Magic Rods",
+    "magic_staff":       "Magic Staves",
+    "gem":               "Gems",
+    "dye":               "Dyes",
+    "poison":            "Poisons & Venoms",
     "misc":              "Miscellaneous",
     "creature_item":     "Creature Items",
 }
@@ -906,16 +935,17 @@ _CATEGORY_LABELS: dict[str, str] = {
 # dynamically-discovered weapon_* keys at render time.
 _TOC_GROUPS: list[tuple[str, list[str]]] = [
     ("Weapons",  ["WEAPONS", "ammo"]),
-    ("Armor",    ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield_small", "shield_large", "shield_tower", "helmet"]),
-    ("Gear",     ["amulet", "belt", "boots", "bracers_gauntlets", "ring", "cloak"]),
-    ("Misc.",    ["consumable", "misc"]),
+    ("Armor",    ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield_small", "shield_large", "shield_tower"]),
+    ("Gear",     ["amulet", "belt", "boots", "bracers_gauntlets", "ring", "cloak", "helmet"]),
+    ("Misc.",    ["wand", "potion", "scroll", "grenade", "book", "magic_rod", "magic_staff", "gem", "dye", "poison", "misc"]),
 ]
 # Special heading covers creature weapons, creature items, inaccessible, and broken.
 
 
-def _item_category(item: dict) -> str:
+def _item_category(item: dict, name: str = "") -> str:
     """Return the items-index category key for an item dict."""
-    bi = int(fld(item, "BaseItem", -1) or -1)
+    _raw = fld(item, "BaseItem", None)
+    bi = -1 if _raw is None else int(_raw)
     if bi in _ARMOR_BASEITEMS:
         ac = _torso_base_ac(item)
         if ac <= 0:
@@ -935,15 +965,27 @@ def _item_category(item: dict) -> str:
         return "helmet"
     if bi in _ACCESSORY_BASEITEM_MAP:
         return _ACCESSORY_BASEITEM_MAP[bi]
-    if bi in _CONSUMABLE_BASEITEMS:
-        return "consumable"
+    if bi in _WAND_BASEITEMS:    return "wand"
+    if bi in _POTION_BASEITEMS:  return "potion"
+    if bi in _SCROLL_BASEITEMS:  return "scroll"
+    if bi in _GRENADE_BASEITEMS: return "grenade"
     if bi in _AMMO_BASEITEMS:
         return "ammo"
     stats = WEAPONS.get(bi)
     if stats and stats.get("WeaponType", "0") not in ("0", "", None):
         return f"weapon_{bi}"
+    if bi in _CEP_WEAPON_BASEITEMS:
+        return f"weapon_{bi}"
     if bi in _CREATURE_ITEM_BASEITEMS:
         return "creature_item"
+    mapped = _MISC_TYPE_MAP.get(bi)
+    if mapped:
+        return mapped
+    if bi in _MISC_LIKE_BASEITEMS or bi == -1:
+        nl = name.lower()
+        if "gem" in nl or " agate" in nl: return "gem"
+        if "dye" in nl:                   return "dye"
+        if "poison" in nl or "venom" in nl: return "poison"
     return "misc"
 
 
@@ -5017,7 +5059,7 @@ def _creature_detail_sections(
             if irr in db.items:
                 iname = db.item_name(irr)
                 iobj = db.items[irr]
-                cat_key = _item_category(iobj)
+                cat_key = _item_category(iobj, nwn_text(iname))
                 cat_label = _item_category_label(cat_key)
                 cat_slug = cat_key.replace("_", "-")
                 type_cell = link(f"{items_dir}/index.html#{E(cat_slug)}", cat_label)
@@ -5455,7 +5497,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
 
     buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
     for rr, i in inaccessible:
-        buckets[_item_category(i)].append((rr, i))
+        buckets[_item_category(i, nwn_text(db.item_name(rr)))].append((rr, i))
 
     for key in buckets:
         buckets[key].sort(key=_item_cost_key, reverse=True)
@@ -5565,7 +5607,7 @@ def render_items_index(db: Db, out: Path) -> None:
                 or rr in db.item_from_script
             )
             if accessible:
-                buckets[_item_category(i)].append((rr, i))
+                buckets[_item_category(i, nwn_text(name))].append((rr, i))
             else:
                 inaccessible.append((rr, i))
 
@@ -5743,7 +5785,8 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     props = list_items(i.get("PropertiesList"))
     is_cursed = bool(int(fld(i, "Cursed", 0) or 0))
     is_plot   = bool(int(fld(i, "Plot",   0) or 0))
-    _bi = int(fld(i, "BaseItem", -1) or -1)
+    _bi_raw = fld(i, "BaseItem", None)
+    _bi = -1 if _bi_raw is None else int(_bi_raw)
     is_creature_item = _bi in _CREATURE_WEAPON_BASEITEMS or _bi in _CREATURE_ITEM_BASEITEMS
     _carriers = db.item_carried_by.get(resref, [])
     _any_droppable = any(e.get("dropable") for e in _carriers)
@@ -5767,7 +5810,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         _drop_label = "No"
         _drop_reason = " — not flagged droppable"
         _drop_tt = "title=\"No creature carrying this item has it flagged as droppable. It will not appear in any loot bag.\""
-    _cat_slug = _item_category(i).replace("_", "-")
+    _cat_slug = _item_category(i, nwn_text(display_name)).replace("_", "-")
     if is_broken:
         _type_href = f"index.html#broken"
     elif is_inaccessible:
@@ -5780,7 +5823,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
         f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
-        f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i)))}</dd>",
+        f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i, nwn_text(display_name))))}</dd>",
         *(
             (lambda _ac: [
                 f"<dt>Base AC</dt><dd>{_ac}</dd>",
@@ -6294,7 +6337,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     "</tr></thead><tbody>"
                 )
                 for resref, name, _, _, qty in sub_entries:
-                    _icat = _item_category(db.items[resref])
+                    _icat = _item_category(db.items[resref], nwn_text(name))
                     itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
@@ -6318,7 +6361,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 "</tr></thead><tbody>"
             )
             for resref, name, cost_str, _, qty in entries:
-                _icat = _item_category(db.items[resref])
+                _icat = _item_category(db.items[resref], nwn_text(name))
                 itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
                 body += (
                     f"<tr><td>{link(f'../{resref}.html', name)}</td>"
@@ -6346,7 +6389,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     "</tr></thead><tbody>"
                 )
                 for resref, name, _, _, qty in tier_entries:
-                    _icat = _item_category(db.items[resref])
+                    _icat = _item_category(db.items[resref], nwn_text(name))
                     itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
                     body += (
                         f"<tr><td>{link(f'../{resref}.html', name)}</td>"
@@ -6417,9 +6460,12 @@ fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
 
 var _FIXED_VALS={
   'Heavy Armor':1,'Medium Armor':1,'Light Armor':1,'Cloth & Robes':1,
-  'Small Shields':1,'Large Shields':1,'Tower Shields':1,'Helmets':1,
-  'Amulets':1,'Belts':1,'Boots':1,'Bracers & Gauntlets':1,'Rings':1,'Cloaks':1,
-  'Ammunition':1,'Consumables':1,'Miscellaneous':1,'Creature Items':1
+  'Small Shields':1,'Large Shields':1,'Tower Shields':1,
+  'Helmets':1,'Amulets':1,'Belts':1,'Boots':1,'Bracers & Gauntlets':1,'Rings':1,'Cloaks':1,
+  'Ammunition':1,
+  'Wands':1,'Potions':1,'Scrolls':1,'Grenades':1,
+  'Books':1,'Magic Rods':1,'Magic Staves':1,'Gems':1,'Dyes':1,'Poisons & Venoms':1,
+  'Miscellaneous':1,'Creature Items':1
 };
 
 function _addOpts(grp,opts,bisSet){
@@ -6450,8 +6496,7 @@ function populateFilters(){
       {l:'Cloth & Robes',v:'Cloth & Robes'},
       {l:'Small Shields',v:'Small Shields'},
       {l:'Large Shields',v:'Large Shields'},
-      {l:'Tower Shields',v:'Tower Shields'},
-      {l:'Helmets',v:'Helmets'}
+      {l:'Tower Shields',v:'Tower Shields'}
     ]},
     {label:'Weapons',dyn:true,extra:[{l:'Ammunition',v:'Ammunition'}]},
     {label:'Gear',opts:[
@@ -6460,10 +6505,20 @@ function populateFilters(){
       {l:'Boots',v:'Boots'},
       {l:'Bracers & Gauntlets',v:'Bracers & Gauntlets'},
       {l:'Rings',v:'Rings'},
-      {l:'Cloaks',v:'Cloaks'}
+      {l:'Cloaks',v:'Cloaks'},
+      {l:'Helmets',v:'Helmets'}
     ]},
     {label:'Misc.',opts:[
-      {l:'Consumables',v:'Consumables'},
+      {l:'Wands',v:'Wands'},
+      {l:'Potions',v:'Potions'},
+      {l:'Scrolls',v:'Scrolls'},
+      {l:'Grenades',v:'Grenades'},
+      {l:'Books',v:'Books'},
+      {l:'Magic Rods',v:'Magic Rods'},
+      {l:'Magic Staves',v:'Magic Staves'},
+      {l:'Gems',v:'Gems'},
+      {l:'Dyes',v:'Dyes'},
+      {l:'Poisons & Venoms',v:'Poisons & Venoms'},
       {l:'Miscellaneous',v:'Miscellaneous'},
       {l:'Creature Items',v:'Creature Items'}
     ]}
@@ -6608,7 +6663,8 @@ def render_items_search(db: "Db", out: Path) -> None:
         name = db.item_name(resref)
         if name.startswith("[TLK#") or name == resref:
             continue
-        bi = int(fld(i, "BaseItem", -1) or -1)
+        _bi_raw = fld(i, "BaseItem", None)
+        bi = -1 if _bi_raw is None else int(_bi_raw)
         try:
             cost_val = int(fld(i, "Cost", 0) or 0)
         except (TypeError, ValueError):
@@ -6636,7 +6692,7 @@ def render_items_search(db: "Db", out: Path) -> None:
                 "detail_slug": detail_slug,
                 "cost_anchor": cost_anchor,
             })
-        _cat = _item_category(i)
+        _cat = _item_category(i, nwn_text(name))
         index.append({
             "resref": resref,
             "name": nwn_text(name),
