@@ -94,16 +94,30 @@ def read_tlk(path: Path) -> dict[int, str]:
     return out
 
 
-def _load_stock_item_names() -> dict[str, str]:
+def _load_stock_item_names() -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
     p = DATA_DIR / "stock_item_names.json"
     if not p.exists():
-        return {}
+        return {}, {}, {}
     raw = json.loads(p.read_text())
-    return {k: v["name"] for k, v in raw.items()
-            if not k.startswith("_") and isinstance(v, dict) and "name" in v}
+    names: dict[str, str] = {}
+    base_items: dict[str, int] = {}
+    costs: dict[str, int] = {}
+    for k, v in raw.items():
+        if k.startswith("_") or not isinstance(v, dict):
+            continue
+        if "name" in v:
+            names[k] = v["name"]
+        if "base_item" in v:
+            base_items[k] = int(v["base_item"])
+        if "cost" in v and v["cost"]:
+            costs[k] = int(v["cost"])
+    return names, base_items, costs
 
 
-STOCK_ITEM_NAMES: dict[str, str] = _load_stock_item_names()
+STOCK_ITEM_NAMES: dict[str, str]
+STOCK_ITEM_BASE: dict[str, int]
+STOCK_ITEM_COST: dict[str, int]
+STOCK_ITEM_NAMES, STOCK_ITEM_BASE, STOCK_ITEM_COST = _load_stock_item_names()
 
 
 def loc(node: Any, lang: int = 0) -> str:
@@ -885,8 +899,11 @@ _CREATURE_ITEM_BASEITEMS:   frozenset[int] = frozenset({73})
 
 # Named misc subtypes matched by base item ID.
 _MISC_TYPE_MAP: dict[int, str] = {
+    39: "tool_kit",   # Healer's Kit
     44: "magic_rod",
     45: "magic_staff",
+    62: "tool_kit",   # Thieves' Tools
+    64: "tool_kit",   # Trap Kit
     74: "book",
     77: "gem",
 }
@@ -927,6 +944,7 @@ _CATEGORY_LABELS: dict[str, str] = {
     "gem":               "Gems",
     "dye":               "Dyes",
     "poison":            "Poisons & Venoms",
+    "tool_kit":          "Tools & Kits",
     "misc":              "Miscellaneous",
     "creature_item":     "Creature Items",
 }
@@ -937,7 +955,7 @@ _TOC_GROUPS: list[tuple[str, list[str]]] = [
     ("Weapons",  ["WEAPONS", "ammo"]),
     ("Armor",    ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield_small", "shield_large", "shield_tower"]),
     ("Gear",     ["amulet", "belt", "boots", "bracers_gauntlets", "ring", "cloak", "helmet"]),
-    ("Misc.",    ["wand", "potion", "scroll", "grenade", "book", "magic_rod", "magic_staff", "gem", "dye", "poison", "misc"]),
+    ("Misc.",    ["wand", "potion", "scroll", "grenade", "book", "magic_rod", "magic_staff", "gem", "dye", "poison", "tool_kit", "misc"]),
 ]
 # Special heading covers creature weapons, creature items, inaccessible, and broken.
 
@@ -1497,6 +1515,16 @@ class Db:
         for inst_list in self.area_stores.values():
             for inst in inst_list:
                 _absorb_store_pages(list_items(inst.get("StoreList")))
+
+        # For stock-game items that landed in db.items as sparse store-entry
+        # dicts (no standalone .uti blueprint), back-fill BaseItem and Cost from
+        # the pre-built stock_item_names.json so that categorization and the
+        # GP Value / Base Item columns work correctly on the items index.
+        for irr, it in self.items.items():
+            if fld(it, "BaseItem") is None and irr in STOCK_ITEM_BASE:
+                it["BaseItem"] = STOCK_ITEM_BASE[irr]
+            if fld(it, "Cost", "") in ("", None) and irr in STOCK_ITEM_COST:
+                it["Cost"] = STOCK_ITEM_COST[irr]
 
         # Build item-source cross-references for item pages.
         for area_rr, store_list in self.area_stores.items():
