@@ -94,14 +94,15 @@ def read_tlk(path: Path) -> dict[int, str]:
     return out
 
 
-def _load_stock_item_names() -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
+def _load_stock_item_names() -> tuple[dict[str, str], dict[str, int], dict[str, int], dict[str, list]]:
     p = DATA_DIR / "stock_item_names.json"
     if not p.exists():
-        return {}, {}, {}
+        return {}, {}, {}, {}
     raw = json.loads(p.read_text())
     names: dict[str, str] = {}
     base_items: dict[str, int] = {}
     costs: dict[str, int] = {}
+    props: dict[str, list] = {}
     for k, v in raw.items():
         if k.startswith("_") or not isinstance(v, dict):
             continue
@@ -111,13 +112,16 @@ def _load_stock_item_names() -> tuple[dict[str, str], dict[str, int], dict[str, 
             base_items[k] = int(v["base_item"])
         if "cost" in v and v["cost"]:
             costs[k] = int(v["cost"])
-    return names, base_items, costs
+        if "properties" in v and isinstance(v["properties"], list):
+            props[k] = v["properties"]
+    return names, base_items, costs, props
 
 
 STOCK_ITEM_NAMES: dict[str, str]
 STOCK_ITEM_BASE: dict[str, int]
 STOCK_ITEM_COST: dict[str, int]
-STOCK_ITEM_NAMES, STOCK_ITEM_BASE, STOCK_ITEM_COST = _load_stock_item_names()
+STOCK_ITEM_PROPS: dict[str, list]
+STOCK_ITEM_NAMES, STOCK_ITEM_BASE, STOCK_ITEM_COST, STOCK_ITEM_PROPS = _load_stock_item_names()
 
 
 def loc(node: Any, lang: int = 0) -> str:
@@ -563,21 +567,27 @@ def _spell_level_classes(info: dict | None) -> tuple[str, str]:
     return (level_str, classes_str)
 
 
-def _scroll_cast_spell_info(item: dict) -> dict | None:
-    """Return the SPELL_INFO entry for a scroll item's Cast Spell property subtype."""
+def _scroll_cast_spell_info(item: dict, name: str = "") -> dict | None:
+    """Return the SPELL_INFO entry for a scroll item's Cast Spell property subtype.
+
+    Falls back to name-based lookup when PropertiesList is absent (e.g. stock
+    items that appear only as sparse store-inventory references)."""
     for p in list_items(item.get("PropertiesList")):
         pname_id = fld(p, "PropertyName")
         if pname_id is not None and int(pname_id) == _CAST_SPELL_PROP_ID:
             subtype = fld(p, "Subtype")
             if subtype is not None:
                 return _iprp_spell_info("iprp_spells", int(subtype))
+    if name and not list_items(item.get("PropertiesList")):
+        return _iprp_name_spell_info("iprp_spells", name)
     return None
 
 
-def _scroll_spell_sort_key(entry: tuple[str, dict]) -> tuple[int, str]:
+def _scroll_spell_sort_key(entry: tuple[str, dict], db: "Db | None" = None) -> tuple[int, str]:
     """Sort key for scrolls: (innate_level, spell_name_lower)."""
     rr, i = entry
-    info = _scroll_cast_spell_info(i)
+    display_name = nwn_text(db.item_name(rr)) if db else ""
+    info = _scroll_cast_spell_info(i, display_name)
     lvl = info.get("innate_level") if info else None
     for p in list_items(i.get("PropertiesList")):
         pname_id = fld(p, "PropertyName")
@@ -587,7 +597,10 @@ def _scroll_spell_sort_key(entry: tuple[str, dict]) -> tuple[int, str]:
                 sname = _table_lookup("iprp_spells", int(subtype)) or ""
                 return (-(lvl) if lvl is not None else 999, sname.lower())
             break
-    return (-(lvl) if lvl is not None else 999, "")
+    # Name fallback: use item display name as spell name for sort
+    if display_name and lvl is not None:
+        return (-(lvl), display_name.lower())
+    return (-(lvl) if lvl is not None else 999, display_name.lower())
 
 
 def _iprp_name_spell_info(tbl_name: str, spell_name_str: str) -> dict | None:
@@ -1630,15 +1643,18 @@ class Db:
             for inst in inst_list:
                 _absorb_store_pages(list_items(inst.get("StoreList")))
 
-        # For stock-game items that landed in db.items as sparse store-entry
-        # dicts (no standalone .uti blueprint), back-fill BaseItem and Cost from
-        # the pre-built stock_item_names.json so that categorization and the
-        # GP Value / Base Item columns work correctly on the items index.
-        for irr, it in self.items.items():
-            if fld(it, "BaseItem") is None and irr in STOCK_ITEM_BASE:
-                it["BaseItem"] = STOCK_ITEM_BASE[irr]
-            if fld(it, "Cost", "") in ("", None) and irr in STOCK_ITEM_COST:
-                it["Cost"] = STOCK_ITEM_COST[irr]
+        # _backfill_stock_items() is called twice: once here (after store items are
+        # collected) and again after creature inventory items are added below, so
+        # both populations get BaseItem/Cost/PropertiesList filled in.
+        def _backfill_stock_items() -> None:
+            for irr, it in self.items.items():
+                if fld(it, "BaseItem") is None and irr in STOCK_ITEM_BASE:
+                    it["BaseItem"] = STOCK_ITEM_BASE[irr]
+                if fld(it, "Cost", "") in ("", None) and irr in STOCK_ITEM_COST:
+                    it["Cost"] = STOCK_ITEM_COST[irr]
+                if not list_items(it.get("PropertiesList")) and irr in STOCK_ITEM_PROPS:
+                    it["PropertiesList"] = STOCK_ITEM_PROPS[irr]
+        _backfill_stock_items()
 
         # Build item-source cross-references for item pages.
         for area_rr, store_list in self.area_stores.items():
@@ -1716,33 +1732,40 @@ class Db:
                             self.item_carried_by[irr].append(
                                 {"area_rr": area_rr, "crr": crr, "cname": cname, "dropable": dropable}
                             )
+                        if irr not in self.items:
+                            self.items[irr] = it
         for crr, spawns in self.creature_encounter_spawns.items():
             bp = self.creatures.get(crr, {})
             if not bp:
                 continue
             cname = self.creature_name(crr)
-            item_entries: list[tuple[str, bool]] = []  # (irr, dropable)
+            item_entries: list[tuple[str, bool, dict]] = []  # (irr, dropable, item_dict)
             for e in list_items(bp.get("Equip_ItemList")):
                 irr = (fld(e, "EquippedRes", "")
                        or fld(e, "TemplateResRef", "") or "").strip()
                 if irr:
-                    item_entries.append((irr, bool(int(fld(e, "Dropable", 0) or 0))))
+                    item_entries.append((irr, bool(int(fld(e, "Dropable", 0) or 0)), e))
             for it in list_items(bp.get("ItemList")):
                 irr = (fld(it, "InventoryRes", "")
                        or fld(it, "TemplateResRef", "") or "").strip()
                 if irr:
-                    item_entries.append((irr, bool(int(fld(it, "Dropable", 0) or 0))))
+                    item_entries.append((irr, bool(int(fld(it, "Dropable", 0) or 0)), it))
             for spawn in spawns:
                 area_rr = spawn["area"]
                 if area_rr in self.hidden_areas:
                     continue
-                for irr, dropable in item_entries:
+                for irr, dropable, item_dict in item_entries:
                     key = (irr, area_rr, crr)
                     if key not in _seen_carrier:
                         _seen_carrier.add(key)
                         self.item_carried_by[irr].append(
                             {"area_rr": area_rr, "crr": crr, "cname": cname, "dropable": dropable}
                         )
+                    if irr not in self.items:
+                        self.items[irr] = item_dict
+
+        # Second pass: back-fill stock data for creature-inventory items added above.
+        _backfill_stock_items()
 
         hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
                       if self.hidden_areas else "")
@@ -5631,7 +5654,7 @@ def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
         _mac = _torso_base_ac(i)
         cells.append(f"<td>{_mac if _mac is not None else ''}</td>")
     if show_spell_info:
-        _lvl, _cls = _spell_level_classes(_scroll_cast_spell_info(i))
+        _lvl, _cls = _spell_level_classes(_scroll_cast_spell_info(i, nwn_text(db.item_name(rr))))
         cells.append(f"<td>{E(_lvl)}</td>")
         cells.append(f"<td>{E(_cls)}</td>")
     cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
@@ -5816,7 +5839,7 @@ def render_items_index(db: Db, out: Path) -> None:
     # Sort each bucket: scrolls by (innate_level, spell_name), others by decreasing GP cost.
     for key in buckets:
         if key == "scroll":
-            buckets[key].sort(key=_scroll_spell_sort_key)
+            buckets[key].sort(key=lambda e: _scroll_spell_sort_key(e, db))
         else:
             buckets[key].sort(key=_item_cost_key, reverse=True)
 
@@ -5997,7 +6020,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         _type_href = f"index.html#{_cat_slug}"
     _is_scroll = _bi in _SCROLL_BASEITEMS
     _scroll_spell_lvl, _scroll_spell_cls = (
-        _spell_level_classes(_scroll_cast_spell_info(i)) if _is_scroll else ("", "")
+        _spell_level_classes(_scroll_cast_spell_info(i, nwn_text(display_name))) if _is_scroll else ("", "")
     )
     sections = [
         f"<h1>{nwn_html(display_name)}</h1>",
