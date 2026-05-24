@@ -9143,6 +9143,134 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         print(f"[nwn-wiki] rendered {total} manual page(s) from {manual_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Tag-conflict report
+# ---------------------------------------------------------------------------
+
+def generate_tag_conflict_report(
+    db: "Db",
+    project_root: Path,
+    module_title: str,
+    wiki_out: Path,
+    base_url: str,
+) -> None:
+    """Scan all item blueprints for shared TAG values with differing properties.
+
+    Writes item_tag_conflicts.json to project_root (the directory that *contains*
+    the unpacked/ tree, not inside it).  Items whose TAG is empty or identical to
+    their resref are skipped.  Groups where every variant has exactly the same
+    property set are also skipped — only genuine differences are reported.
+
+    Each variant includes a wiki_url field:
+      - Fully-qualified URL when base_url is set (e.g. https://…/items/foo.html)
+      - Relative path from project_root when base_url is empty (e.g. docs/items/foo.html)
+    """
+
+    # Build a URL or relative path for a single item resref.
+    if base_url:
+        _url_prefix = base_url.rstrip("/") + "/items/"
+        def _item_url(resref: str) -> str:
+            return _url_prefix + resref + ".html"
+    else:
+        try:
+            rel_wiki = wiki_out.relative_to(project_root)
+        except ValueError:
+            rel_wiki = wiki_out  # wiki is outside project root; use absolute path
+        _rel_prefix = str(rel_wiki).rstrip("/") + "/items/"
+        def _item_url(resref: str) -> str:
+            return _rel_prefix + resref + ".html"
+
+    # Group resrefs by their TAG value (case-insensitive; blank tags ignored).
+    tag_groups: dict[str, list[str]] = defaultdict(list)
+    for resref, item in db.items.items():
+        tag = (fld(item, "Tag") or "").strip()
+        if tag and tag.lower() != resref.lower():
+            tag_groups[tag.lower()].append(resref)
+
+    def _prop_sig(item: dict) -> frozenset[str]:
+        return frozenset(itemprop_oneliner(p) for p in list_items(item.get("PropertiesList")))
+
+    def _item_sources(resref: str) -> list[str]:
+        sources: list[str] = []
+        for s in db.item_sold_at.get(resref, []):
+            area = db.area_name(s["area_rr"]) if "area_rr" in s else ""
+            label = nwn_text(s["name"])
+            sources.append("Sold at: " + label + (f" ({area})" if area else ""))
+        for c in db.item_in_container.get(resref, []):
+            area = db.area_name(c["area_rr"]) if "area_rr" in c else ""
+            pname = nwn_text(c.get("pname", ""))
+            sources.append("In container: " + pname + (f" ({area})" if area else ""))
+        for c in db.item_carried_by.get(resref, []):
+            area = db.area_name(c["area_rr"]) if "area_rr" in c else ""
+            cname = nwn_text(c.get("cname", ""))
+            sources.append("Carried by: " + cname + (f" ({area})" if area else ""))
+        for s in db.item_from_script.get(resref, []):
+            sources.append("Script: " + (s.get("label") or s.get("script", "")))
+        return sources
+
+    conflicts: list[dict] = []
+    for _tag_lower, resrefs in sorted(tag_groups.items()):
+        if len(resrefs) < 2:
+            continue
+        sigs = {rr: _prop_sig(db.items[rr]) for rr in resrefs}
+        unique_sigs = set(frozenset(s) for s in sigs.values())
+        if len(unique_sigs) == 1:
+            continue  # all variants identical — not a conflict
+
+        # Canonical tag: take from the first alphabetically-sorted item.
+        canonical_tag = (fld(db.items[sorted(resrefs)[0]], "Tag") or "").strip()
+
+        variants: list[dict] = []
+        for rr in sorted(resrefs):
+            item = db.items[rr]
+            name = nwn_text(db.item_name(rr))
+            bi = fld(item, "BaseItem")
+            base_name = baseitem_name(bi) if bi is not None else ""
+            try:
+                cost = int(fld(item, "Cost", 0) or 0)
+            except (TypeError, ValueError):
+                cost = 0
+            props = sorted(sigs[rr])
+            variants.append({
+                "resref": rr,
+                "name": name,
+                "base_item": base_name,
+                "cost_gp": cost,
+                "wiki_url": _item_url(rr),
+                "properties": props,
+                "found_at": _item_sources(rr),
+            })
+
+        conflicts.append({
+            "shared_tag": canonical_tag,
+            "item_count": len(resrefs),
+            "variants": variants,
+            "recommendation": (
+                "Give each variant a unique tag (and consider a matching unique resref) "
+                "so scripts, players, and the wiki can unambiguously identify each item."
+            ),
+        })
+
+    report = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "module": module_title,
+        "conflict_count": len(conflicts),
+        "summary": (
+            f"{len(conflicts)} item tag conflict(s) found across "
+            f"{sum(c['item_count'] for c in conflicts)} item variants."
+            if conflicts else "No item tag conflicts found."
+        ),
+        "conflicts": conflicts,
+    }
+
+    out_path = project_root / "item_tag_conflicts.json"
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    if conflicts:
+        print(f"[nwn-wiki] tag conflicts: {len(conflicts)} conflict(s) written → {out_path}")
+    else:
+        print(f"[nwn-wiki] tag conflicts: none found → {out_path}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", required=True, help="path to unpacked/ tree")
@@ -9358,6 +9486,9 @@ def main() -> int:
     if not title and db.ifo:
         title = loc(db.ifo.get("Mod_Name")) or "NWN Module"
     title = title or "NWN Module"
+
+    # Tag-conflict burndown list
+    generate_tag_conflict_report(db, src.parent, title, out, args.base_url or "")
 
     # Layout
     print("[nwn-wiki] computing area layout")
