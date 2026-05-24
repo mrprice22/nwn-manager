@@ -809,6 +809,21 @@ def itemprop_format(prop: dict) -> dict[str, str]:
     }
 
 
+def _item_prop_key(props: list) -> tuple:
+    """Stable hashable key for a PropertiesList, used to detect property variants."""
+    parts = []
+    for p in props:
+        parts.append((
+            fld(p, "PropertyName"),
+            fld(p, "Subtype"),
+            fld(p, "CostTable"),
+            fld(p, "CostValue"),
+            fld(p, "Param1"),
+            fld(p, "Param1Value"),
+        ))
+    return tuple(sorted(parts))
+
+
 def itemprop_oneliner(prop: dict) -> str:
     """Compact single-line summary (used in tooltips / loot lists)."""
     f = itemprop_format(prop)
@@ -1439,6 +1454,14 @@ class Db:
         self.item_from_script: dict[str, list[dict]] = defaultdict(list)
         # (area_rr, container_idx) pairs for containers with random-treasure OnOpen
         self.random_treasure_containers: set[tuple[str, int]] = set()
+        # Property-variant tracking: inline items with the same TemplateResRef but
+        # different PropertiesList get synthetic resrefs (base__v2, base__v3 …).
+        # item_variants_of: base_rr → [variant_rr, ...]
+        # item_is_variant_of: variant_rr → base_rr
+        # _item_prop_registry: base_rr → {prop_key → assigned_rr} (internal)
+        self.item_variants_of: dict[str, list[str]] = defaultdict(list)
+        self.item_is_variant_of: dict[str, str] = {}
+        self._item_prop_registry: dict[str, dict[tuple, str]] = {}
 
     # ---- Loading ----
 
@@ -1503,6 +1526,59 @@ class Db:
                 self.fac = obj
             # everything else (palettes, etc.) ignored
         print(f"  loaded {n_loaded} json files + {len(self.scripts)} scripts in {time.time()-t0:.1f}s")
+
+    # ---- Item variant registry ----
+
+    def _intern_item(self, base_rr: str, it: dict) -> str:
+        """Register an inline item and return the resref to use for cross-references.
+
+        Inline items with no PropertiesList defer to the blueprint — they map to
+        base_rr unchanged.  Items with PropertiesList are compared to what is already
+        stored for base_rr; if the properties differ, a synthetic variant resref
+        (base_rr__v2, __v3 …) is created so each unique property set gets its own
+        wiki page and accurate "where to find" listings.
+        """
+        inline_props = list_items(it.get("PropertiesList"))
+
+        if not inline_props:
+            # Thin reference — ensure the base is registered, return it as-is.
+            if base_rr not in self.items:
+                self.items[base_rr] = it
+            return base_rr
+
+        prop_key = _item_prop_key(inline_props)
+        registry = self._item_prop_registry.setdefault(base_rr, {})
+
+        if prop_key in registry:
+            return registry[prop_key]
+
+        if base_rr not in self.items:
+            # First rich instance for this resref — store as the base.
+            self.items[base_rr] = it
+            registry[prop_key] = base_rr
+            return base_rr
+
+        stored_key = _item_prop_key(list_items(self.items[base_rr].get("PropertiesList")))
+
+        if not stored_key:
+            # Stored version is a thin reference (no props) — promote this rich
+            # version to the base so thin refs don't spawn spurious variants.
+            self.items[base_rr] = it
+            registry[prop_key] = base_rr
+            return base_rr
+
+        if stored_key == prop_key:
+            registry[prop_key] = base_rr
+            return base_rr
+
+        # Properties differ — create a numbered variant resref.
+        n = len(self.item_variants_of[base_rr]) + 2
+        variant_rr = f"{base_rr}__v{n}"
+        self.items[variant_rr] = it
+        self.item_variants_of[base_rr].append(variant_rr)
+        self.item_is_variant_of[variant_rr] = base_rr
+        registry[prop_key] = variant_rr
+        return variant_rr
 
     # ---- Indexing ----
 
@@ -1639,41 +1715,23 @@ class Db:
             if "WIKI_HIDDEN" in (fld(a, "Comments") or "").upper()
         }
 
-        # Absorb items embedded inline in store inventories (UTM and GIT) that
-        # have no standalone .uti blueprint. Without this, they are invisible to
-        # the items index and can't be linked from the stores pages.
-        _seen_store_irrs: set[str] = set(self.items.keys())
-        def _absorb_store_pages(pages: list) -> None:
-            for p in pages:
-                for it in list_items(p.get("ItemList")):
-                    irr = (fld(it, "TemplateResRef", "")
-                           or fld(it, "InventoryRes", "") or "").strip()
-                    if irr and irr not in _seen_store_irrs:
-                        _seen_store_irrs.add(irr)
-                        self.items[irr] = it
+        # Build item-source cross-references, absorbing inline items through
+        # _intern_item() so that instances with different PropertiesList get
+        # their own synthetic resref (base__v2, __v3 …) and their own accurate
+        # "where to find" entries rather than being merged under one blueprint.
+
+        # Stand-alone UTM blueprints — absorb items without area cross-refs.
         for s in self.stores.values():
-            _absorb_store_pages(list_items(s.get("StoreList")))
-        for inst_list in self.area_stores.values():
-            for inst in inst_list:
-                _absorb_store_pages(list_items(inst.get("StoreList")))
+            for p in list_items(s.get("StoreList")):
+                for it in list_items(p.get("ItemList")):
+                    base_rr = (fld(it, "TemplateResRef", "")
+                               or fld(it, "InventoryRes", "") or "").strip()
+                    if base_rr:
+                        self._intern_item(base_rr, it)
 
-        # _backfill_stock_items() is called twice: once here (after store items are
-        # collected) and again after creature inventory items are added below, so
-        # both populations get BaseItem/Cost/PropertiesList filled in.
-        def _backfill_stock_items() -> None:
-            for irr, it in self.items.items():
-                if fld(it, "BaseItem") is None and irr in STOCK_ITEM_BASE:
-                    it["BaseItem"] = STOCK_ITEM_BASE[irr]
-                if fld(it, "Cost", "") in ("", None) and irr in STOCK_ITEM_COST:
-                    it["Cost"] = STOCK_ITEM_COST[irr]
-                if not list_items(it.get("PropertiesList")) and irr in STOCK_ITEM_PROPS:
-                    it["PropertiesList"] = STOCK_ITEM_PROPS[irr]
-        _backfill_stock_items()
-
-        # Build item-source cross-references for item pages.
+        # Area store instances — absorb and build item_sold_at.
         for area_rr, store_list in self.area_stores.items():
-            if area_rr in self.hidden_areas:
-                continue
+            skip = area_rr in self.hidden_areas
             for inst in store_list:
                 rr = fld(inst, "ResRef", "") or fld(inst, "TemplateResRef", "")
                 tag = fld(inst, "Tag", "")
@@ -1681,16 +1739,19 @@ class Db:
                 slug = _store_instance_slug(area_rr, inst)
                 for p in list_items(inst.get("StoreList")):
                     for it in list_items(p.get("ItemList")):
-                        irr = (fld(it, "TemplateResRef", "")
-                               or fld(it, "InventoryRes", "")
-                               or fld(it, "EquippedRes", "") or "").strip()
-                        if irr:
-                            self.item_sold_at[irr].append(
-                                {"area_rr": area_rr, "slug": slug, "name": sname}
-                            )
+                        base_rr = (fld(it, "TemplateResRef", "")
+                                   or fld(it, "InventoryRes", "")
+                                   or fld(it, "EquippedRes", "") or "").strip()
+                        if base_rr:
+                            actual_rr = self._intern_item(base_rr, it)
+                            if not skip:
+                                self.item_sold_at[actual_rr].append(
+                                    {"area_rr": area_rr, "slug": slug, "name": sname}
+                                )
+
+        # Container placeables — absorb and build item_in_container.
         for area_rr, containers in self.area_containers.items():
-            if area_rr in self.hidden_areas:
-                continue
+            skip = area_rr in self.hidden_areas
             for c in containers:
                 p = c["p"]
                 idx = c["idx"]
@@ -1700,18 +1761,21 @@ class Db:
                 locked = bool(int(fld(p, "Locked", 0) or 0))
                 dc = fld(p, "OpenLockDC", 0) or 0
                 for it in list_items(p.get("ItemList")):
-                    irr = (fld(it, "TemplateResRef", "")
-                           or fld(it, "InventoryRes", "")
-                           or fld(it, "EquippedRes", "") or "").strip()
-                    if irr:
-                        self.item_in_container[irr].append(
-                            {"area_rr": area_rr, "idx": idx,
-                             "pname": pname, "locked": locked, "dc": dc}
-                        )
+                    base_rr = (fld(it, "TemplateResRef", "")
+                               or fld(it, "InventoryRes", "")
+                               or fld(it, "EquippedRes", "") or "").strip()
+                    if base_rr:
+                        actual_rr = self._intern_item(base_rr, it)
+                        if not skip:
+                            self.item_in_container[actual_rr].append(
+                                {"area_rr": area_rr, "idx": idx,
+                                 "pname": pname, "locked": locked, "dc": dc}
+                            )
+
+        # Creature instances — absorb and build item_carried_by.
         _seen_carrier: set[tuple[str, str, str]] = set()
         for area_rr, insts in self.area_creature_instances.items():
-            if area_rr in self.hidden_areas:
-                continue
+            skip = area_rr in self.hidden_areas
             for inst in insts:
                 c = inst["c"]
                 crr = fld(c, "TemplateResRef", "") or ""
@@ -1725,60 +1789,82 @@ class Db:
                 equip_list = (list_items(c.get("Equip_ItemList"))
                               or list_items(bp.get("Equip_ItemList")))
                 for e in equip_list:
-                    irr = (fld(e, "EquippedRes", "")
-                           or fld(e, "TemplateResRef", "") or "").strip()
-                    if irr:
+                    base_rr = (fld(e, "EquippedRes", "")
+                               or fld(e, "TemplateResRef", "") or "").strip()
+                    if base_rr:
+                        actual_rr = self._intern_item(base_rr, e)
                         dropable = bool(int(fld(e, "Dropable", 0) or 0))
-                        key = (irr, area_rr, crr)
-                        if key not in _seen_carrier:
+                        key = (actual_rr, area_rr, crr)
+                        if key not in _seen_carrier and not skip:
                             _seen_carrier.add(key)
-                            self.item_carried_by[irr].append(
-                                {"area_rr": area_rr, "crr": crr, "cname": cname, "dropable": dropable}
+                            self.item_carried_by[actual_rr].append(
+                                {"area_rr": area_rr, "crr": crr,
+                                 "cname": cname, "dropable": dropable}
                             )
                 for it in list_items(c.get("ItemList")):
-                    irr = (fld(it, "InventoryRes", "")
-                           or fld(it, "TemplateResRef", "") or "").strip()
-                    if irr:
+                    base_rr = (fld(it, "InventoryRes", "")
+                               or fld(it, "TemplateResRef", "") or "").strip()
+                    if base_rr:
+                        actual_rr = self._intern_item(base_rr, it)
                         dropable = bool(int(fld(it, "Dropable", 0) or 0))
-                        key = (irr, area_rr, crr)
-                        if key not in _seen_carrier:
+                        key = (actual_rr, area_rr, crr)
+                        if key not in _seen_carrier and not skip:
                             _seen_carrier.add(key)
-                            self.item_carried_by[irr].append(
-                                {"area_rr": area_rr, "crr": crr, "cname": cname, "dropable": dropable}
+                            self.item_carried_by[actual_rr].append(
+                                {"area_rr": area_rr, "crr": crr,
+                                 "cname": cname, "dropable": dropable}
                             )
-                        if irr not in self.items:
-                            self.items[irr] = it
+
         for crr, spawns in self.creature_encounter_spawns.items():
             bp = self.creatures.get(crr, {})
             if not bp:
                 continue
             cname = self.creature_name(crr)
-            item_entries: list[tuple[str, bool, dict]] = []  # (irr, dropable, item_dict)
+            # Resolve each blueprint item to its variant resref once, then reuse
+            # across all spawn areas (the blueprint's items are constant).
+            item_entries: list[tuple[str, bool]] = []  # (actual_rr, dropable)
             for e in list_items(bp.get("Equip_ItemList")):
-                irr = (fld(e, "EquippedRes", "")
-                       or fld(e, "TemplateResRef", "") or "").strip()
-                if irr:
-                    item_entries.append((irr, bool(int(fld(e, "Dropable", 0) or 0)), e))
+                base_rr = (fld(e, "EquippedRes", "")
+                           or fld(e, "TemplateResRef", "") or "").strip()
+                if base_rr:
+                    item_entries.append(
+                        (self._intern_item(base_rr, e),
+                         bool(int(fld(e, "Dropable", 0) or 0)))
+                    )
             for it in list_items(bp.get("ItemList")):
-                irr = (fld(it, "InventoryRes", "")
-                       or fld(it, "TemplateResRef", "") or "").strip()
-                if irr:
-                    item_entries.append((irr, bool(int(fld(it, "Dropable", 0) or 0)), it))
+                base_rr = (fld(it, "InventoryRes", "")
+                           or fld(it, "TemplateResRef", "") or "").strip()
+                if base_rr:
+                    item_entries.append(
+                        (self._intern_item(base_rr, it),
+                         bool(int(fld(it, "Dropable", 0) or 0)))
+                    )
             for spawn in spawns:
                 area_rr = spawn["area"]
                 if area_rr in self.hidden_areas:
                     continue
-                for irr, dropable, item_dict in item_entries:
-                    key = (irr, area_rr, crr)
+                for actual_rr, dropable in item_entries:
+                    key = (actual_rr, area_rr, crr)
                     if key not in _seen_carrier:
                         _seen_carrier.add(key)
-                        self.item_carried_by[irr].append(
-                            {"area_rr": area_rr, "crr": crr, "cname": cname, "dropable": dropable}
+                        self.item_carried_by[actual_rr].append(
+                            {"area_rr": area_rr, "crr": crr,
+                             "cname": cname, "dropable": dropable}
                         )
-                    if irr not in self.items:
-                        self.items[irr] = item_dict
 
-        # Second pass: back-fill stock data for creature-inventory items added above.
+        # Back-fill stock BaseItem/Cost/PropertiesList for plain references.
+        # For variant resrefs, use the base resref for stock data lookup; skip
+        # PropertiesList backfill for variants (they already have explicit props).
+        def _backfill_stock_items() -> None:
+            for irr, it in self.items.items():
+                base = self.item_is_variant_of.get(irr, irr)
+                if fld(it, "BaseItem") is None and base in STOCK_ITEM_BASE:
+                    it["BaseItem"] = STOCK_ITEM_BASE[base]
+                if fld(it, "Cost", "") in ("", None) and base in STOCK_ITEM_COST:
+                    it["Cost"] = STOCK_ITEM_COST[base]
+                if (not list_items(it.get("PropertiesList"))
+                        and irr == base and irr in STOCK_ITEM_PROPS):
+                    it["PropertiesList"] = STOCK_ITEM_PROPS[irr]
         _backfill_stock_items()
 
         hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
@@ -2721,7 +2807,10 @@ class Db:
             return STOCK_ITEM_NAMES.get(resref, resref)
         resolved = loc(i.get("LocalizedName"))
         if not resolved or resolved.startswith("[TLK#"):
-            return STOCK_ITEM_NAMES.get(resref) or resolved or resref
+            base = self.item_is_variant_of.get(resref, resref)
+            return (STOCK_ITEM_NAMES.get(base)
+                    or STOCK_ITEM_NAMES.get(resref)
+                    or resolved or resref)
         return resolved
 
     def store_name(self, resref: str) -> str:
@@ -6065,6 +6154,26 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         f"{'<small class=\"muted\">' + _drop_reason + '</small>' if _drop_reason else ''}</dd>",
         '</dl>',
     ]
+    # Variant notices
+    _base_rr = db.item_is_variant_of.get(resref)
+    if _base_rr:
+        _base_name = nwn_text(db.item_name(_base_rr))
+        sections.append(
+            f'<p class="muted"><em><strong>Property variant</strong> — '
+            f'this is an in-world customised version of '
+            f'{link(f"{_base_rr}.html", _base_name)} ({E(_base_rr)}) '
+            f'with different item properties.</em></p>'
+        )
+    _variants = db.item_variants_of.get(resref, [])
+    if _variants:
+        _vlinks = ", ".join(
+            link(f"{vrr}.html", nwn_text(db.item_name(vrr)) + f" ({E(vrr)})")
+            for vrr in _variants
+        )
+        sections.append(
+            f'<p class="muted"><em><strong>{len(_variants)} property variant(s)</strong> '
+            f'of this item exist in-world with different item properties: {_vlinks}</em></p>'
+        )
     if is_cursed:
         sections.append(
             '<p class="warn-cursed"><strong>Warning: this item is Cursed.</strong> '
