@@ -9180,12 +9180,14 @@ def generate_tag_conflict_report(
         def _item_url(resref: str) -> str:
             return _rel_prefix + resref + ".html"
 
-    # Group resrefs by their TAG value (case-insensitive; blank tags ignored).
+    # Group resrefs by their in-game TAG value (case-insensitive).
+    # Items with no explicit Tag field use their resref as the implicit tag —
+    # this catches conflicts where a plain InventoryRes reference (no inline Tag)
+    # shares a tag with a custom inline item that explicitly sets the same tag.
     tag_groups: dict[str, list[str]] = defaultdict(list)
     for resref, item in db.items.items():
-        tag = (fld(item, "Tag") or "").strip()
-        if tag and tag.lower() != resref.lower():
-            tag_groups[tag.lower()].append(resref)
+        tag = (fld(item, "Tag") or resref).strip()
+        tag_groups[tag.lower()].append(resref)
 
     def _prop_sig(item: dict) -> frozenset[str]:
         return frozenset(itemprop_oneliner(p) for p in list_items(item.get("PropertiesList")))
@@ -9217,8 +9219,15 @@ def generate_tag_conflict_report(
         if len(unique_sigs) == 1:
             continue  # all variants identical — not a conflict
 
-        # Canonical tag: take from the first alphabetically-sorted item.
-        canonical_tag = (fld(db.items[sorted(resrefs)[0]], "Tag") or "").strip()
+        # Canonical tag: prefer an explicit Tag field; fall back to the group key.
+        canonical_tag = next(
+            (
+                (fld(db.items[rr], "Tag") or "").strip()
+                for rr in sorted(resrefs)
+                if (fld(db.items[rr], "Tag") or "").strip()
+            ),
+            _tag_lower,  # group key (the implicit shared tag)
+        )
 
         variants: list[dict] = []
         for rr in sorted(resrefs):
