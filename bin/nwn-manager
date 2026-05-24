@@ -37,6 +37,25 @@ Usage:
                           docs/ is the folder GitHub Pages publishes
                           from. Extra args pass through to nwn-wiki.
 
+  $PROG serve --log-dir <dir> [options]
+                          Monitor player activity via NWN server logs.
+                          Polls every 5 minutes (configurable). When
+                          the last player leaves, optionally refreshes
+                          activity.html and publishes it to git.
+
+                          Options:
+                            --log-dir <dir>        NWN server log dir
+                                                   (repeat for multiple)
+                            --poll-interval <min>  Check interval in
+                                                   minutes (default: 5)
+                            --auto-publish         On player session end:
+                                                   refresh activity.html,
+                                                   git commit, and push
+                            --activity-cache <path> JSON session cache
+                                                   (default: first
+                                                   log-dir/activity-
+                                                   sessions.json)
+
   $PROG -h | --help       Show this help.
 
 Per-project layout (created by 'init'):
@@ -531,6 +550,99 @@ cmd_wiki() {
   exec "$SCRIPT_DIR/nwn-wiki" --src unpacked --out "$out" "${tlk_args[@]}" "$@"
 }
 
+cmd_serve() {
+  local root
+  root=$(find_project_root) || {
+    echo "error: not inside a project (no nasher.cfg found)" >&2
+    exit 1
+  }
+  cd "$root"
+
+  local log_dirs=()
+  local poll_interval=5
+  local auto_publish=0
+  local activity_cache=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --log-dir)
+        [[ -n ${2:-} ]] || { echo "error: --log-dir requires a directory" >&2; exit 2; }
+        log_dirs+=("$2"); shift 2
+        ;;
+      --poll-interval)
+        [[ -n ${2:-} ]] || { echo "error: --poll-interval requires a number" >&2; exit 2; }
+        poll_interval=$2; shift 2
+        ;;
+      --auto-publish)
+        auto_publish=1; shift
+        ;;
+      --activity-cache)
+        [[ -n ${2:-} ]] || { echo "error: --activity-cache requires a path" >&2; exit 2; }
+        activity_cache=$2; shift 2
+        ;;
+      *) echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+
+  if [[ ${#log_dirs[@]} -eq 0 ]]; then
+    echo "error: at least one --log-dir is required" >&2
+    usage >&2
+    exit 2
+  fi
+
+  local wiki_activity="$SCRIPT_DIR/nwn-wiki-activity"
+  if [[ ! -f $wiki_activity ]]; then
+    echo "error: nwn-wiki-activity not found at $wiki_activity" >&2
+    exit 1
+  fi
+
+  local log_dir_args=()
+  for d in "${log_dirs[@]}"; do
+    log_dir_args+=(--log-dir "$d")
+  done
+  local cache_args=()
+  [[ -n $activity_cache ]] && cache_args+=(--activity-cache "$activity_cache")
+
+  local poll_secs=$(( poll_interval * 60 ))
+  local publish_label
+  publish_label=$([ $auto_publish -eq 1 ] && echo "enabled" || echo "disabled")
+
+  echo "[$PROG] serve: monitoring player activity every ${poll_interval}m" \
+       "(auto-publish: ${publish_label})"
+  echo "[$PROG] serve: project root: $root"
+
+  while true; do
+    # Trigger when: no players currently online AND a logout occurred within
+    # the last poll window.  This fires at most once per poll period per
+    # session end, naturally self-clears when the window expires, and
+    # survives monitor restarts without any saved state.
+    if python3 "$wiki_activity" --check-should-refresh "$poll_secs" \
+        "${log_dir_args[@]}" "${cache_args[@]}" 2>/dev/null; then
+      echo "[$PROG] serve: $(date '+%Y-%m-%d %H:%M:%S') — no players + recent logout; refreshing activity page"
+      if python3 "$wiki_activity" \
+          --src unpacked --out docs \
+          "${log_dir_args[@]}" "${cache_args[@]}"; then
+        echo "[$PROG] serve: activity page refreshed"
+        if [[ $auto_publish -eq 1 ]]; then
+          local ts
+          ts=$(date '+%Y-%m-%d %H:%M:%S')
+          if [[ -z "$(git -C "$root" status --porcelain -- docs/activity.html 2>/dev/null)" ]]; then
+            echo "[$PROG] serve: no changes to activity.html; skipping commit"
+          else
+            git -C "$root" add -- docs/activity.html
+            git -C "$root" commit -m "Auto Wiki Activity Refresh: $ts"
+            git -C "$root" push
+            echo "[$PROG] serve: committed and pushed activity update ($ts)"
+          fi
+        fi
+      else
+        echo "[$PROG] serve: warn: activity page refresh failed" >&2
+      fi
+    fi
+    sleep "$poll_secs"
+  done
+}
+
 main() {
   case "${1:-}" in
     init)
@@ -548,6 +660,10 @@ main() {
     wiki)
       shift; preflight python3
       cmd_wiki "$@"
+      ;;
+    serve)
+      shift; preflight python3
+      cmd_serve "$@"
       ;;
     -h|--help|"")
       usage

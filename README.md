@@ -523,6 +523,113 @@ migration), use `bin/shift-log-timestamps`:
 bin/shift-log-timestamps ~/.local/state/nwnxee-mygame -5
 ```
 
+##### Standalone activity page refresh
+
+`bin/nwn-wiki-activity` regenerates only `activity.html` without
+rebuilding the full wiki. It is called automatically by `nwn-wiki` at
+the end of each full build, but can also be invoked directly:
+
+```sh
+# Refresh docs/activity.html from the current project directory
+nwn-wiki-activity --src unpacked --out docs \
+  --log-dir ~/.local/state/nwnxee-mygame
+
+# Check whether any player is currently logged in (exit 0 = online)
+nwn-wiki-activity --check-online \
+  --log-dir ~/.local/state/nwnxee-mygame
+echo $?   # 0 = players online, 1 = no players
+```
+
+#### Auto activity refreshing and publishing
+
+`nwn-manager serve` is a long-running monitor that polls player activity
+from the NWN server logs and, when the last player logs out, refreshes
+`activity.html` and optionally commits and pushes it to git — so the
+published wiki always reflects the most recent session data.
+
+```sh
+cd ~/GIT/my_module
+
+# Monitor only (no git operations)
+nwn-manager serve \
+  --log-dir ~/.local/state/nwnxee-mygame
+
+# Monitor + auto-publish on player session end
+nwn-manager serve \
+  --log-dir ~/.local/state/nwnxee-mygame \
+  --auto-publish
+
+# Custom poll interval (default: 5 minutes)
+nwn-manager serve \
+  --log-dir ~/.local/state/nwnxee-mygame \
+  --poll-interval 10 \
+  --auto-publish
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--log-dir <dir>` | *(required)* | NWN server log directory (same as `--log-dir` for `wiki`). Repeat for multiple roots. |
+| `--poll-interval <min>` | `5` | How often to check for player activity, in minutes. |
+| `--auto-publish` | off | When enabled: after the last player leaves, refresh `activity.html`, `git commit`, and `git push`. |
+| `--activity-cache <path>` | `<first log-dir>/activity-sessions.json` | JSON cache file to persist session history across log rotations. |
+
+**How it works**
+
+Every `--poll-interval` minutes the monitor checks two conditions:
+
+1. **No player is currently online** (no open session in the logs).
+2. **A player logout occurred within the last poll window** (a leave
+   event appears in the log files with a timestamp in the past
+   `--poll-interval` minutes).
+
+When both conditions hold, the monitor:
+
+1. Runs `nwn-wiki-activity` to rebuild `docs/activity.html` from the
+   latest log data.
+2. If `--auto-publish` is set and `activity.html` actually changed:
+   - `git add docs/activity.html`
+   - `git commit -m "Auto Wiki Activity Refresh: <datetime>"`
+   - `git push`
+
+Because the trigger looks at the log timestamps directly rather than
+tracking in-memory state, the monitor is **stateless across restarts** —
+if it was stopped while a player was online and restarted after the last
+player left, it will still fire on the next poll as long as the logout is
+within the current poll window. The trigger also naturally self-clears:
+once the logout is older than one poll window, the condition no longer
+holds and no further refreshes fire until the next session ends.
+
+This keeps the public wiki up to date without rebuilding the entire site
+after every session.
+
+**Hook into server startup**
+
+The simplest way to pair `serve` with a dedicated NWN server is to
+launch it in the background from the same script that starts the server:
+
+```sh
+#!/usr/bin/env bash
+# start-server.sh — start the NWN server and activity monitor together
+
+cd ~/GIT/my_module
+
+# Export TZ so the activity chart uses local time (matches server.env)
+[[ -f server.env ]] && . server.env && export TZ
+
+# Start the activity monitor in the background
+nwn-manager serve \
+  --log-dir ~/.local/state/nwnxee-mygame \
+  --poll-interval 5 \
+  --auto-publish &
+SERVE_PID=$!
+
+# Start the NWN server (replace with your actual server command)
+nwnee-server ...
+
+# Stop the monitor when the server exits
+kill "$SERVE_PID" 2>/dev/null
+```
+
 #### TLK resolution (StrRef references)
 
 NWN GFF blobs reference player-visible strings indirectly. A
@@ -850,4 +957,6 @@ incremental repack produces stale or unexpected output.
 - TLK / HAK packing — supported by nasher via `nasher.cfg`, but no
   wrapper command in v1. (Read-only TLK extraction for wiki StrRef
   resolution *is* handled — see "TLK resolution" above.)
-- Git hooks and CI helpers.
+- Full wiki auto-rebuild on player session end (only `activity.html`
+  is refreshed by `nwn-manager serve`; a full rebuild is triggered
+  manually via `nwn-manager wiki` or `refresh-homers-lotr-wiki`).

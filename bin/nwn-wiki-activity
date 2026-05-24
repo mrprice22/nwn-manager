@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Regenerate the wiki activity page (activity.html) from NWN server logs.
+
+Run standalone to refresh activity.html without rebuilding the full wiki.
+Called automatically by nwn-wiki during full wiki builds.
+
+Exit codes for check modes:
+  --check-online:          0 = players online,  1 = no players online
+  --check-should-refresh:  0 = should refresh,  1 = should not refresh
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def _load_nwn_wiki():
+    """Load nwn-wiki as a Python module via importlib."""
+    path = Path(__file__).resolve().parent / "nwn-wiki"
+    loader = importlib.machinery.SourceFileLoader("nwn_wiki", str(path))
+    spec = importlib.util.spec_from_loader("nwn_wiki", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _should_refresh(activity: dict, within_seconds: int) -> bool:
+    """Return True when the activity monitor should trigger a refresh.
+
+    Conditions (both must hold):
+      - No player is currently online (no open session with role=Player).
+      - At least one player logout occurred within the last within_seconds seconds.
+
+    Log timestamps are naive datetimes parsed in the server's local timezone
+    (TZ env var); datetime.now() is also naive local time, so the comparison
+    is consistent as long as TZ matches the server configuration.
+    """
+    cutoff = datetime.now() - timedelta(seconds=within_seconds)
+    sessions = activity["sessions"]
+    has_open_player = any(
+        s for s in sessions
+        if s.get("leave") is None and s.get("role") == "Player"
+    )
+    if has_open_player:
+        return False
+    recent_logout = any(
+        s for s in sessions
+        if s.get("role") == "Player"
+        and s.get("leave") is not None
+        and s["leave"] >= cutoff
+    )
+    return recent_logout
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument(
+        "--src", default=None,
+        help="path to the unpacked/ tree (for wiki theme and manual-pages nav; "
+             "required unless a --check-* mode is used)",
+    )
+    ap.add_argument(
+        "--out", default=None,
+        help="path to wiki output dir (docs/); required unless a --check-* mode is used",
+    )
+    ap.add_argument(
+        "--log-dir", action="append", default=[], dest="log_dirs", metavar="DIR",
+        help="Directory containing NWN server logs (nwserverLog*.txt), or a parent "
+             "directory whose subdirectories contain them (e.g. logs.0/, logs.1/). "
+             "Repeat for multiple log roots.",
+    )
+    ap.add_argument(
+        "--activity-cache", default=None, dest="activity_cache", metavar="PATH",
+        help="JSON file for persisting player-session data across log rotations. "
+             "Defaults to activity-sessions.json inside the first --log-dir.",
+    )
+    ap.add_argument(
+        "--check-online", action="store_true",
+        help="Exit 0 if at least one player is currently online, 1 if not. "
+             "No output files are written.",
+    )
+    ap.add_argument(
+        "--check-should-refresh", type=int, default=None, metavar="SECONDS",
+        help="Exit 0 if no players are currently online AND at least one player "
+             "logout occurred within the last SECONDS seconds. No files are written. "
+             "Designed for the poll loop in 'nwn-manager serve'.",
+    )
+    args = ap.parse_args()
+
+    if not args.log_dirs:
+        print("error: at least one --log-dir is required", file=sys.stderr)
+        return 2
+
+    wiki = _load_nwn_wiki()
+
+    log_dir_paths = [Path(d).resolve() for d in args.log_dirs]
+    cache_path = (
+        Path(args.activity_cache).resolve()
+        if args.activity_cache
+        else log_dir_paths[0] / "activity-sessions.json"
+    )
+
+    activity = wiki.parse_nwserver_logs(log_dir_paths, cache_path=cache_path)
+
+    if args.check_online:
+        online = any(
+            s for s in activity["sessions"]
+            if s.get("leave") is None and s.get("role") == "Player"
+        )
+        return 0 if online else 1
+
+    if args.check_should_refresh is not None:
+        return 0 if _should_refresh(activity, args.check_should_refresh) else 1
+
+    if not args.src or not args.out:
+        print("error: --src and --out are required (or use a --check-* mode)",
+              file=sys.stderr)
+        return 2
+
+    src = Path(args.src).resolve()
+    out = Path(args.out).resolve()
+
+    player_sessions = [
+        s for s in activity["sessions"]
+        if s.get("join") is not None and s.get("role") == "Player"
+    ]
+    if not player_sessions:
+        print("[nwn-wiki-activity] no player sessions found; nothing to render",
+              file=sys.stderr)
+        return 0
+
+    # Set globals required by page() and render_activity_page().
+    wiki._HAS_ACTIVITY_PAGE = True
+    wiki._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
+    wiki._MANUAL_PAGES = []
+    wiki.load_wiki_theme(src.parent, out)
+    # Populate _MANUAL_PAGES so the Documents nav dropdown matches the rest of
+    # the wiki. render_manual_pages is idempotent; re-writing existing pages is
+    # harmless, and the call is skipped entirely when docs.manual/ is absent.
+    wiki.render_manual_pages(src.parent, out)
+
+    wiki.render_activity_page(activity, out, tz_label=wiki._tz_label_from_env())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -22,6 +22,7 @@ import random
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict, deque
@@ -9667,8 +9668,14 @@ def main() -> int:
 
     render_manual_pages(src.parent, out)
 
-    if activity and _HAS_ACTIVITY_PAGE:
-        render_activity_page(activity, out, tz_label=_tz_label_from_env())
+    if _HAS_ACTIVITY_PAGE:
+        _act_cmd = [sys.executable, str(SCRIPT_DIR / "nwn-wiki-activity"),
+                    "--src", str(src), "--out", str(out)]
+        for _d in args.log_dirs:
+            _act_cmd += ["--log-dir", str(_d)]
+        if args.activity_cache:
+            _act_cmd += ["--activity-cache", str(args.activity_cache)]
+        subprocess.run(_act_cmd, check=True)
 
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
