@@ -8159,8 +8159,8 @@ def render_factions(db: Db, out: Path) -> None:
         sections.append(
             '<dl class="meta">'
             f"<dt>Attitude</dt><dd>{'Friendly to PC' if friendly else 'Hostile to PC'}</dd>"
-            f"<dt>Direct placements</dt><dd>{n_inst}</dd>"
-            f"<dt>Encounter pool slots</dt><dd>{n_spawn}</dd>"
+            f"<dt>Direct placements</dt><dd>{n_inst:,}</dd>"
+            f"<dt>Encounter pool slots</dt><dd>{n_spawn:,}</dd>"
             f"<dt>Total class levels</dt><dd>{total_lvls:,}</dd>"
             f"<dt>Areas</dt><dd>{area_links}</dd>"
             "</dl>"
@@ -8172,30 +8172,33 @@ def render_factions(db: Db, out: Path) -> None:
 
         rows: list[str] = []
         for area_rr in sorted(by_area, key=lambda a: db.area_name(a).lower()):
-            for e in sorted(by_area[area_rr], key=lambda x: x["name"].lower()):
-                crr = e["crr"]
+            # Collapse identical (crr, kind) pairs within the same area into one row.
+            grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+            for e in by_area[area_rr]:
+                grouped[(e["crr"], e["kind"])].append(e)
+
+            for (crr, kind) in sorted(
+                grouped,
+                key=lambda k: (db.creature_name(k[0]) or k[0]).lower(),
+            ):
+                group = grouped[(crr, kind)]
+                count = len(group)
+                e = group[0]
                 classes = e["classes"]
                 cls_str = "/".join(
                     f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
                     for cl in classes
                 ) or "&#x2014;"
 
-                if e["kind"] == "instance":
-                    area_rr_e = e["area"]
-                    inst_url = f"creatures/instances/{area_rr_e}-{e['idx']:03d}.html"
-                    name_cell = f'<a href="{E(inst_url)}">{nwn_html(e["name"])}</a>'
-                    kind_cell = '<span class="badge">placed</span>'
-                else:
-                    name_cell = (
-                        link(f"creatures/{crr}.html", e["name"])
-                        if crr in db.creatures else nwn_html(e["name"])
-                    )
-                    kind_cell = '<span class="badge">encounter pool</span>'
-
-                bp_cell = (
-                    link(f"creatures/{crr}.html", db.creature_name(crr))
-                    if crr in db.creatures else
-                    (f"<code>{E(crr)}</code>" if crr else "&#x2014;")
+                disp_name = db.creature_name(crr) or e["name"] or crr
+                name_cell = (
+                    link(f"creatures/{crr}.html", disp_name)
+                    if crr in db.creatures else nwn_html(disp_name)
+                )
+                kind_cell = (
+                    '<span class="badge">placed</span>'
+                    if kind == "instance" else
+                    '<span class="badge">encounter pool</span>'
                 )
                 area_cell = link(f"areas/{area_rr}.html", db.area_name(area_rr))
 
@@ -8208,8 +8211,8 @@ def render_factions(db: Db, out: Path) -> None:
                 rows.append(
                     "<tr>"
                     f"<td>{name_cell}{cross_flag}</td>"
-                    f"<td>{bp_cell}</td>"
                     f"<td>{kind_cell}</td>"
+                    f"<td>{count}</td>"
                     f"<td>{area_cell}</td>"
                     f"<td>{cls_str}</td>"
                     f"<td>{_fmt_hp(e['hp'])}</td>"
@@ -8219,7 +8222,7 @@ def render_factions(db: Db, out: Path) -> None:
 
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Name</th><th>Blueprint</th><th>Kind</th><th>Area</th>"
+            "<th>Name</th><th>Kind</th><th>Count</th><th>Area</th>"
             "<th>Classes</th><th>HP</th><th>CR</th>"
             "</tr></thead><tbody>"
             + "\n".join(rows)
