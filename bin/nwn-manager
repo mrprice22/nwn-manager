@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "[nwn-manager] ERROR at line $LINENO in ${FUNCNAME[0]:-main}: $BASH_COMMAND (exit $?)" >&2' ERR
 
 # nwn-manager — multi-module manager for NWN1 .mod files (git-friendly,
 # LLM-editable workflow). Thin wrapper around nasher (squattingmonk/nasher)

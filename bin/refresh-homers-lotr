@@ -83,7 +83,14 @@ else
 
   if [[ $status -ne 0 ]]; then
     echo
-    cat "$tmpout"
+    if [[ -s "$tmpout" ]]; then
+      cat "$tmpout"
+    else
+      echo "[diagnostic] nwn-manager exited $status with no output"
+      echo "             Try running with --verbose for full output, or check:"
+      echo "               PATH=\$HOME/.nimble/bin:$NWN_MANAGER_BIN:\$PATH \\"
+      echo "               nwn-manager unpack \"$MOD\" 2>&1 | head -30"
+    fi
   else
     sed -n '/^\[nwn-manager\] unpacked\/ summary:/,$ p' "$tmpout"
   fi
