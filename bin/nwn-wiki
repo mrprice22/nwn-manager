@@ -4414,6 +4414,41 @@ def render_areas_index(db: Db, out: Path, *,
             has_real_incoming.add(dst)
     has_any_fallback = has_fallback_incoming  # areas with at least one fallback route
 
+    def _dominant_faction_cell(resref: str) -> str:
+        faction_votes: dict[int, int] = {}
+        for c in db.area_npcs.get(resref, []):
+            try:
+                fid = int(fld(c, "FactionID"))
+            except (TypeError, ValueError):
+                continue
+            faction_votes[fid] = faction_votes.get(fid, 0) + 1
+        for e in db.area_encounters.get(resref, []):
+            rr = fld(e, "TemplateResRef", "")
+            blueprint = db.encounters.get(rr, {})
+            spawns = list_items(blueprint.get("CreatureList")) or list_items(e.get("CreatureList"))
+            for s in spawns:
+                srr = fld(s, "ResRef", "")
+                bp = db.creatures.get(srr, {})
+                try:
+                    fid = int(fld(bp, "FactionID"))
+                except (TypeError, ValueError):
+                    continue
+                faction_votes[fid] = faction_votes.get(fid, 0) + 1
+        total = sum(faction_votes.values())
+        if not total:
+            return "<td>None</td>"
+        max_count = max(faction_votes.values())
+        top_fids = [fid for fid, cnt in faction_votes.items() if cnt == max_count]
+        if len(top_fids) > 1:
+            return "<td>Tie</td>"
+        dominant_fid = top_fids[0]
+        pct = round(100 * max_count / total)
+        raw_name = db.faction_name(dominant_fid)
+        slug = re.sub(r"[^a-z0-9]+", "-", raw_name.lower()).strip("-")
+        anchor = f"faction-{dominant_fid}-{slug}" if slug else f"faction-{dominant_fid}"
+        href = f"../factions.html#{anchor}"
+        return f'<td><a href="{E(href)}">{nwn_html(raw_name)}</a> {pct}%</td>'
+
     def _area_row(resref: str) -> str:
         a = db.areas[resref]
         npc_count = len(db.area_npcs.get(resref, []))
@@ -4423,11 +4458,11 @@ def render_areas_index(db: Db, out: Path, *,
         return (
             f'<tr>'
             f'<td>{link(f"{resref}.html", db.area_name(resref))}</td>'
-            f'<td>{E(resref)}</td>'
             f'<td>{E(tileset_name(fld(a, "Tileset", "")))}</td>'
             f'<td>{E(fld(a, "Width", ""))}×{E(fld(a, "Height", ""))}</td>'
             f'<td>{npc_count}</td>'
             f'<td>{enc_count}</td>'
+            + _dominant_faction_cell(resref) +
             f'<td>{store_count}</td>'
             f'<td>{cont_count}</td>'
             f'</tr>'
@@ -4460,8 +4495,8 @@ def render_areas_index(db: Db, out: Path, *,
 
     table_head = (
         '<table class="data"><thead><tr>'
-        "<th>Name</th><th>ResRef</th><th>Tileset</th><th>Size</th>"
-        "<th>NPCs</th><th>Encounters</th><th>Stores</th><th>Containers</th>"
+        "<th>Name</th><th>Tileset</th><th>Size</th>"
+        "<th>NPCs</th><th>Encounters</th><th>Dominant Faction</th><th>Stores</th><th>Containers</th>"
         "</tr></thead><tbody>"
     )
 
