@@ -1453,8 +1453,13 @@ class Db:
         # item resref → list of script-source dicts for the item page
         # {"kind", "script", "label", "areas", "dlg", "crr", "prr"}
         self.item_from_script: dict[str, list[dict]] = defaultdict(list)
-        # item resref → [{"area_rr", "kind" (container|door), "name", "idx" (containers only)}]
+        # item resref → [{"area_rr", "kind" (container|door), "name", "idx" (containers only),
+        #                  "required" (bool), "dst_area" (doors only, may be None)}]
         self.item_is_key_for: dict[str, list[dict]] = defaultdict(list)
+        # script resref → set of item tags checked via GetItemPossessedBy
+        self.script_checks_item_tags: dict[str, set[str]] = defaultdict(set)
+        # item resref → list of {kind, script, event, area(s), …} for script-based key checks
+        self.item_script_checks: dict[str, list[dict]] = defaultdict(list)
         # (area_rr, container_idx) pairs for containers with random-treasure OnOpen
         self.random_treasure_containers: set[tuple[str, int]] = set()
         # Property-variant tracking: inline items with the same TemplateResRef but
@@ -1978,6 +1983,9 @@ class Db:
         r"\bGenerate(?:High|Medium|Low|Boss|Book)?Treasure\s*\("
     )
     _RE_SET_TOKEN = re.compile(r"\bSetCustomToken\s*\(\s*(\d+)\s*,")
+    _RE_ITEM_POSSESSED_BY = re.compile(
+        r'\bGetItemPossessedBy\s*\((?:[^,()]+|\([^)]*\))+,\s*"([A-Za-z0-9_]+)"'
+    )
 
     def _parse_scripts(self) -> None:
         """One-shot scan of every .nss file. Populates script_dialogs and
@@ -2028,6 +2036,9 @@ class Db:
             # SetCustomToken(N, ...) — track which scripts set which custom tokens.
             for m in self._RE_SET_TOKEN.finditer(text):
                 self.token_setters[int(m.group(1))].add(resref)
+            # GetItemPossessedBy(obj, "tag") — item-tag checks for key/quest logic.
+            for m in self._RE_ITEM_POSSESSED_BY.finditer(text):
+                self.script_checks_item_tags[resref].add(m.group(1))
 
     def _build_tag_to_area(self) -> None:
         """Tag → area resref index spanning every placement (waypoints,
@@ -2483,6 +2494,7 @@ class Db:
         self._index_script_item_sources()
         self._index_random_treasure_containers()
         self._index_key_items()
+        self._index_script_item_checks()
 
     def _index_script_item_sources(self) -> None:
         """Trace CreateItemOnObject calls back to their trigger context and
@@ -2667,33 +2679,181 @@ class Db:
             for c in containers:
                 p = c["p"]
                 idx = c["idx"]
-                if not int(fld(p, "KeyRequired", 0) or 0):
-                    continue
                 key_tag = (fld(p, "KeyName", "") or "").strip().lower()
                 if not key_tag:
                     continue
+                required = bool(int(fld(p, "KeyRequired", 0) or 0))
                 name = (loc(p.get("LocName")) or fld(p, "Tag", "") or
                         fld(p, "TemplateResRef", "") or "(unnamed)")
                 for rr in tag_to_resrefs.get(key_tag, []):
                     self.item_is_key_for[rr].append(
-                        {"area_rr": area_rr, "kind": "container", "name": name, "idx": idx}
+                        {"area_rr": area_rr, "kind": "container", "name": name,
+                         "idx": idx, "required": required}
                     )
 
         for area_rr, doors in self.area_doors.items():
             if area_rr in self.hidden_areas:
                 continue
             for d in doors:
-                if not int(fld(d, "KeyRequired", 0) or 0):
-                    continue
                 key_tag = (fld(d, "KeyName", "") or "").strip().lower()
                 if not key_tag:
                     continue
+                required = bool(int(fld(d, "KeyRequired", 0) or 0))
                 name = (loc(d.get("LocName")) or fld(d, "Tag", "") or
                         fld(d, "TemplateResRef", "") or "(unnamed door)")
+                linked_to = fld(d, "LinkedTo", "") or ""
+                dst_area = self.tag_to_area.get(linked_to) if linked_to else None
+                if dst_area == area_rr:
+                    dst_area = None  # same-area transition, not worth showing
                 for rr in tag_to_resrefs.get(key_tag, []):
                     self.item_is_key_for[rr].append(
-                        {"area_rr": area_rr, "kind": "door", "name": name}
+                        {"area_rr": area_rr, "kind": "door", "name": name,
+                         "required": required, "dst_area": dst_area}
                     )
+
+    def _index_script_item_checks(self) -> None:
+        """Populate item_script_checks: item resref → contexts where
+        GetItemPossessedBy is called with the item's tag (event scripts on
+        triggers, placeables, doors, areas, and dialog action nodes).
+        Must run after _parse_scripts, _build_tag_to_area, and index_dialogs."""
+        if not self.script_checks_item_tags:
+            return
+
+        tag_to_resrefs: dict[str, list[str]] = defaultdict(list)
+        for rr, it in self.items.items():
+            tag = (fld(it, "Tag", "") or "").strip()
+            if tag:
+                tag_to_resrefs[tag.lower()].append(rr)
+
+        def _emit(script_rr: str, entry: dict) -> None:
+            for tag in self.script_checks_item_tags.get(script_rr, set()):
+                for item_rr in tag_to_resrefs.get(tag.lower(), []):
+                    self.item_script_checks[item_rr].append(entry)
+
+        # Blueprint → placed areas
+        trigger_areas: dict[str, set[str]] = defaultdict(set)
+        placeable_areas: dict[str, set[str]] = defaultdict(set)
+        door_areas: dict[str, set[str]] = defaultdict(set)
+        for ar, ts in self.area_triggers.items():
+            for t in ts:
+                rr = (fld(t, "TemplateResRef", "") or "").lower()
+                if rr:
+                    trigger_areas[rr].add(ar)
+        for ar, ps in self.area_placeables.items():
+            for p in ps:
+                rr = (fld(p, "TemplateResRef", "") or "").lower()
+                if rr:
+                    placeable_areas[rr].add(ar)
+        for ar, ds in self.area_doors.items():
+            for d in ds:
+                rr = (fld(d, "TemplateResRef", "") or "").lower()
+                if rr:
+                    door_areas[rr].add(ar)
+
+        # Blueprint triggers
+        for rr, bp in self.triggers.items():
+            for fld_name, label in self.TRIGGER_EVENT_FIELDS.items():
+                s = (fld(bp, fld_name, "") or "").lower()
+                if s in self.script_checks_item_tags:
+                    _emit(s, {"kind": "trigger", "resref": rr, "event": label,
+                               "script": s, "areas": sorted(trigger_areas.get(rr, set()))})
+
+        # Instance trigger overrides
+        for area_rr, ts in self.area_triggers.items():
+            for idx, inst in enumerate(ts):
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                inst_tag = fld(inst, "Tag", "") or ""
+                for fld_name, label in self.TRIGGER_EVENT_FIELDS.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if s in self.script_checks_item_tags:
+                        _emit(s, {"kind": "trigger-instance", "resref": bp_rr,
+                                   "tag": inst_tag, "event": label, "script": s,
+                                   "area": area_rr, "areas": [area_rr]})
+
+        # Blueprint placeables
+        for rr, bp in self.placeables.items():
+            for fld_name, label in self.PLACEABLE_EVENT_FIELDS.items():
+                s = (fld(bp, fld_name, "") or "").lower()
+                if s in self.script_checks_item_tags:
+                    name = loc(bp.get("LocName")) or rr
+                    _emit(s, {"kind": "placeable", "resref": rr, "name": name,
+                               "event": label, "script": s,
+                               "areas": sorted(placeable_areas.get(rr, set()))})
+
+        # Instance placeables
+        for area_rr, ps in self.area_placeables.items():
+            for inst in ps:
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                for fld_name, label in self.PLACEABLE_EVENT_FIELDS.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if s in self.script_checks_item_tags:
+                        name = loc(inst.get("LocName")) or bp_rr
+                        _emit(s, {"kind": "placeable-instance", "resref": bp_rr,
+                                   "name": name, "event": label, "script": s,
+                                   "area": area_rr, "areas": [area_rr]})
+
+        # Blueprint doors
+        for rr, bp in self.doors.items():
+            for fld_name, label in self.DOOR_EVENT_FIELDS.items():
+                s = (fld(bp, fld_name, "") or "").lower()
+                if s in self.script_checks_item_tags:
+                    name = loc(bp.get("LocName")) or rr
+                    _emit(s, {"kind": "door", "resref": rr, "name": name,
+                               "event": label, "script": s,
+                               "areas": sorted(door_areas.get(rr, set()))})
+
+        # Instance doors
+        for area_rr, ds in self.area_doors.items():
+            for inst in ds:
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                for fld_name, label in self.DOOR_EVENT_FIELDS.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if s in self.script_checks_item_tags:
+                        name = loc(inst.get("LocName")) or bp_rr
+                        _emit(s, {"kind": "door-instance", "resref": bp_rr,
+                                   "name": name, "event": label, "script": s,
+                                   "area": area_rr, "areas": [area_rr]})
+
+        # Area events
+        for area_rr, area in self.areas.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for fld_name, label in self.AREA_EVENT_FIELDS.items():
+                s = (fld(area, fld_name, "") or "").lower()
+                if s in self.script_checks_item_tags:
+                    _emit(s, {"kind": "area-event", "event": label, "script": s,
+                               "area": area_rr, "areas": [area_rr]})
+
+        # Dialog action scripts → trace back to callers via dialog_callers
+        action_script_to_dlgs: dict[str, set[str]] = defaultdict(set)
+        for dlg_rr, entries in self.dialog_scripts.items():
+            for e in entries:
+                if e["kind"] == "action":
+                    action_script_to_dlgs[e["resref"]].add(dlg_rr)
+        for script_rr, dlg_set in action_script_to_dlgs.items():
+            if script_rr not in self.script_checks_item_tags:
+                continue
+            for dlg_rr in dlg_set:
+                for caller in self.dialog_callers.get(dlg_rr, []):
+                    _emit(script_rr, {
+                        "kind": "dialog-action", "script": script_rr,
+                        "dialog": dlg_rr,
+                        "caller_kind": caller.get("kind", ""),
+                        "caller_resref": caller.get("resref", ""),
+                        "areas": caller.get("areas", []),
+                    })
+
+        # Deduplicate per item
+        for rr in list(self.item_script_checks.keys()):
+            seen: set[tuple] = set()
+            uniq = []
+            for entry in self.item_script_checks[rr]:
+                key = (entry.get("kind"), entry.get("resref"), entry.get("script"),
+                       entry.get("area"), entry.get("event"), entry.get("dialog"))
+                if key not in seen:
+                    seen.add(key)
+                    uniq.append(entry)
+            self.item_script_checks[rr] = uniq
 
     def _build_store_openers(self) -> None:
         """Populate store_tag_openers. Must be called after index_dialogs so
@@ -6501,6 +6661,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
 
     key_for = db.item_is_key_for.get(resref, [])
     if key_for:
+        has_dst = any(kf.get("dst_area") for kf in key_for)
         rows = []
         for kf in key_for:
             area_rr = kf["area_rr"]
@@ -6512,15 +6673,71 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 )
             else:
                 obj_cell = E(kf["name"])
-            rows.append(
-                f"<tr><td>{obj_cell}</td>"
-                f"<td>{E(kf['kind'].capitalize())}</td>"
-                f"<td>{area_cell}</td></tr>"
-            )
+            required = kf.get("required", True)
+            type_label = kf["kind"].capitalize() + ("" if required else " (optional)")
+            row = (f"<tr><td>{obj_cell}</td>"
+                   f"<td>{E(type_label)}</td>"
+                   f"<td>{area_cell}</td>")
+            if has_dst:
+                dst_rr = kf.get("dst_area")
+                if dst_rr:
+                    dst_cell = (link(f"../areas/{dst_rr}.html", db.area_name(dst_rr))
+                                if dst_rr in db.areas else E(dst_rr))
+                else:
+                    dst_cell = ""
+                row += f"<td>{dst_cell}</td>"
+            row += "</tr>"
+            rows.append(row)
+        headers = "<th>Opens</th><th>Type</th><th>Area</th>"
+        if has_dst:
+            headers += "<th>Leads to</th>"
         sections.append(
             "<h2>Key for</h2>"
+            f'<table class="data"><thead><tr>{headers}'
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    script_checks = db.item_script_checks.get(resref, [])
+    if script_checks:
+        rows = []
+        for sc in script_checks:
+            script_rr = sc["script"]
+            script_cell = (link(f"../scripts/{script_rr}.html", script_rr)
+                           if script_rr in db.script_paths else
+                           f"<code>{E(script_rr)}</code>")
+            event_cell = E(sc.get("event", ""))
+            kind = sc.get("kind", "")
+            if kind == "area-event":
+                ctx_cell = "Area event"
+            elif kind == "dialog-action":
+                dlg = sc.get("dialog", "")
+                ctx_cell = (link(f"../conversations/{dlg}.html",
+                                 db.dialog_label(dlg) if dlg else dlg)
+                            if dlg in db.dialogs else E(f"Dialog: {dlg}"))
+            elif kind in ("trigger", "trigger-instance"):
+                tag = sc.get("tag") or sc.get("resref") or ""
+                ctx_cell = E(f"Trigger ({tag})" if tag else "Trigger")
+            elif kind in ("placeable", "placeable-instance"):
+                ctx_cell = E(sc.get("name") or sc.get("resref") or "Placeable")
+            elif kind in ("door", "door-instance"):
+                ctx_cell = E(sc.get("name") or sc.get("resref") or "Door")
+            else:
+                ctx_cell = E(kind)
+            areas = sc.get("areas") or []
+            area_cells = ", ".join(
+                link(f"../areas/{a}.html", db.area_name(a))
+                for a in areas if a in db.areas
+            ) or "—"
+            rows.append(
+                f"<tr><td>{script_cell}</td><td>{event_cell}</td>"
+                f"<td>{ctx_cell}</td><td>{area_cells}</td></tr>"
+            )
+        sections.append(
+            "<h2>Script checks</h2>"
+            '<p class="muted">This item\'s tag is checked via '
+            "<code>GetItemPossessedBy</code> in these scripts:</p>"
             '<table class="data"><thead><tr>'
-            "<th>Opens</th><th>Type</th><th>Area</th>"
+            "<th>Script</th><th>Event</th><th>Context</th><th>Area(s)</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
