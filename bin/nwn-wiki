@@ -825,6 +825,52 @@ def _item_prop_key(props: list) -> tuple:
     return tuple(sorted(parts))
 
 
+def _creature_key(c: dict, bp: dict | None = None) -> tuple:
+    """Stable fingerprint for a creature's combat identity.
+
+    Compares abilities, classes, feats, special abilities, equipment resrefs,
+    NaturalAC, and Race.  Deliberately excludes name, tag, faction,
+    conversation, scripts, and position — those are presentation/placement
+    details, not combat identity.
+
+    `c` is the primary struct (UTC blueprint or GIT placement).
+    `bp` is the blueprint to fall back to when `c` is a GIT instance,
+    mirroring the fallback pattern in _creature_detail_sections().
+    """
+    def _f(key):
+        v = fld(c, key)
+        if v is None and bp is not None:
+            v = fld(bp, key)
+        return v
+
+    def _lst(key):
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    abilities = tuple(_f(a) for a in ("Str", "Dex", "Con", "Int", "Wis", "Cha"))
+    classes   = tuple(sorted(
+        (fld(cl, "Class"), fld(cl, "ClassLevel"))
+        for cl in _lst("ClassList")
+    ))
+    feats     = tuple(sorted(
+        int(fld(f, "Feat"))
+        for f in _lst("FeatList")
+        if fld(f, "Feat") is not None
+    ))
+    spec_ab   = tuple(sorted(
+        (fld(s, "Spell"), fld(s, "SpellCasterLevel"))
+        for s in _lst("SpecAbilityList")
+    ))
+    equip     = tuple(sorted(
+        (fld(e, "__struct_id"),
+         fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or "")
+        for e in _lst("Equip_ItemList")
+    ))
+    return (abilities, classes, feats, spec_ab, equip, _f("NaturalAC"), _f("Race"))
+
+
 def itemprop_oneliner(prop: dict) -> str:
     """Compact single-line summary (used in tooltips / loot lists)."""
     f = itemprop_format(prop)
@@ -1471,6 +1517,23 @@ class Db:
         self.item_is_variant_of: dict[str, str] = {}
         self._item_prop_registry: dict[str, dict[tuple, str]] = {}
 
+        # Canonical creature tracking (built in index() after encounter_spawns).
+        # canonical_rr → {"c": gff_struct, "bp_rr": source_blueprint_rr}
+        # For a blueprint-only canonical, "c" == db.creatures[bp_rr].
+        # For a variant, "c" is the instance GFF struct that first introduced
+        # the differing key, and "bp_rr" is the source blueprint resref.
+        self.canonical_creatures: dict[str, dict] = {}
+        # blueprint_rr → canonical_rr  (equals rr for non-variants)
+        self.canonical_for_bp: dict[str, str] = {}
+        # (area_rr, idx) → canonical_rr
+        self.canonical_for_inst: dict[tuple, str] = {}
+        # canonical_rr → source blueprint_rr (rr → rr for non-variants)
+        self.canonical_bp_of: dict[str, str] = {}
+        # internal: blueprint_rr → {creature_key_tuple → canonical_rr}
+        self._creature_key_registry: dict[str, dict[tuple, str]] = {}
+        # canonical_rr → [{"area", "kind": "placed"|"encounter", "enc_rr", "count"}]
+        self.canonical_locations: dict[str, list[dict]] = defaultdict(list)
+
     # ---- Loading ----
 
     def load(self) -> None:
@@ -1586,6 +1649,43 @@ class Db:
         self.item_variants_of[base_rr].append(variant_rr)
         self.item_is_variant_of[variant_rr] = base_rr
         registry[prop_key] = variant_rr
+        return variant_rr
+
+    def _intern_creature(self, bp_rr: str, c: dict, *, bp: dict | None = None) -> str:
+        """Register a creature (blueprint or GIT instance) and return its
+        canonical_rr.
+
+        If the creature's _creature_key() matches what is already stored for
+        bp_rr, the canonical_rr equals bp_rr (or the previously-assigned rr).
+        If the key differs from the blueprint's key, a variant canonical is
+        created: bp_rr__v2, bp_rr__v3, etc.
+        """
+        key = _creature_key(c, bp)
+        registry = self._creature_key_registry.setdefault(bp_rr, {})
+
+        if key in registry:
+            return registry[key]
+
+        if bp_rr not in self.canonical_creatures:
+            # First registration for this blueprint — it is its own canonical.
+            self.canonical_creatures[bp_rr] = {"c": c, "bp_rr": bp_rr}
+            self.canonical_bp_of[bp_rr] = bp_rr
+            registry[key] = bp_rr
+            return bp_rr
+
+        # Blueprint already registered; check whether this key matches it.
+        existing_key = next(iter(registry))
+        if existing_key == key:
+            registry[key] = bp_rr
+            return bp_rr
+
+        # Different key — create a numbered variant.
+        n = sum(1 for v, src in self.canonical_bp_of.items()
+                if src == bp_rr and v != bp_rr) + 2
+        variant_rr = f"{bp_rr}__v{n}"
+        self.canonical_creatures[variant_rr] = {"c": c, "bp_rr": bp_rr}
+        self.canonical_bp_of[variant_rr] = bp_rr
+        registry[key] = variant_rr
         return variant_rr
 
     # ---- Indexing ----
@@ -1725,6 +1825,76 @@ class Db:
             if "WIKI_HIDDEN" in (fld(a, "Comments") or "").upper()
         }
 
+        # ---- Build canonical creature index --------------------------------
+        # Pass 1: register each UTC blueprint as its own canonical.
+        for bp_rr, bp in self.creatures.items():
+            can_rr = self._intern_creature(bp_rr, bp, bp=None)
+            self.canonical_for_bp[bp_rr] = can_rr
+
+        # Pass 2: walk each placed instance; check if it diverges from its
+        # blueprint's canonical key. Instances in WIKI_HIDDEN areas are still
+        # registered (needed for item_carried_by de-dup) but their areas are
+        # excluded from canonical_locations.
+        for area_rr, insts in self.area_creature_instances.items():
+            for inst in insts:
+                c_git = inst["c"]
+                idx = inst["idx"]
+                bp_rr = fld(c_git, "TemplateResRef", "") or ""
+                bp = self.creatures.get(bp_rr)
+                if bp_rr:
+                    can_rr = self._intern_creature(bp_rr, c_git, bp=bp)
+                else:
+                    # Orphan instance — no blueprint on file. Synthesise a
+                    # canonical using area+idx as a unique resref.
+                    synth_rr = f"__orphan_{area_rr}_{idx:03d}"
+                    key = _creature_key(c_git, bp=None)
+                    reg = self._creature_key_registry.setdefault(synth_rr, {})
+                    if key not in reg:
+                        self.canonical_creatures[synth_rr] = {
+                            "c": c_git, "bp_rr": synth_rr
+                        }
+                        self.canonical_bp_of[synth_rr] = synth_rr
+                        reg[key] = synth_rr
+                    can_rr = reg[key]
+                self.canonical_for_inst[(area_rr, idx)] = can_rr
+
+        # Pass 3: canonical_locations from encounter spawn pools.
+        # Aggregate by (can_rr, area_rr, enc_rr) → count.
+        # Skip blueprints not found in the module's files (e.g. stock NWN
+        # resrefs like nw_* that come from the game data, not the module).
+        _enc_agg: dict[tuple, int] = {}
+        for crr, spawns in self.creature_encounter_spawns.items():
+            if crr not in self.canonical_for_bp:
+                continue
+            can_rr = self.canonical_for_bp[crr]
+            for sp in spawns:
+                area_rr = sp["area"]
+                if area_rr in self.hidden_areas:
+                    continue
+                enc_rr = sp["encounter_resref"]
+                agg_key = (can_rr, area_rr, enc_rr)
+                _enc_agg[agg_key] = _enc_agg.get(agg_key, 0) + 1
+        for (can_rr, area_rr, enc_rr), count in _enc_agg.items():
+            self.canonical_locations[can_rr].append(
+                {"area": area_rr, "kind": "encounter", "enc_rr": enc_rr, "count": count}
+            )
+
+        # Pass 4: canonical_locations from direct placements.
+        _placed_agg: dict[tuple, int] = {}
+        for area_rr, insts in self.area_creature_instances.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for inst in insts:
+                can_rr = self.canonical_for_inst.get((area_rr, inst["idx"]))
+                if can_rr:
+                    agg_key = (can_rr, area_rr)
+                    _placed_agg[agg_key] = _placed_agg.get(agg_key, 0) + 1
+        for (can_rr, area_rr), count in _placed_agg.items():
+            self.canonical_locations[can_rr].append(
+                {"area": area_rr, "kind": "placed", "enc_rr": None, "count": count}
+            )
+        # ---- End canonical creature index ----------------------------------
+
         # Build item-source cross-references, absorbing inline items through
         # _intern_item() so that instances with different PropertiesList get
         # their own synthetic resref (base__v2, __v3 …) and their own accurate
@@ -1783,19 +1953,17 @@ class Db:
                             )
 
         # Creature instances — absorb and build item_carried_by.
+        # crr in item_carried_by entries is now the canonical_rr so item pages
+        # can link directly to the canonical creature page.
         _seen_carrier: set[tuple[str, str, str]] = set()
         for area_rr, insts in self.area_creature_instances.items():
             skip = area_rr in self.hidden_areas
             for inst in insts:
                 c = inst["c"]
-                crr = fld(c, "TemplateResRef", "") or ""
-                bp = self.creatures.get(crr, {})
-                cname = (
-                    (loc(c.get("FirstName") or {}) + " " +
-                     loc(c.get("LastName") or {})).strip()
-                    or self.creature_name(crr)
-                    or crr
-                )
+                bp_rr = fld(c, "TemplateResRef", "") or ""
+                bp = self.creatures.get(bp_rr, {})
+                can_rr = self.canonical_for_inst.get((area_rr, inst["idx"]), bp_rr)
+                cname = self.canonical_creature_name(can_rr) or bp_rr
                 equip_list = (list_items(c.get("Equip_ItemList"))
                               or list_items(bp.get("Equip_ItemList")))
                 for e in equip_list:
@@ -1805,11 +1973,11 @@ class Db:
                         actual_rr = self._intern_item(base_rr, e)
                         dropable = bool(int(fld(e, "Dropable", 0) or 0))
                         pickpocketable = bool(int(fld(e, "Pickpocketable", 0) or 0))
-                        key = (actual_rr, area_rr, crr)
+                        key = (actual_rr, area_rr, can_rr)
                         if key not in _seen_carrier and not skip:
                             _seen_carrier.add(key)
                             self.item_carried_by[actual_rr].append(
-                                {"area_rr": area_rr, "crr": crr,
+                                {"area_rr": area_rr, "crr": can_rr,
                                  "cname": cname, "dropable": dropable,
                                  "pickpocketable": pickpocketable}
                             )
@@ -1820,11 +1988,11 @@ class Db:
                         actual_rr = self._intern_item(base_rr, it)
                         dropable = bool(int(fld(it, "Dropable", 0) or 0))
                         pickpocketable = bool(int(fld(it, "Pickpocketable", 0) or 0))
-                        key = (actual_rr, area_rr, crr)
+                        key = (actual_rr, area_rr, can_rr)
                         if key not in _seen_carrier and not skip:
                             _seen_carrier.add(key)
                             self.item_carried_by[actual_rr].append(
-                                {"area_rr": area_rr, "crr": crr,
+                                {"area_rr": area_rr, "crr": can_rr,
                                  "cname": cname, "dropable": dropable,
                                  "pickpocketable": pickpocketable}
                             )
@@ -1833,7 +2001,8 @@ class Db:
             bp = self.creatures.get(crr, {})
             if not bp:
                 continue
-            cname = self.creature_name(crr)
+            can_rr = self.canonical_for_bp.get(crr, crr)
+            cname = self.canonical_creature_name(can_rr)
             # Resolve each blueprint item to its variant resref once, then reuse
             # across all spawn areas (the blueprint's items are constant).
             item_entries: list[tuple[str, bool, bool]] = []  # (actual_rr, dropable, pickpocketable)
@@ -1860,11 +2029,11 @@ class Db:
                 if area_rr in self.hidden_areas:
                     continue
                 for actual_rr, dropable, pickpocketable in item_entries:
-                    key = (actual_rr, area_rr, crr)
+                    key = (actual_rr, area_rr, can_rr)
                     if key not in _seen_carrier:
                         _seen_carrier.add(key)
                         self.item_carried_by[actual_rr].append(
-                            {"area_rr": area_rr, "crr": crr,
+                            {"area_rr": area_rr, "crr": can_rr,
                              "cname": cname, "dropable": dropable,
                              "pickpocketable": pickpocketable}
                         )
@@ -3073,6 +3242,25 @@ class Db:
         rr = fld(c, "TemplateResRef", "") or ""
         return self.creature_name(rr) if rr else "(unnamed)"
 
+    def canonical_creature_name(self, canonical_rr: str) -> str:
+        """Display name for a canonical creature entry.
+        Uses FirstName/LastName from the canonical struct (which may be a
+        GIT instance override), falling back to the source blueprint's name.
+        """
+        entry = self.canonical_creatures.get(canonical_rr)
+        if not entry:
+            return canonical_rr
+        c = entry["c"]
+        first = loc(c.get("FirstName"))
+        last = loc(c.get("LastName"))
+        full = (first + " " + last).strip()
+        if full:
+            return full
+        bp_rr = entry["bp_rr"]
+        if bp_rr and bp_rr != canonical_rr and bp_rr in self.creatures:
+            return self.creature_name(bp_rr)
+        return self.creature_name(canonical_rr) or canonical_rr
+
     def dialog_label(self, resref: str) -> str:
         """A short human label for a dialog: the first line of its first
         Starting entry, truncated. Falls back to the resref."""
@@ -3823,8 +4011,14 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
     <nav>
       <a href="{E(root_rel)}/index.html">Map</a>
       <a href="{E(root_rel)}/areas/index.html">Areas</a>
-      <a href="{E(root_rel)}/creatures/index.html">Creature Blueprints</a>
-      <a href="{E(root_rel)}/creatures/instances/index.html">Creature Instances</a>
+      <div class="nav-dropdown">
+        <span class="nav-dropdown-label">Creatures &#9660;</span>
+        <div class="nav-dropdown-menu">
+          <a href="{E(root_rel)}/creatures/index.html">All Creatures</a>
+          <a href="{E(root_rel)}/creatures/by-area/index.html">By Area</a>
+          <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
+        </div>
+      </div>
       <div class="nav-dropdown">
         <span class="nav-dropdown-label">Items &#9660;</span>
         <div class="nav-dropdown-menu">
@@ -4763,14 +4957,14 @@ def render_area_page(db: Db, resref: str, out: Path,
             hp = fld(c, "MaxHitPoints", fld(c, "HitPoints", ""))
             cr = fld(c, "ChallengeRating", "")
             conv = fld(c, "Conversation", "")
-            inst_url = f"../creatures/instances/{resref}-{idx:03d}.html"
+            can_rr = db.canonical_for_inst.get((resref, idx), rr)
+            inst_url = f"../creatures/{can_rr}.html"
             name_cell = f'<a href="{E(inst_url)}">{nwn_html(disp)}</a>'
-            bp_cell = (link(f"../creatures/{rr}.html", db.creature_name(rr))
-                       if rr in db.creatures else
+            bp_cell = (link(f"../creatures/{can_rr}.html", db.canonical_creature_name(can_rr))
+                       if can_rr in db.canonical_creatures else
                        (f"<code>{E(rr)}</code>" if rr else ""))
             rows.append(
                 f"<tr><td>{name_cell}</td>"
-                f"<td>{bp_cell}</td>"
                 f"<td>{E(rr)}</td>"
                 f"<td>{E(race_name(fld(c, 'Race')))}</td>"
                 f"<td>{E(cls_str)}</td>"
@@ -4781,7 +4975,7 @@ def render_area_page(db: Db, resref: str, out: Path,
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Name</th><th>Blueprint</th><th>ResRef</th>"
+            "<th>Name</th><th>ResRef</th>"
             "<th>Race</th><th>Class</th><th>HP</th><th>CR</th>"
             "<th>Faction</th><th>Conversation</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
@@ -4809,9 +5003,10 @@ def render_area_page(db: Db, resref: str, out: Path,
                 for s in spawns:
                     srr = fld(s, "ResRef", "")
                     cr = fld(s, "CR", "")
-                    disp = db.creature_name(srr) if srr in db.creatures else srr
-                    cell = (link(f"../creatures/{srr}.html", disp)
-                            if srr in db.creatures else nwn_html(disp))
+                    can_srr = db.canonical_for_bp.get(srr, srr)
+                    disp = db.canonical_creature_name(can_srr) if can_srr in db.canonical_creatures else (db.creature_name(srr) if srr in db.creatures else srr)
+                    cell = (link(f"../creatures/{can_srr}.html", disp)
+                            if can_srr in db.canonical_creatures else nwn_html(disp))
                     spawn_cells.append(f"{cell}<small> CR {E(cr)}</small>")
                 enc_groups[rr] = {
                     "ename": ename, "max_c": max_c, "diff": diff,
@@ -4971,8 +5166,9 @@ def render_area_page(db: Db, resref: str, out: Path,
                 if k == "creature-instance":
                     a = c.get("area", "")
                     idx = c.get("idx", 0)
-                    nm = db.creature_instance_name(a, idx) or c.get("resref", "")
-                    href = f"../creatures/instances/{a}-{idx:03d}.html"
+                    can_rr2 = db.canonical_for_inst.get((a, idx), "")
+                    nm = db.canonical_creature_name(can_rr2) if can_rr2 else (db.creature_instance_name(a, idx) or c.get("resref", ""))
+                    href = f"../creatures/{can_rr2}.html" if can_rr2 else "#"
                     return f'NPC <a href="{E(href)}">{nwn_html(nm)}</a>'
                 if k == "placeable":
                     return f"placeable <code>{E(c['resref'])}</code>"
@@ -5135,34 +5331,63 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
 
 def render_creatures_index(db: Db, out: Path) -> None:
     rows = []
-    for rr in sorted(db.creatures.keys(), key=lambda r: nwn_text(db.creature_name(r)).lower()):
-        c = db.creatures[rr]
-        classes = list_items(c.get("ClassList"))
+    for can_rr in sorted(db.canonical_creatures.keys(),
+                         key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        entry = db.canonical_creatures[can_rr]
+        c = entry["c"]
+        bp_rr = entry["bp_rr"]
+        bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+
+        def _f(key, default=None):
+            v = fld(c, key)
+            if v is None and bp is not None:
+                v = fld(bp, key)
+            return default if v is None else v
+
+        classes = list_items(c.get("ClassList")) or (list_items(bp.get("ClassList")) if bp else [])
         cls_str = "/".join(
             f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
             for cl in classes
         )
+        is_variant = db.canonical_bp_of.get(can_rr) != can_rr
+        if is_variant:
+            base_rr = db.canonical_bp_of[can_rr]
+            variant_note = (
+                f' <small class="muted">(variant of '
+                f'{link(f"{base_rr}.html", db.canonical_creature_name(base_rr))})</small>'
+            )
+        else:
+            variant_note = ""
         rows.append(
-            f"<tr><td>{link(f'{rr}.html', db.creature_name(rr))}</td>"
-            f"<td>{E(rr)}</td>"
-            f"<td>{E(race_name(fld(c, 'Race')))}</td>"
+            f"<tr><td>{link(f'{can_rr}.html', db.canonical_creature_name(can_rr))}"
+            f"{variant_note}</td>"
+            f"<td>{E(can_rr)}</td>"
+            f"<td>{E(race_name(_f('Race')))}</td>"
             f"<td>{E(cls_str)}</td>"
-            f"<td>{E(fld(c, 'MaxHitPoints', ''))}</td>"
-            f"<td>{E(fld(c, 'ChallengeRating', ''))}</td>"
-            f"<td>{E(db.faction_name(fld(c, 'FactionID', '')))}</td></tr>"
+            f"<td>{E(_f('MaxHitPoints', ''))}</td>"
+            f"<td>{E(_f('ChallengeRating', ''))}</td>"
+            f"<td>{E(db.faction_name(_f('FactionID', '')))}</td></tr>"
         )
+    n_unique = len(db.canonical_creatures)
+    n_variants = sum(1 for r in db.canonical_creatures
+                     if db.canonical_bp_of.get(r) != r)
+    variant_note_str = (
+        f" ({n_variants} equipment/class variant{'s' if n_variants != 1 else ''})"
+        if n_variants else ""
+    )
     body = (
-        "<h1>Creature Blueprints</h1>"
-        f"<p>{len(db.creatures)} blueprints. Each may be placed zero, one, "
-        f'or many times across areas — see '
-        f'<a href="instances/index.html">Creature Instances</a> for placements.</p>'
+        "<h1>Creatures</h1>"
+        f"<p>{n_unique} unique creature{'s' if n_unique != 1 else ''}{variant_note_str}. "
+        f'See <a href="by-area/index.html">By Area</a> or '
+        f'<a href="by-cr/index.html">By Challenge Rating</a> for other views.</p>'
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th>"
         "<th>HP</th><th>CR</th><th>Faction</th>"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
     write(out / "creatures" / "index.html",
-          page("Creature Blueprints", body, root_rel=".."))
+          page("Creatures", body, root_rel=".."))
+
 
 
 def _creature_detail_sections(
@@ -5781,239 +6006,323 @@ def _creature_detail_sections(
     return sections
 
 
-def render_creature_page(db: Db, resref: str, out: Path) -> None:
-    c = db.creatures.get(resref)
-    if not c:
+def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
+    """One page per unique creature (canonical entity).  Replaces the old
+    separate blueprint page + instance page model."""
+    entry = db.canonical_creatures.get(canonical_rr)
+    if not entry:
         return
-    name = db.creature_name(resref)
-    classes = list_items(c.get("ClassList"))
-    cls_str = "/".join(
-        f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
-        for cl in classes
-    )
+    c = entry["c"]
+    bp_rr = entry["bp_rr"]
+    bp = db.creatures.get(bp_rr) if bp_rr != canonical_rr else None
+    name = db.canonical_creature_name(canonical_rr)
 
-    sections = [
-        f"<h1>{nwn_html(name)}</h1>",
-        '<dl class="meta">',
-        f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
-        f"<dt>Tag</dt><dd>{E(fld(c, 'Tag', ''))}</dd>",
-        f"<dt>Race</dt><dd>{E(race_name(fld(c, 'Race')))}</dd>",
-        f"<dt>Appearance</dt><dd>{E(appearance_name(fld(c, 'Appearance_Type')))}</dd>",
-        f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
-        f"<dt>HP</dt><dd>{E(_fmt_hp(fld(c, 'MaxHitPoints', fld(c, 'HitPoints', ''))))}</dd>",
-        f"<dt>CR</dt><dd>{E(fld(c, 'ChallengeRating', ''))}</dd>",
-        f"<dt>Faction</dt><dd>{_faction_dd(db, fld(c, 'FactionID', ''), root_rel='..')}</dd>",
-        f"<dt>Conversation</dt><dd>{_conv_link(db, fld(c, 'Conversation', ''), root_rel='..')}</dd>",
-        '</dl>',
-    ]
-
-    # Encounter spawns — areas where this creature can appear via an encounter
-    # trigger's spawn pool. Aggregate by (area, encounter blueprint) so a
-    # single encounter placed once doesn't get listed once per pool entry.
-    enc_spawns = db.creature_encounter_spawns.get(resref, [])
-    if enc_spawns:
-        agg: dict[tuple[str, str], int] = defaultdict(int)
-        for s in enc_spawns:
-            if s["area"] not in db.hidden_areas:
-                agg[(s["area"], s["encounter_resref"])] += 1
-        spawn_rows = []
-        for (area_rr, enc_rr) in sorted(
-            agg.keys(),
-            key=lambda k: (db.area_name(k[0]).lower(), k[1]),
-        ):
-            blueprint = db.encounters.get(enc_rr, {})
-            ename = (loc(blueprint.get("LocalizedName"))
-                     or enc_rr or "(unnamed)")
-            spawn_rows.append(
-                f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
-                f"<td>{nwn_html(ename)}</td>"
-                f"<td><code>{E(enc_rr)}</code></td></tr>"
-            )
-        n_areas = len({a for (a, _) in agg.keys()})
-        sections.append(
-            f"<h2>Encounter spawns <small class=\"muted\">"
-            f"({n_areas} area{'s' if n_areas != 1 else ''})</small></h2>"
-            '<table class="data"><thead><tr>'
-            "<th>Area</th><th>Encounter</th><th>Encounter ResRef</th>"
-            "</tr></thead><tbody>" + "\n".join(spawn_rows) + "</tbody></table>"
-        )
-
-    store_section = _creature_store_section(db, resref, filter_area=None, root_rel="..")
-    if store_section:
-        sections.append(store_section)
-
-    sections.extend(_creature_detail_sections(db, c, bp=None, root_rel=".."))
-
-    # "Instances" — each placement of this blueprint, with overrides.
-    inst_rows = []
-    for area_rr in sorted(db.area_creature_instances.keys(),
-                          key=lambda r: db.area_name(r).lower()):
-        if area_rr in db.hidden_areas:
-            continue
-        for inst in db.area_creature_instances[area_rr]:
-            ic = inst["c"]
-            if fld(ic, "TemplateResRef", "") != resref:
-                continue
-            idx = inst["idx"]
-            disp = db.creature_instance_name(area_rr, idx) or "(unnamed)"
-            url = f"instances/{area_rr}-{idx:03d}.html"
-            inst_conv = (fld(ic, "Conversation", "") or "").lower()
-            blueprint_conv = (fld(c, "Conversation", "") or "").lower()
-            conv_note = ""
-            if inst_conv and inst_conv != blueprint_conv:
-                conv_note = (' <small class="muted">(conv override: '
-                             f'{_conv_link(db, inst_conv, root_rel="..")})</small>')
-            inst_rows.append(
-                f"<tr><td><a href=\"{E(url)}\">{nwn_html(disp)}</a></td>"
-                f"<td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
-                f"<td>{E(db.faction_name(fld(ic, 'FactionID', '')))}</td>"
-                f"<td>{conv_note or '—'}</td></tr>"
-            )
-    if inst_rows:
-        sections.append(
-            f"<h2>Instances <small class=\"muted\">({len(inst_rows)})</small></h2>"
-            '<table class="data"><thead><tr>'
-            "<th>Name</th><th>Area</th><th>Faction</th><th>Notes</th>"
-            "</tr></thead><tbody>" + "\n".join(inst_rows) + "</tbody></table>"
-        )
-
-    write(out / "creatures" / f"{resref}.html",
-          page(name, "\n".join(sections), root_rel=".."))
-
-
-def render_creature_instances_index(db: Db, out: Path) -> None:
-    """One row per placed creature, grouped by area. Instances may or may not
-    track their blueprint exactly — the toolset lets a builder rename a
-    placement, swap its conversation, or change its faction without editing
-    the underlying utc."""
-    sections = ["<h1>Creature Instances</h1>"]
-    n_total = len(db.creature_instances)
-    n_areas = sum(1 for v in db.area_creature_instances.values() if v)
-    sections.append(
-        f"<p>{n_total} placed creatures across {n_areas} areas. "
-        f'See <a href="../index.html">Creature Blueprints</a> for the '
-        f"underlying templates.</p>"
-    )
-    for area_rr in sorted(db.area_creature_instances.keys(),
-                          key=lambda r: db.area_name(r).lower()):
-        if area_rr in db.hidden_areas:
-            continue
-        insts = db.area_creature_instances[area_rr]
-        if not insts:
-            continue
-        sections.append(
-            f'<h2>{link(f"../../areas/{area_rr}.html", db.area_name(area_rr))} '
-            f'<small class="muted">({len(insts)})</small></h2>'
-        )
-        rows = []
-        for inst in insts:
-            c = inst["c"]
-            idx = inst["idx"]
-            rr = fld(c, "TemplateResRef", "") or ""
-            disp = db.creature_instance_name(area_rr, idx) or rr or "(unnamed)"
-            url = f"{area_rr}-{idx:03d}.html"
-            bp_cell = (link(f"../{rr}.html", db.creature_name(rr))
-                       if rr in db.creatures else
-                       (f"<code>{E(rr)}</code>" if rr else "—"))
-            inst_conv = (fld(c, "Conversation", "") or "")
-            conv_cell = _conv_link(db, inst_conv, root_rel="../..") if inst_conv else "—"
-            rows.append(
-                f"<tr><td><a href=\"{E(url)}\">{nwn_html(disp)}</a></td>"
-                f"<td>{bp_cell}</td>"
-                f"<td>{E(rr)}</td>"
-                f"<td><code>{E(fld(c, 'Tag', ''))}</code></td>"
-                f"<td>{E(db.faction_name(fld(c, 'FactionID', '')))}</td>"
-                f"<td>{conv_cell}</td></tr>"
-            )
-        sections.append(
-            '<table class="data"><thead><tr>'
-            "<th>Name</th><th>Blueprint</th><th>ResRef</th>"
-            "<th>Tag</th><th>Faction</th><th>Conversation</th>"
-            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
-        )
-    write(out / "creatures" / "instances" / "index.html",
-          page("Creature Instances", "\n".join(sections), root_rel="../.."))
-
-
-def render_creature_instance_page(db: Db, area_rr: str, idx: int, out: Path) -> None:
-    """One page per creature placement. Surfaces instance-specific overrides
-    (name, faction, conversation, position) alongside a back-link to the
-    blueprint, so the reader can see at a glance whether this placement is a
-    plain spawn or a customised NPC like Crazy Maggie."""
-    insts = db.area_creature_instances.get(area_rr, [])
-    if not (0 <= idx < len(insts)):
-        return
-    c = insts[idx]["c"]
-    rr = fld(c, "TemplateResRef", "") or ""
-    bp = db.creatures.get(rr)
-    name = db.creature_instance_name(area_rr, idx) or rr or "(unnamed)"
-
-    # Instance GFFs frequently store only the toolset overrides — most stats
-    # come from the underlying UTC. Fall through to the blueprint so the
-    # meta block reads sensibly even for plain spawns.
     def _meta(key: str, default: Any = None) -> Any:
         v = fld(c, key, None)
         if v is None and bp is not None:
             v = fld(bp, key, default)
         return default if v is None else v
 
-    inst_conv = (fld(c, "Conversation", "") or "")
-    bp_conv = (fld(bp, "Conversation", "") or "") if bp else ""
-
     classes = list_items(c.get("ClassList")) or (list_items(bp.get("ClassList")) if bp else [])
     cls_str = "/".join(
         f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
         for cl in classes
     )
-
-    x = fld(c, "XPosition", fld(c, "X", 0.0)) or 0.0
-    y = fld(c, "YPosition", fld(c, "Y", 0.0)) or 0.0
-    z = fld(c, "ZPosition", fld(c, "Z", 0.0)) or 0.0
-
-    bp_link = (link(f"../{rr}.html", db.creature_name(rr))
-               if rr in db.creatures else
-               (f"<code>{E(rr)}</code>" if rr else "—"))
+    conv = _meta("Conversation", "")
 
     sections = [
         f"<h1>{nwn_html(name)}</h1>",
         '<dl class="meta">',
-        f"<dt>Area</dt><dd>{link(f'../../areas/{area_rr}.html', db.area_name(area_rr))}</dd>",
-        f"<dt>Blueprint</dt><dd>{bp_link}</dd>",
-        f"<dt>ResRef</dt><dd>{E(rr)}</dd>",
-        f"<dt>Tag</dt><dd><code>{E(_meta('Tag', ''))}</code></dd>",
-        f"<dt>Position (X, Y, Z)</dt><dd>"
-        f"{(float(x) if isinstance(x, (int, float)) else 0.0):.2f}, "
-        f"{(float(y) if isinstance(y, (int, float)) else 0.0):.2f}, "
-        f"{(float(z) if isinstance(z, (int, float)) else 0.0):.2f}</dd>",
+        f"<dt>ResRef</dt><dd>{E(canonical_rr)}</dd>",
+        f"<dt>Tag</dt><dd>{E(_meta('Tag', ''))}</dd>",
         f"<dt>Race</dt><dd>{E(race_name(_meta('Race')))}</dd>",
         f"<dt>Appearance</dt><dd>{E(appearance_name(_meta('Appearance_Type')))}</dd>",
         f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
         f"<dt>HP</dt><dd>{E(_fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
         f"<dt>CR</dt><dd>{E(_meta('ChallengeRating', ''))}</dd>",
-        f"<dt>Faction</dt><dd>{_faction_dd(db, _meta('FactionID', ''), root_rel='../..')}</dd>",
-        f"<dt>Conversation</dt><dd>{_conv_link(db, inst_conv, root_rel='../..') if inst_conv else (_conv_link(db, bp_conv, root_rel='../..') if bp_conv else '—')}</dd>",
+        f"<dt>Faction</dt><dd>{_faction_dd(db, _meta('FactionID', ''), root_rel='..')}</dd>",
+        f"<dt>Conversation</dt><dd>{_conv_link(db, conv, root_rel='..') if conv else '—'}</dd>",
     ]
-    if inst_conv and bp_conv and inst_conv.lower() != bp_conv.lower():
+
+    # Variant notice
+    is_variant = db.canonical_bp_of.get(canonical_rr) != canonical_rr
+    if is_variant:
+        base_rr = db.canonical_bp_of[canonical_rr]
         sections.append(
-            f'<dt>Blueprint conversation</dt><dd>'
-            f'{_conv_link(db, bp_conv, root_rel="../..")} '
-            f'<small class="muted">(overridden on this placement)</small></dd>'
+            f'<dt>Variant of</dt><dd>'
+            f'{link(f"{base_rr}.html", db.canonical_creature_name(base_rr))}'
+            f' <small class="muted">(differs in equipment, class levels, or feats)</small></dd>'
         )
     sections.append('</dl>')
 
-    sections.append(
-        f"<h2>Found in</h2>"
-        f'<p>{link(f"../../areas/{area_rr}.html", db.area_name(area_rr))}</p>'
-    )
+    # "Where to find" section
+    locs = db.canonical_locations.get(canonical_rr, [])
+    placed_locs  = [l for l in locs if l["kind"] == "placed"]
+    enc_locs     = [l for l in locs if l["kind"] == "encounter"]
 
-    store_section = _creature_store_section(db, rr, filter_area=area_rr, root_rel="../..")
+    if placed_locs or enc_locs:
+        sections.append("<h2>Where to find</h2>")
+        if placed_locs:
+            # Aggregate by area
+            placed_by_area: dict[str, int] = {}
+            for l in placed_locs:
+                placed_by_area[l["area"]] = placed_by_area.get(l["area"], 0) + l["count"]
+            place_rows = []
+            for area_rr in sorted(placed_by_area.keys(),
+                                  key=lambda r: db.area_name(r).lower()):
+                cnt = placed_by_area[area_rr]
+                place_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{cnt}</td></tr>"
+                )
+            sections.append(
+                "<h3>Placed directly</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Count</th>"
+                "</tr></thead><tbody>" + "\n".join(place_rows) + "</tbody></table>"
+            )
+        if enc_locs:
+            # Aggregate by (area, enc_rr)
+            enc_by_key: dict[tuple[str, str], int] = {}
+            for l in enc_locs:
+                k = (l["area"], l["enc_rr"] or "")
+                enc_by_key[k] = enc_by_key.get(k, 0) + l["count"]
+            enc_rows = []
+            for (area_rr, enc_rr) in sorted(
+                enc_by_key.keys(),
+                key=lambda k: (db.area_name(k[0]).lower(), k[1]),
+            ):
+                blueprint = db.encounters.get(enc_rr, {})
+                ename = loc(blueprint.get("LocalizedName")) or enc_rr or "(unnamed)"
+                enc_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{nwn_html(ename)}</td>"
+                    f"<td><code>{E(enc_rr)}</code></td></tr>"
+                )
+            sections.append(
+                "<h3>Encounter pools</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Encounter</th><th>Encounter ResRef</th>"
+                "</tr></thead><tbody>" + "\n".join(enc_rows) + "</tbody></table>"
+            )
+    else:
+        sections.append("<h2>Where to find</h2><p>Not placed in any area.</p>")
+
+    store_section = _creature_store_section(db, bp_rr, filter_area=None, root_rel="..")
     if store_section:
         sections.append(store_section)
 
-    sections.extend(_creature_detail_sections(db, c, bp=bp, root_rel="../.."))
+    sections.extend(_creature_detail_sections(db, c, bp=bp, root_rel=".."))
 
-    write(out / "creatures" / "instances" / f"{area_rr}-{idx:03d}.html",
-          page(name, "\n".join(sections), root_rel="../.."))
+    write(out / "creatures" / f"{canonical_rr}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_creatures_by_area(db: Db, out: Path) -> None:
+    """Creatures grouped by area. One row per unique creature per area, with
+    spawn-method badges and a count of total appearances."""
+    # Build area → {can_rr → {"placed": N, "enc": N, "enc_rrs": set}}
+    area_map: dict[str, dict[str, dict]] = defaultdict(dict)
+    for can_rr, locs in db.canonical_locations.items():
+        for loc_entry in locs:
+            area_rr = loc_entry["area"]
+            if area_rr not in area_map[can_rr]:
+                area_map[can_rr][area_rr] = {"placed": 0, "enc": 0, "enc_rrs": set()}
+            if loc_entry["kind"] == "placed":
+                area_map[can_rr][area_rr]["placed"] += loc_entry["count"]
+            else:
+                area_map[can_rr][area_rr]["enc"] += loc_entry["count"]
+                if loc_entry["enc_rr"]:
+                    area_map[can_rr][area_rr]["enc_rrs"].add(loc_entry["enc_rr"])
+
+    # Invert to area → [can_rr, ...]
+    by_area: dict[str, list[str]] = defaultdict(list)
+    for can_rr, areas in area_map.items():
+        for area_rr in areas:
+            by_area[area_rr].append(can_rr)
+
+    visible_areas = [a for a in by_area if a not in db.hidden_areas]
+
+    # Build sidebar TOC
+    toc_parts = ['<div class="toc-group-heading">Areas</div>']
+    for area_rr in sorted(visible_areas, key=lambda r: db.area_name(r).lower()):
+        cnt = len(by_area[area_rr])
+        slug = f"area-{area_rr}"
+        toc_parts.append(
+            f'<div><a href="#{E(slug)}">{E(db.area_name(area_rr))}'
+            f' <span class="muted">({cnt})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    sections: list[str] = [
+        "<h1>Creatures by Area</h1>",
+        f"<p>{len(visible_areas)} areas with creatures. "
+        f'See <a href="../index.html">All Creatures</a> for a flat list.</p>',
+    ]
+    for area_rr in sorted(visible_areas, key=lambda r: db.area_name(r).lower()):
+        can_rrs = by_area[area_rr]
+        slug = f"area-{area_rr}"
+        sections.append(
+            f'<h2 id="{E(slug)}">'
+            f'{link(f"../../areas/{area_rr}.html", db.area_name(area_rr))} '
+            f'<small class="muted">({len(can_rrs)})</small></h2>'
+        )
+        rows = []
+        for can_rr in sorted(can_rrs,
+                              key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+            entry = db.canonical_creatures[can_rr]
+            c2 = entry["c"]
+            bp2_rr = entry["bp_rr"]
+            bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+
+            def _f2(key, default=None):
+                v = fld(c2, key)
+                if v is None and bp2 is not None:
+                    v = fld(bp2, key)
+                return default if v is None else v
+
+            classes2 = list_items(c2.get("ClassList")) or (
+                list_items(bp2.get("ClassList")) if bp2 else [])
+            cls_str2 = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes2
+            )
+            info = area_map[can_rr][area_rr]
+            placed = info["placed"]
+            enc = info["enc"]
+            if placed and enc:
+                method = '<span class="badge">placed</span> + <span class="badge">encounter</span>'
+            elif placed:
+                method = '<span class="badge">placed</span>'
+            else:
+                method = '<span class="badge">encounter</span>'
+            count = placed + enc
+            rows.append(
+                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
+                f"<td>{E(race_name(_f2('Race')))}</td>"
+                f"<td>{E(cls_str2)}</td>"
+                f"<td>{E(_f2('MaxHitPoints', ''))}</td>"
+                f"<td>{E(_f2('ChallengeRating', ''))}</td>"
+                f"<td>{method}</td>"
+                f"<td>{count}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Race</th><th>Class</th>"
+            "<th>HP</th><th>CR</th><th>Spawn Method</th><th>Count</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "by-area" / "index.html",
+          page("Creatures by Area",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel="../.."))
+
+
+def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> None:
+    """Creatures grouped by Challenge Rating range, with a left-sidebar TOC."""
+    _UNKNOWN = "__unknown__"
+
+    def _cr_bucket(can_rr: str) -> int | str:
+        entry = db.canonical_creatures[can_rr]
+        c2 = entry["c"]
+        bp2_rr = entry["bp_rr"]
+        bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+        raw = fld(c2, "ChallengeRating")
+        if raw is None and bp2 is not None:
+            raw = fld(bp2, "ChallengeRating")
+        if raw is None:
+            return _UNKNOWN
+        try:
+            cr = float(raw)
+            return int(cr // cr_bucket_size) * cr_bucket_size
+        except (TypeError, ValueError):
+            return _UNKNOWN
+
+    # Group canonicals into buckets
+    buckets: dict[int | str, list[str]] = defaultdict(list)
+    for can_rr in db.canonical_creatures:
+        buckets[_cr_bucket(can_rr)].append(can_rr)
+
+    int_buckets = sorted(k for k in buckets if k != _UNKNOWN)
+    bucket_order: list[int | str] = int_buckets
+    if _UNKNOWN in buckets:
+        bucket_order = int_buckets + [_UNKNOWN]
+
+    def _bucket_label(b: int | str) -> str:
+        if b == _UNKNOWN:
+            return "Unknown CR"
+        end = b + cr_bucket_size - 1
+        return f"CR {b}–{end}"
+
+    def _bucket_anchor(b: int | str) -> str:
+        return "cr-unknown" if b == _UNKNOWN else f"cr-{b}"
+
+    # Build sidebar TOC
+    toc_parts = ['<div class="toc-group-heading">Challenge Rating</div>']
+    for b in bucket_order:
+        cnt = len(buckets[b])
+        anchor = _bucket_anchor(b)
+        toc_parts.append(
+            f'<div><a href="#{E(anchor)}">{E(_bucket_label(b))}'
+            f' <span class="muted">({cnt})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    sections: list[str] = [
+        "<h1>Creatures by Challenge Rating</h1>",
+        f"<p>Grouped in ranges of {cr_bucket_size} CR. "
+        f'See <a href="../index.html">All Creatures</a> for a flat list.</p>',
+    ]
+    for b in bucket_order:
+        anchor = _bucket_anchor(b)
+        label = _bucket_label(b)
+        can_rrs_in_bucket = sorted(
+            buckets[b],
+            key=lambda r: nwn_text(db.canonical_creature_name(r)).lower(),
+        )
+        rows = []
+        for can_rr in can_rrs_in_bucket:
+            entry = db.canonical_creatures[can_rr]
+            c2 = entry["c"]
+            bp2_rr = entry["bp_rr"]
+            bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+
+            def _f3(key, default=None):
+                v = fld(c2, key)
+                if v is None and bp2 is not None:
+                    v = fld(bp2, key)
+                return default if v is None else v
+
+            classes3 = list_items(c2.get("ClassList")) or (
+                list_items(bp2.get("ClassList")) if bp2 else [])
+            cls_str3 = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes3
+            )
+            rows.append(
+                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
+                f"<td>{E(race_name(_f3('Race')))}</td>"
+                f"<td>{E(cls_str3)}</td>"
+                f"<td>{E(_f3('MaxHitPoints', ''))}</td>"
+                f"<td>{E(_f3('ChallengeRating', ''))}</td>"
+                f"<td>{E(db.faction_name(_f3('FactionID', '')))}</td></tr>"
+            )
+        sections.append(
+            f'<h2 id="{E(anchor)}">{E(label)}'
+            f' <small class="muted">({len(rows)})</small></h2>'
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Race</th><th>Class</th>"
+            "<th>HP</th><th>CR</th><th>Faction</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "by-cr" / "index.html",
+          page("Creatures by Challenge Rating",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel="../.."))
 
 
 def _fmt_cost(raw) -> str:
@@ -6686,7 +6995,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                              if area_rr in db.areas else E(area_rr))
                 crr = c["crr"]
                 creature_cell = (link(f"../creatures/{crr}.html", c["cname"])
-                                 if crr in db.creatures else E(c["cname"]))
+                                 if crr in db.canonical_creatures else E(c["cname"]))
                 drops = c.get("dropable", False)
                 drop_cell = "Yes" if drops else '<span class="muted">No</span>'
                 pp = c.get("pickpocketable", False)
@@ -6723,9 +7032,10 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                                    if dlg in db.dialogs else E(dlg_label))
                 elif kind == "creature-event":
                     crr = src.get("crr") or ""
-                    cname = db.creature_name(crr) if crr else script_rr
-                    creature_html = (link(f"../creatures/{crr}.html", cname)
-                                     if crr in db.creatures else E(cname))
+                    can_crr = db.canonical_for_bp.get(crr, crr) if crr else ""
+                    cname = db.canonical_creature_name(can_crr) if can_crr else script_rr
+                    creature_html = (link(f"../creatures/{can_crr}.html", cname)
+                                     if can_crr in db.canonical_creatures else E(cname))
                     source_cell = f"{creature_html} <small class=\"muted\">({E(src['label'])})</small>"
                 else:  # placeable-event
                     prr = src.get("prr") or ""
@@ -7817,13 +8127,15 @@ def _store_opener_html(db: Db, opener: dict, root_rel: str = "..") -> str:
         if kind == "creature-instance":
             area_rr = opener.get("area", "")
             idx = opener.get("idx", 0)
-            name = db.creature_instance_name(area_rr, idx) or rr or "(NPC)"
-            url = f"{root_rel}/creatures/instances/{area_rr}-{idx:03d}.html"
+            can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
+            name = db.canonical_creature_name(can_rr) if can_rr else (rr or "(NPC)")
+            url = f"{root_rel}/creatures/{can_rr}.html" if can_rr else "#"
             npc_html = f'<a href="{E(url)}">{nwn_html(name)}</a>'
         else:
-            name = db.creature_name(rr) if rr in db.creatures else (rr or "NPC")
-            npc_html = (link(f"{root_rel}/creatures/{rr}.html", name)
-                        if rr in db.creatures else nwn_html(name))
+            can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
+            name = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else (rr or "NPC")
+            npc_html = (link(f"{root_rel}/creatures/{can_rr}.html", name)
+                        if can_rr in db.canonical_creatures else nwn_html(name))
         if via_dlg and via_dlg in db.dialogs:
             conv = link(f"{root_rel}/conversations/{via_dlg}.html", "conversation")
             return f"NPC {npc_html} (via {conv})"
@@ -8602,10 +8914,11 @@ def render_factions(db: Db, out: Path) -> None:
                     for cl in classes
                 ) or "&#x2014;"
 
-                disp_name = db.creature_name(crr) or e["name"] or crr
+                can_crr = db.canonical_for_bp.get(crr, crr)
+                disp_name = db.canonical_creature_name(can_crr) or e["name"] or crr
                 name_cell = (
-                    link(f"creatures/{crr}.html", disp_name)
-                    if crr in db.creatures else nwn_html(disp_name)
+                    link(f"creatures/{can_crr}.html", disp_name)
+                    if can_crr in db.canonical_creatures else nwn_html(disp_name)
                 )
                 kind_cell = (
                     '<span class="badge">placed</span>'
@@ -8651,11 +8964,12 @@ def render_factions(db: Db, out: Path) -> None:
             "review.</p>"
         )
         cf_rows: list[str] = []
-        for crr in sorted(cross_faction, key=lambda r: db.creature_name(r).lower()):
+        for crr in sorted(cross_faction, key=lambda r: (db.canonical_creature_name(db.canonical_for_bp.get(r, r)) or r).lower()):
             fids = sorted(cross_faction[crr])
+            can_crr = db.canonical_for_bp.get(crr, crr)
             bp_cell = (
-                link(f"creatures/{crr}.html", db.creature_name(crr))
-                if crr in db.creatures else f"<code>{E(crr)}</code>"
+                link(f"creatures/{can_crr}.html", db.canonical_creature_name(can_crr))
+                if can_crr in db.canonical_creatures else f"<code>{E(crr)}</code>"
             )
             faction_list = ", ".join(
                 f'<a href="#{E(_faction_anchor(fid))}">{E(db.faction_name(fid))}</a>'
@@ -8721,26 +9035,25 @@ def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
     kind = c.get("kind")
     rr = c.get("resref", "")
     if kind == "creature":
-        cell = (link(f"{root_rel}/creatures/{rr}.html", db.creature_name(rr))
-                if rr in db.creatures else nwn_html(rr))
+        can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
+        cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
+        cell = (link(f"{root_rel}/creatures/{can_rr}.html", cname)
+                if can_rr in db.canonical_creatures else nwn_html(rr))
         areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
                           for a in c.get("areas", []) if a in db.areas)
-        return (f'<span class="badge">blueprint</span> NPC {cell} '
+        return (f'<span class="badge">creature</span> NPC {cell} '
                 f"<code>{E(rr)}</code>" + (f" — in {areas}" if areas else ""))
     if kind == "creature-instance":
         area_rr = c.get("area", "")
         idx = c.get("idx", 0)
-        inst_label = db.creature_instance_name(area_rr, idx) or rr or "(unnamed)"
-        inst_url = f"{root_rel}/creatures/instances/{area_rr}-{idx:03d}.html"
-        bp_link = (link(f"{root_rel}/creatures/{rr}.html", db.creature_name(rr))
-                   if rr in db.creatures else
-                   (f"<code>{E(rr)}</code>" if rr else ""))
+        can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
+        inst_label = db.canonical_creature_name(can_rr) if can_rr else (db.creature_instance_name(area_rr, idx) or rr or "(unnamed)")
+        inst_url = f"{root_rel}/creatures/{can_rr}.html" if can_rr else "#"
         area_link = (link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
                      if area_rr in db.areas else nwn_html(area_rr))
-        bp_part = f" <small class=\"muted\">(blueprint {bp_link})</small>" if bp_link else ""
-        return (f'<span class="badge">instance</span> NPC '
+        return (f'<span class="badge">creature</span> NPC '
                 f'<a href="{E(inst_url)}">{nwn_html(inst_label)}</a>'
-                f"{bp_part} — in {area_link}")
+                f" — in {area_link}")
     if kind == "placeable":
         # Placeables don't have their own page; we'll link to one of their
         # area pages instead, which is where the placement lives.
@@ -8771,8 +9084,10 @@ def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
         s = c.get("script", "")
         is_instance = kind.endswith("-instance")
         if kind == "creature-event":
-            ent = (link(f"{root_rel}/creatures/{rr}.html", db.creature_name(rr))
-                   if rr in db.creatures else nwn_html(rr))
+            can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
+            cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
+            ent = (link(f"{root_rel}/creatures/{can_rr}.html", cname)
+                   if can_rr in db.canonical_creatures else nwn_html(rr))
             label = f"NPC {ent} <code>{E(rr)}</code>"
         elif kind == "area-event":
             ent = (link(f"{root_rel}/areas/{rr}.html", db.area_name(rr))
@@ -10135,6 +10450,11 @@ def main() -> int:
                          "every area page (except the source itself) shows the "
                          "shortest path back to this area via door/trigger/conversation "
                          "transitions. Omit to suppress the section entirely.")
+    ap.add_argument("--cr-bucket-size", type=int, default=10, metavar="N",
+                    dest="cr_bucket_size",
+                    help="Width of each Challenge Rating range bucket on the "
+                         "Creatures → By Challenge Rating page (default: 10, "
+                         "producing CR 0–9, CR 10–19, …).")
     args = ap.parse_args()
 
     global _GENERATED_AT
@@ -10386,14 +10706,10 @@ def main() -> int:
         for c in conts:
             render_container_page(db, resref, c, out)
     render_creatures_index(db, out)
-    for resref in db.creatures:
-        render_creature_page(db, resref, out)
-    render_creature_instances_index(db, out)
-    for area_rr, insts in db.area_creature_instances.items():
-        if area_rr in db.hidden_areas:
-            continue
-        for inst in insts:
-            render_creature_instance_page(db, area_rr, inst["idx"], out)
+    render_creatures_by_area(db, out)
+    render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
+    for can_rr in db.canonical_creatures:
+        render_creature_page(db, can_rr, out)
     render_items_index(db, out)
     for resref in db.items:
         render_item_page(db, resref, out)

@@ -292,6 +292,24 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
 - `assets/style.css` — bundled stylesheet.
 - `manual/` — rendered hand-written documentation pages (see below).
 
+#### Creatures: By Challenge Rating grouping
+
+The **Creatures → By Challenge Rating** page groups all unique creatures into
+ascending CR range buckets (CR 0–9, CR 10–19, …) with a left-sidebar
+table-of-contents for quick navigation. The default bucket width is 10.
+
+Pass `--cr-bucket-size N` to change the width:
+
+```sh
+nwn-manager wiki -- --cr-bucket-size 5
+# or, calling the generator directly:
+nwn-wiki --src unpacked --out docs --cr-bucket-size 5
+```
+
+With `--cr-bucket-size 5` the page uses CR 0–4, CR 5–9, CR 10–14, … buckets.
+Creatures with a missing or non-numeric CR appear in an "Unknown CR" bucket at
+the bottom.
+
 #### Shortest-path sections on area pages
 
 Pass `--path-from <resref>` to add a **Path from …** section near the top of
