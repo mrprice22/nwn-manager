@@ -1453,6 +1453,8 @@ class Db:
         # item resref → list of script-source dicts for the item page
         # {"kind", "script", "label", "areas", "dlg", "crr", "prr"}
         self.item_from_script: dict[str, list[dict]] = defaultdict(list)
+        # item resref → [{"area_rr", "kind" (container|door), "name", "idx" (containers only)}]
+        self.item_is_key_for: dict[str, list[dict]] = defaultdict(list)
         # (area_rr, container_idx) pairs for containers with random-treasure OnOpen
         self.random_treasure_containers: set[tuple[str, int]] = set()
         # Property-variant tracking: inline items with the same TemplateResRef but
@@ -1795,12 +1797,14 @@ class Db:
                     if base_rr:
                         actual_rr = self._intern_item(base_rr, e)
                         dropable = bool(int(fld(e, "Dropable", 0) or 0))
+                        pickpocketable = bool(int(fld(e, "Pickpocketable", 0) or 0))
                         key = (actual_rr, area_rr, crr)
                         if key not in _seen_carrier and not skip:
                             _seen_carrier.add(key)
                             self.item_carried_by[actual_rr].append(
                                 {"area_rr": area_rr, "crr": crr,
-                                 "cname": cname, "dropable": dropable}
+                                 "cname": cname, "dropable": dropable,
+                                 "pickpocketable": pickpocketable}
                             )
                 for it in list_items(c.get("ItemList")):
                     base_rr = (fld(it, "InventoryRes", "")
@@ -1808,12 +1812,14 @@ class Db:
                     if base_rr:
                         actual_rr = self._intern_item(base_rr, it)
                         dropable = bool(int(fld(it, "Dropable", 0) or 0))
+                        pickpocketable = bool(int(fld(it, "Pickpocketable", 0) or 0))
                         key = (actual_rr, area_rr, crr)
                         if key not in _seen_carrier and not skip:
                             _seen_carrier.add(key)
                             self.item_carried_by[actual_rr].append(
                                 {"area_rr": area_rr, "crr": crr,
-                                 "cname": cname, "dropable": dropable}
+                                 "cname": cname, "dropable": dropable,
+                                 "pickpocketable": pickpocketable}
                             )
 
         for crr, spawns in self.creature_encounter_spawns.items():
@@ -1823,14 +1829,15 @@ class Db:
             cname = self.creature_name(crr)
             # Resolve each blueprint item to its variant resref once, then reuse
             # across all spawn areas (the blueprint's items are constant).
-            item_entries: list[tuple[str, bool]] = []  # (actual_rr, dropable)
+            item_entries: list[tuple[str, bool, bool]] = []  # (actual_rr, dropable, pickpocketable)
             for e in list_items(bp.get("Equip_ItemList")):
                 base_rr = (fld(e, "EquippedRes", "")
                            or fld(e, "TemplateResRef", "") or "").strip()
                 if base_rr:
                     item_entries.append(
                         (self._intern_item(base_rr, e),
-                         bool(int(fld(e, "Dropable", 0) or 0)))
+                         bool(int(fld(e, "Dropable", 0) or 0)),
+                         bool(int(fld(e, "Pickpocketable", 0) or 0)))
                     )
             for it in list_items(bp.get("ItemList")):
                 base_rr = (fld(it, "InventoryRes", "")
@@ -1838,19 +1845,21 @@ class Db:
                 if base_rr:
                     item_entries.append(
                         (self._intern_item(base_rr, it),
-                         bool(int(fld(it, "Dropable", 0) or 0)))
+                         bool(int(fld(it, "Dropable", 0) or 0)),
+                         bool(int(fld(it, "Pickpocketable", 0) or 0)))
                     )
             for spawn in spawns:
                 area_rr = spawn["area"]
                 if area_rr in self.hidden_areas:
                     continue
-                for actual_rr, dropable in item_entries:
+                for actual_rr, dropable, pickpocketable in item_entries:
                     key = (actual_rr, area_rr, crr)
                     if key not in _seen_carrier:
                         _seen_carrier.add(key)
                         self.item_carried_by[actual_rr].append(
                             {"area_rr": area_rr, "crr": crr,
-                             "cname": cname, "dropable": dropable}
+                             "cname": cname, "dropable": dropable,
+                             "pickpocketable": pickpocketable}
                         )
 
         # Back-fill stock BaseItem/Cost/PropertiesList for plain references.
@@ -2473,6 +2482,7 @@ class Db:
         self._build_store_openers()
         self._index_script_item_sources()
         self._index_random_treasure_containers()
+        self._index_key_items()
 
     def _index_script_item_sources(self) -> None:
         """Trace CreateItemOnObject calls back to their trigger context and
@@ -2640,6 +2650,50 @@ class Db:
                     on_open = (fld(self.placeables.get(bp_rr, {}), "OnOpen", "") or "").lower()
                 if on_open and on_open in self.script_generates_treasure:
                     self.random_treasure_containers.add((area_rr, idx))
+
+    def _index_key_items(self) -> None:
+        """Build item_is_key_for: maps item resref → containers/doors that require
+        that item's tag as a key (KeyRequired=1, KeyName=<item tag>)."""
+        # Build a lowercase-tag → list[resref] map from known items.
+        tag_to_resrefs: dict[str, list[str]] = defaultdict(list)
+        for rr, it in self.items.items():
+            tag = (fld(it, "Tag", "") or "").strip().lower()
+            if tag:
+                tag_to_resrefs[tag].append(rr)
+
+        for area_rr, containers in self.area_containers.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for c in containers:
+                p = c["p"]
+                idx = c["idx"]
+                if not int(fld(p, "KeyRequired", 0) or 0):
+                    continue
+                key_tag = (fld(p, "KeyName", "") or "").strip().lower()
+                if not key_tag:
+                    continue
+                name = (loc(p.get("LocName")) or fld(p, "Tag", "") or
+                        fld(p, "TemplateResRef", "") or "(unnamed)")
+                for rr in tag_to_resrefs.get(key_tag, []):
+                    self.item_is_key_for[rr].append(
+                        {"area_rr": area_rr, "kind": "container", "name": name, "idx": idx}
+                    )
+
+        for area_rr, doors in self.area_doors.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for d in doors:
+                if not int(fld(d, "KeyRequired", 0) or 0):
+                    continue
+                key_tag = (fld(d, "KeyName", "") or "").strip().lower()
+                if not key_tag:
+                    continue
+                name = (loc(d.get("LocName")) or fld(d, "Tag", "") or
+                        fld(d, "TemplateResRef", "") or "(unnamed door)")
+                for rr in tag_to_resrefs.get(key_tag, []):
+                    self.item_is_key_for[rr].append(
+                        {"area_rr": area_rr, "kind": "door", "name": name}
+                    )
 
     def _build_store_openers(self) -> None:
         """Populate store_tag_openers. Must be called after index_dialogs so
@@ -5900,7 +5954,8 @@ def render_items_index(db: Db, out: Path) -> None:
             accessible = (
                 rr in db.item_sold_at
                 or rr in db.item_in_container
-                or any(e.get("dropable") for e in db.item_carried_by.get(rr, []))
+                or any(e.get("dropable") or e.get("pickpocketable")
+                       for e in db.item_carried_by.get(rr, []))
                 or rr in db.item_from_script
             )
             if accessible:
@@ -6083,7 +6138,8 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     accessible = (
         resref in db.item_sold_at
         or resref in db.item_in_container
-        or any(e.get("dropable") for e in db.item_carried_by.get(resref, []))
+        or any(e.get("dropable") or e.get("pickpocketable")
+               for e in db.item_carried_by.get(resref, []))
         or resref in db.item_from_script
     )
     is_inaccessible = not is_broken and not accessible
@@ -6095,6 +6151,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     is_creature_item = _bi in _CREATURE_WEAPON_BASEITEMS or _bi in _CREATURE_ITEM_BASEITEMS
     _carriers = db.item_carried_by.get(resref, [])
     _any_droppable = any(e.get("dropable") for e in _carriers)
+    _any_pickpocketable = any(e.get("pickpocketable") for e in _carriers)
     if is_plot:
         _drop_label = "No"
         _drop_reason = " — plot item"
@@ -6207,11 +6264,20 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "they are intended for use by NPCs and monsters only.</p>"
         )
     if _carriers and not _any_droppable and not is_plot and not is_cursed:
-        sections.append(
-            '<p class="warn-no-drop"><strong>Note: this item does not drop on death.</strong> '
-            "It is carried by creatures, but none of them have it flagged as droppable "
-            "(Dropable=1 on the item instance). It will not appear in any loot bag.</p>"
-        )
+        if _any_pickpocketable:
+            sections.append(
+                '<p class="warn-no-drop"><strong>Note: this item does not drop on death.</strong> '
+                "It is carried by creatures but none have it flagged as droppable — "
+                "it will not appear in any loot bag. "
+                "However, it <strong>can be pickpocketed</strong> from creatures where "
+                "Pickpocketable is set.</p>"
+            )
+        else:
+            sections.append(
+                '<p class="warn-no-drop"><strong>Note: this item does not drop on death.</strong> '
+                "It is carried by creatures, but none of them have it flagged as droppable "
+                "(Dropable=1 on the item instance). It will not appear in any loot bag.</p>"
+            )
 
     desc = loc(i.get("Description"))
     if desc:
@@ -6372,12 +6438,18 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                                  if crr in db.creatures else E(c["cname"]))
                 drops = c.get("dropable", False)
                 drop_cell = "Yes" if drops else '<span class="muted">No</span>'
-                rows.append(f"<tr><td>{creature_cell}</td><td>{area_cell}</td><td>{drop_cell}</td></tr>")
+                pp = c.get("pickpocketable", False)
+                pp_cell = "Yes" if pp else '<span class="muted">No</span>'
+                rows.append(
+                    f"<tr><td>{creature_cell}</td><td>{area_cell}</td>"
+                    f"<td>{drop_cell}</td><td>{pp_cell}</td></tr>"
+                )
             sections.append(
                 "<h3>Carried by</h3>"
                 '<table class="data"><thead><tr>'
                 '<th>Creature</th><th>Area</th>'
                 '<th title="Whether this item appears in the loot bag when the creature is killed (Dropable=1 on the item instance)">Drops on death</th>'
+                '<th title="Whether this item can be stolen via Pickpocket (Pickpocketable=1 on the item instance)">Pickpocketable</th>'
                 "</tr></thead>"
                 "<tbody>" + "\n".join(rows) + "</tbody></table>"
             )
@@ -6424,6 +6496,31 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "<h2>Where to find</h2>"
             '<p class="muted">Not found in any store, container, creature inventory, '
             "or script reward — this item may be inaccessible to players.</p>"
+        )
+
+    key_for = db.item_is_key_for.get(resref, [])
+    if key_for:
+        rows = []
+        for kf in key_for:
+            area_rr = kf["area_rr"]
+            area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                         if area_rr in db.areas else E(area_rr))
+            if kf["kind"] == "container":
+                obj_cell = link(
+                    f"../containers/{area_rr}-{kf['idx']:03d}.html", kf["name"]
+                )
+            else:
+                obj_cell = E(kf["name"])
+            rows.append(
+                f"<tr><td>{obj_cell}</td>"
+                f"<td>{E(kf['kind'].capitalize())}</td>"
+                f"<td>{area_cell}</td></tr>"
+            )
+        sections.append(
+            "<h2>Key for</h2>"
+            '<table class="data"><thead><tr>'
+            "<th>Opens</th><th>Type</th><th>Area</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
     write(out / "items" / f"{resref}.html",
