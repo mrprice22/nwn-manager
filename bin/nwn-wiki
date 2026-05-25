@@ -1694,6 +1694,8 @@ class Db:
                     "src_resref": fld(d, "TemplateResRef", ""),
                     "src_x": fld(d, "X"),
                     "src_y": fld(d, "Y"),
+                    "key_tag": (fld(d, "KeyName", "") or "").strip(),
+                    "key_required": bool(int(fld(d, "KeyRequired", 0) or 0)),
                 })
 
         # Containers: placeables that hold an inventory.
@@ -4626,20 +4628,38 @@ def render_area_page(db: Db, resref: str, out: Path,
                  + [t for t in db.script_transitions if t["src_area"] == resref])
     if out_trans:
         sections.append("<h2>Outgoing transitions</h2>")
+        has_key_out = any(t.get("key_required") and t.get("key_tag") for t in out_trans)
+        if has_key_out:
+            tag_to_item_rr: dict[str, str] = {}
+            for _rr, _it in db.items.items():
+                _tag = (fld(_it, "Tag", "") or "").strip().lower()
+                if _tag and _tag not in tag_to_item_rr:
+                    tag_to_item_rr[_tag] = _rr
         rows = []
         for t in out_trans:
             dst = t["dst_area"]
             dst_link = (link(f"{dst}.html", db.area_name(dst))
                         if dst else f'<em>(unresolved waypoint <code>{E(t["dst_tag"])}</code>)</em>')
+            key_cell = ""
+            if has_key_out:
+                kt = t.get("key_tag", "")
+                if t.get("key_required") and kt:
+                    item_rr = tag_to_item_rr.get(kt.lower())
+                    key_cell = (f"<td>{link(f'../items/{item_rr}.html', db.item_name(item_rr))}</td>"
+                                if item_rr else f"<td><code>{E(kt)}</code></td>")
+                else:
+                    key_cell = "<td></td>"
             rows.append(
                 f"<tr><td>{E(t['kind'])}</td>"
                 f"<td>{E(t['label'])}</td>"
                 f"<td>{dst_link}</td>"
-                f"<td><code>{E(t['dst_tag'])}</code></td></tr>"
+                f"<td><code>{E(t['dst_tag'])}</code></td>"
+                + key_cell + "</tr>"
             )
+        key_th = "<th>Requires Key</th>" if has_key_out else ""
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Kind</th><th>Label</th><th>Destination</th><th>Waypoint tag</th>"
+            f"<th>Kind</th><th>Label</th><th>Destination</th><th>Waypoint tag</th>{key_th}"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
@@ -4648,17 +4668,35 @@ def render_area_page(db: Db, resref: str, out: Path,
                 + [t for t in db.script_transitions if t["dst_area"] == resref])
     if in_trans:
         sections.append("<h2>Incoming transitions</h2>")
+        has_key_in = any(t.get("key_required") and t.get("key_tag") for t in in_trans)
+        if has_key_in:
+            tag_to_item_rr = {}
+            for _rr, _it in db.items.items():
+                _tag = (fld(_it, "Tag", "") or "").strip().lower()
+                if _tag and _tag not in tag_to_item_rr:
+                    tag_to_item_rr[_tag] = _rr
         rows = []
         for t in in_trans:
             src = t["src_area"]
+            key_cell = ""
+            if has_key_in:
+                kt = t.get("key_tag", "")
+                if t.get("key_required") and kt:
+                    item_rr = tag_to_item_rr.get(kt.lower())
+                    key_cell = (f"<td>{link(f'../items/{item_rr}.html', db.item_name(item_rr))}</td>"
+                                if item_rr else f"<td><code>{E(kt)}</code></td>")
+                else:
+                    key_cell = "<td></td>"
             rows.append(
                 f"<tr><td>{E(t['kind'])}</td>"
                 f"<td>{link(f'{src}.html', db.area_name(src))}</td>"
-                f"<td>{E(t['label'])}</td></tr>"
+                f"<td>{E(t['label'])}</td>"
+                + key_cell + "</tr>"
             )
+        key_th = "<th>Requires Key</th>" if has_key_in else ""
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Kind</th><th>From</th><th>Label</th>"
+            f"<th>Kind</th><th>From</th><th>Label</th>{key_th}"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
@@ -4721,34 +4759,51 @@ def render_area_page(db: Db, resref: str, out: Path,
     encs = db.area_encounters.get(resref, [])
     if encs:
         sections.append("<h2>Encounters</h2>")
-        rows = []
+        enc_groups: dict[str, dict] = {}
+        enc_order: list[str] = []
         for e in encs:
             tag = fld(e, "Tag", "")
             rr = fld(e, "TemplateResRef", "")
-            blueprint = db.encounters.get(rr, {})
-            ename = loc(blueprint.get("LocalizedName")) or loc(e.get("LocalizedName")) or rr
-            max_c = fld(blueprint, "MaxCreatures", fld(e, "MaxCreatures", ""))
-            diff = fld(blueprint, "DifficultyIndex", fld(e, "DifficultyIndex", ""))
-            spawns = list_items(blueprint.get("CreatureList")) or list_items(e.get("CreatureList"))
-            spawn_cells = []
-            for s in spawns:
-                srr = fld(s, "ResRef", "")
-                cr = fld(s, "CR", "")
-                disp = db.creature_name(srr) if srr in db.creatures else srr
-                cell = (link(f"../creatures/{srr}.html", disp)
-                        if srr in db.creatures else nwn_html(disp))
-                spawn_cells.append(f"{cell}<small> CR {E(cr)}</small>")
+            if rr not in enc_groups:
+                blueprint = db.encounters.get(rr, {})
+                ename = loc(blueprint.get("LocalizedName")) or loc(e.get("LocalizedName")) or rr
+                max_c = fld(blueprint, "MaxCreatures", fld(e, "MaxCreatures", ""))
+                diff = fld(blueprint, "DifficultyIndex", fld(e, "DifficultyIndex", ""))
+                spawns = list_items(blueprint.get("CreatureList")) or list_items(e.get("CreatureList"))
+                spawn_cells = []
+                for s in spawns:
+                    srr = fld(s, "ResRef", "")
+                    cr = fld(s, "CR", "")
+                    disp = db.creature_name(srr) if srr in db.creatures else srr
+                    cell = (link(f"../creatures/{srr}.html", disp)
+                            if srr in db.creatures else nwn_html(disp))
+                    spawn_cells.append(f"{cell}<small> CR {E(cr)}</small>")
+                enc_groups[rr] = {
+                    "ename": ename, "max_c": max_c, "diff": diff,
+                    "spawn_cells": spawn_cells,
+                    "tags": [tag] if tag else [], "count": 1,
+                }
+                enc_order.append(rr)
+            else:
+                enc_groups[rr]["count"] += 1
+                if tag:
+                    enc_groups[rr]["tags"].append(tag)
+        rows = []
+        for rr in enc_order:
+            g = enc_groups[rr]
+            tags_str = ", ".join(E(t) for t in g["tags"]) if g["tags"] else ""
             rows.append(
-                f"<tr><td>{nwn_html(ename)}</td>"
+                f"<tr><td>{nwn_html(g['ename'])}</td>"
                 f"<td>{E(rr)}</td>"
-                f"<td>{E(tag)}</td>"
-                f"<td>{E(max_c)}</td>"
-                f"<td>{E(diff)}</td>"
-                f"<td>{', '.join(spawn_cells) if spawn_cells else '—'}</td></tr>"
+                f"<td>{tags_str}</td>"
+                f"<td>{E(g['max_c'])}</td>"
+                f"<td>{E(g['diff'])}</td>"
+                f"<td>{', '.join(g['spawn_cells']) if g['spawn_cells'] else '—'}</td>"
+                f"<td>{g['count']}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Name</th><th>ResRef</th><th>Tag</th><th>Max</th><th>Diff</th><th>Spawn pool</th>"
+            "<th>Name</th><th>ResRef</th><th>Tag</th><th>Max</th><th>Diff</th><th>Spawn pool</th><th>Count</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
