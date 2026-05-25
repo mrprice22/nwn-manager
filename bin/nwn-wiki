@@ -6221,10 +6221,14 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
 
 
 def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> None:
-    """Creatures grouped by Challenge Rating range, with a left-sidebar TOC."""
-    _UNKNOWN = "__unknown__"
+    """Creatures grouped by Challenge Rating range, with a left-sidebar TOC.
 
-    def _cr_bucket(can_rr: str) -> int | str:
+    Each bucket spans at least cr_bucket_size CR levels AND contains at least
+    cr_bucket_size creatures; adjacent natural buckets are merged until both
+    conditions are met.
+    """
+
+    def _cr_val(can_rr: str) -> float | None:
         entry = db.canonical_creatures[can_rr]
         c2 = entry["c"]
         bp2_rr = entry["bp_rr"]
@@ -6233,66 +6237,84 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
         if raw is None and bp2 is not None:
             raw = fld(bp2, "ChallengeRating")
         if raw is None:
-            return _UNKNOWN
+            return None
         try:
-            cr = float(raw)
-            return int(cr // cr_bucket_size) * cr_bucket_size
+            return float(raw)
         except (TypeError, ValueError):
-            return _UNKNOWN
+            return None
 
-    # Group canonicals into buckets
-    buckets: dict[int | str, list[str]] = defaultdict(list)
+    # Separate known-CR from unknown-CR canonicals
+    known: list[tuple[float, str]] = []
+    unknown: list[str] = []
     for can_rr in db.canonical_creatures:
-        buckets[_cr_bucket(can_rr)].append(can_rr)
+        cr = _cr_val(can_rr)
+        if cr is None:
+            unknown.append(can_rr)
+        else:
+            known.append((cr, can_rr))
+    known.sort(key=lambda x: x[0])
 
-    int_buckets = sorted(k for k in buckets if k != _UNKNOWN)
-    bucket_order: list[int | str] = int_buckets
-    if _UNKNOWN in buckets:
-        bucket_order = int_buckets + [_UNKNOWN]
+    # Build natural fixed-width buckets
+    natural: dict[int, list[str]] = {}
+    for cr, can_rr in known:
+        b = int(cr // cr_bucket_size) * cr_bucket_size
+        natural.setdefault(b, []).append(can_rr)
 
-    def _bucket_label(b: int | str) -> str:
-        if b == _UNKNOWN:
-            return "Unknown CR"
-        end = b + cr_bucket_size - 1
-        return f"CR {b}–{end}"
-
-    def _bucket_anchor(b: int | str) -> str:
-        return "cr-unknown" if b == _UNKNOWN else f"cr-{b}"
+    # Merge adjacent natural buckets until each has >= cr_bucket_size creatures
+    all_starts = sorted(natural.keys())
+    merged: list[tuple[int, int, list[str]]] = []  # (start, end_inclusive, creatures)
+    i = 0
+    while i < len(all_starts):
+        start = all_starts[i]
+        end = start + cr_bucket_size - 1
+        creatures = list(natural[start])
+        i += 1
+        while len(creatures) < cr_bucket_size and i < len(all_starts):
+            next_start = all_starts[i]
+            end = next_start + cr_bucket_size - 1
+            creatures.extend(natural[next_start])
+            i += 1
+        merged.append((start, end, creatures))
 
     # Build sidebar TOC
     toc_parts = ['<div class="toc-group-heading">Challenge Rating</div>']
-    for b in bucket_order:
-        cnt = len(buckets[b])
-        anchor = _bucket_anchor(b)
+    for start, end, creatures in merged:
+        anchor = f"cr-{start}"
+        label = f"CR {start}–{end}"
         toc_parts.append(
-            f'<div><a href="#{E(anchor)}">{E(_bucket_label(b))}'
-            f' <span class="muted">({cnt})</span></a></div>'
+            f'<div><a href="#{E(anchor)}">{E(label)}'
+            f' <span class="muted">({len(creatures)})</span></a></div>'
+        )
+    if unknown:
+        toc_parts.append(
+            f'<div><a href="#cr-unknown">Unknown CR'
+            f' <span class="muted">({len(unknown)})</span></a></div>'
         )
     sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
 
     sections: list[str] = [
         "<h1>Creatures by Challenge Rating</h1>",
-        f"<p>Grouped in ranges of {cr_bucket_size} CR. "
+        f"<p>Each group spans at least {cr_bucket_size} CR levels and contains at least "
+        f"{cr_bucket_size} creatures (adjacent ranges are merged as needed). "
         f'See <a href="../index.html">All Creatures</a> for a flat list.</p>',
     ]
-    for b in bucket_order:
-        anchor = _bucket_anchor(b)
-        label = _bucket_label(b)
-        can_rrs_in_bucket = sorted(
-            buckets[b],
+
+    def _render_cr_section(anchor: str, label: str, can_rrs: list[str]) -> str:
+        sorted_rrs = sorted(
+            can_rrs,
             key=lambda r: nwn_text(db.canonical_creature_name(r)).lower(),
         )
         rows = []
-        for can_rr in can_rrs_in_bucket:
+        for can_rr in sorted_rrs:
             entry = db.canonical_creatures[can_rr]
             c2 = entry["c"]
             bp2_rr = entry["bp_rr"]
             bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
 
-            def _f3(key, default=None):
-                v = fld(c2, key)
-                if v is None and bp2 is not None:
-                    v = fld(bp2, key)
+            def _f3(key, default=None, _c2=c2, _bp2=bp2):
+                v = fld(_c2, key)
+                if v is None and _bp2 is not None:
+                    v = fld(_bp2, key)
                 return default if v is None else v
 
             classes3 = list_items(c2.get("ClassList")) or (
@@ -6309,7 +6331,7 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
                 f"<td>{E(_f3('ChallengeRating', ''))}</td>"
                 f"<td>{E(db.faction_name(_f3('FactionID', '')))}</td></tr>"
             )
-        sections.append(
+        return (
             f'<h2 id="{E(anchor)}">{E(label)}'
             f' <small class="muted">({len(rows)})</small></h2>'
             '<table class="data"><thead><tr>'
@@ -6317,6 +6339,11 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
             "<th>HP</th><th>CR</th><th>Faction</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+
+    for start, end, creatures in merged:
+        sections.append(_render_cr_section(f"cr-{start}", f"CR {start}–{end}", creatures))
+    if unknown:
+        sections.append(_render_cr_section("cr-unknown", "Unknown CR", unknown))
 
     body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
     write(out / "creatures" / "by-cr" / "index.html",
