@@ -5445,7 +5445,8 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
 
 
 def render_creatures_index(db: Db, out: Path) -> None:
-    rows = []
+    rows_present = []
+    rows_absent = []
     for can_rr in sorted(db.canonical_creatures.keys(),
                          key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
         entry = db.canonical_creatures[can_rr]
@@ -5474,7 +5475,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
         else:
             variant_note = ""
         total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
-        rows.append(
+        row = (
             f"<tr><td>{link(f'{can_rr}.html', db.canonical_creature_name(can_rr))}"
             f"{variant_note}</td>"
             f"<td>{total_count if total_count else '—'}</td>"
@@ -5484,6 +5485,10 @@ def render_creatures_index(db: Db, out: Path) -> None:
             f"<td>{E(_f('ChallengeRating', ''))}</td>"
             f"<td>{E(db.faction_name(_f('FactionID', '')))}</td></tr>"
         )
+        if total_count:
+            rows_present.append(row)
+        else:
+            rows_absent.append(row)
     n_unique = len(db.canonical_creatures)
     n_variants = sum(1 for r in db.canonical_creatures
                      if db.canonical_bp_of.get(r) != r)
@@ -5491,18 +5496,50 @@ def render_creatures_index(db: Db, out: Path) -> None:
         f" ({n_variants} equipment/class variant{'s' if n_variants != 1 else ''})"
         if n_variants else ""
     )
-    body = (
-        "<h1>Creatures</h1>"
-        f"<p>{n_unique} unique creature{'s' if n_unique != 1 else ''}{variant_note_str}. "
-        f'See <a href="by-area/index.html">By Area</a> or '
-        f'<a href="by-cr/index.html">By Challenge Rating</a> for other views.</p>'
+    TABLE_HEAD = (
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>Count</th><th>Race</th><th>Class</th>"
         "<th>HP</th><th>CR</th><th>Faction</th>"
-        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        "</tr></thead><tbody>"
     )
+    toc_parts = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="by-area/index.html">By Area</a></div>',
+        '<div><a href="by-cr/index.html">By Challenge Rating</a></div>',
+        '<div class="toc-group-heading">Sections</div>',
+    ]
+    if rows_present:
+        toc_parts.append(
+            f'<div><a href="#present">In Module'
+            f' <span class="muted">({len(rows_present)})</span></a></div>'
+        )
+    if rows_absent:
+        toc_parts.append(
+            f'<div><a href="#absent">Blueprint Only'
+            f' <span class="muted">({len(rows_absent)})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sections: list[str] = [
+        "<h1>Creatures</h1>",
+        f"<p>{n_unique} unique creature{'s' if n_unique != 1 else ''}{variant_note_str}.</p>",
+    ]
+    if rows_present:
+        sections.append(
+            f'<h2 id="present">In Module'
+            f' <small class="muted">({len(rows_present)})</small></h2>'
+            + TABLE_HEAD + "\n".join(rows_present) + "</tbody></table>"
+        )
+    if rows_absent:
+        sections.append(
+            f'<h2 id="absent">Blueprint Only'
+            f' <small class="muted">({len(rows_absent)})</small></h2>'
+            + TABLE_HEAD + "\n".join(rows_absent) + "</tbody></table>"
+        )
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
     write(out / "creatures" / "index.html",
-          page("Creatures", body, root_rel=".."))
+          page("Creatures",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel=".."))
 
 
 
@@ -6269,7 +6306,12 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
     visible_areas = [a for a in by_area if a not in db.hidden_areas]
 
     # Build sidebar TOC
-    toc_parts = ['<div class="toc-group-heading">Areas</div>']
+    toc_parts = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="../index.html">All Creatures</a></div>',
+        '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
+        '<div class="toc-group-heading">Areas</div>',
+    ]
     for area_rr in sorted(visible_areas, key=lambda r: db.area_name(r).lower()):
         cnt = len(by_area[area_rr])
         slug = f"area-{area_rr}"
@@ -6402,7 +6444,12 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
         merged.append((start, end, creatures))
 
     # Build sidebar TOC
-    toc_parts = ['<div class="toc-group-heading">Challenge Rating</div>']
+    toc_parts = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="../index.html">All Creatures</a></div>',
+        '<div><a href="../by-area/index.html">By Area</a></div>',
+        '<div class="toc-group-heading">Challenge Rating</div>',
+    ]
     for start, end, creatures in merged:
         anchor = f"cr-{start}"
         label = f"CR {start}–{end}"
