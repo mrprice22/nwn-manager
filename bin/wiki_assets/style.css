@@ -412,6 +412,14 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.95em;
 }
+.note-pickpocket {
+  background: #f0fff4;
+  border-left: 4px solid #2e8b57;
+  color: #1a4d2e;
+  padding: 0.6em 0.9em;
+  margin: 0.5em 0 1em;
+  font-size: 0.95em;
+}
 .reason-missing     { color: #888; font-size: 0.9em; }
 .reason-undroppable { color: #b07820; font-size: 0.9em; font-style: italic; }
 .badge-no-drop {

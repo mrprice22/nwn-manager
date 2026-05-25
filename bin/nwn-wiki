@@ -6267,10 +6267,11 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         if _any_pickpocketable:
             sections.append(
                 '<p class="warn-no-drop"><strong>Note: this item does not drop on death.</strong> '
-                "It is carried by creatures but none have it flagged as droppable — "
-                "it will not appear in any loot bag. "
-                "However, it <strong>can be pickpocketed</strong> from creatures where "
-                "Pickpocketable is set.</p>"
+                "It is carried by creatures, but none have it flagged as droppable "
+                "(Dropable=1). It will not appear in any loot bag.</p>"
+                '<p class="note-pickpocket"><strong>This item can be pickpocketed.</strong> '
+                "At least one creature carrying it has Pickpocketable set — "
+                "see the Carried by table below.</p>"
             )
         else:
             sections.append(
