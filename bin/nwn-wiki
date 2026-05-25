@@ -871,6 +871,121 @@ def _creature_key(c: dict, bp: dict | None = None) -> tuple:
     return (abilities, classes, feats, spec_ab, equip, _f("NaturalAC"), _f("Race"))
 
 
+def _variant_diff_items(
+    c: dict, base_c: dict, db: "Db", *, bp: dict | None = None, base_bp: dict | None = None
+) -> list[str]:
+    """Return human-readable difference strings between a variant creature and its base.
+
+    `c`/`bp` are the variant's instance struct + blueprint fallback.
+    `base_c`/`base_bp` are the base canonical's struct + blueprint fallback.
+    """
+    def _fv(key):
+        v = fld(c, key)
+        return fld(bp, key) if v is None and bp is not None else v
+
+    def _fb(key):
+        v = fld(base_c, key)
+        return fld(base_bp, key) if v is None and base_bp is not None else v
+
+    def _lstv(key):
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    def _lstb(key):
+        items = list_items(base_c.get(key))
+        if not items and base_bp is not None:
+            items = list_items(base_bp.get(key))
+        return items
+
+    diffs: list[str] = []
+
+    # Abilities
+    ABILITY_KEYS = ("Str", "Dex", "Con", "Int", "Wis", "Cha")
+    ab_diffs = []
+    for key in ABILITY_KEYS:
+        bv, vv = _fb(key), _fv(key)
+        if bv != vv and vv is not None:
+            if bv is not None:
+                delta = int(vv) - int(bv)
+                ab_diffs.append(f"{key} {int(bv)}→{int(vv)} ({'+' if delta > 0 else ''}{delta})")
+            else:
+                ab_diffs.append(f"{key} +{int(vv)}")
+    if ab_diffs:
+        diffs.append("Abilities: " + ", ".join(ab_diffs))
+
+    # Classes
+    base_cls = {fld(cl, "Class"): fld(cl, "ClassLevel") for cl in _lstb("ClassList")}
+    var_cls  = {fld(cl, "Class"): fld(cl, "ClassLevel") for cl in _lstv("ClassList")}
+    cls_diffs = []
+    for cid in sorted(set(base_cls) | set(var_cls), key=lambda x: int(x) if x is not None else 0):
+        bl, vl = base_cls.get(cid), var_cls.get(cid)
+        cname = class_name(cid)
+        if bl is None:
+            cls_diffs.append(f"+{cname} {vl}")
+        elif vl is None:
+            cls_diffs.append(f"−{cname}")
+        elif bl != vl:
+            cls_diffs.append(f"{cname} {bl}→{vl}")
+    if cls_diffs:
+        diffs.append("Classes: " + ", ".join(cls_diffs))
+
+    # Feats
+    base_feats = {int(fld(f, "Feat")) for f in _lstb("FeatList") if fld(f, "Feat") is not None}
+    var_feats  = {int(fld(f, "Feat")) for f in _lstv("FeatList") if fld(f, "Feat") is not None}
+    feat_diffs = (
+        [f"+{feat_name(f)}" for f in sorted(var_feats - base_feats)] +
+        [f"−{feat_name(f)}" for f in sorted(base_feats - var_feats)]
+    )
+    if feat_diffs:
+        diffs.append("Feats: " + ", ".join(feat_diffs))
+
+    # Special abilities
+    base_sab = {(fld(s, "Spell"), fld(s, "SpellCasterLevel")) for s in _lstb("SpecAbilityList")}
+    var_sab  = {(fld(s, "Spell"), fld(s, "SpellCasterLevel")) for s in _lstv("SpecAbilityList")}
+    sab_diffs = (
+        [f"+{spell_name(sp)} (CL {lv})" for sp, lv in sorted(var_sab - base_sab, key=lambda x: str(x))] +
+        [f"−{spell_name(sp)} (CL {lv})" for sp, lv in sorted(base_sab - var_sab, key=lambda x: str(x))]
+    )
+    if sab_diffs:
+        diffs.append("Special abilities: " + ", ".join(sab_diffs))
+
+    # Equipment
+    base_eq = {fld(e, "__struct_id"): (fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or "")
+               for e in _lstb("Equip_ItemList")}
+    var_eq  = {fld(e, "__struct_id"): (fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or "")
+               for e in _lstv("Equip_ItemList")}
+    eq_diffs = []
+    for slot_id in sorted(set(base_eq) | set(var_eq), key=lambda x: int(x) if x is not None else 0):
+        bi, vi = base_eq.get(slot_id, ""), var_eq.get(slot_id, "")
+        if bi == vi:
+            continue
+        slot_label = SLOT_NAMES.get(int(slot_id) if slot_id is not None else 0, f"Slot {slot_id}")
+        bn = db.item_name(bi) or bi
+        vn = db.item_name(vi) or vi
+        if not bi:
+            eq_diffs.append(f"{slot_label}: +{vn}")
+        elif not vi:
+            eq_diffs.append(f"{slot_label}: −{bn}")
+        else:
+            eq_diffs.append(f"{slot_label}: {bn} → {vn}")
+    if eq_diffs:
+        diffs.append("Equipment: " + ", ".join(eq_diffs))
+
+    # Natural AC
+    bac, vac = _fb("NaturalAC"), _fv("NaturalAC")
+    if bac != vac and vac is not None:
+        diffs.append(f"Natural AC: {bac}→{vac}" if bac is not None else f"Natural AC: +{vac}")
+
+    # Race
+    br, vr = _fb("Race"), _fv("Race")
+    if br != vr and vr is not None:
+        diffs.append(f"Race: {race_name(br)} → {race_name(vr)}")
+
+    return diffs
+
+
 def itemprop_oneliner(prop: dict) -> str:
     """Compact single-line summary (used in tooltips / loot lists)."""
     f = itemprop_format(prop)
@@ -5358,10 +5473,11 @@ def render_creatures_index(db: Db, out: Path) -> None:
             )
         else:
             variant_note = ""
+        total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
         rows.append(
             f"<tr><td>{link(f'{can_rr}.html', db.canonical_creature_name(can_rr))}"
             f"{variant_note}</td>"
-            f"<td>{E(can_rr)}</td>"
+            f"<td>{total_count if total_count else '—'}</td>"
             f"<td>{E(race_name(_f('Race')))}</td>"
             f"<td>{E(cls_str)}</td>"
             f"<td>{E(_f('MaxHitPoints', ''))}</td>"
@@ -5381,7 +5497,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
         f'See <a href="by-area/index.html">By Area</a> or '
         f'<a href="by-cr/index.html">By Challenge Rating</a> for other views.</p>'
         '<table class="data"><thead><tr>'
-        "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th>"
+        "<th>Name</th><th>Count</th><th>Race</th><th>Class</th>"
         "<th>HP</th><th>CR</th><th>Faction</th>"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
@@ -6048,10 +6164,19 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     is_variant = db.canonical_bp_of.get(canonical_rr) != canonical_rr
     if is_variant:
         base_rr = db.canonical_bp_of[canonical_rr]
+        base_entry = db.canonical_creatures.get(base_rr, {})
+        base_c = base_entry.get("c", {})
+        base_bp_rr = base_entry.get("bp_rr", base_rr)
+        base_bp = db.creatures.get(base_bp_rr) if base_bp_rr != base_rr else None
+        diff_items = _variant_diff_items(c, base_c, db, bp=bp, base_bp=base_bp)
+        if diff_items:
+            diff_detail = "; ".join(diff_items)
+        else:
+            diff_detail = "differs in equipment, class levels, or feats"
         sections.append(
             f'<dt>Variant of</dt><dd>'
             f'{link(f"{base_rr}.html", db.canonical_creature_name(base_rr))}'
-            f' <small class="muted">(differs in equipment, class levels, or feats)</small></dd>'
+            f'<br><small class="muted">{E(diff_detail)}</small></dd>'
         )
     sections.append('</dl>')
 
