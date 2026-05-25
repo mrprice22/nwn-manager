@@ -7479,6 +7479,7 @@ form.addEventListener('submit',function(e){
   var sortBy=document.getElementById('fo').value;
   var asc=document.getElementById('fd').value==='asc';
   var inclNonDrop=document.getElementById('fnd').checked;
+  var ppOnly=document.getElementById('fpp').checked;
   var conds=[];
   for(var i=0;i<N;i++){
     var prop=propSels[i].value,sub=subSels[i].value;
@@ -7488,6 +7489,7 @@ form.addEventListener('submit',function(e){
   var out=[];
   data.forEach(function(it){
     if(!it.accessible&&!inclNonDrop)return;
+    if(ppOnly&&!it.pickpocketable)return;
     if(bi){
       if(it.base_item!==bi)return;
     }
@@ -7575,10 +7577,11 @@ def render_items_search(db: "Db", out: Path) -> None:
     for resref, i in sorted(db.items.items(),
                             key=lambda kv: nwn_text(db.item_name(kv[0])).lower()):
         carriers = db.item_carried_by.get(resref, [])
+        pickpocketable = any(e.get("pickpocketable") for e in carriers)
         accessible = (
             resref in db.item_sold_at
             or resref in db.item_in_container
-            or any(e.get("dropable") for e in carriers)
+            or any(e.get("dropable") or e.get("pickpocketable") for e in carriers)
             or resref in db.item_from_script
         )
         if not accessible and not carriers:
@@ -7635,6 +7638,7 @@ def render_items_search(db: "Db", out: Path) -> None:
             "url": f"{resref}.html",
             "properties": props,
             "accessible": accessible,
+            "pickpocketable": pickpocketable,
         })
 
     write(out / "items" / "search-index.json",
@@ -7672,6 +7676,9 @@ def render_items_search(db: "Db", out: Path) -> None:
         '</select>'
         '<label class="checkbox-label" title="Include items carried by NPCs that have no Dropable=1 flag — they exist in the module but cannot be looted">'
         '<input type="checkbox" id="fnd"> Include non-droppable items'
+        '</label>'
+        '<label class="checkbox-label">'
+        '<input type="checkbox" id="fpp"> Pickpocketable only'
         '</label>'
         '<button type="submit">Search</button>'
         '</div>'
