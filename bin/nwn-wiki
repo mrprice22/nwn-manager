@@ -8940,6 +8940,7 @@ def render_factions(db: Db, out: Path) -> None:
             except (TypeError, ValueError):
                 hp = 0
             cr = fld(c, "ChallengeRating") or fld(bp, "ChallengeRating") or ""
+            race = fld(c, "Race") if fld(c, "Race") not in (None, "") else fld(bp, "Race")
             faction_entries[fid].append({
                 "kind": "instance",
                 "area": area_rr,
@@ -8950,6 +8951,7 @@ def render_factions(db: Db, out: Path) -> None:
                 "lvls": _total_levels(classes),
                 "hp": hp,
                 "cr": cr,
+                "race": race,
             })
             if crr:
                 crr_fids[crr].add(fid)
@@ -8967,6 +8969,7 @@ def render_factions(db: Db, out: Path) -> None:
         cr = fld(bp, "ChallengeRating") or ""
         name = db.creature_name(crr) or crr
         lvls = _total_levels(classes)
+        race = fld(bp, "Race")
         for s in spawns:
             area_rr = s["area"]
             if area_rr in db.hidden_areas:
@@ -8981,6 +8984,7 @@ def render_factions(db: Db, out: Path) -> None:
                 "lvls": lvls,
                 "hp": hp,
                 "cr": cr,
+                "race": race,
             })
             if crr:
                 crr_fids[crr].add(fid)
@@ -9132,12 +9136,14 @@ def render_factions(db: Db, out: Path) -> None:
                     if crr in cross_faction else ""
                 )
 
+                race_str = E(race_name(e.get("race")))
                 rows.append(
                     "<tr>"
                     f"<td>{name_cell}{cross_flag}</td>"
                     f"<td>{kind_cell}</td>"
                     f"<td>{count}</td>"
                     f"<td>{area_cell}</td>"
+                    f"<td>{race_str}</td>"
                     f"<td>{cls_str}</td>"
                     f"<td>{_fmt_hp(e['hp'])}</td>"
                     f"<td>{E(e['cr'])}</td>"
@@ -9147,7 +9153,7 @@ def render_factions(db: Db, out: Path) -> None:
         sections.append(
             '<table class="data"><thead><tr>'
             "<th>Name</th><th>Kind</th><th>Count</th><th>Area</th>"
-            "<th>Classes</th><th>HP</th><th>CR</th>"
+            "<th>Race</th><th>Classes</th><th>HP</th><th>CR</th>"
             "</tr></thead><tbody>"
             + "\n".join(rows)
             + "</tbody></table>"
