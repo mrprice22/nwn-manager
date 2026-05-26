@@ -3334,6 +3334,8 @@ class Db:
             i = int(faction_id)
         except (TypeError, ValueError):
             return str(faction_id)
+        if i == 65535:
+            return "(None)"
         if not self.fac:
             return str(i)
         flist = list_items(self.fac.get("FactionList"))
@@ -3929,9 +3931,16 @@ def _faction_dd(db: Db, faction_id, root_rel: str = ".") -> str:
     if faction_id is None or faction_id == "":
         return ""
     name = db.faction_name(faction_id)
+    try:
+        _fid_int = int(faction_id)
+    except (TypeError, ValueError):
+        _fid_int = None
     if name and str(name) != str(faction_id):
-        return (f'<a href="{E(root_rel)}/factions.html">{nwn_html(name)}</a>'
-                f' <small class="muted">(id {E(faction_id)})</small>')
+        id_suffix = (
+            "" if _fid_int == 65535
+            else f' <small class="muted">(id {E(faction_id)})</small>'
+        )
+        return f'<a href="{E(root_rel)}/factions.html">{nwn_html(name)}</a>{id_suffix}'
     return (f'<a href="{E(root_rel)}/factions.html">{E(faction_id)}</a>')
 
 
@@ -6602,10 +6611,19 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
     for rid in sorted_races:
         rname = race_name(rid) if rid is not None else "(unset)"
         anchor = _race_anchor(rid)
-        can_rrs = sorted(
-            by_race[rid],
-            key=lambda r: nwn_text(db.canonical_creature_name(r)).lower(),
-        )
+        def _race_sort_key(r):
+            total = sum(l["count"] for l in db.canonical_locations.get(r, []))
+            has_any = 0 if total > 0 else 1
+            _e2 = db.canonical_creatures[r]
+            _c2 = _e2["c"]
+            _bp2 = db.creatures.get(_e2["bp_rr"]) if _e2["bp_rr"] != r else None
+            raw_cr = fld(_c2, "ChallengeRating") or (_bp2 and fld(_bp2, "ChallengeRating"))
+            try:
+                cr_val = float(raw_cr) if raw_cr else float("-inf")
+            except (TypeError, ValueError):
+                cr_val = float("-inf")
+            return (has_any, -cr_val, nwn_text(db.canonical_creature_name(r)).lower())
+        can_rrs = sorted(by_race[rid], key=_race_sort_key)
         rows = []
         for can_rr in can_rrs:
             entry = db.canonical_creatures[can_rr]
@@ -9126,6 +9144,12 @@ def render_factions(db: Db, out: Path) -> None:
         toc_parts.append(
             f'<div><a href="#{E(_faction_anchor(i))}">{E(fname)}{cnt}</a></div>'
         )
+    _none_entries = faction_entries.get(65535, [])
+    if _none_entries:
+        toc_parts.append(
+            f'<div><a href="#{E(_faction_anchor(65535))}">(None)'
+            f' <span class="muted">({len(_none_entries)})</span></a></div>'
+        )
     if cross_faction:
         toc_parts.append('<div class="toc-group-heading">Flags</div>')
         toc_parts.append(
@@ -9167,6 +9191,23 @@ def render_factions(db: Db, out: Path) -> None:
             f"<td>{n_bps:,}</td>"
             f"<td>{n_areas:,}</td>"
             f"<td>{total_lvls:,}</td>"
+            "</tr>"
+        )
+
+    if faction_entries.get(65535):
+        _ne = faction_entries[65535]
+        sum_rows.append(
+            "<tr>"
+            f'<td><a href="#{E(_faction_anchor(65535))}">(None)</a></td>'
+            f"<td>65535</td>"
+            f"<td>&#x2014;</td>"
+            f"<td>&#x2014;</td>"
+            f"<td>&#x2014;</td>"
+            f"<td>{sum(1 for e in _ne if e['kind'] == 'instance'):,}</td>"
+            f"<td>{sum(1 for e in _ne if e['kind'] == 'spawn'):,}</td>"
+            f"<td>{len({e['crr'] for e in _ne if e['crr']}):,}</td>"
+            f"<td>{len({e['area'] for e in _ne}):,}</td>"
+            f"<td>{sum(e['lvls'] for e in _ne):,}</td>"
             "</tr>"
         )
 
@@ -9323,6 +9364,77 @@ def render_factions(db: Db, out: Path) -> None:
             "<th>Race</th><th>Classes</th><th>HP</th><th>CR</th>"
             "</tr></thead><tbody>"
             + "\n".join(rows)
+            + "</tbody></table>"
+        )
+
+    # ---- (None) faction detail section ----
+    _none_ent = faction_entries.get(65535, [])
+    if _none_ent:
+        _anchor_none = _faction_anchor(65535)
+        sections.append(f'<h2 id="{E(_anchor_none)}">(None)</h2>')
+        _n_inst_n = sum(1 for e in _none_ent if e["kind"] == "instance")
+        _n_spawn_n = sum(1 for e in _none_ent if e["kind"] == "spawn")
+        _areas_n = sorted({e["area"] for e in _none_ent}, key=lambda a: db.area_name(a).lower())
+        _area_links_n = ", ".join(link(f"areas/{a}.html", db.area_name(a)) for a in _areas_n)
+        sections.append(
+            '<dl class="meta">'
+            f"<dt>Direct placements</dt><dd>{_n_inst_n:,}</dd>"
+            f"<dt>Encounter pool slots</dt><dd>{_n_spawn_n:,}</dd>"
+            f"<dt>Total class levels</dt><dd>{sum(e['lvls'] for e in _none_ent):,}</dd>"
+            f"<dt>Areas</dt><dd>{_area_links_n}</dd>"
+            "</dl>"
+        )
+        _by_area_n: dict[str, list[dict]] = defaultdict(list)
+        for _e in _none_ent:
+            _by_area_n[_e["area"]].append(_e)
+        _rows_n: list[str] = []
+        for _area_rr in sorted(_by_area_n, key=lambda a: db.area_name(a).lower()):
+            _grouped_n: dict[tuple, list[dict]] = defaultdict(list)
+            for _e in _by_area_n[_area_rr]:
+                _grouped_n[(_e["crr"], _e["kind"])].append(_e)
+            for (_crr, _kind) in sorted(
+                _grouped_n,
+                key=lambda k: (db.creature_name(k[0]) or k[0]).lower(),
+            ):
+                _grp = _grouped_n[(_crr, _kind)]
+                _e0 = _grp[0]
+                _cls_str = "/".join(
+                    f"{class_name(fld(_cl, 'Class'))} {fld(_cl, 'ClassLevel', '')}"
+                    for _cl in _e0["classes"]
+                ) or "&#x2014;"
+                _can_crr = db.canonical_for_bp.get(_crr, _crr)
+                _disp = db.canonical_creature_name(_can_crr) or _e0["name"] or _crr
+                _name_cell = (
+                    link(f"creatures/{_can_crr}.html", _disp)
+                    if _can_crr in db.canonical_creatures else nwn_html(_disp)
+                )
+                _kind_cell = (
+                    '<span class="badge">placed</span>' if _kind == "instance"
+                    else '<span class="badge">encounter pool</span>'
+                )
+                _cross_flag = (
+                    f' <a href="#cross-faction" class="muted"'
+                    f' title="blueprint appears in multiple factions">&#x26A0;</a>'
+                    if _crr in cross_faction else ""
+                )
+                _rows_n.append(
+                    "<tr>"
+                    f"<td>{_name_cell}{_cross_flag}</td>"
+                    f"<td>{_kind_cell}</td>"
+                    f"<td>{len(_grp)}</td>"
+                    f"<td>{link(f'areas/{_area_rr}.html', db.area_name(_area_rr))}</td>"
+                    f"<td>{E(race_name(_e0.get('race')))}</td>"
+                    f"<td>{_cls_str}</td>"
+                    f"<td>{_fmt_hp(_e0['hp'])}</td>"
+                    f"<td>{E(_e0['cr'])}</td>"
+                    "</tr>"
+                )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Kind</th><th>Count</th><th>Area</th>"
+            "<th>Race</th><th>Classes</th><th>HP</th><th>CR</th>"
+            "</tr></thead><tbody>"
+            + "\n".join(_rows_n)
             + "</tbody></table>"
         )
 
