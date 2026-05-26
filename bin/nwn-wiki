@@ -3935,6 +3935,18 @@ def _faction_dd(db: Db, faction_id, root_rel: str = ".") -> str:
     return (f'<a href="{E(root_rel)}/factions.html">{E(faction_id)}</a>')
 
 
+def _race_link(race_raw, root_rel: str = ".") -> str:
+    """Render a race value as its name, linking to the by-race page anchor."""
+    if race_raw is None or race_raw == "":
+        return ""
+    try:
+        rid = int(race_raw)
+    except (TypeError, ValueError):
+        return E(str(race_raw))
+    anchor = f"race-{rid}"
+    return f'<a href="{E(root_rel)}/creatures/by-race/index.html#{anchor}">{E(race_name(rid))}</a>'
+
+
 def md_to_html(text: str) -> str:
     """Convert a subset of Markdown to HTML (no third-party deps)."""
     import html as _html
@@ -4132,6 +4144,7 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
           <a href="{E(root_rel)}/creatures/index.html">All Creatures</a>
           <a href="{E(root_rel)}/creatures/by-area/index.html">By Area</a>
           <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
+          <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
         </div>
       </div>
       <div class="nav-dropdown">
@@ -5506,6 +5519,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
         '<div class="toc-group-heading">Views</div>',
         '<div><a href="by-area/index.html">By Area</a></div>',
         '<div><a href="by-cr/index.html">By Challenge Rating</a></div>',
+        '<div><a href="by-race/index.html">By Race</a></div>',
         '<div class="toc-group-heading">Sections</div>',
     ]
     if rows_present:
@@ -6188,7 +6202,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(canonical_rr)}</dd>",
         f"<dt>Tag</dt><dd>{E(_meta('Tag', ''))}</dd>",
-        f"<dt>Race</dt><dd>{E(race_name(_meta('Race')))}</dd>",
+        f"<dt>Race</dt><dd>{_race_link(_meta('Race'), root_rel='..')}</dd>",
         f"<dt>Appearance</dt><dd>{E(appearance_name(_meta('Appearance_Type')))}</dd>",
         f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
         f"<dt>HP</dt><dd>{E(_fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
@@ -6310,6 +6324,7 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
         '<div class="toc-group-heading">Views</div>',
         '<div><a href="../index.html">All Creatures</a></div>',
         '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
+        '<div><a href="../by-race/index.html">By Race</a></div>',
         '<div class="toc-group-heading">Areas</div>',
     ]
     for area_rr in sorted(visible_areas, key=lambda r: db.area_name(r).lower()):
@@ -6448,6 +6463,7 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
         '<div class="toc-group-heading">Views</div>',
         '<div><a href="../index.html">All Creatures</a></div>',
         '<div><a href="../by-area/index.html">By Area</a></div>',
+        '<div><a href="../by-race/index.html">By Race</a></div>',
         '<div class="toc-group-heading">Challenge Rating</div>',
     ]
     for start, end, creatures in merged:
@@ -6520,6 +6536,113 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
     body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
     write(out / "creatures" / "by-cr" / "index.html",
           page("Creatures by Challenge Rating",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel="../.."))
+
+
+def render_creatures_by_race(db: Db, out: Path) -> None:
+    """Creatures grouped by Race, with a left-sidebar TOC."""
+
+    def _race_id(can_rr: str) -> "int | None":
+        entry = db.canonical_creatures[can_rr]
+        c2 = entry["c"]
+        bp2_rr = entry["bp_rr"]
+        bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+        raw = fld(c2, "Race")
+        if raw is None and bp2 is not None:
+            raw = fld(bp2, "Race")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    by_race: dict = defaultdict(list)
+    for can_rr in db.canonical_creatures:
+        by_race[_race_id(can_rr)].append(can_rr)
+
+    sorted_races = sorted(
+        by_race.keys(),
+        key=lambda r: race_name(r).lower() if r is not None else "\xff",
+    )
+
+    def _race_anchor(rid) -> str:
+        return "race-unset" if rid is None else f"race-{rid}"
+
+    toc_parts = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="../index.html">All Creatures</a></div>',
+        '<div><a href="../by-area/index.html">By Area</a></div>',
+        '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
+        '<div class="toc-group-heading">Races</div>',
+    ]
+    for rid in sorted_races:
+        rname = race_name(rid) if rid is not None else "(unset)"
+        toc_parts.append(
+            f'<div><a href="#{E(_race_anchor(rid))}">{E(rname)}'
+            f' <span class="muted">({len(by_race[rid])})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    TABLE_HEAD = (
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>Count</th><th>Class</th>"
+        "<th>HP</th><th>CR</th><th>Faction</th>"
+        "</tr></thead><tbody>"
+    )
+
+    sections: list[str] = [
+        "<h1>Creatures by Race</h1>",
+        f"<p>{len(db.canonical_creatures)} unique creature{'s' if len(db.canonical_creatures) != 1 else ''}"
+        f" across {len(sorted_races)} race{'s' if len(sorted_races) != 1 else ''}. "
+        f'See <a href="../index.html">All Creatures</a> for a flat list.</p>',
+    ]
+
+    for rid in sorted_races:
+        rname = race_name(rid) if rid is not None else "(unset)"
+        anchor = _race_anchor(rid)
+        can_rrs = sorted(
+            by_race[rid],
+            key=lambda r: nwn_text(db.canonical_creature_name(r)).lower(),
+        )
+        rows = []
+        for can_rr in can_rrs:
+            entry = db.canonical_creatures[can_rr]
+            c2 = entry["c"]
+            bp2_rr = entry["bp_rr"]
+            bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+
+            def _f4(key, default=None, _c2=c2, _bp2=bp2):
+                v = fld(_c2, key)
+                if v is None and _bp2 is not None:
+                    v = fld(_bp2, key)
+                return default if v is None else v
+
+            classes4 = list_items(c2.get("ClassList")) or (
+                list_items(bp2.get("ClassList")) if bp2 else [])
+            cls_str4 = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes4
+            )
+            total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
+            rows.append(
+                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
+                f"<td>{total_count if total_count else '&#x2014;'}</td>"
+                f"<td>{E(cls_str4)}</td>"
+                f"<td>{E(_f4('MaxHitPoints', ''))}</td>"
+                f"<td>{E(_f4('ChallengeRating', ''))}</td>"
+                f"<td>{E(db.faction_name(_f4('FactionID', '')))}</td></tr>"
+            )
+        sections.append(
+            f'<h2 id="{E(anchor)}">{E(rname)}'
+            f' <small class="muted">({len(rows)})</small></h2>'
+            + TABLE_HEAD + "\n".join(rows) + "</tbody></table>"
+        )
+
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "by-race" / "index.html",
+          page("Creatures by Race",
                '<div class="items-layout">' + body + "</div>",
                root_rel="../.."))
 
@@ -9047,6 +9170,46 @@ def render_factions(db: Db, out: Path) -> None:
             "</tr>"
         )
 
+    # ---- Race × Faction matrix ----
+    # Collect (race_id, faction_id) → count across all entries
+    race_faction_counts: dict[tuple, int] = defaultdict(int)
+    for fid, entries in faction_entries.items():
+        for e in entries:
+            rid = e.get("race")
+            if rid is None or rid == "":
+                rid = None
+            race_faction_counts[(rid, fid)] += 1
+
+    all_race_ids = sorted(
+        {k[0] for k in race_faction_counts},
+        key=lambda r: race_name(r).lower() if r is not None else "",
+    )
+    factions_with_creatures = sorted(
+        {k[1] for k in race_faction_counts},
+    )
+
+    rf_header = "<tr><th>Race</th>" + "".join(
+        f'<th><a href="#{E(_faction_anchor(fid))}">{E(db.faction_name(fid))}</a></th>'
+        for fid in factions_with_creatures
+    ) + "<th>Total</th></tr>"
+
+    rf_rows: list[str] = []
+    col_totals: dict[int, int] = {fid: 0 for fid in factions_with_creatures}
+    for rid in all_race_ids:
+        row_total = 0
+        cells = ""
+        for fid in factions_with_creatures:
+            n = race_faction_counts.get((rid, fid), 0)
+            col_totals[fid] += n
+            row_total += n
+            cells += f"<td>{n if n else '&#x2014;'}</td>"
+        rname_cell = _race_link(rid, root_rel=".") if rid is not None else E("(unset)")
+        rf_rows.append(f"<tr><td>{rname_cell}</td>{cells}<td>{row_total}</td></tr>")
+
+    total_cells = "".join(f"<td>{col_totals[fid]}</td>" for fid in factions_with_creatures)
+    grand_total = sum(col_totals.values())
+    rf_rows.append(f"<tr><th>Total</th>{total_cells}<th>{grand_total}</th></tr>")
+
     sections: list[str] = [
         "<h1>Factions</h1>",
         f"<p>{len(flist)} factions defined in repute.fac.</p>",
@@ -9055,6 +9218,10 @@ def render_factions(db: Db, out: Path) -> None:
         "<th>Placed</th><th>Enc. Pool</th><th>Blueprints</th><th>Areas</th><th>Total Levels</th>"
         "</tr></thead><tbody>",
         "\n".join(sum_rows),
+        "</tbody></table>",
+        "<h2>Race &times; Faction</h2>",
+        '<table class="data"><thead>' + rf_header + "</thead><tbody>",
+        "\n".join(rf_rows),
         "</tbody></table>",
     ]
 
@@ -10913,6 +11080,7 @@ def main() -> int:
     render_creatures_index(db, out)
     render_creatures_by_area(db, out)
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
+    render_creatures_by_race(db, out)
     for can_rr in db.canonical_creatures:
         render_creature_page(db, can_rr, out)
     render_items_index(db, out)
