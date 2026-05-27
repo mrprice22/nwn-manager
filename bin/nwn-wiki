@@ -10607,13 +10607,55 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
     else:
         date_range = []
     date_counts: Counter = Counter(s["join"].date() for s in ps)
+    date_hours: dict = {}
+    for s in ps:
+        if s.get("duration_min") is not None:
+            d = s["join"].date()
+            date_hours[d] = date_hours.get(d, 0.0) + s["duration_min"] / 60.0
+
+    # Sweep-line: peak concurrent players per day and overall.
+    # Leaves are sorted before joins at identical timestamps so a player
+    # departing and another arriving at the same instant don't inflate the peak.
+    _now = datetime.now()
+    conc_events: list[tuple] = []
+    for s in ps:
+        if s.get("join") is None:
+            continue
+        conc_events.append((s["join"], 1))
+        conc_events.append((s.get("leave") or _now, -1))
+    conc_events.sort(key=lambda e: (e[0], e[1]))
+    daily_peak_conc: dict = {}
+    peak_conc = 0
+    peak_conc_date = None
+    _cur = 0
+    for _t, _delta in conc_events:
+        _cur += _delta
+        _d = _t.date()
+        if _cur > daily_peak_conc.get(_d, 0):
+            daily_peak_conc[_d] = _cur
+        if _cur > peak_conc:
+            peak_conc = _cur
+            peak_conc_date = _d
+
+    first_seen: dict[str, object] = {}
+    for s in ps:
+        p, j = s["player"], s["join"]
+        if p not in first_seen or j < first_seen[p]:
+            first_seen[p] = j
+    newest_players = sorted(first_seen.items(), key=lambda x: x[1], reverse=True)[:3]
 
     n_players = len(sess_by_player)
     n_sessions = len(ps)
     total_hours = sum(time_by_player.values()) / 60
-    top_player = sess_by_player.most_common(1)[0][0] if sess_by_player else "—"
-    top_date_pair = date_counts.most_common(1)[0] if date_counts else (None, 0)
-    top_day_str = top_date_pair[0].strftime("%b %d, %Y") if top_date_pair[0] else "—"
+    top_player = max(time_by_player, key=time_by_player.get) if time_by_player else "—"
+    top_day = max(date_hours, key=date_hours.get) if date_hours else None
+    top_day_str = top_day.strftime("%b %d, %Y") if top_day else "—"
+    top_day_hours = date_hours[top_day] if top_day else 0.0
+    peak_conc_str = (
+        f"{peak_conc} player{'s' if peak_conc != 1 else ''}"
+        f" ({peak_conc_date.strftime('%b %d, %Y')})"
+        if peak_conc_date else "—"
+    )
 
     top_players = [p for p, _ in sess_by_player.most_common(10)]
     chart_sess = svg_hbar_chart(
@@ -10656,6 +10698,25 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         height=270,
         rotate_labels=True,
     )
+    date_hour_values = [round(date_hours.get(d, 0.0), 2) for d in date_range]
+    chart_daily_hours = svg_vbar_chart(
+        date_labels, date_hour_values,
+        "Daily play-hours",
+        ylabel="hours",
+        width=max(700, len(date_range) * 20 + 80),
+        height=270,
+        rotate_labels=True,
+        bar_color="#5a2b78",
+    )
+    conc_values = [daily_peak_conc.get(d, 0) for d in date_range]
+    chart_concurrent = svg_vbar_chart(
+        date_labels, conc_values,
+        "Peak concurrent players per day",
+        ylabel="players",
+        width=max(700, len(date_range) * 20 + 80),
+        height=270,
+        rotate_labels=True,
+    )
 
     range_str = (
         f"{all_dates[0].strftime('%b %d, %Y')} – {all_dates[-1].strftime('%b %d, %Y')}"
@@ -10666,15 +10727,27 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         f'<p class="muted">Parsed from {file_count} server log file'
         f'{"s" if file_count != 1 else ""}'
         f'{f" &mdash; {E(range_str)}" if range_str else ""}</p>\n'
-        "<h2>Summary</h2>\n"
+        + (
+            "<h2>Welcome, new adventurers!</h2>\n"
+            "<p>Our most recently seen players:</p>\n"
+            "<ul>\n"
+            + "".join(
+                f"  <li><strong>{E(p)}</strong> &mdash; first joined"
+                f" {j.strftime('%b %d, %Y')}</li>\n"
+                for p, j in newest_players
+            )
+            + "</ul>\n"
+            if newest_players else ""
+        )
+        + "<h2>Summary</h2>\n"
         '<dl class="meta">\n'
         f"  <dt>Unique players</dt><dd>{n_players}</dd>\n"
         f"  <dt>Total sessions</dt><dd>{n_sessions}</dd>\n"
         f"  <dt>Combined play-hours</dt><dd>{total_hours:.1f} h</dd>\n"
         f"  <dt>Most active player</dt><dd>{E(top_player)}</dd>\n"
         f"  <dt>Busiest day</dt><dd>{E(top_day_str)}"
-        f" ({top_date_pair[1]} session"
-        f'{"s" if top_date_pair[1] != 1 else ""})</dd>\n'
+        f" ({top_day_hours:.1f} h)</dd>\n"
+        f"  <dt>Peak concurrent players</dt><dd>{E(peak_conc_str)}</dd>\n"
         "</dl>\n"
         "<h2>Sessions per player</h2>\n"
         f'<div style="overflow-x:auto;">{chart_sess}</div>\n'
@@ -10682,6 +10755,10 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         f'<div style="overflow-x:auto;">{chart_time}</div>\n'
         "<h2>Daily sessions</h2>\n"
         f'<div style="overflow-x:auto;">{chart_daily}</div>\n'
+        "<h2>Daily play-hours</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_daily_hours}</div>\n'
+        "<h2>Concurrent players</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_concurrent}</div>\n'
         "<h2>Active time of day</h2>\n"
         f'<div style="overflow-x:auto;">{chart_hour}</div>\n'
         "<h2>Day of week</h2>\n"

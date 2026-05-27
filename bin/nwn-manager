@@ -509,6 +509,11 @@ cmd_wiki() {
     exit 1
   }
   cd "$root"
+
+  # Export TZ from server.env so activity-page timezone label is correct.
+  # shellcheck disable=SC1091
+  [[ -f server.env ]] && . server.env && export TZ
+
   local out=docs
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -557,6 +562,10 @@ cmd_serve() {
     exit 1
   }
   cd "$root"
+
+  # Export TZ from server.env so activity-page timezone label is correct.
+  # shellcheck disable=SC1091
+  [[ -f server.env ]] && . server.env && export TZ
 
   local log_dirs=()
   local poll_interval=5
