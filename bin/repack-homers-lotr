@@ -150,17 +150,6 @@ if [[ -f homers_lotr_v3.mod ]]; then
     cp "homers_lotr_v3.mod" "$ARCHIVE_DEST"
     echo "[archive] → $ARCHIVE_DEST"
     echo
-    # Refresh nwsync so connecting EE clients pull the new module's haks/tlk
-    # snapshot. Non-fatal: if this fails, the .mod itself is still good.
-    if [[ -x "$PROJECT/bin/refresh-nwsync" ]]; then
-      echo "--------------------------------------------------------------------------"
-      echo "[nwsync] refreshing manifest..."
-      nwsync_flags=()
-      [[ $VERBOSE -eq 0 ]] && nwsync_flags+=(--silent)
-      "$PROJECT/bin/refresh-nwsync" "${nwsync_flags[@]}" || \
-        echo "[nwsync] WARNING: refresh failed; the .mod is fine, but clients won't see the latest CEP snapshot until you re-run bin/refresh-nwsync"
-      echo
-    fi
     echo "Next: launch the server with the 'Host Homer's LotR Server' app-grid"
     echo "      shortcut (or run bin/serve from the project root)."
     status=0
