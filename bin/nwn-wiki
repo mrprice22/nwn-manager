@@ -170,6 +170,12 @@ def _load_lookup(name: str) -> dict[int, str]:
 
 
 BASEITEMS = _load_lookup("baseitems")
+# Snapshot of the stock baseitems.2da rows, captured before load_2da_overrides()
+# extends BASEITEMS in place with the module's CEP/custom rows. Used to recognise
+# a store's "buy nothing" sentinel: builders restrict a store's WillOnlyBuy list to
+# an out-of-range base item row (one no normal player merchandise uses) so the store
+# refuses every sale. Such a row is absent from this stock set. See _store_buy_summary.
+STOCK_BASEITEMS: frozenset[int] = frozenset(BASEITEMS)
 CLASSES = _load_lookup("classes")
 RACES = _load_lookup("racialtypes")
 APPEARANCE = _load_lookup("appearance")
@@ -5230,8 +5236,9 @@ def render_area_page(db: Db, resref: str, out: Path,
 
             mu_val = fld(inst, "MarkUp", None)
             md_val = fld(inst, "MarkDown", None)
+            buy_html, buys_any = _store_buy_summary(inst)
             mu_str = f"{mu_val}%" if mu_val is not None else "—"
-            md_str = f"{md_val}%" if md_val is not None else "—"
+            md_str = (f"{md_val}%" if md_val is not None else "—") if buys_any else "N/A"
             mbp_raw = fld(inst, "MaxBuyPrice", None)
 
             area_openers = [o for o in db.store_tag_openers.get(tag.lower(), [])
@@ -5259,8 +5266,9 @@ def render_area_page(db: Db, resref: str, out: Path,
                 f"<td>{n_items}</td>"
                 f"<td>{opener_cell}</td>"
                 f"<td>{mu_str}</td>"
+                f"<td>{buy_html}</td>"
                 f"<td>{md_str}</td>"
-                f"<td>{_buy_limit_str(mbp_raw)}</td>"
+                f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
                 f"<td>{max_gp_str}</td>"
                 f"<td>{avg_gp_str}</td>"
                 f"</tr>"
@@ -5269,7 +5277,8 @@ def render_area_page(db: Db, resref: str, out: Path,
             '<table class="data"><thead><tr>'
             "<th>Name</th><th>Items</th><th>Opened By</th>"
             '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
-            '<th title="Price store pays you for items (% of base)">Buys At</th>'
+            '<th title="Item types the store will buy from you">Buys</th>'
+            '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
             '<th title="Maximum the store will pay for any single item">Max Buy</th>'
             '<th title="Highest base item value in stock (before markup)">Max GP</th>'
             '<th title="Average base item value in stock (before markup)">Avg GP</th>'
@@ -8351,11 +8360,50 @@ def _buy_limit_str(mbp: Any) -> str:
     return f"{mbp:,} gp"
 
 
+def _store_buy_base_types(store: dict, field: str) -> list[int]:
+    """BaseItem rows listed under a store's WillOnlyBuy / WillNotBuy list."""
+    out: list[int] = []
+    for s in list_items(store.get(field)):
+        bi = fld(s, "BaseItem")
+        if bi is not None:
+            out.append(int(bi))
+    return out
+
+
+def _store_buy_summary(store: dict) -> tuple[str, bool]:
+    """Describe which item types a store will buy from the player.
+
+    Returns (html_label, buys_anything). NWN store buy rules:
+      * WillOnlyBuy non-empty → store buys ONLY those base item types.
+      * else WillNotBuy non-empty → buys everything EXCEPT those types.
+      * else → buys all types.
+
+    Builders make a store refuse all sales by pointing WillOnlyBuy at an
+    out-of-range sentinel base item (a row absent from stock baseitems.2da, e.g.
+    309) that no real merchandise uses. When every WillOnlyBuy row is such a
+    sentinel the store buys nothing, so buys_anything is False and callers show
+    N/A for the buy-back rate rather than a misleading percentage."""
+    def _labels(rows: list[int]) -> str:
+        return ", ".join(E(baseitem_name(r) or f"BaseItem #{r}")
+                         for r in sorted(set(rows)))
+
+    only = _store_buy_base_types(store, "WillOnlyBuy")
+    if only:
+        if not any(r in STOCK_BASEITEMS for r in only):
+            return ('<em class="muted">Nothing</em>', False)
+        return (f"Only: {_labels(only)}", True)
+    nope = _store_buy_base_types(store, "WillNotBuy")
+    if nope:
+        return (f"All except: {_labels(nope)}", True)
+    return ("All types", True)
+
+
 _CREATURE_STORES_TABLE_HEAD = (
     '<table class="data"><thead><tr>'
     "<th>Name</th><th>Items</th><th>Area</th>"
     '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
-    '<th title="Price store pays you for items (% of base)">Buys At</th>'
+    '<th title="Item types the store will buy from you">Buys</th>'
+    '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
     '<th title="Maximum the store will pay for any single item">Max Buy</th>'
     '<th title="Highest base item value in stock (before markup)">Max GP</th>'
     '<th title="Average base item value in stock (before markup)">Avg GP</th>'
@@ -8410,8 +8458,9 @@ def _creature_store_section(db: "Db", creature_resref: str,
 
             mu_val = fld(inst, "MarkUp", None)
             md_val = fld(inst, "MarkDown", None)
+            buy_html, buys_any = _store_buy_summary(inst)
             mu_str = f"{mu_val}%" if mu_val is not None else "—"
-            md_str = f"{md_val}%" if md_val is not None else "—"
+            md_str = (f"{md_val}%" if md_val is not None else "—") if buys_any else "N/A"
             mbp_raw = fld(inst, "MaxBuyPrice", None)
 
             max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
@@ -8423,8 +8472,9 @@ def _creature_store_section(db: "Db", creature_resref: str,
                 f"<td>{n_items}</td>"
                 f"<td>{area_cell}</td>"
                 f"<td>{mu_str}</td>"
+                f"<td>{buy_html}</td>"
                 f"<td>{md_str}</td>"
-                f"<td>{_buy_limit_str(mbp_raw)}</td>"
+                f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
                 f"<td>{max_gp_str}</td>"
                 f"<td>{avg_gp_str}</td>"
                 f"</tr>"
@@ -8705,15 +8755,17 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
     ]
     mu = fld(inst, "MarkUp", None)
     md = fld(inst, "MarkDown", None)
+    buy_html, buys_any = _store_buy_summary(inst)
     if mu is not None or md is not None:
+        md_disp = (f'{md}%' if md is not None else '—') if buys_any else "N/A"
         meta.append(
             f"<dt>Sells At / Buys At</dt><dd>"
-            f"{f'{mu}%' if mu is not None else '—'} / "
-            f"{f'{md}%' if md is not None else '—'}</dd>"
+            f"{f'{mu}%' if mu is not None else '—'} / {md_disp}</dd>"
         )
+    meta.append(f"<dt>Buys</dt><dd>{buy_html}</dd>")
     mbp = fld(inst, "MaxBuyPrice", None)
     if mbp is not None:
-        meta.append(f"<dt>Max Buy Price</dt><dd>{_buy_limit_str(mbp)}</dd>")
+        meta.append(f"<dt>Max Buy Price</dt><dd>{'N/A' if not buys_any else _buy_limit_str(mbp)}</dd>")
     inst_pages = list_items(inst.get("StoreList"))
     max_gp, max_irr, max_name, avg_gp = _store_item_gp_stats(db, inst_pages)
     if max_gp > 0:
@@ -8789,7 +8841,8 @@ def render_stores_index(db: Db, out: Path) -> None:
         "<th>Items</th>"
         "<th>Area</th><th>Opened By</th>"
         '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
-        '<th title="Price store pays you for items (% of base)">Buys At</th>'
+        '<th title="Item types the store will buy from you">Buys</th>'
+        '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
         '<th title="Maximum the store will pay for any single item">Max Buy</th>'
         '<th title="Highest base item value in stock (before markup)">Max GP</th>'
         '<th title="Average base item value in stock (before markup)">Avg GP</th>'
@@ -8814,8 +8867,9 @@ def render_stores_index(db: Db, out: Path) -> None:
 
             mu_val = fld(inst, "MarkUp", None)
             md_val = fld(inst, "MarkDown", None)
+            buy_html, buys_any = _store_buy_summary(inst)
             mu_str = f"{mu_val}%" if mu_val is not None else "—"
-            md_str = f"{md_val}%" if md_val is not None else "—"
+            md_str = (f"{md_val}%" if md_val is not None else "—") if buys_any else "N/A"
 
             area_cell = link(f"../areas/{area_rr}.html", db.area_name(area_rr))
 
@@ -8852,8 +8906,9 @@ def render_stores_index(db: Db, out: Path) -> None:
                 f"<td>{area_cell}</td>"
                 f"<td>{opener_cell}</td>"
                 f"<td>{mu_str}</td>"
+                f"<td>{buy_html}</td>"
                 f"<td>{md_str}</td>"
-                f"<td>{_buy_limit_str(mbp_raw)}</td>"
+                f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
                 f"<td>{max_gp_str}</td>"
                 f"<td>{avg_gp_str}</td>"
                 f"</tr>"
@@ -8886,6 +8941,7 @@ def render_stores_index(db: Db, out: Path) -> None:
         n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
         mu_val = fld(s, "MarkUp", None)
         md_val = fld(s, "MarkDown", None)
+        buy_html, buys_any = _store_buy_summary(s)
         mbp_raw = fld(s, 'MaxBuyPrice', None)
         mbp_sort = float('inf') if mbp_raw == -1 else (mbp_raw if mbp_raw is not None else 0)
         md_sort = md_val if md_val is not None else 0
@@ -8900,8 +8956,9 @@ def render_stores_index(db: Db, out: Path) -> None:
             f"<td><em>Not placed</em></td>"
             f"<td>—</td>"
             f"<td>{f'{mu_val}%' if mu_val is not None else '—'}</td>"
-            f"<td>{f'{md_val}%' if md_val is not None else '—'}</td>"
-            f"<td>{_buy_limit_str(mbp_raw)}</td>"
+            f"<td>{buy_html}</td>"
+            f"<td>{(f'{md_val}%' if md_val is not None else '—') if buys_any else 'N/A'}</td>"
+            f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
             f"<td>{f'{u_max_gp:,}' if u_max_gp > 0 else '—'}</td>"
             f"<td>{f'{u_avg_gp:,.0f}' if u_avg_gp > 0 else '—'}</td>"
             f"</tr>"
@@ -8977,6 +9034,7 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
         for area_rr, inst in instances:
             mu = fld(inst, "MarkUp", None)
             md = fld(inst, "MarkDown", None)
+            buy_html, buys_any = _store_buy_summary(inst)
             pages = list_items(inst.get("StoreList"))
             n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
             inst_tag = fld(inst, "Tag", "") or ""
@@ -8987,8 +9045,9 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
                 f"<td>{link(f'{slug}.html', inst_tag) if inst_tag else '—'}</td>"
                 f"<td>{n_items}</td>"
                 f"<td>{f'{mu}%' if mu is not None else '—'}</td>"
-                f"<td>{f'{md}%' if md is not None else '—'}</td>"
-                f"<td>{_buy_limit_str(fld(inst, 'MaxBuyPrice', None))}</td>"
+                f"<td>{buy_html}</td>"
+                f"<td>{(f'{md}%' if md is not None else '—') if buys_any else 'N/A'}</td>"
+                f"<td>{'N/A' if not buys_any else _buy_limit_str(fld(inst, 'MaxBuyPrice', None))}</td>"
                 f"</tr>"
             )
         sections.append(
@@ -8996,7 +9055,8 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
             '<table class="data"><thead><tr>'
             '<th>Area</th><th>Tag</th><th>Items</th>'
             '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
-            '<th title="Price store pays you for items (% of base)">Buys At</th>'
+            '<th title="Item types the store will buy from you">Buys</th>'
+            '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
             '<th title="Maximum the store will pay for any single item">Max Buy</th>'
             "</tr></thead><tbody>" + "\n".join(inst_rows) + "</tbody></table>"
         )
@@ -9012,14 +9072,18 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
     if bp_max_gp > 0:
         bp_max_item_html = (link(f"../items/{bp_max_irr}.html", bp_max_name)
                             if bp_max_irr in db.items else E(bp_max_name))
+    _bp_buy_html, _bp_buys_any = _store_buy_summary(s)
     bp_meta = [
         "<h2>Blueprint</h2>",
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(s, 'Tag', ''))}</dd>",
         f"<dt>Sells At (MarkUp) / Buys At (MarkDown)</dt>"
-        f"<dd>{E(fld(s, 'MarkUp', ''))} / {E(fld(s, 'MarkDown', ''))}</dd>",
-        f"<dt>MaxBuyPrice</dt><dd>{_buy_limit_str(fld(s, 'MaxBuyPrice', None))}</dd>",
+        f"<dd>{E(fld(s, 'MarkUp', ''))} / "
+        f"{E(fld(s, 'MarkDown', '')) if _bp_buys_any else 'N/A'}</dd>",
+        f"<dt>Buys</dt><dd>{_bp_buy_html}</dd>",
+        f"<dt>MaxBuyPrice</dt><dd>"
+        f"{'N/A' if not _bp_buys_any else _buy_limit_str(fld(s, 'MaxBuyPrice', None))}</dd>",
         f"<dt>StoreGold</dt><dd>{E(fld(s, 'StoreGold', ''))}</dd>",
         f"<dt>BlackMarket</dt><dd>{E(fld(s, 'BlackMarket', ''))}</dd>",
     ]
