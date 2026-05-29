@@ -9637,16 +9637,27 @@ def _quest_entry_id(e: dict) -> int:
 
 # Builder-authored directives parsed from a quest category's Comment field —
 # the only per-quest free text the toolset exposes (individual journal entries
-# have no Comment field). Both are optional and module-agnostic:
+# have no Comment field). All optional and module-agnostic:
 #   @group 'Name'   place this quest under the "Name" heading on the index
 #   @order 1,3,2    show this quest's entries in this entry-ID order
+#   @hidden         retired/inactive quest — omit it from the wiki entirely
+#                   (@retired and @inactive are accepted synonyms)
 # The group name may be wrapped in single quotes, double quotes, or left bare.
 _RE_QUEST_GROUP = re.compile(
     r"@group\s+(?:'([^']*)'|\"([^\"]*)\"|([^\n]+))", re.IGNORECASE)
 _RE_QUEST_ORDER = re.compile(r"@order\s+([0-9][0-9,\s]*)", re.IGNORECASE)
+_RE_QUEST_HIDDEN = re.compile(r"@(?:hidden|retired|inactive)\b", re.IGNORECASE)
 # Whole directive lines, stripped before the Comment is shown to readers.
 _RE_QUEST_DIRECTIVE = re.compile(
-    r"^[ \t]*@(?:group|order)\b[^\n]*$", re.IGNORECASE | re.MULTILINE)
+    r"^[ \t]*@(?:group|order|hidden|retired|inactive)\b[^\n]*$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _quest_hidden(comment: str) -> bool:
+    """True when a quest's Comment marks it retired/inactive via @hidden (or
+    the @retired / @inactive synonyms). Such quests are dropped from all wiki
+    output, mirroring the area-level WIKI_HIDDEN convention."""
+    return bool(_RE_QUEST_HIDDEN.search(comment or ""))
 
 
 def _quest_group(comment: str) -> str:
@@ -9693,20 +9704,23 @@ def _quest_group_anchor(name: str) -> str:
 
 def render_quests_index(db: Db, out: Path) -> None:
     """Quests landing page: an overview plus a table of contents of every
-    journal quest, each row linking to that quest's detail page. When any
-    quest declares `@group 'Name'` in its builder Comment, quests are gathered
-    under those headings; otherwise every quest sits in one table."""
+    journal quest, each row linking to that quest's detail page. Quests whose
+    Comment marks them @hidden are omitted entirely. When any visible quest
+    declares `@group 'Name'` in its builder Comment, quests are gathered under
+    those headings; otherwise every quest sits in one table."""
     cats = _quest_categories(db)
-    if not cats:
+    visible = [i for i in range(len(cats))
+               if not _quest_hidden(fld(cats[i], "Comment", ""))]
+    if not visible:
+        msg = "(no active quests)" if cats else "(no journal quests)"
         write(out / "quests" / "index.html",
-              page("Quests", "<h1>Quests</h1><p>(no journal quests)</p>",
-                   root_rel=".."))
+              page("Quests", f"<h1>Quests</h1><p>{msg}</p>", root_rel=".."))
         return
 
     slugs = _quest_slugs(cats)
-    total_steps = sum(len(list_items(c.get("EntryList"))) for c in cats)
-    quest_groups = [_quest_group(fld(c, "Comment", "")) for c in cats]
-    has_groups = any(quest_groups)
+    total_steps = sum(len(list_items(cats[i].get("EntryList"))) for i in visible)
+    quest_groups = {i: _quest_group(fld(cats[i], "Comment", "")) for i in visible}
+    has_groups = any(quest_groups.values())
 
     def row(i: int) -> str:
         c = cats[i]
@@ -9743,7 +9757,7 @@ def render_quests_index(db: Db, out: Path) -> None:
 
     parts = [
         "<h1>Quests</h1>",
-        f"<p>{len(cats)} quests &middot; {total_steps} journal entries. "
+        f"<p>{len(visible)} quests &middot; {total_steps} journal entries. "
         '<small class="muted">Quests are the module&rsquo;s journal categories; '
         "each row links to that quest&rsquo;s entries. &ldquo;Final step&rdquo; marks "
         "a quest with a completion entry. &ldquo;Awarded&rdquo; counts the entries a "
@@ -9755,10 +9769,10 @@ def render_quests_index(db: Db, out: Path) -> None:
 
     if not has_groups:
         # No quest declares a group — a single flat table, no section headings.
-        parts.append(table(list(range(len(cats)))))
+        parts.append(table(visible))
     else:
         grouped: dict[str, list[int]] = defaultdict(list)
-        for i in range(len(cats)):
+        for i in visible:
             grouped[quest_groups[i]].append(i)  # "" == no @group declared
         # Named groups alphabetically; quests with no @group come last under a
         # neutral "Other" heading.
@@ -12197,6 +12211,8 @@ def main() -> int:
     qslugs = _quest_slugs(qcats)
     render_quests_index(db, out)
     for qcat, qslug in zip(qcats, qslugs):
+        if _quest_hidden(fld(qcat, "Comment", "")):
+            continue  # retired/inactive quest — no detail page
         render_quest_page(db, qcat, qslug, out)
     print(f"  rendered in {time.time() - t0:.1f}s")
 

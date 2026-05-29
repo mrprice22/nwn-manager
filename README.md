@@ -230,9 +230,10 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
   categories): an overview table plus a detail page per quest. Each entry on a
   quest page is cross-referenced to the scripts that award it (the **Awarded
   by** column), discovered by scanning every `.nss` for
-  `AddJournalQuestEntry("tag", id, …)`. Quests can be gathered under headings
-  and their entries re-ordered via lightweight `@group` / `@order` directives in
-  a quest's builder Comment — see *Quests: grouping and entry order* below.
+  `AddJournalQuestEntry("tag", id, …)`. Quests can be gathered under headings,
+  have their entries re-ordered, or be hidden when retired via lightweight
+  `@group` / `@order` / `@hidden` directives in a quest's builder Comment — see
+  *Quests: grouping and entry order* below.
 - `conversations/index.html` — every `.dlg` in the module, with per-dialog
   pages that render the entry/reply outline plus the static cross-reference
   graph: which NPCs / placeables / doors host the conversation, which
@@ -321,18 +322,18 @@ the bottom.
 #### Quests: grouping and entry order
 
 By default the **Quests** index is a single table of every journal category,
-sorted by quest name. Two optional directives let the builder reshape it.
-Both live in a journal category's **Comment** field — the only per-quest free
-text the toolset exposes (individual journal *entries* have just an ID, an
+sorted by quest name. A few optional directives let the builder reshape it.
+They all live in a journal category's **Comment** field — the only per-quest
+free text the toolset exposes (individual journal *entries* have just an ID, an
 "end of quest" flag, and their text — there is no per-entry comment field).
 Edit the Comment in the NWN Toolset's Journal editor; nothing else in the
 module changes.
 
 **`@group 'Name'` — gather related quests under a heading.** Add the directive
-to each quest you want grouped:
+to the Comment of each quest you want grouped (use the same `Name` on each):
 
 ```
-@group 'MeaningWave'
+@group 'Main Story'
 Builder notes can follow on the same comment; the directive line is
 stripped from the note shown on the quest page.
 ```
@@ -341,16 +342,15 @@ stripped from the note shown on the quest page.
   count and an anchor link.
 - The name may be wrapped in single quotes, double quotes, or left bare, and
   `@group` itself is case-insensitive.
+- The heading is **exactly the text you type** — `@group 'Main Story'` yields a
+  **Main Story** heading. It is not derived from the quest Tag or any prefix, so
+  any module can name its groups however it likes without code changes.
 - **All-or-nothing fallback:** if **no** quest in the module declares a
   `@group`, the index stays a single flat table — no headings, no "Other"
   section, identical to the un-grouped layout.
 - If **some** quests are grouped and others aren't, the named groups render
   first (alphabetically), and the quests with no `@group` follow under a
   neutral **Other** heading.
-
-The heading is exactly the text you type — `@group 'MeaningWave'` yields a
-**MeaningWave** heading, not a tag/prefix abbreviation — so it works for any
-module without code changes.
 
 **`@order 1,3,2` — set entry display order.** Journal entries are otherwise
 shown in ascending entry-ID order (the usual in-game progression). When the
@@ -365,10 +365,28 @@ narrative order differs from the ID order, list the entry IDs in display order:
   page shows `4, 1, 3` first, then `2, 5`.
 - IDs may be separated by commas, spaces, or both.
 
-Both directives are parsed from the same Comment, so a quest can use either or
-both. The directive lines are removed from the "Builder comment" note rendered
-on the quest's detail page, so the machine-readable markers never show to
-readers.
+**`@hidden` (or `@retired` / `@inactive`) — drop a quest from the wiki.** Mark
+an obsolete, work-in-progress, or otherwise inactive quest so it disappears
+from the generated site entirely:
+
+```
+@hidden
+Optional notes after the directive — e.g. why it was retired. Kept in the
+journal so existing player journals that reference it don't break.
+```
+
+- `@hidden`, `@retired`, and `@inactive` are interchangeable synonyms — use
+  whichever reads best. All three are case-insensitive.
+- The quest is removed from the Quests index **and** gets no detail page; it no
+  longer counts toward the overview totals or any `@group` heading count.
+- This only affects the wiki; the journal category stays in the module, so
+  in-progress player journals that reference it are unaffected. (It mirrors the
+  area-level `WIKI_HIDDEN` marker described above.)
+
+The directives are all parsed from the same Comment, so a quest can combine
+them (e.g. `@group` + `@order`). Every directive line is removed from the
+"Builder comment" note rendered on the quest's detail page, so the
+machine-readable markers never show to readers.
 
 #### Shortest-path sections on area pages
 
