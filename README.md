@@ -226,11 +226,13 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
   - Spell resistance is inferred from feats only; SR granted by scripts
     or items is not summed into the AC/SR display.
 - `factions.html` — module-level faction data.
-- `quests/index.html` — the module's journal quest lines (the `module.jrl`
-  categories): an overview table plus a detail page per quest line with its
-  entries cross-referenced to the scripts that award each step. Related quest
-  lines are grouped into separate tables — see *Quests: grouping by tag prefix*
-  below.
+- `quests/index.html` — the module's journal quests (the `module.jrl`
+  categories): an overview table plus a detail page per quest. Each entry on a
+  quest page is cross-referenced to the scripts that award it (the **Awarded
+  by** column), discovered by scanning every `.nss` for
+  `AddJournalQuestEntry("tag", id, …)`. Quests can be gathered under headings
+  and their entries re-ordered via lightweight `@group` / `@order` directives in
+  a quest's builder Comment — see *Quests: grouping and entry order* below.
 - `conversations/index.html` — every `.dlg` in the module, with per-dialog
   pages that render the entry/reply outline plus the static cross-reference
   graph: which NPCs / placeables / doors host the conversation, which
@@ -316,49 +318,57 @@ With `--cr-bucket-size 5` the page uses CR 0–4, CR 5–9, CR 10–14, … buck
 Creatures with a missing or non-numeric CR appear in an "Unknown CR" bucket at
 the bottom.
 
-#### Quests: grouping by tag prefix
+#### Quests: grouping and entry order
 
-The **Quests** index splits quest lines into separate tables by *family*, so
-related quests (e.g. a multi-part questline, or a themed set like MeaningWave's
-`MW …` entries) read as a group instead of being scattered through one long
-alphabetical list.
+By default the **Quests** index is a single table of every journal category,
+sorted by quest name. Two optional directives let the builder reshape it.
+Both live in a journal category's **Comment** field — the only per-quest free
+text the toolset exposes (individual journal *entries* have just an ID, an
+"end of quest" flag, and their text — there is no per-entry comment field).
+Edit the Comment in the NWN Toolset's Journal editor; nothing else in the
+module changes.
 
-**How a family is decided.** Each quest's family is the **leading alphabetic
-token of its journal category Tag** (the `Tag` field on the `module.jrl`
-category — the same plot id your scripts pass to `AddJournalQuestEntry`),
-lowercased. When **3 or more** quests share that leading token they form their
-own table; quests below the threshold fall into the catch-all *Story & Side
-Quests* table. The leading token is the run of letters before the first
-space/digit/punctuation, so:
+**`@group 'Name'` — gather related quests under a heading.** Add the directive
+to each quest you want grouped:
 
-| Tag                        | Leading token | Groups with …                |
-|----------------------------|---------------|------------------------------|
-| `MW Carl Jung`             | `mw`          | every other `MW …` quest     |
-| `MW Carl Jung Loyalty`     | `mw`          | ditto                        |
-| `Ferny's Ring`             | `ferny`       | (alone → *Story & Side*)     |
-| `gdquest1`                 | `gdquest`     | (alone → *Story & Side*)     |
-| `rules`, `guilds`          | `rules`/`guilds` | (distinct → *Story & Side*) |
+```
+@group 'MeaningWave'
+Builder notes can follow on the same comment; the directive line is
+stripped from the note shown on the quest page.
+```
 
-**Tuning your module to control grouping.** This is driven entirely by your
-Tag naming — no flags required:
+- Quests sharing a `@group` name render together under that heading, with a
+  count and an anchor link.
+- The name may be wrapped in single quotes, double quotes, or left bare, and
+  `@group` itself is case-insensitive.
+- **All-or-nothing fallback:** if **no** quest in the module declares a
+  `@group`, the index stays a single flat table — no headings, no "Other"
+  section, identical to the un-grouped layout.
+- If **some** quests are grouped and others aren't, the named groups render
+  first (alphabetically), and the quests with no `@group` follow under a
+  neutral **Other** heading.
 
-- **To group a set of quests together**, give their journal categories a shared
-  leading word, e.g. tag them `Moria Bridge`, `Moria Balrog`, `Moria Escape`
-  (three `moria` quests → a "Moria" table). One- or two-quest sets stay in the
-  general table by design; add a third sharing the prefix to promote them.
-- **To keep a quest out of a family**, change its leading word so it no longer
-  matches (e.g. rename `MW Backstory` → `Backstory of the Wave`).
-- Tags are case-insensitive for grouping (`MW`, `mw`, `Mw` all match) but the
-  rest of the engine treats journal tags as case-sensitive, so keep the Tag in
-  your `.dlg` Quest fields and scripts byte-for-byte identical to the category.
+The heading is exactly the text you type — `@group 'MeaningWave'` yields a
+**MeaningWave** heading, not a tag/prefix abbreviation — so it works for any
+module without code changes.
 
-**Headings.** A family's table heading is derived from its prefix: prefixes of
-3 letters or fewer are upper-cased (`mw` → `MW`-style), longer ones are
-title-cased. To give a family a nicer name (e.g. `mw` → **MeaningWave**), add an
-entry to the `_QUEST_GROUP_LABELS` map near the top of `render_quests_index` in
-`bin/nwn-wiki`; the threshold itself is `_QUEST_FAMILY_MIN` in the same file.
-If no prefix reaches the threshold the page falls back to a single un-headed
-table, identical to the pre-grouping layout.
+**`@order 1,3,2` — set entry display order.** Journal entries are otherwise
+shown in ascending entry-ID order (the usual in-game progression). When the
+narrative order differs from the ID order, list the entry IDs in display order:
+
+```
+@order 4,1,3
+```
+
+- **Partial orders are fine.** Any entry IDs you omit are appended after the
+  listed ones, in ascending ID order. With five entries and `@order 4,1,3`, the
+  page shows `4, 1, 3` first, then `2, 5`.
+- IDs may be separated by commas, spaces, or both.
+
+Both directives are parsed from the same Comment, so a quest can use either or
+both. The directive lines are removed from the "Builder comment" note rendered
+on the quest's detail page, so the machine-readable markers never show to
+readers.
 
 #### Shortest-path sections on area pages
 

@@ -9635,36 +9635,67 @@ def _quest_entry_id(e: dict) -> int:
         return 0
 
 
-# Quests that share a leading tag token (e.g. every "MW ..." MeaningWave line)
-# are clearly related, so the index groups them into their own table once at
-# least this many share the prefix. Below the threshold a quest falls into the
-# catch-all "Story & Side Quests" table.
-_QUEST_FAMILY_MIN = 3
-
-# Pretty section headings for known tag prefixes. Unknown prefixes that clear
-# the threshold are titled from the prefix itself.
-_QUEST_GROUP_LABELS = {
-    "mw": "MeaningWave",
-}
-
-
-def _quest_group_key(tag: str, name: str) -> str:
-    """Family key for grouping: the leading alphabetic token of the Tag,
-    lowercased (e.g. "MW Carl Jung" -> "mw"). Empty when the tag has no
-    leading letters, which keeps such quests in the general table."""
-    m = re.match(r"[A-Za-z]+", (tag or "").strip())
-    return m.group(0).lower() if m else ""
+# Builder-authored directives parsed from a quest category's Comment field —
+# the only per-quest free text the toolset exposes (individual journal entries
+# have no Comment field). Both are optional and module-agnostic:
+#   @group 'Name'   place this quest under the "Name" heading on the index
+#   @order 1,3,2    show this quest's entries in this entry-ID order
+# The group name may be wrapped in single quotes, double quotes, or left bare.
+_RE_QUEST_GROUP = re.compile(
+    r"@group\s+(?:'([^']*)'|\"([^\"]*)\"|([^\n]+))", re.IGNORECASE)
+_RE_QUEST_ORDER = re.compile(r"@order\s+([0-9][0-9,\s]*)", re.IGNORECASE)
+# Whole directive lines, stripped before the Comment is shown to readers.
+_RE_QUEST_DIRECTIVE = re.compile(
+    r"^[ \t]*@(?:group|order)\b[^\n]*$", re.IGNORECASE | re.MULTILINE)
 
 
-def _quest_group_label(key: str) -> str:
-    return _QUEST_GROUP_LABELS.get(key, key.upper() if len(key) <= 3 else key.title())
+def _quest_group(comment: str) -> str:
+    """The @group name declared in a quest's Comment, or '' if none."""
+    m = _RE_QUEST_GROUP.search(comment or "")
+    if not m:
+        return ""
+    return (m.group(1) or m.group(2) or m.group(3) or "").strip()
+
+
+def _quest_entry_order(comment: str) -> list[int]:
+    """Entry IDs listed in an @order directive, in display order. Empty when
+    no @order is present (callers then fall back to ascending ID order)."""
+    m = _RE_QUEST_ORDER.search(comment or "")
+    if not m:
+        return []
+    return [int(tok) for tok in re.split(r"[,\s]+", m.group(1).strip()) if tok]
+
+
+def _quest_comment_display(comment: str) -> str:
+    """Builder comment with the @group/@order directive lines removed, so the
+    machine-readable markers don't surface in the human-facing note."""
+    if not comment:
+        return ""
+    cleaned = _RE_QUEST_DIRECTIVE.sub("", comment)
+    return re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", cleaned).strip()
+
+
+def _quest_ordered_entries(entries: list[dict], order_ids: list[int]) -> list[dict]:
+    """Entries sorted by an @order list when given (entries it omits follow in
+    ID order), else by ascending ID — the default in-game progression."""
+    if not order_ids:
+        return sorted(entries, key=_quest_entry_id)
+    pos = {eid: i for i, eid in enumerate(order_ids)}
+    return sorted(entries,
+                  key=lambda e: (pos.get(_quest_entry_id(e), len(pos)),
+                                 _quest_entry_id(e)))
+
+
+def _quest_group_anchor(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return f"group-{slug}" if slug else "group"
 
 
 def render_quests_index(db: Db, out: Path) -> None:
     """Quests landing page: an overview plus a table of contents of every
-    journal quest line, each row linking to that quest line's detail page.
-    Related quest lines (those sharing a leading tag token, such as the
-    MeaningWave "MW ..." quests) are grouped into their own table."""
+    journal quest, each row linking to that quest's detail page. When any
+    quest declares `@group 'Name'` in its builder Comment, quests are gathered
+    under those headings; otherwise every quest sits in one table."""
     cats = _quest_categories(db)
     if not cats:
         write(out / "quests" / "index.html",
@@ -9674,15 +9705,8 @@ def render_quests_index(db: Db, out: Path) -> None:
 
     slugs = _quest_slugs(cats)
     total_steps = sum(len(list_items(c.get("EntryList"))) for c in cats)
-
-    # Assign each quest a family. A leading tag token shared by >= the
-    # threshold forms a family; everything else lands in the general group ("").
-    keys = [_quest_group_key(fld(c, "Tag", ""), loc(c.get("Name"))) for c in cats]
-    counts = Counter(k for k in keys if k)
-    groups: dict[str, list[int]] = defaultdict(list)
-    for i in range(len(cats)):
-        k = keys[i]
-        groups[k if (k and counts[k] >= _QUEST_FAMILY_MIN) else ""].append(i)
+    quest_groups = [_quest_group(fld(c, "Comment", "")) for c in cats]
+    has_groups = any(quest_groups)
 
     def row(i: int) -> str:
         c = cats[i]
@@ -9717,28 +9741,37 @@ def render_quests_index(db: Db, out: Path) -> None:
             + "</tbody></table>"
         )
 
-    # General group first, then each family alphabetically by heading.
-    sections: list[tuple[str, list[int]]] = []
-    if groups.get(""):
-        sections.append(("Story &amp; Side Quests", groups[""]))
-    for k in sorted((k for k in groups if k), key=lambda k: _quest_group_label(k).lower()):
-        sections.append((E(_quest_group_label(k)), groups[k]))
-
     parts = [
         "<h1>Quests</h1>",
-        f"<p>{len(cats)} quest lines &middot; {total_steps} journal entries. "
+        f"<p>{len(cats)} quests &middot; {total_steps} journal entries. "
         '<small class="muted">Quests are the module&rsquo;s journal categories; '
-        "each row links to that quest line&rsquo;s entries. Related quest lines "
-        "are grouped into separate tables. &ldquo;Final step&rdquo; marks a quest "
-        "line with a completion entry. &ldquo;Awarded&rdquo; counts the entries a "
+        "each row links to that quest&rsquo;s entries. &ldquo;Final step&rdquo; marks "
+        "a quest with a completion entry. &ldquo;Awarded&rdquo; counts the entries a "
         "script is known to grant via <code>AddJournalQuestEntry</code>."
-        "</small></p>",
+        + (" Quests are grouped by the <code>@group</code> label set in their "
+           "builder Comment." if has_groups else "")
+        + "</small></p>",
     ]
-    multi = len(sections) > 1
-    for heading, indices in sections:
-        if multi:
-            parts.append(f"<h2>{heading} <small class=\"muted\">({len(indices)})</small></h2>")
-        parts.append(table(indices))
+
+    if not has_groups:
+        # No quest declares a group — a single flat table, no section headings.
+        parts.append(table(list(range(len(cats)))))
+    else:
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for i in range(len(cats)):
+            grouped[quest_groups[i]].append(i)  # "" == no @group declared
+        # Named groups alphabetically; quests with no @group come last under a
+        # neutral "Other" heading.
+        for g in sorted((g for g in grouped if g), key=str.lower):
+            parts.append(
+                f'<h2 id="{E(_quest_group_anchor(g))}">{nwn_html(g)} '
+                f'<small class="muted">({len(grouped[g])})</small></h2>')
+            parts.append(table(grouped[g]))
+        if grouped.get(""):
+            parts.append(
+                f'<h2 id="{E(_quest_group_anchor("Other"))}">Other '
+                f'<small class="muted">({len(grouped[""])})</small></h2>')
+            parts.append(table(grouped[""]))
 
     write(out / "quests" / "index.html", page("Quests", "".join(parts), root_rel=".."))
 
@@ -9750,13 +9783,18 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
     qname = loc(c.get("Name")) or tag or "(unnamed quest)"
     prio = _quest_priority_label(fld(c, "Priority"))
     xp = fld(c, "XP", 0) or 0
-    comment = fld(c, "Comment", "")
+    raw_comment = fld(c, "Comment", "")
+    group = _quest_group(raw_comment)
+    comment = _quest_comment_display(raw_comment)
 
     parts = [
         '<p><a href="index.html">&larr; All quests</a></p>',
         f"<h1>{nwn_html(qname)}</h1>",
     ]
     meta = []
+    if group:
+        meta.append('Group: <a href="index.html#'
+                    f'{E(_quest_group_anchor(group))}">{nwn_html(group)}</a>')
     if tag:
         meta.append(f"Tag: <code>{E(tag)}</code>")
     if prio:
@@ -9775,8 +9813,9 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
         parts.append("<p>(no journal entries)</p>")
     else:
         rows = []
-        # ID order mirrors the in-game quest progression.
-        for e in sorted(entries, key=_quest_entry_id):
+        # @order from the Comment when present, else ascending ID — the
+        # default in-game quest progression.
+        for e in _quest_ordered_entries(entries, _quest_entry_order(raw_comment)):
             eid = _quest_entry_id(e)
             end = fld(e, "End", 0)
             txt = loc(e.get("Text"))
