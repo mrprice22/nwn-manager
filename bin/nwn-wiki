@@ -9702,6 +9702,79 @@ def _quest_group_anchor(name: str) -> str:
     return f"group-{slug}" if slug else "group"
 
 
+def _quest_start_locations(db: Db, c: dict, action_to_dlgs):
+    """Best-effort guess at where a quest begins, for the index overview.
+
+    ``action_to_dlgs`` maps a (lowercased) script resref to the dialogs that run
+    it as an action node (the reverse of ``db.dialog_scripts``). We take the
+    scripts that award the quest's *first known* journal step, find the
+    conversations whose nodes run them, and the NPCs that own those
+    conversations (``db.dialog_callers``). Returns ``(npcs, areas)``:
+
+      npcs  - ``[(canonical_rr, name), ...]`` quest-giver creatures, deduped by
+              blueprint resref. ``canonical_rr`` is "" when the blueprint has no
+              creature page of its own.
+      areas - ``[(area_rr, name), ...]`` areas those NPCs are placed in, deduped
+              by area resref.
+
+    Either list may be empty: the opening grant has to be a statically traceable
+    ``AddJournalQuestEntry`` (``db.quest_grants``) run by a placed NPC's
+    conversation. Grants wired straight to event handlers aren't resolved here.
+    """
+    tag = fld(c, "Tag", "")
+    grants = db.quest_grants.get((tag or "").lower(), {})
+    entries = list_items(c.get("EntryList"))
+    if not entries or not grants:
+        return [], []
+    # Opening step = the first entry, in builder/progression order, that we
+    # actually know a granting script for (early steps aren't always mapped).
+    ordered = _quest_ordered_entries(
+        entries, _quest_entry_order(fld(c, "Comment", "")))
+    scripts = set()
+    for e in ordered:
+        scripts = grants.get(_quest_entry_id(e)) or set()
+        if scripts:
+            break
+    if not scripts:
+        return [], []
+    npcs = {}     # bp_rr -> (canonical_rr, name)
+    areas = {}    # area_rr -> area name
+    for sref in scripts:
+        for dlg in action_to_dlgs.get(sref.lower(), ()):
+            for caller in db.dialog_callers.get(dlg, ()):
+                # Callers are tagged "creature" (blueprint owns the conv) or
+                # "creature-instance" (a placed instance overrides it); both are
+                # NPCs that can hand out the quest.
+                if caller.get("kind") not in ("creature", "creature-instance"):
+                    continue
+                bp = (caller.get("resref") or "").lower()
+                if bp:
+                    # The caller resref is the creature page key when it's its
+                    # own canonical entry (common for instance-only quest-givers
+                    # that have no stand-alone blueprint); otherwise map the
+                    # blueprint to its canonical via canonical_for_bp.
+                    can = (bp if bp in db.canonical_creatures
+                           else db.canonical_for_bp.get(bp, ""))
+                    name = (db.canonical_creature_name(can) if can
+                            else (db.creature_name(bp) or caller.get("tag") or bp))
+                    npcs.setdefault(bp, (can, name))
+                car = caller.get("areas") or (
+                    [caller["area"]] if caller.get("area") else [])
+                for ar in car:
+                    if ar:
+                        areas.setdefault(ar, db.area_name(ar))
+    return list(npcs.values()), list(areas.items())
+
+
+def _quest_loc_cell(items, render):
+    """Render an index "begins at" cell: up to three links via ``render(item)``,
+    an em dash when empty, a muted +N when more than three are known."""
+    if not items:
+        return '<span class="muted">&mdash;</span>'
+    cell = ", ".join(render(it) for it in items[:3])
+    if len(items) > 3:
+        cell += f' <span class="muted">+{len(items) - 3}</span>'
+    return cell
 def render_quests_index(db: Db, out: Path) -> None:
     """Quests landing page: an overview plus a table of contents of every
     journal quest, each row linking to that quest's detail page. Quests whose
@@ -9722,6 +9795,15 @@ def render_quests_index(db: Db, out: Path) -> None:
     quest_groups = {i: _quest_group(fld(cats[i], "Comment", "")) for i in visible}
     has_groups = any(quest_groups.values())
 
+    # script (lowercased) -> dialogs running it as an action node, i.e. the
+    # reverse of db.dialog_scripts. Lets a quest's grant script be traced to
+    # the NPC whose conversation awards it (where the quest is picked up).
+    action_to_dlgs: dict[str, set[str]] = defaultdict(set)
+    for _dlg_rr, _ents in db.dialog_scripts.items():
+        for _e in _ents:
+            if _e.get("kind") == "action":
+                action_to_dlgs[(_e.get("resref") or "").lower()].add(_dlg_rr)
+
     def row(i: int) -> str:
         c = cats[i]
         tag = fld(c, "Tag", "")
@@ -9732,9 +9814,19 @@ def render_quests_index(db: Db, out: Path) -> None:
         xp = fld(c, "XP", 0) or 0
         grants = db.quest_grants.get((tag or "").lower(), {})
         n_grants = sum(1 for e in entries if grants.get(_quest_entry_id(e)))
+        npcs, areas = _quest_start_locations(db, c, action_to_dlgs)
+        npc_cell = _quest_loc_cell(
+            npcs,
+            lambda it: (link(f"../creatures/{it[0]}.html", it[1])
+                        if it[0] else nwn_html(it[1])))
+        area_cell = _quest_loc_cell(
+            areas,
+            lambda it: link(f"../areas/{it[0]}.html", it[1]))
         return (
             f"<tr><td>{link(f'{slugs[i]}.html', qname)}</td>"
             f"<td><code>{E(tag)}</code></td>"
+            f"<td>{npc_cell}</td>"
+            f"<td>{area_cell}</td>"
             f"<td>{E(prio)}</td>"
             f"<td>{E(xp) if xp else ''}</td>"
             f"<td>{len(entries)}</td>"
@@ -9748,7 +9840,9 @@ def render_quests_index(db: Db, out: Path) -> None:
                                         or fld(cats[i], "Tag", "")).lower())
         return (
             '<table class="data"><thead><tr>'
-            "<th>Quest</th><th>Tag</th><th>Priority</th><th>XP</th>"
+            "<th>Quest</th><th>Tag</th>"
+            "<th>Begins (NPC)</th><th>Begins (area)</th>"
+            "<th>Priority</th><th>XP</th>"
             "<th>Steps</th><th>Final step</th><th>Awarded</th>"
             "</tr></thead><tbody>"
             + "\n".join(row(i) for i in ordered)
@@ -9759,7 +9853,9 @@ def render_quests_index(db: Db, out: Path) -> None:
         "<h1>Quests</h1>",
         f"<p>{len(visible)} quests &middot; {total_steps} journal entries. "
         '<small class="muted">Quests are the module&rsquo;s journal categories; '
-        "each row links to that quest&rsquo;s entries. &ldquo;Final step&rdquo; marks "
+        "each row links to that quest&rsquo;s entries. &ldquo;Begins&rdquo; is a "
+        "best-effort hint at the NPC and area that grant the opening step, traced "
+        "from the scripts that award it. &ldquo;Final step&rdquo; marks "
         "a quest with a completion entry. &ldquo;Awarded&rdquo; counts the entries a "
         "script is known to grant via <code>AddJournalQuestEntry</code>."
         + (" Quests are grouped by the <code>@group</code> label set in their "
