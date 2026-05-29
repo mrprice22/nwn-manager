@@ -1617,6 +1617,11 @@ class Db:
         self.script_generates_treasure: set[str] = set()
         # custom token number → set of script resrefs that call SetCustomToken(N, ...)
         self.token_setters: dict[int, set[str]] = defaultdict(set)
+        # quest plot tag (lowercased) → {entry id → set of script resrefs that
+        # award that entry via AddJournalQuestEntry("tag", id, ...)}. Surfaced on
+        # the per-quest pages so the reader can trace where each step is granted.
+        self.quest_grants: dict[str, dict[int, set[str]]] = defaultdict(
+            lambda: defaultdict(set))
         # item resref → list of script-source dicts for the item page
         # {"kind", "script", "label", "areas", "dlg", "crr", "prr"}
         self.item_from_script: dict[str, list[dict]] = defaultdict(list)
@@ -2275,6 +2280,12 @@ class Db:
         r"\bGenerate(?:High|Medium|Low|Boss|Book)?Treasure\s*\("
     )
     _RE_SET_TOKEN = re.compile(r"\bSetCustomToken\s*\(\s*(\d+)\s*,")
+    # AddJournalQuestEntry("plotID", nState, oCreature, ...) — quest progression.
+    # The plot id matches a journal category Tag; nState matches an entry ID.
+    # Tags may contain spaces, so accept anything but a closing quote.
+    _RE_ADD_JOURNAL = re.compile(
+        r'\bAddJournalQuestEntry\s*\(\s*"([^"]*)"\s*,\s*(\d+)'
+    )
     _RE_ITEM_POSSESSED_BY = re.compile(
         r'\bGetItemPossessedBy\s*\((?:[^,()]+|\([^)]*\))+,\s*"([A-Za-z0-9_]+)"'
     )
@@ -2328,6 +2339,9 @@ class Db:
             # SetCustomToken(N, ...) — track which scripts set which custom tokens.
             for m in self._RE_SET_TOKEN.finditer(text):
                 self.token_setters[int(m.group(1))].add(resref)
+            # AddJournalQuestEntry("tag", id, ...) — which script awards which step.
+            for m in self._RE_ADD_JOURNAL.finditer(text):
+                self.quest_grants[m.group(1).strip().lower()][int(m.group(2))].add(resref)
             # GetItemPossessedBy(obj, "tag") — item-tag checks for key/quest logic.
             for m in self._RE_ITEM_POSSESSED_BY.finditer(text):
                 self.script_checks_item_tags[resref].add(m.group(1))
@@ -4174,6 +4188,7 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
       <a href="{E(root_rel)}/stores/index.html">Stores</a>
       <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
       <a href="{E(root_rel)}/factions.html">Factions</a>
+      <a href="{E(root_rel)}/quests/index.html">Quests</a>
       <a href="{E(root_rel)}/journal.html">Journal</a>
       {f'<a href="{E(root_rel)}/activity.html">Activity</a>' if _HAS_ACTIVITY_PAGE else ""}
       {_docs_dropdown(root_rel)}
@@ -9575,6 +9590,163 @@ def render_journal(db: Db, out: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Quests — a browseable, structured view of the module journal: one overview
+# index (table of contents) plus a detail page per quest line.
+# ---------------------------------------------------------------------------
+
+# NWN toolset journal "Priority" dropdown values.
+_QUEST_PRIORITY_LABELS = {0: "Highest", 1: "High", 2: "Medium", 3: "Low", 4: "Lowest"}
+
+
+def _quest_priority_label(prio: Any) -> str:
+    try:
+        p = int(prio)
+    except (TypeError, ValueError):
+        return ""
+    return _QUEST_PRIORITY_LABELS.get(p, str(p))
+
+
+def _quest_slug(tag: str, name: str, used: set[str]) -> str:
+    """Stable, unique, filename-safe slug for a quest line. Prefers the quest
+    Tag (the plot id scripts reference); falls back to the display name.
+    Disambiguates collisions with a numeric suffix."""
+    base = re.sub(r"[^a-z0-9]+", "-", (tag or name or "").lower()).strip("-") or "quest"
+    slug, n = base, 2
+    while slug in used:
+        slug, n = f"{base}-{n}", n + 1
+    used.add(slug)
+    return slug
+
+
+def _quest_categories(db: Db) -> list[dict]:
+    return list_items(db.jrl.get("Categories")) if db.jrl else []
+
+
+def _quest_slugs(cats: list[dict]) -> list[str]:
+    """Slug per category, in category order. Deterministic, so the index and
+    the per-quest pages agree on URLs as long as both iterate in this order."""
+    used: set[str] = set()
+    return [_quest_slug(fld(c, "Tag", ""), loc(c.get("Name")), used) for c in cats]
+
+
+def _quest_entry_id(e: dict) -> int:
+    try:
+        return int(fld(e, "ID", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def render_quests_index(db: Db, out: Path) -> None:
+    """Quests landing page: an overview plus a table of contents of every
+    journal quest line, each row linking to that quest line's detail page."""
+    cats = _quest_categories(db)
+    if not cats:
+        write(out / "quests" / "index.html",
+              page("Quests", "<h1>Quests</h1><p>(no journal quests)</p>",
+                   root_rel=".."))
+        return
+
+    slugs = _quest_slugs(cats)
+    # Order the table of contents by display name, keeping slug alignment.
+    order = sorted(range(len(cats)),
+                   key=lambda i: (loc(cats[i].get("Name"))
+                                  or fld(cats[i], "Tag", "")).lower())
+
+    rows: list[str] = []
+    total_steps = 0
+    for i in order:
+        c = cats[i]
+        tag = fld(c, "Tag", "")
+        qname = loc(c.get("Name")) or tag or "(unnamed quest)"
+        entries = list_items(c.get("EntryList"))
+        total_steps += len(entries)
+        has_end = any(fld(e, "End", 0) for e in entries)
+        prio = _quest_priority_label(fld(c, "Priority"))
+        xp = fld(c, "XP", 0) or 0
+        grants = db.quest_grants.get((tag or "").lower(), {})
+        n_grants = sum(1 for e in entries if grants.get(_quest_entry_id(e)))
+        rows.append(
+            f"<tr><td>{link(f'{slugs[i]}.html', qname)}</td>"
+            f"<td><code>{E(tag)}</code></td>"
+            f"<td>{E(prio)}</td>"
+            f"<td>{E(xp) if xp else ''}</td>"
+            f"<td>{len(entries)}</td>"
+            f"<td>{'&#10003;' if has_end else ''}</td>"
+            f"<td>{n_grants if n_grants else ''}</td></tr>"
+        )
+
+    body = (
+        "<h1>Quests</h1>"
+        f"<p>{len(cats)} quest lines &middot; {total_steps} journal entries. "
+        '<small class="muted">Quests are the module&rsquo;s journal categories; '
+        "each row links to that quest line&rsquo;s entries. &ldquo;Final step&rdquo; "
+        "marks a quest line with a completion entry. &ldquo;Awarded&rdquo; counts the "
+        "entries a script is known to grant via <code>AddJournalQuestEntry</code>."
+        "</small></p>"
+        '<table class="data"><thead><tr>'
+        "<th>Quest</th><th>Tag</th><th>Priority</th><th>XP</th>"
+        "<th>Steps</th><th>Final step</th><th>Awarded</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "quests" / "index.html", page("Quests", body, root_rel=".."))
+
+
+def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
+    """Detail page for a single quest line: metadata plus its journal entries
+    in progression order, cross-referenced to the scripts that award each."""
+    tag = fld(c, "Tag", "")
+    qname = loc(c.get("Name")) or tag or "(unnamed quest)"
+    prio = _quest_priority_label(fld(c, "Priority"))
+    xp = fld(c, "XP", 0) or 0
+    comment = fld(c, "Comment", "")
+
+    parts = [
+        '<p><a href="index.html">&larr; All quests</a></p>',
+        f"<h1>{nwn_html(qname)}</h1>",
+    ]
+    meta = []
+    if tag:
+        meta.append(f"Tag: <code>{E(tag)}</code>")
+    if prio:
+        meta.append(f"Priority: {E(prio)}")
+    if xp:
+        meta.append(f"XP: {E(xp)}")
+    if meta:
+        parts.append(f"<p>{' &middot; '.join(meta)}</p>")
+    if comment:
+        parts.append('<p class="muted"><strong>Builder comment:</strong> '
+                     f"{nwn_html(comment)}</p>")
+
+    entries = list_items(c.get("EntryList"))
+    grants = db.quest_grants.get((tag or "").lower(), {})
+    if not entries:
+        parts.append("<p>(no journal entries)</p>")
+    else:
+        rows = []
+        # ID order mirrors the in-game quest progression.
+        for e in sorted(entries, key=_quest_entry_id):
+            eid = _quest_entry_id(e)
+            end = fld(e, "End", 0)
+            txt = loc(e.get("Text"))
+            granters = sorted(grants.get(eid, set()))
+            grant_html = (", ".join(_script_link(db, s) for s in granters)
+                          if granters else '<span class="muted">&mdash;</span>')
+            end_badge = '<span class="badge">final</span>' if end else ""
+            rows.append(
+                f"<tr><td>{eid}</td><td>{end_badge}</td>"
+                f"<td>{nwn_html(txt)}</td><td>{grant_html}</td></tr>"
+            )
+        parts.append(
+            '<table class="data"><thead><tr>'
+            "<th>ID</th><th></th><th>Journal text</th><th>Awarded by</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    write(out / "quests" / f"{slug}.html",
+          page(f"Quest: {qname}", "\n".join(parts), root_rel=".."))
+
+
+# ---------------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------------
 
@@ -11931,6 +12103,11 @@ def main() -> int:
         render_script_page(db, resref, out)
     render_factions(db, out)
     render_journal(db, out)
+    qcats = _quest_categories(db)
+    qslugs = _quest_slugs(qcats)
+    render_quests_index(db, out)
+    for qcat, qslug in zip(qcats, qslugs):
+        render_quest_page(db, qcat, qslug, out)
     print(f"  rendered in {time.time() - t0:.1f}s")
 
     print(f"[nwn-wiki] done — {out}/index.html")
