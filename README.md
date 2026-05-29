@@ -225,7 +225,12 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
     (see below).
   - Spell resistance is inferred from feats only; SR granted by scripts
     or items is not summed into the AC/SR display.
-- `factions.html`, `journal.html` — module-level data.
+- `factions.html` — module-level faction data.
+- `quests/index.html` — the module's journal quest lines (the `module.jrl`
+  categories): an overview table plus a detail page per quest line with its
+  entries cross-referenced to the scripts that award each step. Related quest
+  lines are grouped into separate tables — see *Quests: grouping by tag prefix*
+  below.
 - `conversations/index.html` — every `.dlg` in the module, with per-dialog
   pages that render the entry/reply outline plus the static cross-reference
   graph: which NPCs / placeables / doors host the conversation, which
@@ -310,6 +315,50 @@ nwn-wiki --src unpacked --out docs --cr-bucket-size 5
 With `--cr-bucket-size 5` the page uses CR 0–4, CR 5–9, CR 10–14, … buckets.
 Creatures with a missing or non-numeric CR appear in an "Unknown CR" bucket at
 the bottom.
+
+#### Quests: grouping by tag prefix
+
+The **Quests** index splits quest lines into separate tables by *family*, so
+related quests (e.g. a multi-part questline, or a themed set like MeaningWave's
+`MW …` entries) read as a group instead of being scattered through one long
+alphabetical list.
+
+**How a family is decided.** Each quest's family is the **leading alphabetic
+token of its journal category Tag** (the `Tag` field on the `module.jrl`
+category — the same plot id your scripts pass to `AddJournalQuestEntry`),
+lowercased. When **3 or more** quests share that leading token they form their
+own table; quests below the threshold fall into the catch-all *Story & Side
+Quests* table. The leading token is the run of letters before the first
+space/digit/punctuation, so:
+
+| Tag                        | Leading token | Groups with …                |
+|----------------------------|---------------|------------------------------|
+| `MW Carl Jung`             | `mw`          | every other `MW …` quest     |
+| `MW Carl Jung Loyalty`     | `mw`          | ditto                        |
+| `Ferny's Ring`             | `ferny`       | (alone → *Story & Side*)     |
+| `gdquest1`                 | `gdquest`     | (alone → *Story & Side*)     |
+| `rules`, `guilds`          | `rules`/`guilds` | (distinct → *Story & Side*) |
+
+**Tuning your module to control grouping.** This is driven entirely by your
+Tag naming — no flags required:
+
+- **To group a set of quests together**, give their journal categories a shared
+  leading word, e.g. tag them `Moria Bridge`, `Moria Balrog`, `Moria Escape`
+  (three `moria` quests → a "Moria" table). One- or two-quest sets stay in the
+  general table by design; add a third sharing the prefix to promote them.
+- **To keep a quest out of a family**, change its leading word so it no longer
+  matches (e.g. rename `MW Backstory` → `Backstory of the Wave`).
+- Tags are case-insensitive for grouping (`MW`, `mw`, `Mw` all match) but the
+  rest of the engine treats journal tags as case-sensitive, so keep the Tag in
+  your `.dlg` Quest fields and scripts byte-for-byte identical to the category.
+
+**Headings.** A family's table heading is derived from its prefix: prefixes of
+3 letters or fewer are upper-cased (`mw` → `MW`-style), longer ones are
+title-cased. To give a family a nicer name (e.g. `mw` → **MeaningWave**), add an
+entry to the `_QUEST_GROUP_LABELS` map near the top of `render_quests_index` in
+`bin/nwn-wiki`; the threshold itself is `_QUEST_FAMILY_MIN` in the same file.
+If no prefix reaches the threshold the page falls back to a single un-headed
+table, identical to the pre-grouping layout.
 
 #### Shortest-path sections on area pages
 

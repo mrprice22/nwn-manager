@@ -4189,7 +4189,6 @@ def page(title: str, body: str, root_rel: str = ".") -> str:
       <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
       <a href="{E(root_rel)}/factions.html">Factions</a>
       <a href="{E(root_rel)}/quests/index.html">Quests</a>
-      <a href="{E(root_rel)}/journal.html">Journal</a>
       {f'<a href="{E(root_rel)}/activity.html">Activity</a>' if _HAS_ACTIVITY_PAGE else ""}
       {_docs_dropdown(root_rel)}
     </nav>
@@ -9636,9 +9635,36 @@ def _quest_entry_id(e: dict) -> int:
         return 0
 
 
+# Quests that share a leading tag token (e.g. every "MW ..." MeaningWave line)
+# are clearly related, so the index groups them into their own table once at
+# least this many share the prefix. Below the threshold a quest falls into the
+# catch-all "Story & Side Quests" table.
+_QUEST_FAMILY_MIN = 3
+
+# Pretty section headings for known tag prefixes. Unknown prefixes that clear
+# the threshold are titled from the prefix itself.
+_QUEST_GROUP_LABELS = {
+    "mw": "MeaningWave",
+}
+
+
+def _quest_group_key(tag: str, name: str) -> str:
+    """Family key for grouping: the leading alphabetic token of the Tag,
+    lowercased (e.g. "MW Carl Jung" -> "mw"). Empty when the tag has no
+    leading letters, which keeps such quests in the general table."""
+    m = re.match(r"[A-Za-z]+", (tag or "").strip())
+    return m.group(0).lower() if m else ""
+
+
+def _quest_group_label(key: str) -> str:
+    return _QUEST_GROUP_LABELS.get(key, key.upper() if len(key) <= 3 else key.title())
+
+
 def render_quests_index(db: Db, out: Path) -> None:
     """Quests landing page: an overview plus a table of contents of every
-    journal quest line, each row linking to that quest line's detail page."""
+    journal quest line, each row linking to that quest line's detail page.
+    Related quest lines (those sharing a leading tag token, such as the
+    MeaningWave "MW ..." quests) are grouped into their own table."""
     cats = _quest_categories(db)
     if not cats:
         write(out / "quests" / "index.html",
@@ -9647,25 +9673,28 @@ def render_quests_index(db: Db, out: Path) -> None:
         return
 
     slugs = _quest_slugs(cats)
-    # Order the table of contents by display name, keeping slug alignment.
-    order = sorted(range(len(cats)),
-                   key=lambda i: (loc(cats[i].get("Name"))
-                                  or fld(cats[i], "Tag", "")).lower())
+    total_steps = sum(len(list_items(c.get("EntryList"))) for c in cats)
 
-    rows: list[str] = []
-    total_steps = 0
-    for i in order:
+    # Assign each quest a family. A leading tag token shared by >= the
+    # threshold forms a family; everything else lands in the general group ("").
+    keys = [_quest_group_key(fld(c, "Tag", ""), loc(c.get("Name"))) for c in cats]
+    counts = Counter(k for k in keys if k)
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i in range(len(cats)):
+        k = keys[i]
+        groups[k if (k and counts[k] >= _QUEST_FAMILY_MIN) else ""].append(i)
+
+    def row(i: int) -> str:
         c = cats[i]
         tag = fld(c, "Tag", "")
         qname = loc(c.get("Name")) or tag or "(unnamed quest)"
         entries = list_items(c.get("EntryList"))
-        total_steps += len(entries)
         has_end = any(fld(e, "End", 0) for e in entries)
         prio = _quest_priority_label(fld(c, "Priority"))
         xp = fld(c, "XP", 0) or 0
         grants = db.quest_grants.get((tag or "").lower(), {})
         n_grants = sum(1 for e in entries if grants.get(_quest_entry_id(e)))
-        rows.append(
+        return (
             f"<tr><td>{link(f'{slugs[i]}.html', qname)}</td>"
             f"<td><code>{E(tag)}</code></td>"
             f"<td>{E(prio)}</td>"
@@ -9675,20 +9704,43 @@ def render_quests_index(db: Db, out: Path) -> None:
             f"<td>{n_grants if n_grants else ''}</td></tr>"
         )
 
-    body = (
-        "<h1>Quests</h1>"
+    def table(indices: list[int]) -> str:
+        ordered = sorted(indices,
+                         key=lambda i: (loc(cats[i].get("Name"))
+                                        or fld(cats[i], "Tag", "")).lower())
+        return (
+            '<table class="data"><thead><tr>'
+            "<th>Quest</th><th>Tag</th><th>Priority</th><th>XP</th>"
+            "<th>Steps</th><th>Final step</th><th>Awarded</th>"
+            "</tr></thead><tbody>"
+            + "\n".join(row(i) for i in ordered)
+            + "</tbody></table>"
+        )
+
+    # General group first, then each family alphabetically by heading.
+    sections: list[tuple[str, list[int]]] = []
+    if groups.get(""):
+        sections.append(("Story &amp; Side Quests", groups[""]))
+    for k in sorted((k for k in groups if k), key=lambda k: _quest_group_label(k).lower()):
+        sections.append((E(_quest_group_label(k)), groups[k]))
+
+    parts = [
+        "<h1>Quests</h1>",
         f"<p>{len(cats)} quest lines &middot; {total_steps} journal entries. "
         '<small class="muted">Quests are the module&rsquo;s journal categories; '
-        "each row links to that quest line&rsquo;s entries. &ldquo;Final step&rdquo; "
-        "marks a quest line with a completion entry. &ldquo;Awarded&rdquo; counts the "
-        "entries a script is known to grant via <code>AddJournalQuestEntry</code>."
-        "</small></p>"
-        '<table class="data"><thead><tr>'
-        "<th>Quest</th><th>Tag</th><th>Priority</th><th>XP</th>"
-        "<th>Steps</th><th>Final step</th><th>Awarded</th>"
-        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
-    )
-    write(out / "quests" / "index.html", page("Quests", body, root_rel=".."))
+        "each row links to that quest line&rsquo;s entries. Related quest lines "
+        "are grouped into separate tables. &ldquo;Final step&rdquo; marks a quest "
+        "line with a completion entry. &ldquo;Awarded&rdquo; counts the entries a "
+        "script is known to grant via <code>AddJournalQuestEntry</code>."
+        "</small></p>",
+    ]
+    multi = len(sections) > 1
+    for heading, indices in sections:
+        if multi:
+            parts.append(f"<h2>{heading} <small class=\"muted\">({len(indices)})</small></h2>")
+        parts.append(table(indices))
+
+    write(out / "quests" / "index.html", page("Quests", "".join(parts), root_rel=".."))
 
 
 def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
@@ -12102,7 +12154,6 @@ def main() -> int:
     for resref in db.script_paths:
         render_script_page(db, resref, out)
     render_factions(db, out)
-    render_journal(db, out)
     qcats = _quest_categories(db)
     qslugs = _quest_slugs(qcats)
     render_quests_index(db, out)
