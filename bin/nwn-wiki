@@ -1644,6 +1644,10 @@ class Db:
         # the per-quest pages so the reader can trace where each step is granted.
         self.quest_grants: dict[str, dict[int, set[str]]] = defaultdict(
             lambda: defaultdict(set))
+        # quest plot tag (lowercased) → {entry id → set of dialog resrefs} for quests
+        # granted via a dialog node's built-in Quest/QuestEntry fields (no script needed).
+        self.quest_dialog_grants: dict[str, dict[int, set[str]]] = defaultdict(
+            lambda: defaultdict(set))
         # item resref → list of script-source dicts for the item page
         # {"kind", "script", "label", "areas", "dlg", "crr", "prr"}
         self.item_from_script: dict[str, list[dict]] = defaultdict(list)
@@ -2790,6 +2794,12 @@ class Db:
                             "node_kind": kind,
                             "node_index": idx,
                         })
+                # Dialog-native quest grant: Quest/QuestEntry fields set a journal
+                # entry directly without a script (e.g. b_miller_convo1.dlg).
+                q_tag = (fld(node, "Quest", "") or "").strip().lower()
+                if q_tag:
+                    q_step = fld(node, "QuestEntry", 0) or 0
+                    self.quest_dialog_grants[q_tag][q_step].add(dlg_resref)
                 # Conditional / starting-list "Active" gates also have
                 # their own scripts, surfaced for completeness.
                 for cond in list_items(node.get("RepliesList")) + list_items(node.get("EntriesList")):
@@ -10073,19 +10083,24 @@ def _quest_start_locations(db: Db, c: dict, action_to_dlgs,
     - Waypoint-spawned NPCs → area from canonical_locations fallback
     """
     tag = fld(c, "Tag", "")
-    grants = db.quest_grants.get((tag or "").lower(), {})
+    tag_lower = (tag or "").lower()
+    grants = db.quest_grants.get(tag_lower, {})
+    dlg_grants = db.quest_dialog_grants.get(tag_lower, {})
     entries = list_items(c.get("EntryList"))
-    if not entries or not grants:
+    if not entries or (not grants and not dlg_grants):
         return [], []
     # Opening step = the first entry, in builder/progression order, that we
-    # actually know a granting script for (early steps aren't always mapped).
+    # actually know a granting script or dialog-native grant for.
     ordered = sorted(entries, key=_quest_entry_id)
-    scripts = set()
+    scripts: set[str] = set()
+    dlgs_direct: set[str] = set()
     for e in ordered:
-        scripts = grants.get(_quest_entry_id(e)) or set()
-        if scripts:
+        step = _quest_entry_id(e)
+        scripts = grants.get(step) or set()
+        dlgs_direct = dlg_grants.get(step) or set()
+        if scripts or dlgs_direct:
             break
-    if not scripts:
+    if not scripts and not dlgs_direct:
         return [], []
     npcs = {}     # bp_rr -> (canonical_rr, name)
     areas = {}    # area_rr -> area name
@@ -10112,40 +10127,43 @@ def _quest_start_locations(db: Db, c: dict, action_to_dlgs,
             for ar in script_to_trigger_areas.get(sref.lower(), ()):
                 areas.setdefault(ar, db.area_name(ar))
 
-    # Priority 2: dialog-action tracing — NPC quest-givers and their areas.
+    def _trace_dlg_callers(dlg_resref: str) -> None:
+        """Resolve a dialog resref to NPC quest-givers and their areas."""
+        for caller in db.dialog_callers.get(dlg_resref, ()):
+            if caller.get("kind") not in ("creature", "creature-instance"):
+                continue
+            bp = (caller.get("resref") or "").lower()
+            if bp:
+                can = (bp if bp in db.canonical_creatures
+                       else db.canonical_for_bp.get(bp, ""))
+                name = (db.canonical_creature_name(can) if can
+                        else (db.creature_name(bp) or caller.get("tag") or bp))
+                npcs.setdefault(bp, (can, name))
+            car = caller.get("areas") or (
+                [caller["area"]] if caller.get("area") else [])
+            # Waypoint-spawned NPCs have no placed area in dialog_callers;
+            # fall back to canonical_locations (includes script-spawn areas).
+            if not car and bp:
+                can_for_bp = (bp if bp in db.canonical_creatures
+                              else db.canonical_for_bp.get(bp, ""))
+                if can_for_bp:
+                    car = [loc["area"]
+                           for loc in db.canonical_locations.get(can_for_bp, [])
+                           if loc.get("area")]
+            for ar in car:
+                if ar:
+                    areas.setdefault(ar, db.area_name(ar))
+
+    # Priority 2: dialog-action tracing — scripts that run inside dialog action
+    # nodes → find the owning dialog → resolve NPC callers.
     for sref in scripts:
         for dlg in action_to_dlgs.get(sref.lower(), ()):
-            for caller in db.dialog_callers.get(dlg, ()):
-                # Callers are tagged "creature" (blueprint owns the conv) or
-                # "creature-instance" (a placed instance overrides it); both are
-                # NPCs that can hand out the quest.
-                if caller.get("kind") not in ("creature", "creature-instance"):
-                    continue
-                bp = (caller.get("resref") or "").lower()
-                if bp:
-                    # The caller resref is the creature page key when it's its
-                    # own canonical entry (common for instance-only quest-givers
-                    # that have no stand-alone blueprint); otherwise map the
-                    # blueprint to its canonical via canonical_for_bp.
-                    can = (bp if bp in db.canonical_creatures
-                           else db.canonical_for_bp.get(bp, ""))
-                    name = (db.canonical_creature_name(can) if can
-                            else (db.creature_name(bp) or caller.get("tag") or bp))
-                    npcs.setdefault(bp, (can, name))
-                car = caller.get("areas") or (
-                    [caller["area"]] if caller.get("area") else [])
-                # Waypoint-spawned NPCs have no placed area in dialog_callers;
-                # fall back to canonical_locations (includes script-spawn areas).
-                if not car and bp:
-                    can_for_bp = (bp if bp in db.canonical_creatures
-                                  else db.canonical_for_bp.get(bp, ""))
-                    if can_for_bp:
-                        car = [loc["area"]
-                               for loc in db.canonical_locations.get(can_for_bp, [])
-                               if loc.get("area")]
-                for ar in car:
-                    if ar:
-                        areas.setdefault(ar, db.area_name(ar))
+            _trace_dlg_callers(dlg)
+
+    # Priority 3: dialog-native quest grants (Quest/QuestEntry fields on dialog
+    # nodes) — the dialog itself is already known, go straight to callers.
+    for dlg in dlgs_direct:
+        _trace_dlg_callers(dlg)
 
     return list(npcs.values()), list(areas.items())
 
@@ -10371,6 +10389,7 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
 
     entries = list_items(c.get("EntryList"))
     grants = db.quest_grants.get((tag or "").lower(), {})
+    dlg_grants = db.quest_dialog_grants.get((tag or "").lower(), {})
     if not entries:
         parts.append("<p>(no journal entries)</p>")
     else:
@@ -10380,8 +10399,14 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
             end = fld(e, "End", 0)
             txt = loc(e.get("Text"))
             granters = sorted(grants.get(eid, set()))
-            grant_html = (", ".join(_script_link(db, s) for s in granters)
-                          if granters else '<span class="muted">&mdash;</span>')
+            granter_parts = [_script_link(db, s) for s in granters]
+            for dlg_rr in sorted(dlg_grants.get(eid, set())):
+                dlg_label = db.dialog_label(dlg_rr)
+                granter_parts.append(
+                    link(f"../conversations/{dlg_rr}.html",
+                         f"dialog: {dlg_label}"))
+            grant_html = (", ".join(granter_parts)
+                          if granter_parts else '<span class="muted">&mdash;</span>')
             end_badge = '<span class="badge">final</span>' if end else ""
             rows.append(
                 f"<tr><td>{eid}</td><td>{end_badge}</td>"
