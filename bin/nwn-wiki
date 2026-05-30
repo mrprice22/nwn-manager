@@ -9639,17 +9639,22 @@ def _quest_entry_id(e: dict) -> int:
 # the only per-quest free text the toolset exposes (individual journal entries
 # have no Comment field). All optional and module-agnostic:
 #   @group 'Name'   place this quest under the "Name" heading on the index
-#   @order 1,3,2    show this quest's entries in this entry-ID order
+#   @order N        sort position of this quest within its group (integer;
+#                   lower = earlier; ties and ungrouped quests fall back to
+#                   alphabetical order by name)
+#   @group-order N  sort position of this quest's group among all groups
+#                   (set on any quest in the group; first found wins)
 #   @hidden         retired/inactive quest — omit it from the wiki entirely
 #                   (@retired and @inactive are accepted synonyms)
 # The group name may be wrapped in single quotes, double quotes, or left bare.
 _RE_QUEST_GROUP = re.compile(
     r"@group\s+(?:'([^']*)'|\"([^\"]*)\"|([^\n]+))", re.IGNORECASE)
-_RE_QUEST_ORDER = re.compile(r"@order\s+([0-9][0-9,\s]*)", re.IGNORECASE)
+_RE_QUEST_ORDER = re.compile(r"@order\s+(\d+)", re.IGNORECASE)
+_RE_QUEST_GROUP_ORDER = re.compile(r"@group-order\s+(\d+)", re.IGNORECASE)
 _RE_QUEST_HIDDEN = re.compile(r"@(?:hidden|retired|inactive)\b", re.IGNORECASE)
 # Whole directive lines, stripped before the Comment is shown to readers.
 _RE_QUEST_DIRECTIVE = re.compile(
-    r"^[ \t]*@(?:group|order|hidden|retired|inactive)\b[^\n]*$",
+    r"^[ \t]*@(?:group-order|group|order|hidden|retired|inactive)\b[^\n]*$",
     re.IGNORECASE | re.MULTILINE)
 
 
@@ -9668,13 +9673,18 @@ def _quest_group(comment: str) -> str:
     return (m.group(1) or m.group(2) or m.group(3) or "").strip()
 
 
-def _quest_entry_order(comment: str) -> list[int]:
-    """Entry IDs listed in an @order directive, in display order. Empty when
-    no @order is present (callers then fall back to ascending ID order)."""
+def _quest_sort_order(comment: str) -> int | None:
+    """Sort position of this quest within its group declared via @order N.
+    Returns None when no @order is present (callers fall back to alphabetical)."""
     m = _RE_QUEST_ORDER.search(comment or "")
-    if not m:
-        return []
-    return [int(tok) for tok in re.split(r"[,\s]+", m.group(1).strip()) if tok]
+    return int(m.group(1)) if m else None
+
+
+def _quest_group_order(comment: str) -> int | None:
+    """Sort position of this quest's group declared via @group-order N.
+    Returns None when not present (callers fall back to alphabetical)."""
+    m = _RE_QUEST_GROUP_ORDER.search(comment or "")
+    return int(m.group(1)) if m else None
 
 
 def _quest_comment_display(comment: str) -> str:
@@ -9686,15 +9696,6 @@ def _quest_comment_display(comment: str) -> str:
     return re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", cleaned).strip()
 
 
-def _quest_ordered_entries(entries: list[dict], order_ids: list[int]) -> list[dict]:
-    """Entries sorted by an @order list when given (entries it omits follow in
-    ID order), else by ascending ID — the default in-game progression."""
-    if not order_ids:
-        return sorted(entries, key=_quest_entry_id)
-    pos = {eid: i for i, eid in enumerate(order_ids)}
-    return sorted(entries,
-                  key=lambda e: (pos.get(_quest_entry_id(e), len(pos)),
-                                 _quest_entry_id(e)))
 
 
 def _quest_group_anchor(name: str) -> str:
@@ -9728,8 +9729,7 @@ def _quest_start_locations(db: Db, c: dict, action_to_dlgs):
         return [], []
     # Opening step = the first entry, in builder/progression order, that we
     # actually know a granting script for (early steps aren't always mapped).
-    ordered = _quest_ordered_entries(
-        entries, _quest_entry_order(fld(c, "Comment", "")))
+    ordered = sorted(entries, key=_quest_entry_id)
     scripts = set()
     for e in ordered:
         scripts = grants.get(_quest_entry_id(e)) or set()
@@ -9792,7 +9792,9 @@ def render_quests_index(db: Db, out: Path) -> None:
 
     slugs = _quest_slugs(cats)
     total_steps = sum(len(list_items(cats[i].get("EntryList"))) for i in visible)
-    quest_groups = {i: _quest_group(fld(cats[i], "Comment", "")) for i in visible}
+    quest_comments = {i: fld(cats[i], "Comment", "") for i in visible}
+    quest_groups = {i: _quest_group(quest_comments[i]) for i in visible}
+    quest_orders = {i: _quest_sort_order(quest_comments[i]) for i in visible}
     has_groups = any(quest_groups.values())
 
     # script (lowercased) -> dialogs running it as an action node, i.e. the
@@ -9835,9 +9837,11 @@ def render_quests_index(db: Db, out: Path) -> None:
         )
 
     def table(indices: list[int]) -> str:
-        ordered = sorted(indices,
-                         key=lambda i: (loc(cats[i].get("Name"))
-                                        or fld(cats[i], "Tag", "")).lower())
+        def _sort_key(i: int):
+            name = (loc(cats[i].get("Name")) or fld(cats[i], "Tag", "")).lower()
+            order = quest_orders[i]
+            return (order if order is not None else float("inf"), name)
+        ordered = sorted(indices, key=_sort_key)
         return (
             '<table class="data"><thead><tr>'
             "<th>Quest</th><th>Tag</th>"
@@ -9870,9 +9874,20 @@ def render_quests_index(db: Db, out: Path) -> None:
         grouped: dict[str, list[int]] = defaultdict(list)
         for i in visible:
             grouped[quest_groups[i]].append(i)  # "" == no @group declared
-        # Named groups alphabetically; quests with no @group come last under a
-        # neutral "Other" heading.
-        for g in sorted((g for g in grouped if g), key=str.lower):
+        # Determine group sort order: @group-order N from the first quest in
+        # the group that declares it, then alphabetical for the rest.
+        group_sort_order: dict[str, int | None] = {}
+        for g, idxs in grouped.items():
+            order = None
+            for i in idxs:
+                order = _quest_group_order(quest_comments[i])
+                if order is not None:
+                    break
+            group_sort_order[g] = order
+        def _group_key(g: str):
+            o = group_sort_order[g]
+            return (o if o is not None else float("inf"), g.lower())
+        for g in sorted((g for g in grouped if g), key=_group_key):
             parts.append(
                 f'<h2 id="{E(_quest_group_anchor(g))}">{nwn_html(g)} '
                 f'<small class="muted">({len(grouped[g])})</small></h2>')
@@ -9923,9 +9938,7 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
         parts.append("<p>(no journal entries)</p>")
     else:
         rows = []
-        # @order from the Comment when present, else ascending ID — the
-        # default in-game quest progression.
-        for e in _quest_ordered_entries(entries, _quest_entry_order(raw_comment)):
+        for e in sorted(entries, key=_quest_entry_id):
             eid = _quest_entry_id(e)
             end = fld(e, "End", 0)
             txt = loc(e.get("Text"))

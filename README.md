@@ -231,9 +231,9 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
   quest page is cross-referenced to the scripts that award it (the **Awarded
   by** column), discovered by scanning every `.nss` for
   `AddJournalQuestEntry("tag", id, …)`. Quests can be gathered under headings,
-  have their entries re-ordered, or be hidden when retired via lightweight
-  `@group` / `@order` / `@hidden` directives in a quest's builder Comment — see
-  *Quests: grouping and entry order* below.
+  ordered within groups, sorted across groups, or hidden when retired via
+  lightweight `@group` / `@group-order` / `@order` / `@hidden` directives in a
+  quest's builder Comment — see *Quests: grouping and ordering* below.
 - `conversations/index.html` — every `.dlg` in the module, with per-dialog
   pages that render the entry/reply outline plus the static cross-reference
   graph: which NPCs / placeables / doors host the conversation, which
@@ -319,7 +319,7 @@ With `--cr-bucket-size 5` the page uses CR 0–4, CR 5–9, CR 10–14, … buck
 Creatures with a missing or non-numeric CR appear in an "Unknown CR" bucket at
 the bottom.
 
-#### Quests: grouping and entry order
+#### Quests: grouping and ordering
 
 By default the **Quests** index is a single table of every journal category,
 sorted by quest name. A few optional directives let the builder reshape it.
@@ -328,6 +328,8 @@ free text the toolset exposes (individual journal *entries* have just an ID, an
 "end of quest" flag, and their text — there is no per-entry comment field).
 Edit the Comment in the NWN Toolset's Journal editor; nothing else in the
 module changes.
+
+Journal entries within each quest are always displayed in ascending ID order.
 
 **`@group 'Name'` — gather related quests under a heading.** Add the directive
 to the Comment of each quest you want grouped (use the same `Name` on each):
@@ -349,21 +351,45 @@ stripped from the note shown on the quest page.
   `@group`, the index stays a single flat table — no headings, no "Other"
   section, identical to the un-grouped layout.
 - If **some** quests are grouped and others aren't, the named groups render
-  first (alphabetically), and the quests with no `@group` follow under a
-  neutral **Other** heading.
+  first and the quests with no `@group` follow under a neutral **Other** heading.
 
-**`@order 1,3,2` — set entry display order.** Journal entries are otherwise
-shown in ascending entry-ID order (the usual in-game progression). When the
-narrative order differs from the ID order, list the entry IDs in display order:
+**`@group-order N` — control the order of groups on the index.** By default,
+named groups are sorted alphabetically. Add this directive to any quest that
+belongs to the group to give that group an explicit position:
 
 ```
-@order 4,1,3
+@group 'Prologue'
+@group-order 1
 ```
 
-- **Partial orders are fine.** Any entry IDs you omit are appended after the
-  listed ones, in ascending ID order. With five entries and `@order 4,1,3`, the
-  page shows `4, 1, 3` first, then `2, 5`.
-- IDs may be separated by commas, spaces, or both.
+```
+@group 'Main Story'
+@group-order 2
+```
+
+- Set `@group-order` on one quest per group (or the same value on all of them —
+  only the first one found is used).
+- Groups without `@group-order` sort alphabetically after all numbered groups.
+- `@group-order` can be combined with `@order` (see below) on the same quest.
+
+**`@order N` — position a quest within its group.** Quests within a group (or
+in the flat ungrouped table) are otherwise sorted alphabetically. Use a single
+integer to place a specific quest at a fixed position:
+
+```
+@group 'Main Story'
+@order 1
+```
+
+```
+@group 'Main Story'
+@order 2
+```
+
+- Quests with lower `@order` values appear first; quests with no `@order` sort
+  alphabetically after all numbered quests.
+- Works in the flat (no-groups) layout too — quests with `@order` appear before
+  alphabetically-sorted quests.
 
 **`@hidden` (or `@retired` / `@inactive`) — drop a quest from the wiki.** Mark
 an obsolete, work-in-progress, or otherwise inactive quest so it disappears
@@ -384,9 +410,9 @@ journal so existing player journals that reference it don't break.
   area-level `WIKI_HIDDEN` marker described above.)
 
 The directives are all parsed from the same Comment, so a quest can combine
-them (e.g. `@group` + `@order`). Every directive line is removed from the
-"Builder comment" note rendered on the quest's detail page, so the
-machine-readable markers never show to readers.
+them freely (e.g. `@group` + `@group-order` + `@order`). Every directive line
+is removed from the "Builder comment" note rendered on the quest's detail page,
+so the machine-readable markers never show to readers.
 
 #### Shortest-path sections on area pages
 
