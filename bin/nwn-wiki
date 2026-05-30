@@ -1657,8 +1657,14 @@ class Db:
         self.canonical_bp_of: dict[str, str] = {}
         # internal: blueprint_rr → {creature_key_tuple → canonical_rr}
         self._creature_key_registry: dict[str, dict[tuple, str]] = {}
-        # canonical_rr → [{"area", "kind": "placed"|"encounter", "enc_rr", "count"}]
+        # canonical_rr → [{"area", "kind": "placed"|"encounter"|"script", "enc_rr", "count"}]
         self.canonical_locations: dict[str, list[dict]] = defaultdict(list)
+        # Script-spawned creatures (built in index_dialogs() after _build_tag_to_area()).
+        # area_rr → [{"bp_rr": str, "can_rr": str, "script": str}]
+        self.area_script_spawns: dict[str, list[dict]] = defaultdict(list)
+        # script resref → [{"creature_resref": str, "waypoint_tag": str}] raw pairs
+        # extracted during _parse_scripts(); resolved to areas after _build_tag_to_area().
+        self.script_creature_waypoint_spawns: dict[str, list[dict]] = defaultdict(list)
 
     # ---- Loading ----
 
@@ -2289,6 +2295,10 @@ class Db:
     _RE_ITEM_POSSESSED_BY = re.compile(
         r'\bGetItemPossessedBy\s*\((?:[^,()]+|\([^)]*\))+,\s*"([A-Za-z0-9_]+)"'
     )
+    _RE_CREATE_CREATURE = re.compile(
+        r'\bCreateObject\s*\(\s*OBJECT_TYPE_CREATURE\s*,\s*"([A-Za-z0-9_]+)"'
+    )
+    _RE_ANY_LITERAL_STR = re.compile(r'"([A-Za-z0-9_]+)"')
 
     def _parse_scripts(self) -> None:
         """One-shot scan of every .nss file. Populates script_dialogs and
@@ -2345,6 +2355,44 @@ class Db:
             # GetItemPossessedBy(obj, "tag") — item-tag checks for key/quest logic.
             for m in self._RE_ITEM_POSSESSED_BY.finditer(text):
                 self.script_checks_item_tags[resref].add(m.group(1))
+            # Detect creature spawns at waypoints (two strategies):
+            # 1. Window scan: GetWaypointByTag("tag")/GetObjectByTag("tag") within
+            #    10 lines before CreateObject(OBJECT_TYPE_CREATURE, "resref", ...).
+            # 2. Co-location: a script that uses GetWaypointByTag+CreateObject with
+            #    variables (e.g. a helper function) may call that helper with literal
+            #    string arguments on the same line — scan for pairs where one literal
+            #    matches a known waypoint tag and the other a known creature blueprint.
+            if ("CreateObject" in text and "OBJECT_TYPE_CREATURE" in text
+                    and "GetWaypointByTag" in text):
+                lines = text.splitlines()
+                # Window scan
+                recent_tags: list[tuple[str, int]] = []
+                for lineno, line in enumerate(lines):
+                    for m in self._RE_GET_TAG.finditer(line):
+                        recent_tags.append((m.group(1), lineno))
+                    for m in self._RE_CREATE_CREATURE.finditer(line):
+                        crr = m.group(1).lower()
+                        for tag, tag_ln in reversed(recent_tags):
+                            if lineno - tag_ln <= 10:
+                                entry = {"creature_resref": crr, "waypoint_tag": tag}
+                                if entry not in self.script_creature_waypoint_spawns[resref]:
+                                    self.script_creature_waypoint_spawns[resref].append(entry)
+                                break
+                # Co-location scan: pairs of literal strings on the same line
+                # where one is a known waypoint tag and the other is a creature resref.
+                for line in lines:
+                    strs = [m.group(1) for m in self._RE_ANY_LITERAL_STR.finditer(line)]
+                    if len(strs) < 2:
+                        continue
+                    wp_strs = [s for s in strs
+                               if s in self.waypoint_area or s.upper() in self.waypoint_area]
+                    cr_strs = [s.lower() for s in strs if s.lower() in self.creatures]
+                    for wp_tag in wp_strs:
+                        actual_tag = wp_tag if wp_tag in self.waypoint_area else wp_tag.upper()
+                        for crr in cr_strs:
+                            entry = {"creature_resref": crr, "waypoint_tag": actual_tag}
+                            if entry not in self.script_creature_waypoint_spawns[resref]:
+                                self.script_creature_waypoint_spawns[resref].append(entry)
 
     def _build_tag_to_area(self) -> None:
         """Tag → area resref index spanning every placement (waypoints,
@@ -2378,6 +2426,45 @@ class Db:
                 tag = fld(c, "Tag")
                 if tag and tag not in self.tag_to_area:
                     self.tag_to_area[tag] = area_resref
+
+    def _resolve_script_creature_spawns(self) -> None:
+        """Resolve script_creature_waypoint_spawns to area associations and
+        populate canonical_locations (kind='script') and area_script_spawns.
+
+        Must run after _parse_scripts and _build_tag_to_area."""
+        seen: set[tuple[str, str]] = set()  # (can_rr, area_rr) already recorded
+        for script_rr, pairs in self.script_creature_waypoint_spawns.items():
+            for pair in pairs:
+                bp_rr = pair["creature_resref"]
+                wp_tag = pair["waypoint_tag"]
+                if bp_rr not in self.creatures:
+                    continue
+                area_rr = (self.waypoint_area.get(wp_tag)
+                           or self.tag_to_area.get(wp_tag))
+                if not area_rr or area_rr not in self.areas:
+                    continue
+                if area_rr in self.hidden_areas:
+                    continue
+                can_rr = self.canonical_for_bp.get(bp_rr)
+                if not can_rr:
+                    continue
+                key = (can_rr, area_rr)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # Only add if not already covered by a placed or encounter entry
+                # for this (creature, area) pair — script spawn is a fallback.
+                existing = self.canonical_locations.get(can_rr, [])
+                already = any(e["area"] == area_rr and e["kind"] in ("placed", "encounter")
+                              for e in existing)
+                if not already:
+                    self.canonical_locations[can_rr].append(
+                        {"area": area_rr, "kind": "script",
+                         "enc_rr": None, "count": 1}
+                    )
+                self.area_script_spawns[area_rr].append(
+                    {"bp_rr": bp_rr, "can_rr": can_rr, "script": script_rr}
+                )
 
     def _build_direct_teleport_transitions(self) -> None:
         """Detect placeables whose OnUsed script directly calls ActionJumpToLocation
@@ -2492,6 +2579,7 @@ class Db:
         t0 = time.time()
         self._parse_scripts()
         self._build_tag_to_area()
+        self._resolve_script_creature_spawns()
         self._synthesize_zdialogs()
 
         # Per-dialog: action / active scripts and teleport destinations.
@@ -5194,6 +5282,44 @@ def render_area_page(db: Db, resref: str, out: Path,
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
+    # Script-spawned NPCs (creatures created by OnModuleLoad/OnEnter scripts
+    # at waypoint locations rather than placed as instances in the GIT).
+    script_spawns = db.area_script_spawns.get(resref, [])
+    if script_spawns:
+        sections.append("<h2>Script-spawned NPCs</h2>")
+        ss_rows = []
+        seen_ss: set[str] = set()
+        for sp in script_spawns:
+            can_rr2 = sp["can_rr"]
+            if can_rr2 in seen_ss:
+                continue
+            seen_ss.add(can_rr2)
+            bp2 = db.creatures.get(sp["bp_rr"], {})
+            name2 = db.canonical_creature_name(can_rr2) or sp["bp_rr"]
+            classes2 = list_items(db.canonical_creatures.get(can_rr2, {}).get("c", {}).get("ClassList")) or list_items(bp2.get("ClassList"))
+            cls_str2 = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes2
+            )
+            hp2 = fld(bp2, "MaxHitPoints", "")
+            cr2 = fld(bp2, "ChallengeRating", "")
+            conv2 = fld(bp2, "Conversation", "")
+            ss_rows.append(
+                f"<tr><td>{link(f'../creatures/{can_rr2}.html', name2)}</td>"
+                f"<td><code>{E(sp['bp_rr'])}</code></td>"
+                f"<td>{E(race_name(fld(bp2, 'Race')))}</td>"
+                f"<td>{E(cls_str2)}</td>"
+                f"<td>{E(hp2)}</td>"
+                f"<td>{E(cr2)}</td>"
+                f"<td>{_conv_link(db, conv2, root_rel='..')}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th>"
+            "<th>HP</th><th>CR</th><th>Conversation</th>"
+            "</tr></thead><tbody>" + "\n".join(ss_rows) + "</tbody></table>"
+        )
+
     # Containers (placeables with non-empty inventory). Detail lives on a
     # per-container page so this row can stay scannable.
     containers = db.area_containers.get(resref, [])
@@ -6267,8 +6393,9 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     locs = db.canonical_locations.get(canonical_rr, [])
     placed_locs  = [l for l in locs if l["kind"] == "placed"]
     enc_locs     = [l for l in locs if l["kind"] == "encounter"]
+    script_locs  = [l for l in locs if l["kind"] == "script"]
 
-    if placed_locs or enc_locs:
+    if placed_locs or enc_locs or script_locs:
         sections.append("<h2>Where to find</h2>")
         if placed_locs:
             # Aggregate by area
@@ -6313,6 +6440,28 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
                 "<th>Area</th><th>Encounter</th><th>Encounter ResRef</th>"
                 "</tr></thead><tbody>" + "\n".join(enc_rows) + "</tbody></table>"
             )
+        if script_locs:
+            script_by_area: dict[str, list[str]] = defaultdict(list)
+            for l in script_locs:
+                srcs = [e["script"] for e in db.area_script_spawns.get(l["area"], [])
+                        if e["can_rr"] == canonical_rr]
+                script_by_area[l["area"]].extend(srcs)
+            script_rows = []
+            for area_rr in sorted(script_by_area.keys(),
+                                  key=lambda r: db.area_name(r).lower()):
+                scripts = sorted(set(script_by_area[area_rr]))
+                script_cell = (", ".join(f"<code>{E(s)}</code>" for s in scripts)
+                               if scripts else "—")
+                script_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{script_cell}</td></tr>"
+                )
+            sections.append(
+                "<h3>Script-spawned</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Spawn script</th>"
+                "</tr></thead><tbody>" + "\n".join(script_rows) + "</tbody></table>"
+            )
     else:
         sections.append("<h2>Where to find</h2><p>Not placed in any area.</p>")
 
@@ -6329,15 +6478,17 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
 def render_creatures_by_area(db: Db, out: Path) -> None:
     """Creatures grouped by area. One row per unique creature per area, with
     spawn-method badges and a count of total appearances."""
-    # Build area → {can_rr → {"placed": N, "enc": N, "enc_rrs": set}}
+    # Build area → {can_rr → {"placed": N, "enc": N, "script": N, "enc_rrs": set}}
     area_map: dict[str, dict[str, dict]] = defaultdict(dict)
     for can_rr, locs in db.canonical_locations.items():
         for loc_entry in locs:
             area_rr = loc_entry["area"]
             if area_rr not in area_map[can_rr]:
-                area_map[can_rr][area_rr] = {"placed": 0, "enc": 0, "enc_rrs": set()}
+                area_map[can_rr][area_rr] = {"placed": 0, "enc": 0, "script": 0, "enc_rrs": set()}
             if loc_entry["kind"] == "placed":
                 area_map[can_rr][area_rr]["placed"] += loc_entry["count"]
+            elif loc_entry["kind"] == "script":
+                area_map[can_rr][area_rr]["script"] += loc_entry["count"]
             else:
                 area_map[can_rr][area_rr]["enc"] += loc_entry["count"]
                 if loc_entry["enc_rr"]:
@@ -6404,13 +6555,16 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
             info = area_map[can_rr][area_rr]
             placed = info["placed"]
             enc = info["enc"]
-            if placed and enc:
-                method = '<span class="badge">placed</span> + <span class="badge">encounter</span>'
-            elif placed:
-                method = '<span class="badge">placed</span>'
-            else:
-                method = '<span class="badge">encounter</span>'
-            count = placed + enc
+            script = info["script"]
+            badges = []
+            if placed:
+                badges.append('<span class="badge">placed</span>')
+            if enc:
+                badges.append('<span class="badge">encounter</span>')
+            if script:
+                badges.append('<span class="badge">script</span>')
+            method = " + ".join(badges) if badges else "—"
+            count = placed + enc + script
             rows.append(
                 f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
                 f"<td>{E(race_name(_f2('Race')))}</td>"
@@ -11932,7 +12086,12 @@ def generate_module_index(
         for inst in insts
     } - {""}
     encounter_bps: set[str] = set(db.creature_encounter_spawns.keys())
-    used_bps = placed_bps | encounter_bps
+    script_bps: set[str] = {
+        sp["bp_rr"]
+        for spawns in db.area_script_spawns.values()
+        for sp in spawns
+    }
+    used_bps = placed_bps | encounter_bps | script_bps
     unspawned: list[dict] = []
     for bp_rr in sorted(db.creatures,
                         key=lambda r: nwn_text(db.creature_name(r)).lower()):
@@ -11956,9 +12115,10 @@ def generate_module_index(
         "module": module_title,
         "count": len(unspawned),
         "summary": (
-            f"{len(unspawned)} creature blueprint(s) never placed in any area "
-            f"or referenced in any encounter pool."
-            if unspawned else "All creature blueprints are placed or in an encounter pool."
+            f"{len(unspawned)} creature blueprint(s) never placed in any area, "
+            f"referenced in any encounter pool, or spawned by script."
+            if unspawned else
+            "All creature blueprints are placed, in an encounter pool, or spawned by script."
         ),
         "creatures": unspawned,
     })
