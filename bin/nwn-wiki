@@ -1480,6 +1480,28 @@ def item_damage_bonus(item: dict | None) -> tuple[int, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# NWScript function-body extractor (brace counting)
+# ---------------------------------------------------------------------------
+
+def _extract_func_body(text: str, from_pos: int, max_len: int = 8000) -> str:
+    """Return the text of the first balanced-brace block at or after from_pos.
+    Returns "" when no opening brace is found within max_len chars."""
+    i = text.find('{', from_pos, from_pos + max_len)
+    if i < 0:
+        return ""
+    depth = 0
+    end = min(len(text), i + max_len)
+    for j in range(i, end):
+        if text[j] == '{':
+            depth += 1
+        elif text[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return text[i:end]
+
+
+# ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
@@ -2302,6 +2324,25 @@ class Db:
         r'\bconst\s+string\s+([A-Za-z_]\w*)\s*=\s*"([^"]*)"'
     )
     _RE_INCLUDE = re.compile(r'^\s*#\s*include\s+"([A-Za-z0-9_]+)"', re.MULTILINE)
+    # String-returning function signature: string FNAME(param-list)
+    _RE_STR_FUNC_SIG = re.compile(r'\bstring\s+(\w+)\s*\(([^)]*)\)')
+    # Any function signature (any return type): for finding grant-function bodies
+    _RE_FUNC_ANY_SIG = re.compile(
+        r'\b(?:void|string|int|float|object|vector|location|'
+        r'effect|talent|itemproperty|action|command)\s+(\w+)\s*\(([^)]*)\)'
+    )
+    # if (PARAM == "X") return "Y"; — dispatch table entry
+    _RE_IF_EQ_RETURN_STR = re.compile(
+        r'\bif\s*\(\s*(\w+)\s*==\s*"([^"]*)"\s*\)\s*return\s*"([^"]*)"\s*;'
+    )
+    # return "PREFIX" + INNER_FUNC(PARAM); — prefix-chain composition
+    _RE_RETURN_STR_PREFIX = re.compile(
+        r'\breturn\s+"([^"]*)"\s*\+\s*(\w+)\s*\(\s*(\w+)\s*\)\s*;'
+    )
+    # AddJournalQuestEntry(DISPATCH_FUNC(PARAM), step, ...) inside function bodies
+    _RE_JOURNAL_DISPATCH_CALL = re.compile(
+        r'\bAddJournalQuestEntry\s*\(\s*(\w+)\s*\(\s*(\w+)\s*\)\s*,\s*(\d+)'
+    )
     _RE_ITEM_POSSESSED_BY = re.compile(
         r'\bGetItemPossessedBy\s*\((?:[^,()]+|\([^)]*\))+,\s*"([A-Za-z0-9_]+)"'
     )
@@ -2310,12 +2351,76 @@ class Db:
     )
     _RE_ANY_LITERAL_STR = re.compile(r'"([A-Za-z0-9_]+)"')
 
+    def _build_nwstr_dispatch(self, texts: list[str]) -> dict[str, dict[str, str]]:
+        """Build {func_name -> {arg_val -> return_val}} for string functions
+        whose return is fully determined by a single string argument:
+
+        Pass 1 — if-chain dispatch:
+          string F(string P) { if (P=="a") return "X"; if (P=="b") return "Y"; }
+          → dispatch["F"] = {"a": "X", "b": "Y"}
+
+        Pass 2 — prefix-chain composition (iterated until stable):
+          string G(string P) { return "PFX" + F(P); }
+          → dispatch["G"] = {"a": "PFXa", "b": "PFXB"} (using dispatch["F"])
+        """
+        dispatch: dict[str, dict[str, str]] = {}
+
+        # Pass 1: extract if-chain dispatch tables
+        for text in texts:
+            for m in self._RE_STR_FUNC_SIG.finditer(text):
+                fname = m.group(1)
+                str_params = re.findall(r'\bstring\s+(\w+)', m.group(2))
+                if not str_params:
+                    continue
+                param = str_params[0]
+                body = _extract_func_body(text, m.end())
+                if not body:
+                    continue
+                tbl: dict[str, str] = {}
+                for im in self._RE_IF_EQ_RETURN_STR.finditer(body):
+                    if im.group(1) == param:
+                        tbl[im.group(2)] = im.group(3)
+                if tbl:
+                    dispatch.setdefault(fname, {}).update(tbl)
+
+        # Pass 2: compose prefix-chain entries (iterate until stable)
+        changed = True
+        while changed:
+            changed = False
+            for text in texts:
+                for m in self._RE_STR_FUNC_SIG.finditer(text):
+                    fname = m.group(1)
+                    if fname in dispatch:
+                        continue
+                    str_params = re.findall(r'\bstring\s+(\w+)', m.group(2))
+                    if not str_params:
+                        continue
+                    param = str_params[0]
+                    body = _extract_func_body(text, m.end())
+                    if not body:
+                        continue
+                    cm = self._RE_RETURN_STR_PREFIX.search(body)
+                    if cm and cm.group(3) == param and cm.group(2) in dispatch:
+                        prefix = cm.group(1)
+                        inner = cm.group(2)
+                        tbl = {k: prefix + v for k, v in dispatch[inner].items()}
+                        if tbl:
+                            dispatch[fname] = tbl
+                            changed = True
+
+        return dispatch
+
     def _parse_scripts(self) -> None:
         """One-shot scan of every .nss file. Populates script_dialogs and
         script_teleport_tags. Cheap enough (~2300 files in well under 1s on
         a hot disk) and avoids per-renderer file I/O."""
-        # Cache for include file texts (avoid re-reading the same file N times).
+        # Pre-read all scripts into cache (avoid re-reading for includes + dispatch build).
         _include_text_cache: dict[str, str] = {}
+        for _rr, _path in self.script_paths.items():
+            try:
+                _include_text_cache[_rr] = _path.read_text(errors="replace")
+            except Exception:
+                _include_text_cache[_rr] = ""
 
         def _include_text(inc_rr: str) -> str:
             if inc_rr not in _include_text_cache:
@@ -2326,10 +2431,15 @@ class Db:
                     _include_text_cache[inc_rr] = ""
             return _include_text_cache[inc_rr]
 
+        # Build string dispatch table from all script texts. Used to resolve
+        # dynamic tag construction like AddJournalQuestEntry(TagFunc(sParam), ...).
+        _nwstr_dispatch = self._build_nwstr_dispatch(
+            list(_include_text_cache.values())
+        )
+
         for resref, path in self.script_paths.items():
-            try:
-                text = path.read_text(errors="replace")
-            except Exception:
+            text = _include_text_cache.get(resref, "")
+            if not text:
                 continue
             # ActionStartConversation("dlgresref", ...)
             for m in self._RE_START_CONV.finditer(text):
@@ -2397,6 +2507,42 @@ class Db:
                         if var in consts:
                             tag_val = consts[var].strip().lower()
                             self.quest_grants[tag_val][int(m.group(2))].add(resref)
+                # Dynamic tag resolution: find functions in merged text whose body
+                # contains AddJournalQuestEntry(DISPATCH_FUNC(PARAM), step, ...) where
+                # DISPATCH_FUNC is in _nwstr_dispatch, then find call sites to those
+                # functions in the main (non-include) text with a literal string arg.
+                if _nwstr_dispatch and inc_resrefs:
+                    for sig_m in self._RE_FUNC_ANY_SIG.finditer(bodies):
+                        outer_fname = sig_m.group(1)
+                        str_params = re.findall(r'\bstring\s+(\w+)', sig_m.group(2))
+                        if not str_params:
+                            continue
+                        body = _extract_func_body(bodies, sig_m.end())
+                        if not body:
+                            continue
+                        jm = self._RE_JOURNAL_DISPATCH_CALL.search(body)
+                        if not jm:
+                            continue
+                        dispatch_func = jm.group(1)
+                        inner_param = jm.group(2)
+                        step = int(jm.group(3))
+                        if dispatch_func not in _nwstr_dispatch:
+                            continue
+                        if inner_param not in str_params:
+                            continue
+                        # Find call sites in main text with exactly one string literal
+                        for call_m in re.finditer(
+                            r'\b' + re.escape(outer_fname)
+                            + r'\s*\(((?:[^()]*|\([^()]*\))*)\)',
+                            text,
+                        ):
+                            args_str = call_m.group(1)
+                            literals = re.findall(r'"([^"]*)"', args_str)
+                            if len(literals) != 1:
+                                continue
+                            tag = _nwstr_dispatch[dispatch_func].get(literals[0])
+                            if tag:
+                                self.quest_grants[tag.strip().lower()][step].add(resref)
             # GetItemPossessedBy(obj, "tag") — item-tag checks for key/quest logic.
             for m in self._RE_ITEM_POSSESSED_BY.finditer(text):
                 self.script_checks_item_tags[resref].add(m.group(1))
