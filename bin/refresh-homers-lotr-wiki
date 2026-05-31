@@ -24,6 +24,7 @@ nwn-manager wiki \
   --exclude-conv-option "[Admin Options]" \
   --exclude-conv-option "[Options of the Homeless]" \
   --log-dir "$HOME/.local/state/nwnxee-homer" \
+  --2da-dir "$PROJECT/hak_2da" \
   --path-from thewelloferu
 status=$?
 
