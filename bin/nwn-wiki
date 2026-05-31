@@ -1685,6 +1685,8 @@ class Db:
         self._creature_key_registry: dict[str, dict[tuple, str]] = {}
         # canonical_rr → [{"area", "kind": "placed"|"encounter"|"script", "enc_rr", "count"}]
         self.canonical_locations: dict[str, list[dict]] = defaultdict(list)
+        # canonical_rr → set of FactionIDs seen across its placed GIT instances
+        self.canonical_inst_factions: dict[str, set[int]] = defaultdict(set)
         # Script-spawned creatures (built in index_dialogs() after _build_tag_to_area()).
         # area_rr → [{"bp_rr": str, "can_rr": str, "script": str}]
         self.area_script_spawns: dict[str, list[dict]] = defaultdict(list)
@@ -2047,6 +2049,12 @@ class Db:
                 if can_rr:
                     agg_key = (can_rr, area_rr)
                     _placed_agg[agg_key] = _placed_agg.get(agg_key, 0) + 1
+                    raw_fid = fld(inst["c"], "FactionID")
+                    if raw_fid is not None and raw_fid != "":
+                        try:
+                            self.canonical_inst_factions[can_rr].add(int(raw_fid))
+                        except (TypeError, ValueError):
+                            pass
         for (can_rr, area_rr), count in _placed_agg.items():
             self.canonical_locations[can_rr].append(
                 {"area": area_rr, "kind": "placed", "enc_rr": None, "count": count}
@@ -4251,6 +4259,20 @@ def _faction_dd(db: Db, faction_id, root_rel: str = ".") -> str:
         )
         return f'<a href="{E(root_rel)}/factions.html">{nwn_html(name)}</a>{id_suffix}'
     return (f'<a href="{E(root_rel)}/factions.html">{E(faction_id)}</a>')
+
+
+def _faction_cell(db: Db, canonical_rr: str, bp_faction_id, root_rel: str = ".") -> str:
+    """Render faction for a creature detail page.
+
+    Prefers FactionIDs from placed GIT instances (canonical_inst_factions) over
+    the blueprint's stored value, since instances override the blueprint in-game.
+    Falls back to bp_faction_id when no placed instances exist.
+    When instances span multiple factions, renders each one separated by " / ".
+    """
+    inst_fids = sorted(db.canonical_inst_factions.get(canonical_rr, set()))
+    if inst_fids:
+        return " / ".join(_faction_dd(db, fid, root_rel) for fid in inst_fids)
+    return _faction_dd(db, bp_faction_id, root_rel)
 
 
 def _race_link(race_raw, root_rel: str = ".") -> str:
@@ -6566,7 +6588,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
         f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
         f"<dt>HP</dt><dd>{E(_fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
         f"<dt>CR</dt><dd>{E(_meta('ChallengeRating', ''))}</dd>",
-        f"<dt>Faction</dt><dd>{_faction_dd(db, _meta('FactionID', ''), root_rel='..')}</dd>",
+        f"<dt>Faction</dt><dd>{_faction_cell(db, canonical_rr, _meta('FactionID', ''), root_rel='..')}</dd>",
         f"<dt>Conversation</dt><dd>{_conv_link(db, conv, root_rel='..') if conv else '—'}</dd>",
     ]
 
