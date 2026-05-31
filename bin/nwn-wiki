@@ -48,6 +48,15 @@ _THEME_FAVICON: str = ""     # filename in assets/, e.g. "favicon.png"
 _THEME_HEADER_IMG: str = ""  # filename in assets/, e.g. "header.png"
 _THEME_EXTRA_CSS: str = ""   # filename in assets/, e.g. "theme.css"
 
+# Deduplication set for runtime lookup warnings; avoids flooding stderr on large modules.
+_warned: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _warned:
+        _warned.add(msg)
+        print(f"  warn: {msg}", file=sys.stderr)
+
 
 # ---------------------------------------------------------------------------
 # GFF helpers
@@ -139,10 +148,20 @@ def loc(node: Any, lang: int = 0) -> str:
         if isinstance(sid, int) and sid >= 0:
             if sid >= CUSTOM_TLK_BASE:
                 t = CUSTOM_TLK.get(sid - CUSTOM_TLK_BASE)
+                if t is not None:
+                    return t
+                if not CUSTOM_TLK:
+                    _warn_once(f"StrRef {sid} (custom TLK) unresolved: no custom TLK loaded — re-run with --custom-tlk")
+                else:
+                    _warn_once(f"StrRef {sid} (custom TLK row {sid - CUSTOM_TLK_BASE}) not found in loaded custom TLK")
             else:
                 t = BASE_TLK.get(sid)
-            if t is not None:
-                return t
+                if t is not None:
+                    return t
+                if not BASE_TLK:
+                    _warn_once(f"StrRef {sid} unresolved: no dialog.tlk loaded — re-run with --dialog-tlk")
+                else:
+                    _warn_once(f"StrRef {sid} not found in loaded dialog.tlk")
         return f"[TLK#{sid}]"
     for v in val.values():
         if isinstance(v, str):
@@ -165,7 +184,11 @@ def _load_lookup(name: str) -> dict[int, str]:
     p = DATA_DIR / f"{name}.json"
     if not p.exists():
         return {}
-    raw = json.loads(p.read_text())
+    try:
+        raw = json.loads(p.read_text())
+    except Exception as e:
+        print(f"warn: could not parse {p}: {e}", file=sys.stderr)
+        return {}
     return {int(k): str(v) for k, v in raw.items() if not k.startswith("_")}
 
 
@@ -484,6 +507,7 @@ def baseitem_name(row: int | None) -> str:
     r = int(row)
     if r in BASEITEMS:
         return BASEITEMS[r]
+    _warn_once(f"baseitems.2da row {r} not found — add --2da-dir with an override to resolve")
     return f"BaseItem #{r}"
 
 
@@ -502,19 +526,31 @@ def baseitem_label(row: int | None) -> str:
 def class_name(row: int | None) -> str:
     if row is None:
         return ""
-    return CLASSES.get(int(row), f"Class #{row}")
+    r = int(row)
+    if r in CLASSES:
+        return CLASSES[r]
+    _warn_once(f"classes.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Class #{r}"
 
 
 def race_name(row: int | None) -> str:
     if row is None:
         return ""
-    return RACES.get(int(row), f"Race #{row}")
+    r = int(row)
+    if r in RACES:
+        return RACES[r]
+    _warn_once(f"racialtypes.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Race #{r}"
 
 
 def appearance_name(row: int | None) -> str:
     if row is None:
         return ""
-    return APPEARANCE.get(int(row), f"Appearance #{row}")
+    r = int(row)
+    if r in APPEARANCE:
+        return APPEARANCE[r]
+    _warn_once(f"appearance.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Appearance #{r}"
 
 
 def placeable_name(row: int | None) -> str:
@@ -523,25 +559,41 @@ def placeable_name(row: int | None) -> str:
     return real names (CEP modules get them via the auto-detected overlay)."""
     if row is None:
         return ""
-    return PLACEABLES.get(int(row), f"Placeable #{row}")
+    r = int(row)
+    if r in PLACEABLES:
+        return PLACEABLES[r]
+    _warn_once(f"placeables.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Placeable #{r}"
 
 
 def feat_name(row: int | None) -> str:
     if row is None:
         return ""
-    return FEATS.get(int(row), f"Feat #{row}")
+    r = int(row)
+    if r in FEATS:
+        return FEATS[r]
+    _warn_once(f"feat.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Feat #{r}"
 
 
 def skill_name(row: int | None) -> str:
     if row is None:
         return ""
-    return SKILLS.get(int(row), f"Skill #{row}")
+    r = int(row)
+    if r in SKILLS:
+        return SKILLS[r]
+    _warn_once(f"skills.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Skill #{r}"
 
 
 def spell_name(row: int | None) -> str:
     if row is None:
         return ""
-    return SPELLS.get(int(row), f"Spell #{row}")
+    r = int(row)
+    if r in SPELLS:
+        return SPELLS[r]
+    _warn_once(f"spells.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Spell #{r}"
 
 
 # PropertyName id for the Cast Spell item property.
@@ -746,6 +798,8 @@ def itemprop_format(prop: dict) -> dict[str, str]:
     chance = fld(prop, "ChanceAppear", 100)
 
     pdef = IPROP_DEFS.get(int(pname_id), {}) if pname_id is not None else {}
+    if pname_id is not None and not pdef:
+        _warn_once(f"item property {pname_id} not found in itemprops.json — itemprops.json may be outdated")
     pname = pdef.get("name") or (f"Property #{pname_id}" if pname_id is not None else "")
 
     # Subtype: per-property table (e.g. Damage Bonus → damage type name).
@@ -765,8 +819,10 @@ def itemprop_format(prop: dict) -> dict[str, str]:
             else:
                 short = st_tbl.replace("iprp_", "")
                 subtype_str = f"{short} #{subtype_id}"
+                _warn_once(f"item property '{pname}': {st_tbl} row {subtype_id} not found — add --2da-dir with an override to resolve")
         elif int(subtype_id) not in (0, 65535):
             subtype_str = str(subtype_id)
+            _warn_once(f"item property '{pname}': subtype {subtype_id} has no lookup table in itemprops.json — itemprops.json may be outdated")
 
     # Cost: indexes a per-property cost table (e.g. +1..+20).
     # Only fall back to raw when a cost table is defined but the lookup misses
@@ -785,6 +841,7 @@ def itemprop_format(prop: dict) -> dict[str, str]:
                 cost_str = f"{n - 7}/Day" if n >= 8 else f"{n} charges"
             else:
                 cost_str = str(cost_value)
+                _warn_once(f"item property '{pname}': {ct_tbl} row {cost_value} not found — add --2da-dir with an override to resolve")
 
     # Param1: 255 is the engine "no param" sentinel.
     # For certain (property, subtype) combos the Param1Value further qualifies
@@ -11943,6 +12000,7 @@ def generate_module_index(
       creature_tag_conflicts.json— creature blueprints that produced variant resrefs
       item_index.json            — all items with names, costs, and sources
       cross_faction_creatures.json — blueprints appearing in multiple factions
+      faction_bp_instance_discrepancies.json — placed instances whose FactionID differs from their blueprint
       inaccessible_items.json    — items not reachable by players
       unspawned_creatures.json   — creature blueprints never placed or in an encounter
     """
@@ -12358,6 +12416,54 @@ def generate_module_index(
     })
     print(f"[nwn-wiki] module-index: cross_faction_creatures.json ({len(cf_creatures)} blueprint(s))")
 
+    # ------------------------------------------------------------------ faction_bp_instance_discrepancies.json
+    # Each entry: a placed GIT instance whose FactionID differs from its blueprint's FactionID.
+    discrepancies: list[dict] = []
+    for area_rr, insts in db.area_creature_instances.items():
+        if area_rr in db.hidden_areas:
+            continue
+        for inst in insts:
+            c = inst["c"]
+            bp_rr = fld(c, "TemplateResRef", "") or ""
+            if not bp_rr:
+                continue
+            bp = db.creatures.get(bp_rr)
+            if bp is None:
+                continue
+            inst_fid = _int_fid(fld(c, "FactionID"))
+            bp_fid = _int_fid(fld(bp, "FactionID"))
+            if inst_fid is None or bp_fid is None or inst_fid == bp_fid:
+                continue
+            can_rr = db.canonical_for_inst.get((area_rr, inst["idx"]), bp_rr)
+            discrepancies.append({
+                "blueprint_resref": bp_rr,
+                "canonical_resref": can_rr,
+                "name": nwn_text(db.canonical_creature_name(can_rr)),
+                "wiki_url": _cu(can_rr) if can_rr in db.canonical_creatures else "",
+                "area_resref": area_rr,
+                "area_name": nwn_text(db.area_name(area_rr)),
+                "area_url": _au(area_rr),
+                "instance_index": inst["idx"],
+                "blueprint_faction": {"id": bp_fid, "name": db.faction_name(bp_fid)},
+                "instance_faction": {"id": inst_fid, "name": db.faction_name(inst_fid)},
+            })
+    discrepancies.sort(key=lambda d: (
+        (nwn_text(db.canonical_creature_name(d["canonical_resref"])) or d["blueprint_resref"]).lower(),
+        d["area_resref"],
+        d["instance_index"],
+    ))
+    _write_json(module_index_dir / "faction_bp_instance_discrepancies.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(discrepancies),
+        "summary": (
+            f"{len(discrepancies)} placed instance(s) have a FactionID that differs from their blueprint."
+            if discrepancies else "No blueprint/instance faction discrepancies found."
+        ),
+        "discrepancies": discrepancies,
+    })
+    print(f"[nwn-wiki] module-index: faction_bp_instance_discrepancies.json ({len(discrepancies)} instance(s))")
+
     # ------------------------------------------------------------------ inaccessible_items.json
     inac_items: list[dict] = []
     for rr in sorted(db.items, key=lambda r: nwn_text(db.item_name(r)).lower()):
@@ -12683,6 +12789,13 @@ def main() -> int:
     title = title or "NWN Module"
 
     module_index_dir = src.parent / "module-index"
+    # Wipe stale content so removed resources don't linger across refreshes.
+    if module_index_dir.is_dir():
+        for _child in module_index_dir.iterdir():
+            if _child.is_dir():
+                shutil.rmtree(_child)
+            else:
+                _child.unlink()
     module_index_dir.mkdir(parents=True, exist_ok=True)
 
     # Tag-conflict burndown list + all module-index JSON exports
@@ -12814,6 +12927,22 @@ def main() -> int:
             continue  # retired/inactive quest — no detail page
         render_quest_page(db, qcat, qslug, out)
     print(f"  rendered in {time.time() - t0:.1f}s")
+
+    # Write lookup warnings to module-index so they're visible outside the build log.
+    warnings_path = module_index_dir / "lookup_warnings.json"
+    sorted_warnings = sorted(_warned)
+    _write_json(warnings_path, {
+        "_description": "Lookup failures encountered during wiki generation. "
+                        "Integers or [TLK#N] placeholders may appear on wiki pages "
+                        "for each entry below. Re-run with --dialog-tlk / --custom-tlk "
+                        "and/or --2da-dir to resolve.",
+        "count": len(sorted_warnings),
+        "warnings": sorted_warnings,
+    })
+    if sorted_warnings:
+        print(f"[nwn-wiki] module-index: lookup_warnings.json ({len(sorted_warnings)} warning(s))")
+    else:
+        print(f"[nwn-wiki] module-index: lookup_warnings.json (no lookup failures)")
 
     print(f"[nwn-wiki] done — {out}/index.html")
     return 0
