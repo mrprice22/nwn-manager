@@ -68,7 +68,9 @@
     "12": {
       "name": "Bonus Feat",
       "subtype": "iprp_feats",
-      "subtype_prefix_groups": ["Sneak Attack"]
+      "subtype_prefix_groups": [
+        "Sneak Attack"
+      ]
     },
     "13": {
       "name": "Bonus Spell Slot of Level N",
@@ -121,7 +123,8 @@
     },
     "22": {
       "name": "Damage Reduction",
-      "cost_table": "iprp_softcost"
+      "cost_table": "iprp_softcost",
+      "subtype": "iprp_reducestype"
     },
     "23": {
       "name": "Damage Resistance",
@@ -359,7 +362,8 @@
       "cost_table": "iprp_immunlvl"
     },
     "79": {
-      "name": "Special Walk"
+      "name": "Special Walk",
+      "subtype": "iprp_walk"
     },
     "80": {
       "name": "Healer's Kit",
@@ -436,23 +440,23 @@
       "12": "5/Day"
     },
     "iprp_damagecost": {
-      "0": "1d4",
-      "1": "1d6",
-      "2": "1d8",
-      "3": "1d10",
-      "4": "2d6",
-      "5": "2d8",
-      "6": "2d10",
-      "7": "1",
-      "8": "2",
-      "9": "3",
-      "10": "4",
-      "11": "5",
-      "12": "6",
-      "13": "7",
-      "14": "8",
-      "15": "9",
-      "16": "10"
+      "1": "1d4",
+      "2": "1d6",
+      "3": "1d8",
+      "4": "1d10",
+      "5": "2d6",
+      "6": "2d8",
+      "7": "2d10",
+      "8": "1",
+      "9": "2",
+      "10": "3",
+      "11": "4",
+      "12": "5",
+      "13": "6",
+      "14": "7",
+      "15": "8",
+      "16": "9",
+      "17": "10"
     },
     "iprp_softcost": {
       "0": "5/+1",
@@ -487,12 +491,12 @@
       "29": "30/+5"
     },
     "iprp_damageresist": {
-      "0": "5/-",
-      "1": "10/-",
-      "2": "15/-",
-      "3": "20/-",
-      "4": "25/-",
-      "5": "30/-"
+      "1": "5/-",
+      "2": "10/-",
+      "3": "15/-",
+      "4": "20/-",
+      "5": "25/-",
+      "6": "30/-"
     },
     "iprp_damagevuln": {
       "0": "5%",
@@ -552,45 +556,45 @@
       "7": "Sonic"
     },
     "iprp_monstcost": {
-      "0": "1d2",
-      "1": "1d3",
-      "2": "1d4",
-      "3": "1d6",
-      "4": "1d8",
-      "5": "1d10",
-      "6": "1d12",
-      "7": "2d4",
-      "8": "2d6",
-      "9": "2d8",
-      "10": "2d10",
-      "11": "2d12",
-      "12": "3d6",
-      "13": "3d8",
-      "14": "3d10",
-      "15": "3d12",
-      "16": "4d6",
-      "17": "4d8",
-      "18": "4d10",
-      "19": "4d12",
-      "20": "5d6",
-      "21": "5d8",
-      "22": "5d10",
-      "23": "5d12",
-      "24": "6d6",
-      "25": "6d8",
-      "26": "6d10",
-      "27": "6d12"
+      "1": "1d2",
+      "2": "1d3",
+      "3": "1d4",
+      "4": "1d6",
+      "5": "1d8",
+      "6": "1d10",
+      "7": "1d12",
+      "8": "2d4",
+      "9": "2d6",
+      "10": "2d8",
+      "11": "2d10",
+      "12": "2d12",
+      "13": "3d6",
+      "14": "3d8",
+      "15": "3d10",
+      "16": "3d12",
+      "17": "4d6",
+      "18": "4d8",
+      "19": "4d10",
+      "20": "4d12",
+      "21": "5d6",
+      "22": "5d8",
+      "23": "5d10",
+      "24": "5d12",
+      "25": "6d6",
+      "26": "6d8",
+      "27": "6d10",
+      "28": "6d12"
     },
     "iprp_immunlvl": {
-      "0": "1st level and below",
-      "1": "2nd level and below",
-      "2": "3rd level and below",
-      "3": "4th level and below",
-      "4": "5th level and below",
-      "5": "6th level and below",
-      "6": "7th level and below",
-      "7": "8th level and below",
-      "8": "9th level and below"
+      "1": "1st level and below",
+      "2": "2nd level and below",
+      "3": "3rd level and below",
+      "4": "4th level and below",
+      "5": "5th level and below",
+      "6": "6th level and below",
+      "7": "7th level and below",
+      "8": "8th level and below",
+      "9": "9th level and below"
     },
     "iprp_healerscost": {
       "_format": "+{}"
@@ -715,26 +719,27 @@
       "6": "White"
     },
     "iprp_reducestype": {
-      "0": "+1 Enhancement",
-      "1": "+2 Enhancement",
-      "2": "+3 Enhancement",
-      "3": "+4 Enhancement",
-      "4": "+5 Enhancement",
-      "5": "+6 Enhancement",
-      "6": "+7 Enhancement",
-      "7": "+8 Enhancement",
-      "8": "+9 Enhancement",
-      "9": "+10 Enhancement",
-      "10": "+11 Enhancement",
-      "11": "+12 Enhancement",
-      "12": "+13 Enhancement",
-      "13": "+14 Enhancement",
-      "14": "+15 Enhancement",
-      "15": "+16 Enhancement",
-      "16": "+17 Enhancement",
-      "17": "+18 Enhancement",
-      "18": "+19 Enhancement",
-      "19": "+20 Enhancement"
+      "1": "+1 Enhancement",
+      "2": "+2 Enhancement",
+      "3": "+3 Enhancement",
+      "4": "+4 Enhancement",
+      "5": "+5 Enhancement",
+      "6": "+6 Enhancement",
+      "7": "+7 Enhancement",
+      "8": "+8 Enhancement",
+      "9": "+9 Enhancement",
+      "10": "+10 Enhancement",
+      "11": "+11 Enhancement",
+      "12": "+12 Enhancement",
+      "13": "+13 Enhancement",
+      "14": "+14 Enhancement",
+      "15": "+15 Enhancement",
+      "16": "+16 Enhancement",
+      "17": "+17 Enhancement",
+      "18": "+18 Enhancement",
+      "19": "+19 Enhancement",
+      "20": "+20 Enhancement",
+      "0": "-"
     },
     "iprp_onhit": {
       "0": "Sleep",
@@ -1462,6 +1467,58 @@
       "537": "ACTIVATE ITEM T",
       "538": "Ball Lightning",
       "539": "Scintillating Sphere"
+    },
+    "iprp_ammotype": {
+      "0": "Arrow",
+      "1": "Bolt",
+      "2": "Bullet"
+    },
+    "iprp_visualfx": {
+      "0": "None",
+      "1": "Evil",
+      "2": "Good",
+      "3": "Fire",
+      "4": "Frost",
+      "5": "Lightning",
+      "6": "Acid"
+    },
+    "iprp_traps": {
+      "0": "Spike",
+      "1": "Holy",
+      "2": "Tangle",
+      "3": "Blade",
+      "4": "Needle",
+      "5": "Gas",
+      "6": "Thunderstone",
+      "7": "Holy Water",
+      "8": "Fire",
+      "9": "Frost",
+      "10": "Electrical",
+      "11": "Acid",
+      "12": "Sonic",
+      "13": "Slow",
+      "14": "Web"
+    },
+    "iprp_ammocost": {
+      "1": "+1d6 Piercing",
+      "2": "+1d8 Piercing",
+      "3": "+2d6 Piercing",
+      "4": "+2d8 Piercing",
+      "5": "+1d10 Piercing",
+      "6": "+2d10 Piercing",
+      "7": "+1d12 Piercing",
+      "8": "+2d12 Piercing",
+      "9": "+1d6 Fire",
+      "10": "+1d6 Frost",
+      "11": "+1d6 Electrical",
+      "12": "+1d6 Acid",
+      "13": "+1d6 Sonic",
+      "14": "+1d4 Bludgeoning",
+      "15": "+1d6 Bludgeoning"
+    },
+    "iprp_walk": {
+      "0": "Normal",
+      "1": "Zombie"
     }
   }
 }
