@@ -497,9 +497,14 @@ def load_2da_overrides(d: Path) -> None:
                 n_loaded += 1
         print(f"  override: {fname} → {n_loaded} rows")
 
-    # iprp cost/subtype tables: merge Label column from any iprp_*.2da that
-    # matches a known IPROP_TABLES key. Only adds rows not already present
-    # in itemprops.json; row 0 (always the "Random" sentinel) is skipped.
+    # iprp cost/subtype tables: merge from any iprp_*.2da that matches a known
+    # IPROP_TABLES key. Custom 2das fully override stock entries for existing
+    # rows (e.g. a hak that remaps iprp_immuncost row 3 from 20% to 25%).
+    # Row 0 (always the "Random" sentinel) is skipped.
+    # Column preference: if a "Value" column exists and the Label looks like a
+    # decimal fraction (e.g. "0.25"), use Value formatted as "X%" instead —
+    # this handles CEP2-style immuncost tables whose Label is a float (0.25)
+    # rather than a human string (25%).
     for p in sorted(d.glob("iprp_*.2da")):
         tbl_name = p.stem
         if tbl_name not in IPROP_TABLES or tbl_name == "iprp_feats":
@@ -509,12 +514,18 @@ def load_2da_overrides(d: Path) -> None:
         except Exception as e:
             print(f"  warn: could not parse {p}: {e}", file=sys.stderr)
             continue
+        hdrs_lower = [h.lower() for h in headers]
         try:
-            col_idx = [h.lower() for h in headers].index("label") + 1
+            col_idx = hdrs_lower.index("label") + 1
         except ValueError:
             continue  # no Label column — not an iprp cost table
+        val_idx: int | None = None
+        try:
+            val_idx = hdrs_lower.index("value") + 1
+        except ValueError:
+            pass
         tbl = IPROP_TABLES[tbl_name]
-        n_added = 0
+        n_updated = 0
         for row in rows:
             if not row:
                 continue
@@ -524,15 +535,24 @@ def load_2da_overrides(d: Path) -> None:
                 continue
             if ridx == 0:
                 continue  # sentinel row
-            key = str(ridx)
-            if key in tbl:
-                continue  # don't overwrite entries from itemprops.json
             label = row[col_idx] if col_idx < len(row) else ""
-            if label:
-                tbl[key] = label
-                n_added += 1
-        if n_added:
-            print(f"  override: {p.name} → {n_added} new row(s) → {tbl_name}")
+            if not label:
+                continue
+            # If the label looks like a bare decimal fraction (e.g. "0.25"),
+            # prefer the Value column (e.g. "25") formatted as "25%".
+            display = label
+            if val_idx is not None and re.fullmatch(r"0?\.\d+|1\.?0*", label):
+                raw_val = row[val_idx] if val_idx < len(row) else ""
+                try:
+                    display = f"{int(float(raw_val))}%"
+                except (ValueError, TypeError):
+                    pass
+            key = str(ridx)
+            if tbl.get(key) != display:
+                tbl[key] = display
+                n_updated += 1
+        if n_updated:
+            print(f"  override: {p.name} → {n_updated} row(s) updated → {tbl_name}")
 
 
 def baseitem_name(row: int | None) -> str:
