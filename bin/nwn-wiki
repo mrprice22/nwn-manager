@@ -1648,8 +1648,13 @@ class Db:
 
         # Derived
         self.waypoint_area: dict[str, str] = {}
-        # Transitions: list of {src_area, dst_area, dst_tag, kind, label, src_resref}
+        # Transitions: list of {src_area, dst_area, dst_tag, kind, label, src_resref,
+        #   is_dup_tag?, dst_area_alts?}
         self.transitions: list[dict] = []
+        # tag → list of {"kind", "area", "tag_label"} for every object carrying that
+        # tag. Only populated for tags that are referenced by a transition AND appear
+        # on more than one object (i.e. the destination is ambiguous).
+        self.dup_dest_tags: dict[str, list[dict]] = {}
         # Direct-teleport transitions from placeable OnUsed scripts (not dialog-based).
         self.script_transitions: list[dict] = []
         self.area_npcs: dict[str, list[dict]] = defaultdict(list)
@@ -2037,6 +2042,26 @@ class Db:
                 if tag and tag not in trigger_tag_area:
                     trigger_tag_area[tag] = area_resref
 
+        # Multi-map: tag → ALL objects carrying it (waypoints, doors, triggers).
+        # Used to detect ambiguous LinkedTo targets where the game's "first match"
+        # resolution may send the player to an unexpected area.
+        _tag_all_objects: dict[str, list[dict]] = defaultdict(list)
+        for _ar, _git in self.gits.items():
+            for _wp in list_items(_git.get("WaypointList")):
+                _t = fld(_wp, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "waypoint", "area": _ar, "tag_label": _t})
+        for _ar, _doors in self.area_doors.items():
+            for _d in _doors:
+                _t = fld(_d, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "door", "area": _ar, "tag_label": _t})
+        for _ar, _triggers in self.area_triggers.items():
+            for _tr in _triggers:
+                _t = fld(_tr, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "trigger", "area": _ar, "tag_label": _t})
+
         def resolve_link(linked: str) -> str | None:
             return (self.waypoint_area.get(linked)
                     or door_tag_area.get(linked)
@@ -2079,6 +2104,25 @@ class Db:
                     "key_tag": (fld(d, "KeyName", "") or "").strip(),
                     "key_required": bool(int(fld(d, "KeyRequired", 0) or 0)),
                 })
+
+        # Identify transitions whose LinkedTo tag maps to multiple objects.
+        # The game engine resolves to whichever object it finds first, so the
+        # destination is effectively ambiguous and may surprise the builder.
+        _referenced_tags: set[str] = {tr["dst_tag"] for tr in self.transitions if tr.get("dst_tag")}
+        for _tag in _referenced_tags:
+            _all = _tag_all_objects.get(_tag, [])
+            _unique_areas = list(dict.fromkeys(obj["area"] for obj in _all if obj["area"] in self.areas))
+            if len(_unique_areas) > 1:
+                self.dup_dest_tags[_tag] = _all
+        # Annotate each affected transition with is_dup_tag + list of alt destinations.
+        for tr in self.transitions:
+            tag = tr.get("dst_tag")
+            if tag and tag in self.dup_dest_tags:
+                all_areas = list(dict.fromkeys(
+                    obj["area"] for obj in self.dup_dest_tags[tag] if obj["area"] in self.areas
+                ))
+                tr["is_dup_tag"] = True
+                tr["dst_area_alts"] = [a for a in all_areas if a != tr["dst_area"]]
 
         # Containers: placeables that hold an inventory.
         for area_resref, placeables in self.area_placeables.items():
@@ -4839,6 +4883,26 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
             f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}"/>'
             f'</g>'
         )
+        # Draw dashed edges for alt destinations of dup-tag transitions.
+        if tr.get("is_dup_tag"):
+            for alt in tr.get("dst_area_alts", []):
+                if alt not in positions:
+                    continue
+                alt_key = (min(a, alt), max(a, alt), tr["kind"])
+                if alt_key in drawn:
+                    continue
+                drawn.add(alt_key)
+                ax2, ay2 = rect_edge_point(a, positions[alt])
+                bx2, by2 = rect_edge_point(alt, positions[a])
+                title2 = f"{node_label(a)} ↔ {node_label(alt)} (duplicate tag: may not work)"
+                edge_lines.append(
+                    f'<g class="edge-group"><title>{E(title2)}</title>'
+                    f'<line x1="{ax2 * scale:.1f}" y1="{ay2 * scale:.1f}" '
+                    f'x2="{bx2 * scale:.1f}" y2="{by2 * scale:.1f}" class="edge-hit"/>'
+                    f'<line x1="{ax2 * scale:.1f}" y1="{ay2 * scale:.1f}" '
+                    f'x2="{bx2 * scale:.1f}" y2="{by2 * scale:.1f}" class="edge-dup-tag"/>'
+                    f'</g>'
+                )
 
     # Conversation-teleport edges. Drawn as a separate, dashed style so a
     # quest hub's "rest menu can teleport you to X" doesn't get confused
@@ -5001,6 +5065,8 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
         '.edge-door{stroke:#2d6a3a;stroke-width:3;opacity:0.8;fill:none}'
         '.edge-convo{stroke:#9b4dca;stroke-width:3;opacity:0.85;fill:none;'
         'stroke-dasharray:8,5}'
+        '.edge-dup-tag{stroke:#cc6600;stroke-width:2;opacity:0.75;fill:none;'
+        'stroke-dasharray:5,4}'
         '.edge-hit{stroke:transparent;stroke-width:30;fill:none;'
         'pointer-events:stroke;cursor:help}'
         '.convo-node polygon{fill:#f3e8ff;stroke:#9b4dca;stroke-width:2.4}'
@@ -5099,27 +5165,35 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
 _OMIT: object = object()  # sentinel: "no path-from section on this page"
 
 
-def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str, bool]]]:
+def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str, bool, bool]]]:
     """Directed area→area edge graph from door/trigger transitions and conv teleports.
 
     Uses db.conv_transitions (not db.dialog_teleports directly) so that any
     --exclude-conv-option labels (e.g. "[Admin Options]") are already stripped
     out — the same exclusion that applies to the area map SVG edges.
 
-    Each edge is (dst, kind, label, is_fallback) where is_fallback=True means
-    the transition was resolved via a WP_-prefix-stripping fallback and may not
-    work in-game.
+    Each edge is (dst, kind, label, is_fallback, is_dup_tag) where:
+      is_fallback=True  — resolved via WP_-prefix-stripping fallback; may not work in-game
+      is_dup_tag=True   — LinkedTo tag matches multiple objects; actual destination is ambiguous
     """
-    graph: dict[str, list[tuple[str, str, str, bool]]] = {rr: [] for rr in db.areas}
+    graph: dict[str, list[tuple[str, str, str, bool, bool]]] = {rr: [] for rr in db.areas}
     seen: set[tuple[str, str, str, str]] = set()
     for tr in db.transitions:
         src, dst = tr["src_area"], tr["dst_area"]
-        if not dst or src not in graph or dst not in graph or src == dst:
-            continue
-        key = (src, dst, tr["kind"], tr["label"])
-        if key not in seen:
-            seen.add(key)
-            graph[src].append((dst, tr["kind"], tr["label"], False))
+        is_dup = tr.get("is_dup_tag", False)
+        if dst and src in graph and dst in graph and src != dst:
+            key = (src, dst, tr["kind"], tr["label"])
+            if key not in seen:
+                seen.add(key)
+                graph[src].append((dst, tr["kind"], tr["label"], False, is_dup))
+        # Add edges to all alt destinations for duplicate-tag transitions.
+        if is_dup:
+            for alt_dst in tr.get("dst_area_alts", []):
+                if alt_dst and alt_dst in graph and src != alt_dst:
+                    key = (src, alt_dst, tr["kind"], tr["label"])
+                    if key not in seen:
+                        seen.add(key)
+                        graph[src].append((alt_dst, tr["kind"], tr["label"], False, True))
     for tr in db.conv_transitions:
         src, dst = tr["src"], tr["dst_area"]
         if src not in graph or dst not in graph or src == dst:
@@ -5129,7 +5203,7 @@ def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str, bool]]]:
         key = (src, dst, "talk", label)
         if key not in seen:
             seen.add(key)
-            graph[src].append((dst, "talk", label, False))
+            graph[src].append((dst, "talk", label, False, False))
     for tr in db.script_transitions:
         src, dst = tr["src_area"], tr["dst_area"]
         if not dst or src not in graph or dst not in graph or src == dst:
@@ -5137,33 +5211,33 @@ def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str, bool]]]:
         key = (src, dst, tr["kind"], tr["label"])
         if key not in seen:
             seen.add(key)
-            graph[src].append((dst, tr["kind"], tr["label"], tr.get("fallback", False)))
+            graph[src].append((dst, tr["kind"], tr["label"], tr.get("fallback", False), False))
     return graph
 
 
 def bfs_shortest_path(
-    graph: dict[str, list[tuple[str, str, str, bool]]], src: str, dst: str
-) -> list[tuple[str, str, str, str, bool]] | None:
-    """BFS shortest path; returns list of (from, to, kind, label, is_fallback) or None."""
+    graph: dict[str, list[tuple[str, str, str, bool, bool]]], src: str, dst: str
+) -> list[tuple[str, str, str, str, bool, bool]] | None:
+    """BFS shortest path; returns list of (from, to, kind, label, is_fallback, is_dup_tag) or None."""
     if src == dst:
         return []
     came_from: dict[str, str | None] = {src: None}
-    edge_in: dict[str, tuple[str, str, bool]] = {}
+    edge_in: dict[str, tuple[str, str, bool, bool]] = {}
     q: deque[str] = deque([src])
     while q:
         cur = q.popleft()
-        for dest, kind, label, is_fallback in graph.get(cur, []):
+        for dest, kind, label, is_fallback, is_dup_tag in graph.get(cur, []):
             if dest in came_from:
                 continue
             came_from[dest] = cur
-            edge_in[dest] = (kind, label, is_fallback)
+            edge_in[dest] = (kind, label, is_fallback, is_dup_tag)
             if dest == dst:
-                steps: list[tuple[str, str, str, str, bool]] = []
+                steps: list[tuple[str, str, str, str, bool, bool]] = []
                 node = dst
                 while came_from[node] is not None:
                     prev = came_from[node]
-                    k, l, fb = edge_in[node]
-                    steps.append((prev, node, k, l, fb))
+                    k, l, fb, dup = edge_in[node]
+                    steps.append((prev, node, k, l, fb, dup))
                     node = prev
                 return list(reversed(steps))
             q.append(dest)
@@ -5181,9 +5255,17 @@ def render_areas_index(db: Db, out: Path, *,
     # confirmed non-fallback route (door, trigger, conversation, or direct-tag script).
     has_real_incoming: set[str] = set()
     has_fallback_incoming: set[str] = set()
+    # Areas that are a primary or alternative destination of a dup-tag transition.
+    has_dup_tag_incoming: set[str] = set()
     for tr in db.transitions:
         if tr["dst_area"]:
             has_real_incoming.add(tr["dst_area"])
+        if tr.get("is_dup_tag"):
+            if tr["dst_area"] and tr["dst_area"] in db.areas:
+                has_dup_tag_incoming.add(tr["dst_area"])
+            for alt in tr.get("dst_area_alts", []):
+                if alt in db.areas:
+                    has_dup_tag_incoming.add(alt)
     for tr in db.conv_transitions:
         dst = tr.get("dst_area", "")
         if dst and dst in db.areas:
@@ -5274,7 +5356,11 @@ def render_areas_index(db: Db, out: Path, *,
         reachable_resrefs = sorted_resrefs
         no_path_resrefs = []
 
-    normal_resrefs = [r for r in reachable_resrefs if r not in has_any_fallback]
+    # Prioritise fallback > dup-tag > normal so each area appears in exactly one bucket.
+    normal_resrefs = [r for r in reachable_resrefs
+                      if r not in has_any_fallback and r not in has_dup_tag_incoming]
+    dup_tag_resrefs = [r for r in reachable_resrefs
+                       if r not in has_any_fallback and r in has_dup_tag_incoming]
     suspect_resrefs = [r for r in reachable_resrefs if r in has_any_fallback]
 
     table_head = (
@@ -5291,6 +5377,22 @@ def render_areas_index(db: Db, out: Path, *,
         "\n".join(_area_row(r) for r in normal_resrefs),
         "</tbody></table>",
     ]
+
+    if dup_tag_resrefs:
+        body_parts += [
+            '<h2 id="dup-dest-tags">Areas with duplicate destination tags</h2>',
+            '<p class="warn-dup-tag-note">&#9888; The areas below are destinations of'
+            ' transitions whose <code>LinkedTo</code> tag matches multiple objects'
+            ' (waypoints, doors, or triggers) across the module. The game engine'
+            ' resolves to whichever it finds first, so these routes may send the'
+            ' player to an unexpected area. Check'
+            ' <a href="../module-index/duplicate_destination_tags.json">'
+            'duplicate_destination_tags.json</a> for the full list of conflicting tags'
+            ' and see each area\'s shortest-path section for affected steps.</p>',
+            table_head,
+            "\n".join(_area_row(r) for r in dup_tag_resrefs),
+            "</tbody></table>",
+        ]
 
     if suspect_resrefs:
         body_parts += [
@@ -5405,7 +5507,8 @@ def render_area_page(db: Db, resref: str, out: Path,
             hop_word = "hop" if n == 1 else "hops"
             items = []
             has_fallback_step = False
-            for a, b, kind, label, is_fallback in path_steps:
+            has_dup_tag_step = False
+            for a, b, kind, label, is_fallback, is_dup_tag in path_steps:
                 a_link = link(f"{a}.html", db.area_name(a))
                 b_link = link(f"{b}.html", db.area_name(b))
                 if kind == "door":
@@ -5416,15 +5519,21 @@ def render_area_page(db: Db, resref: str, out: Path,
                     via = E(label)
                 else:
                     via = f'{E(kind)}: {E(label)}'
+                warn = ""
                 if is_fallback:
                     has_fallback_step = True
-                    warn = (' <span class="warn-fallback" title="This transition was'
-                            ' resolved via a WP_-prefix fallback — the waypoint tag'
-                            ' in the script may not match the actual waypoint tag,'
-                            ' making this transition possibly broken in-game."'
-                            '>&#9888; possibly broken</span>')
-                else:
-                    warn = ""
+                    warn += (' <span class="warn-fallback" title="This transition was'
+                             ' resolved via a WP_-prefix fallback — the waypoint tag'
+                             ' in the script may not match the actual waypoint tag,'
+                             ' making this transition possibly broken in-game."'
+                             '>&#9888; possibly broken</span>')
+                if is_dup_tag:
+                    has_dup_tag_step = True
+                    warn += (' <span class="warn-dup-tag" title="The destination tag'
+                             ' for this transition matches multiple objects in the'
+                             ' module. The game engine resolves to whichever it finds'
+                             ' first, which may not be this area."'
+                             '>&#9888; duplicate tag</span>')
                 items.append(
                     f"<li>{a_link} &rarr; {b_link}"
                     f" <em class=\"muted\">[{via}]</em>{warn}</li>"
@@ -5436,9 +5545,17 @@ def render_area_page(db: Db, resref: str, out: Path,
                 ' waypoint is tagged <code>WP_foo</code>.</p>'
                 if has_fallback_step else ""
             )
+            dup_tag_note = (
+                '<p class="warn-dup-tag-note">&#9888; One or more steps use a'
+                ' destination tag that matches multiple objects across the module.'
+                ' The game engine picks whichever it finds first, so the actual'
+                ' in-game destination may differ from what this path shows.</p>'
+                if has_dup_tag_step else ""
+            )
             sections.append(
                 f"<p><strong>{n} {hop_word}</strong></p>"
                 + fallback_note
+                + dup_tag_note
                 + f"<ol>{''.join(items)}</ol>"
             )
 
@@ -12062,16 +12179,17 @@ def generate_module_index(
     """Write LLM-friendly JSON indexes to module_index_dir.
 
     Files written:
-      area_graph.json            — directed area transition graph with names
-      area_paths.json            — BFS shortest paths (only when path_from_resref given)
-      area_index.json            — all areas with names, stats, and connections
-      creature_index.json        — all canonical creatures with stats and locations
-      creature_tag_conflicts.json— creature blueprints that produced variant resrefs
-      item_index.json            — all items with names, costs, and sources
-      cross_faction_creatures.json — blueprints appearing in multiple factions
+      area_graph.json                    — directed area transition graph with names
+      area_paths.json                    — BFS shortest paths (only when path_from_resref given)
+      area_index.json                    — all areas with names, stats, and connections
+      duplicate_destination_tags.json    — transitions whose LinkedTo tag matches multiple objects
+      creature_index.json                — all canonical creatures with stats and locations
+      creature_tag_conflicts.json        — creature blueprints that produced variant resrefs
+      item_index.json                    — all items with names, costs, and sources
+      cross_faction_creatures.json       — blueprints appearing in multiple factions
       faction_bp_instance_discrepancies.json — placed instances whose FactionID differs from their blueprint
-      inaccessible_items.json    — items not reachable by players
-      unspawned_creatures.json   — creature blueprints never placed or in an encounter
+      inaccessible_items.json            — items not reachable by players
+      unspawned_creatures.json           — creature blueprints never placed or in an encounter
     """
     module_index_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now().isoformat(timespec="seconds")
@@ -12097,7 +12215,7 @@ def generate_module_index(
     for rr in sorted(db.areas):
         area_name = db.area_name(rr)
         edges = []
-        for dst, kind, label, is_fallback in graph.get(rr, []):
+        for dst, kind, label, is_fallback, is_dup_tag in graph.get(rr, []):
             edge: dict[str, Any] = {
                 "to": dst,
                 "to_name": db.area_name(dst),
@@ -12106,6 +12224,8 @@ def generate_module_index(
             }
             if is_fallback:
                 edge["is_fallback"] = True
+            if is_dup_tag:
+                edge["is_dup_tag"] = True
             edges.append(edge)
         area_graph_data[rr] = {
             "name": area_name,
@@ -12140,8 +12260,9 @@ def generate_module_index(
                             "kind": kind,
                             "label": label,
                             **({"is_fallback": True} if is_fb else {}),
+                            **({"is_dup_tag": True} if is_dup else {}),
                         }
-                        for frm, to, kind, label, is_fb in steps
+                        for frm, to, kind, label, is_fb, is_dup in steps
                     ],
                 }
         _write_json(module_index_dir / "area_paths.json", {
@@ -12157,6 +12278,63 @@ def generate_module_index(
         print(f"[nwn-wiki] module-index: area_paths.json "
               f"({len(paths_out)} reachable, {len(unreachable)} unreachable)")
 
+    # -------------------------------------------------------- duplicate_destination_tags.json
+    dup_tag_entries: list[dict] = []
+    for tag in sorted(db.dup_dest_tags, key=str.lower):
+        objects = db.dup_dest_tags[tag]
+        matching = [
+            {
+                "kind": obj["kind"],
+                "area": obj["area"],
+                "area_name": db.area_name(obj["area"]),
+                "wiki_url": _au(obj["area"]),
+            }
+            for obj in objects
+            if obj["area"] in db.areas
+        ]
+        transitions_using = [
+            {
+                "src_area": tr["src_area"],
+                "src_area_name": db.area_name(tr["src_area"]),
+                "src_wiki_url": _au(tr["src_area"]),
+                "kind": tr["kind"],
+                "label": tr["label"],
+                "primary_dst": tr["dst_area"] or "",
+                "primary_dst_name": db.area_name(tr["dst_area"]) if tr["dst_area"] else "",
+                "alt_dsts": [
+                    {"area": a, "area_name": db.area_name(a)}
+                    for a in tr.get("dst_area_alts", [])
+                ],
+            }
+            for tr in db.transitions
+            if tr.get("dst_tag") == tag
+        ]
+        dup_tag_entries.append({
+            "tag": tag,
+            "matching_object_count": len(matching),
+            "matching_objects": matching,
+            "transition_count": len(transitions_using),
+            "transitions_using_tag": transitions_using,
+        })
+    _write_json(module_index_dir / "duplicate_destination_tags.json", {
+        "_description": (
+            "Transitions whose LinkedTo tag matches multiple objects (waypoints, doors, "
+            "or triggers) across the module. The NWN engine resolves ambiguous tags to "
+            "whichever matching object it finds first, so these routes may send the "
+            "player to an unexpected area. Each entry lists all objects carrying the "
+            "tag and every transition that references it."
+        ),
+        "generated_at": now,
+        "module": module_title,
+        "count": len(dup_tag_entries),
+        "duplicate_tags": dup_tag_entries,
+    })
+    if dup_tag_entries:
+        print(f"[nwn-wiki] module-index: duplicate_destination_tags.json "
+              f"({len(dup_tag_entries)} duplicate tag(s))")
+    else:
+        print("[nwn-wiki] module-index: duplicate_destination_tags.json (none)")
+
     # ------------------------------------------------------------------ area_index.json
     area_index: list[dict] = []
     for rr in sorted(db.areas, key=lambda r: db.area_name(r).lower()):
@@ -12165,7 +12343,7 @@ def generate_module_index(
         n_stores = len(db.area_stores.get(rr, []))
         n_containers = len(db.area_containers.get(rr, []))
         connections = sorted({
-            dst for dst, _kind, _label, _fb in graph.get(rr, [])
+            dst for dst, _kind, _label, _fb, _dup in graph.get(rr, [])
         })
         area_index.append({
             "resref": rr,
@@ -12886,6 +13064,11 @@ def main() -> int:
         a, b = tr["src_area"], tr["dst_area"]
         if a in visible_areas and b in visible_areas:
             edges.append((a, b))
+        # Include alt destinations for dup-tag transitions so they appear on the map.
+        if tr.get("is_dup_tag"):
+            for alt in tr.get("dst_area_alts", []):
+                if a in visible_areas and alt in visible_areas:
+                    edges.append((a, alt))
     for tr in db.script_transitions:
         a, b = tr["src_area"], tr["dst_area"]
         if a in visible_areas and b and b in visible_areas:

@@ -412,6 +412,22 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.95em;
 }
+
+/* Duplicate destination tag warnings */
+.warn-dup-tag {
+  color: #b54708;
+  font-size: 0.85em;
+  margin-left: 0.5em;
+  cursor: help;
+}
+.warn-dup-tag-note {
+  background: #fff8ed;
+  border-left: 3px solid #cc6600;
+  color: #7a3c00;
+  padding: 0.5em 0.75em;
+  margin: 0.5em 0 1em;
+  font-size: 0.9em;
+}
 .note-pickpocket {
   background: #f0fff4;
   border-left: 4px solid #2e8b57;
