@@ -55,6 +55,16 @@ _warned: dict[str, list[str]] = {}
 # record which item/creature triggered them.
 _current_context: str = ""
 
+# Module-index summary collector: (severity, message) tuples accumulated during
+# generation and printed as a grouped, colour-coded block at the end of the run.
+# severity ∈ {"info", "warn", "issue"}
+_module_index_summary: list[tuple[str, str]] = []
+
+_C_INFO  = "\033[36m"    # cyan — informational
+_C_WARN  = "\033[33m"    # yellow — warnings
+_C_ISSUE = "\033[1;31m"  # bold red — major issues
+_C_RESET = "\033[0m"
+
 
 def _warn_once(msg: str) -> None:
     global _warned, _current_context
@@ -12127,9 +12137,9 @@ def generate_tag_conflict_report(
     out_path = module_index_dir / "item_tag_conflicts.json"
     out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     if conflicts:
-        print(f"[nwn-wiki] tag conflicts: {len(conflicts)} conflict(s) written → {out_path}")
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: item_tag_conflicts.json ({len(conflicts)} conflict(s)) — {out_path}"))
     else:
-        print(f"[nwn-wiki] tag conflicts: none found → {out_path}")
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: item_tag_conflicts.json (none) — {out_path}"))
 
 
 # ---------------------------------------------------------------------------
@@ -12236,7 +12246,7 @@ def generate_module_index(
         "area_count": len(area_graph_data),
         "areas": area_graph_data,
     })
-    print(f"[nwn-wiki] module-index: area_graph.json ({len(area_graph_data)} areas)")
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_graph.json ({len(area_graph_data)} areas)"))
 
     # ------------------------------------------------------------------ area_paths.json
     if path_from_resref and area_paths is not None:
@@ -12272,8 +12282,7 @@ def generate_module_index(
             "paths": paths_out,
             "unreachable": sorted(unreachable),
         })
-        print(f"[nwn-wiki] module-index: area_paths.json "
-              f"({len(paths_out)} reachable, {len(unreachable)} unreachable)")
+        _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_paths.json ({len(paths_out)} reachable, {len(unreachable)} unreachable)"))
 
     # -------------------------------------------------------- duplicate_destination_tags.json
     dup_tag_entries: list[dict] = []
@@ -12327,16 +12336,9 @@ def generate_module_index(
         "duplicate_tags": dup_tag_entries,
     })
     if dup_tag_entries:
-        print(f"[nwn-wiki] module-index: duplicate_destination_tags.json "
-              f"({len(dup_tag_entries)} duplicate tag(s)) — "
-              f"{module_index_dir / 'duplicate_destination_tags.json'}")
-        for entry in dup_tag_entries:
-            areas_str = ", ".join(
-                f"{o['area_name']} ({o['area']})" for o in entry["matching_objects"]
-            )
-            print(f"  warn: duplicate destination tag '{entry['tag']}' — {areas_str}")
+        _module_index_summary.append(("issue", f"[nwn-wiki] module-index: duplicate_destination_tags.json ({len(dup_tag_entries)} duplicate tag(s)) — {module_index_dir / 'duplicate_destination_tags.json'}"))
     else:
-        print("[nwn-wiki] module-index: duplicate_destination_tags.json (none)")
+        _module_index_summary.append(("issue", "[nwn-wiki] module-index: duplicate_destination_tags.json (none)"))
 
     # ------------------------------------------------------------------ area_index.json
     area_index: list[dict] = []
@@ -12365,7 +12367,7 @@ def generate_module_index(
         "area_count": len(area_index),
         "areas": area_index,
     })
-    print(f"[nwn-wiki] module-index: area_index.json ({len(area_index)} areas)")
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_index.json ({len(area_index)} areas)"))
 
     # ------------------------------------------------------------------ creature_index.json
     creature_index: list[dict] = []
@@ -12423,7 +12425,7 @@ def generate_module_index(
         "count": len(creature_index),
         "creatures": creature_index,
     })
-    print(f"[nwn-wiki] module-index: creature_index.json ({len(creature_index)} canonical creatures)")
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: creature_index.json ({len(creature_index)} canonical creatures)"))
 
     # ------------------------------------------------------------------ appearance_faction_report.json
     # Group canonical creatures by (appearance_id, faction_id) so that LLMs can
@@ -12493,8 +12495,7 @@ def generate_module_index(
         ),
         "appearances": app_report,
     })
-    print(f"[nwn-wiki] module-index: appearance_faction_report.json "
-          f"({len(app_report)} appearances, {cross_count} cross-faction)")
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: appearance_faction_report.json ({len(app_report)} appearances, {cross_count} cross-faction)"))
 
     # ------------------------------------------------------------------ creature_tag_conflicts.json
     # Canonical entries whose resref was synthesised as bp__v2, bp__v3, …
@@ -12554,8 +12555,7 @@ def generate_module_index(
         ),
         "conflicts": ct_conflicts,
     })
-    print(f"[nwn-wiki] module-index: creature_tag_conflicts.json "
-          f"({len(ct_conflicts)} blueprint(s) with variants)")
+    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: creature_tag_conflicts.json ({len(ct_conflicts)} blueprint(s) with variants)"))
 
     # ------------------------------------------------------------------ item_index.json
     def _item_sources(rr: str) -> list[str]:
@@ -12607,7 +12607,7 @@ def generate_module_index(
         "count": len(item_index),
         "items": item_index,
     })
-    print(f"[nwn-wiki] module-index: item_index.json ({len(item_index)} items)")
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: item_index.json ({len(item_index)} items)"))
 
     # ------------------------------------------------------------------ cross_faction_creatures.json
     crr_fids: dict[str, set[int]] = defaultdict(set)
@@ -12664,7 +12664,7 @@ def generate_module_index(
         ),
         "creatures": cf_creatures,
     })
-    print(f"[nwn-wiki] module-index: cross_faction_creatures.json ({len(cf_creatures)} blueprint(s))")
+    _module_index_summary.append(("issue", f"[nwn-wiki] module-index: cross_faction_creatures.json ({len(cf_creatures)} blueprint(s))"))
 
     # ------------------------------------------------------------------ faction_bp_instance_discrepancies.json
     # Each entry: a placed GIT instance whose FactionID differs from its blueprint's FactionID.
@@ -12712,7 +12712,7 @@ def generate_module_index(
         ),
         "discrepancies": discrepancies,
     })
-    print(f"[nwn-wiki] module-index: faction_bp_instance_discrepancies.json ({len(discrepancies)} instance(s))")
+    _module_index_summary.append(("issue", f"[nwn-wiki] module-index: faction_bp_instance_discrepancies.json ({len(discrepancies)} instance(s))"))
 
     # ------------------------------------------------------------------ inaccessible_items.json
     inac_items: list[dict] = []
@@ -12763,7 +12763,7 @@ def generate_module_index(
         ),
         "items": inac_items,
     })
-    print(f"[nwn-wiki] module-index: inaccessible_items.json ({len(inac_items)} item(s))")
+    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: inaccessible_items.json ({len(inac_items)} item(s))"))
 
     # ------------------------------------------------------------------ unspawned_creatures.json
     placed_bps: set[str] = {
@@ -12808,7 +12808,7 @@ def generate_module_index(
         ),
         "creatures": unspawned,
     })
-    print(f"[nwn-wiki] module-index: unspawned_creatures.json ({len(unspawned)} blueprint(s))")
+    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: unspawned_creatures.json ({len(unspawned)} blueprint(s))"))
 
 
 def _write_json(path: Path, data: Any) -> None:
@@ -13206,10 +13206,23 @@ def main() -> int:
         "warnings": warnings_out,
     })
     if warnings_out:
-        print(f"[nwn-wiki] module-index: lookup_warnings.json "
-              f"({len(warnings_out)} lookup failure(s)) — {warnings_path}")
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json ({len(warnings_out)} lookup failure(s)) — {warnings_path}"))
     else:
-        print(f"[nwn-wiki] module-index: lookup_warnings.json (no lookup failures)")
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json (no lookup failures)"))
+
+    if _module_index_summary:
+        print()
+        print("[nwn-wiki] module-index summary:")
+        for label, color, sev in [
+            ("Informational", _C_INFO,  "info"),
+            ("Warnings",      _C_WARN,  "warn"),
+            ("Issues",        _C_ISSUE, "issue"),
+        ]:
+            msgs = [m for s, m in _module_index_summary if s == sev]
+            if msgs:
+                print(f"  {color}{label}:{_C_RESET}")
+                for m in msgs:
+                    print(f"    {color}{m}{_C_RESET}")
 
     print(f"[nwn-wiki] done — {out}/index.html")
     return 0
