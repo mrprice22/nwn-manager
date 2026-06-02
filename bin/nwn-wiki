@@ -48,14 +48,22 @@ _THEME_FAVICON: str = ""     # filename in assets/, e.g. "favicon.png"
 _THEME_HEADER_IMG: str = ""  # filename in assets/, e.g. "header.png"
 _THEME_EXTRA_CSS: str = ""   # filename in assets/, e.g. "theme.css"
 
-# Deduplication set for runtime lookup warnings; avoids flooding stderr on large modules.
-_warned: set[str] = set()
+# Lookup warning registry: message → sorted list of referencing items/creatures.
+# Populated by _warn_once(); avoids flooding stderr on large modules.
+_warned: dict[str, list[str]] = {}
+# Set by rendering functions before processing each entity so warnings can
+# record which item/creature triggered them.
+_current_context: str = ""
 
 
 def _warn_once(msg: str) -> None:
-    if msg not in _warned:
-        _warned.add(msg)
+    global _warned, _current_context
+    already = msg in _warned
+    if not already:
+        _warned[msg] = []
         print(f"  warn: {msg}", file=sys.stderr)
+    if _current_context and _current_context not in _warned[msg]:
+        _warned[msg].append(_current_context)
 
 
 # ---------------------------------------------------------------------------
@@ -8014,6 +8022,7 @@ _PROP_GROUP_ORDER = [
 
 
 def render_items_by_property(db: "Db", out: Path) -> None:
+    global _current_context
     # Map from property name → list of subtype prefix groups.
     # Subtypes matching a prefix (e.g. "Sneak Attack (+1d6)") are grouped under
     # the prefix key on the index page and shown as sub-sections on the detail page.
@@ -8046,6 +8055,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         name = db.item_name(resref)
         if name.startswith("[TLK#") or name == resref:
             continue
+        _current_context = f"item:{resref} ({name})"
         for p in list_items(i.get("PropertiesList")):
             f = itemprop_format(p)
             pname, subtype, cost_str = f["property"], f["subtype"], f["cost"]
@@ -8737,6 +8747,7 @@ function esc(s){
 
 
 def render_items_search(db: "Db", out: Path) -> None:
+    global _current_context
     index: list[dict] = []
     for resref, i in sorted(db.items.items(),
                             key=lambda kv: nwn_text(db.item_name(kv[0])).lower()):
@@ -8753,6 +8764,7 @@ def render_items_search(db: "Db", out: Path) -> None:
         name = db.item_name(resref)
         if name.startswith("[TLK#") or name == resref:
             continue
+        _current_context = f"item:{resref} ({name})"
         _bi_raw = fld(i, "BaseItem", None)
         bi = -1 if _bi_raw is None else int(_bi_raw)
         try:
@@ -12623,6 +12635,7 @@ def _write_json(path: Path, data: Any) -> None:
 
 
 def main() -> int:
+    global _current_context
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", required=True, help="path to unpacked/ tree")
     ap.add_argument("--out", required=True, help="path to output wiki/ dir")
@@ -12955,12 +12968,18 @@ def main() -> int:
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
     render_creatures_by_race(db, out)
     for can_rr in db.canonical_creatures:
+        _current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
         render_creature_page(db, can_rr, out)
+    _current_context = ""
     render_items_index(db, out)
     for resref in db.items:
+        _current_context = f"item:{resref} ({db.item_name(resref)})"
         render_item_page(db, resref, out)
+    _current_context = ""
     render_items_by_property(db, out)
+    _current_context = ""
     render_items_search(db, out)
+    _current_context = ""
     render_stores_index(db, out)
     for area_rr, inst_list in db.area_stores.items():
         if area_rr in db.hidden_areas:
@@ -12987,17 +13006,21 @@ def main() -> int:
 
     # Write lookup warnings to module-index so they're visible outside the build log.
     warnings_path = module_index_dir / "lookup_warnings.json"
-    sorted_warnings = sorted(_warned)
+    sorted_warnings = sorted(_warned.keys())
+    warnings_out = [
+        {"message": msg, "referenced_by": sorted(_warned[msg])}
+        for msg in sorted_warnings
+    ]
     _write_json(warnings_path, {
         "_description": "Lookup failures encountered during wiki generation. "
                         "Integers or [TLK#N] placeholders may appear on wiki pages "
                         "for each entry below. Re-run with --dialog-tlk / --custom-tlk "
                         "and/or --2da-dir to resolve.",
-        "count": len(sorted_warnings),
-        "warnings": sorted_warnings,
+        "count": len(warnings_out),
+        "warnings": warnings_out,
     })
-    if sorted_warnings:
-        print(f"[nwn-wiki] module-index: lookup_warnings.json ({len(sorted_warnings)} warning(s))")
+    if warnings_out:
+        print(f"[nwn-wiki] module-index: lookup_warnings.json ({len(warnings_out)} warning(s))")
     else:
         print(f"[nwn-wiki] module-index: lookup_warnings.json (no lookup failures)")
 
