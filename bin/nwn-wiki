@@ -61,7 +61,6 @@ def _warn_once(msg: str) -> None:
     already = msg in _warned
     if not already:
         _warned[msg] = []
-        print(f"  warn: {msg}", file=sys.stderr)
     if _current_context and _current_context not in _warned[msg]:
         _warned[msg].append(_current_context)
 
@@ -5385,10 +5384,8 @@ def render_areas_index(db: Db, out: Path, *,
             ' transitions whose <code>LinkedTo</code> tag matches multiple objects'
             ' (waypoints, doors, or triggers) across the module. The game engine'
             ' resolves to whichever it finds first, so these routes may send the'
-            ' player to an unexpected area. Check'
-            ' <a href="../module-index/duplicate_destination_tags.json">'
-            'duplicate_destination_tags.json</a> for the full list of conflicting tags'
-            ' and see each area\'s shortest-path section for affected steps.</p>',
+            ' player to an unexpected area. See each area\'s shortest-path section'
+            ' for affected steps.</p>',
             table_head,
             "\n".join(_area_row(r) for r in dup_tag_resrefs),
             "</tbody></table>",
@@ -12331,7 +12328,13 @@ def generate_module_index(
     })
     if dup_tag_entries:
         print(f"[nwn-wiki] module-index: duplicate_destination_tags.json "
-              f"({len(dup_tag_entries)} duplicate tag(s))")
+              f"({len(dup_tag_entries)} duplicate tag(s)) — "
+              f"{module_index_dir / 'duplicate_destination_tags.json'}")
+        for entry in dup_tag_entries:
+            areas_str = ", ".join(
+                f"{o['area_name']} ({o['area']})" for o in entry["matching_objects"]
+            )
+            print(f"  warn: duplicate destination tag '{entry['tag']}' — {areas_str}")
     else:
         print("[nwn-wiki] module-index: duplicate_destination_tags.json (none)")
 
@@ -13203,7 +13206,8 @@ def main() -> int:
         "warnings": warnings_out,
     })
     if warnings_out:
-        print(f"[nwn-wiki] module-index: lookup_warnings.json ({len(warnings_out)} warning(s))")
+        print(f"[nwn-wiki] module-index: lookup_warnings.json "
+              f"({len(warnings_out)} lookup failure(s)) — {warnings_path}")
     else:
         print(f"[nwn-wiki] module-index: lookup_warnings.json (no lookup failures)")
 
