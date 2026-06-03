@@ -1843,6 +1843,12 @@ class Db:
         # granted via a dialog node's built-in Quest/QuestEntry fields (no script needed).
         self.quest_dialog_grants: dict[str, dict[int, set[str]]] = defaultdict(
             lambda: defaultdict(set))
+        # dialog resref → {quest_tag_lower → set of entry_ids granted in that dialog}
+        # (reverse of quest_grants + quest_dialog_grants; built by _build_dialog_quest_index)
+        self.dialog_quest_grants_rev: dict[str, dict[str, set[int]]] = defaultdict(
+            lambda: defaultdict(set))
+        # quest_tag_lower → (display_name, slug) for link generation
+        self.quest_tag_to_info: dict[str, tuple[str, str]] = {}
         # item resref → list of script-source dicts for the item page
         # {"kind", "script", "label", "areas", "dlg", "crr", "prr"}
         self.item_from_script: dict[str, list[dict]] = defaultdict(list)
@@ -3356,6 +3362,7 @@ class Db:
         self._index_random_treasure_containers()
         self._index_key_items()
         self._index_script_item_checks()
+        self._build_dialog_quest_index()
 
     def _index_script_item_sources(self) -> None:
         """Trace CreateItemOnObject calls back to their trigger context and
@@ -3746,6 +3753,45 @@ class Db:
                     seen.add(key)
                     uniq.append(entry)
             self.item_script_checks[rr] = uniq
+
+    def _build_dialog_quest_index(self) -> None:
+        """Populate dialog_quest_grants_rev and quest_tag_to_info.
+        Must run after _index_script_item_checks (all quest_grants/quest_dialog_grants built)."""
+        if not self.jrl:
+            return
+
+        # Build quest_tag_to_info from the journal categories.
+        used_slugs: set[str] = set()
+        for c in list_items(self.jrl.get("Categories")):
+            if _quest_hidden(fld(c, "Comment", "")):
+                continue
+            q_tag = (fld(c, "Tag", "") or "").strip().lower()
+            q_name = loc(c.get("Name")) or q_tag
+            slug = _quest_slug(q_tag, q_name, used_slugs)
+            if q_tag:
+                self.quest_tag_to_info[q_tag] = (q_name, slug)
+
+        # Invert quest_dialog_grants: q_tag/eid/dlg_rr → dialog_quest_grants_rev
+        for q_tag, eid_map in self.quest_dialog_grants.items():
+            if q_tag not in self.quest_tag_to_info:
+                continue
+            for eid, dlg_set in eid_map.items():
+                for dlg_rr in dlg_set:
+                    self.dialog_quest_grants_rev[dlg_rr][q_tag].add(eid)
+
+        # Script-based grants: action scripts in a dialog that call AddJournalQuestEntry
+        script_to_dlgs: dict[str, set[str]] = defaultdict(set)
+        for dlg_rr, entries in self.dialog_scripts.items():
+            for e in entries:
+                if e["kind"] == "action":
+                    script_to_dlgs[e["resref"]].add(dlg_rr)
+        for q_tag, eid_map in self.quest_grants.items():
+            if q_tag not in self.quest_tag_to_info:
+                continue
+            for eid, script_set in eid_map.items():
+                for script_rr in script_set:
+                    for dlg_rr in script_to_dlgs.get(script_rr, set()):
+                        self.dialog_quest_grants_rev[dlg_rr][q_tag].add(eid)
 
     def _build_store_openers(self) -> None:
         """Populate store_tag_openers. Must be called after index_dialogs so
@@ -8246,6 +8292,40 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
+    # ---- Related quests ----
+    # Collect quests from every dialog and script that checks this item's tag.
+    item_quest_map: dict[str, set[int]] = defaultdict(set)  # q_tag → entry_ids
+    for sc in db.item_script_checks.get(resref, []):
+        dlg = sc.get("dialog", "")
+        if dlg:
+            for q_tag, eids in db.dialog_quest_grants_rev.get(dlg, {}).items():
+                item_quest_map[q_tag].update(eids)
+        else:
+            script_rr = sc.get("script", "")
+            for q_tag, eid_map in db.quest_grants.items():
+                for eid, script_set in eid_map.items():
+                    if script_rr in script_set:
+                        item_quest_map[q_tag].add(eid)
+    if item_quest_map:
+        rows = []
+        for q_tag in sorted(item_quest_map,
+                            key=lambda t: db.quest_tag_to_info.get(t, (t, ""))[0].lower()):
+            q_name, q_slug = db.quest_tag_to_info.get(q_tag, (q_tag, ""))
+            eids = sorted(item_quest_map[q_tag])
+            step_str = ", ".join(str(e) for e in eids)
+            quest_link = (link(f"../quests/{q_slug}.html", q_name)
+                          if q_slug else E(q_name))
+            rows.append(f"<tr><td>{quest_link}</td><td><code>{E(q_tag)}</code></td>"
+                        f"<td>{E(step_str)}</td></tr>")
+        sections.append(
+            "<h2>Related quests</h2>"
+            '<p class="muted">This item is checked in scripts that grant entries '
+            "in these quests:</p>"
+            '<table class="data"><thead><tr>'
+            "<th>Quest</th><th>Tag</th><th>Step(s)</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
     write(out / "items" / f"{resref}.html",
           page(name, "\n".join(sections), root_rel=".."))
 
@@ -10781,32 +10861,115 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
     entries = list_items(c.get("EntryList"))
     grants = db.quest_grants.get((tag or "").lower(), {})
     dlg_grants = db.quest_dialog_grants.get((tag or "").lower(), {})
+
+    # Build a reverse tag→resref map for items referenced in granting scripts
+    tag_to_item_rr: dict[str, str] = {}
+    for rr, it in db.items.items():
+        t = (fld(it, "Tag", "") or "").strip().lower()
+        if t:
+            tag_to_item_rr.setdefault(t, rr)
+
+    def _item_link(irr: str) -> str:
+        return (link(f"../items/{irr}.html", db.item_name(irr))
+                if irr in db.items else E(db.item_name(irr)))
+
+    def _items_html(item_set: set[str]) -> str:
+        if not item_set:
+            return '<span class="muted">&mdash;</span>'
+        return ", ".join(
+            _item_link(irr)
+            for irr in sorted(item_set, key=lambda r: db.item_name(r).lower())
+        )
+
+    def _collect_entry_items(granters: list[str], granting_dlgs: list[str]
+                             ) -> tuple[set[str], set[str], set[str]]:
+        """Return (required, consumed, granted) item resref sets for a quest entry.
+        required  — checked in condition (Active) scripts of granting dialogs
+        consumed  — checked in action scripts of granting dialogs or granting scripts
+        granted   — created by granting action scripts or granting scripts
+        """
+        required: set[str] = set()
+        consumed: set[str] = set()
+        granted: set[str] = set()
+
+        for dlg_rr in granting_dlgs:
+            for ds in db.dialog_scripts.get(dlg_rr, []):
+                s_rr = ds["resref"]
+                s_kind = ds["kind"]
+                if s_kind == "active":
+                    for itag in db.script_checks_item_tags.get(s_rr, set()):
+                        irr = tag_to_item_rr.get(itag.lower())
+                        if irr:
+                            required.add(irr)
+                elif s_kind == "action":
+                    for itag in db.script_checks_item_tags.get(s_rr, set()):
+                        irr = tag_to_item_rr.get(itag.lower())
+                        if irr:
+                            consumed.add(irr)
+                    for irr in db.script_creates_items.get(s_rr, []):
+                        if irr in db.items:
+                            granted.add(irr)
+
+        for script_rr in granters:
+            for itag in db.script_checks_item_tags.get(script_rr, set()):
+                irr = tag_to_item_rr.get(itag.lower())
+                if irr:
+                    consumed.add(irr)
+            for irr in db.script_creates_items.get(script_rr, []):
+                if irr in db.items:
+                    granted.add(irr)
+
+        # Items that are both required and consumed are consumed (they get taken)
+        required -= consumed
+        return required, consumed, granted
+
     if not entries:
         parts.append("<p>(no journal entries)</p>")
     else:
         rows = []
+        any_req = any_cons = any_granted = False
         for e in sorted(entries, key=_quest_entry_id):
             eid = _quest_entry_id(e)
             end = fld(e, "End", 0)
             txt = loc(e.get("Text"))
             granters = sorted(grants.get(eid, set()))
             granter_parts = [_script_link(db, s) for s in granters]
-            for dlg_rr in sorted(dlg_grants.get(eid, set())):
+            granting_dlgs = sorted(dlg_grants.get(eid, set()))
+            for dlg_rr in granting_dlgs:
                 dlg_label = db.dialog_label(dlg_rr)
                 granter_parts.append(
                     link(f"../conversations/{dlg_rr}.html",
                          f"dialog: {dlg_label}"))
             grant_html = (", ".join(granter_parts)
                           if granter_parts else '<span class="muted">&mdash;</span>')
+            req, cons, granted = _collect_entry_items(granters, granting_dlgs)
+            if req:
+                any_req = True
+            if cons:
+                any_cons = True
+            if granted:
+                any_granted = True
             end_badge = '<span class="badge">final</span>' if end else ""
-            rows.append(
-                f"<tr><td>{eid}</td><td>{end_badge}</td>"
-                f"<td>{nwn_html(txt)}</td><td>{grant_html}</td></tr>"
-            )
+            rows.append((eid, end_badge, txt, grant_html, req, cons, granted))
+
+        # Only show item columns that have data in at least one row
+        header = ("<th>ID</th><th></th><th>Journal text</th><th>Awarded by</th>"
+                  + ("<th>Items required</th>" if any_req else "")
+                  + ("<th>Items consumed</th>" if any_cons else "")
+                  + ("<th>Items granted</th>" if any_granted else ""))
+        table_rows = []
+        for eid, end_badge, txt, grant_html, req, cons, granted in rows:
+            r = (f"<tr><td>{eid}</td><td>{end_badge}</td>"
+                 f"<td>{nwn_html(txt)}</td><td>{grant_html}</td>"
+                 + (f"<td>{_items_html(req)}</td>" if any_req else "")
+                 + (f"<td>{_items_html(cons)}</td>" if any_cons else "")
+                 + (f"<td>{_items_html(granted)}</td>" if any_granted else "")
+                 + "</tr>")
+            table_rows.append(r)
         parts.append(
             '<table class="data"><thead><tr>'
-            "<th>ID</th><th></th><th>Journal text</th><th>Awarded by</th>"
-            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+            + header +
+            "</tr></thead><tbody>" + "\n".join(table_rows) + "</tbody></table>"
         )
 
     write(out / "quests" / f"{slug}.html",
@@ -11281,6 +11444,25 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             '<p class="muted">These items\' tags are checked via '
             "<code>GetItemPossessedBy</code> in this conversation's scripts:</p>"
             "<ul>" + "".join(f"<li>{h}</li>" for h in item_links) + "</ul>"
+        )
+
+    # ---- Quest entries granted ----
+    dlg_quests = db.dialog_quest_grants_rev.get(resref, {})
+    if dlg_quests:
+        rows = []
+        for q_tag in sorted(dlg_quests, key=lambda t: db.quest_tag_to_info.get(t, (t, ""))[0].lower()):
+            q_name, q_slug = db.quest_tag_to_info.get(q_tag, (q_tag, ""))
+            eids = sorted(dlg_quests[q_tag])
+            step_str = ", ".join(str(e) for e in eids)
+            quest_link = (link(f"../quests/{q_slug}.html", q_name)
+                          if q_slug else E(q_name))
+            rows.append(f"<tr><td>{quest_link}</td><td><code>{E(q_tag)}</code></td>"
+                        f"<td>{E(step_str)}</td></tr>")
+        sections.append(
+            "<h2>Quest entries granted</h2>"
+            '<table class="data"><thead><tr>'
+            "<th>Quest</th><th>Tag</th><th>Step(s)</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
     # ---- Custom tokens summary (non-z-dialog only) ----
