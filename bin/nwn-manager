@@ -637,11 +637,12 @@ cmd_serve() {
           ts=$(date '+%Y-%m-%d %H:%M:%S')
           if [[ -z "$(git -C "$root" status --porcelain -- docs/activity.html 2>/dev/null)" ]]; then
             echo "[$PROG] serve: no changes to activity.html; skipping commit"
-          else
-            git -C "$root" add -- docs/activity.html
-            git -C "$root" commit -m "Auto Wiki Activity Refresh: $ts"
-            git -C "$root" push
+          elif git -C "$root" add -- docs/activity.html \
+            && git -C "$root" commit -m "Auto Wiki Activity Refresh: $ts" \
+            && git -C "$root" push; then
             echo "[$PROG] serve: committed and pushed activity update ($ts)"
+          else
+            echo "[$PROG] serve: warn: git publish failed; will retry next poll" >&2
           fi
         fi
       else
