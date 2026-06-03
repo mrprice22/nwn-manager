@@ -5671,6 +5671,10 @@ def render_area_page(db: Db, resref: str, out: Path,
             hp = fld(c, "MaxHitPoints", fld(c, "HitPoints", ""))
             cr = fld(c, "ChallengeRating", "")
             conv = fld(c, "Conversation", "")
+            if not conv:
+                bp = db.creatures.get(rr.lower())
+                if bp:
+                    conv = fld(bp, "Conversation", "") or ""
             can_rr = db.canonical_for_inst.get((resref, idx), rr)
             inst_url = f"../creatures/{can_rr}.html"
             name_cell = f'<a href="{E(inst_url)}">{nwn_html(disp)}</a>'
