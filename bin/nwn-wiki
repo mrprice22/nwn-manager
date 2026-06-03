@@ -1853,6 +1853,8 @@ class Db:
         self.script_checks_item_tags: dict[str, set[str]] = defaultdict(set)
         # item resref → list of {kind, script, event, area(s), …} for script-based key checks
         self.item_script_checks: dict[str, list[dict]] = defaultdict(list)
+        # dialog resref → sorted list of item resrefs whose tags are checked in that dialog
+        self.dialog_item_checks: dict[str, list[str]] = defaultdict(list)
         # (area_rr, container_idx) pairs for containers with random-treasure OnOpen
         self.random_treasure_containers: set[tuple[str, int]] = set()
         # Property-variant tracking: inline items with the same TemplateResRef but
@@ -3683,24 +3685,55 @@ class Db:
                     _emit(s, {"kind": "area-event", "event": label, "script": s,
                                "area": area_rr, "areas": [area_rr]})
 
-        # Dialog action scripts → trace back to callers via dialog_callers
-        action_script_to_dlgs: dict[str, set[str]] = defaultdict(set)
+        # Dialog action/condition scripts → item_script_checks + dialog_item_checks
+        # Both "action" (node fires) and "active" (condition gate) scripts can check items.
+        dlg_script_to_dlgs: dict[str, dict[str, set[str]]] = {
+            "action": defaultdict(set),
+            "active": defaultdict(set),
+        }
         for dlg_rr, entries in self.dialog_scripts.items():
             for e in entries:
-                if e["kind"] == "action":
-                    action_script_to_dlgs[e["resref"]].add(dlg_rr)
-        for script_rr, dlg_set in action_script_to_dlgs.items():
-            if script_rr not in self.script_checks_item_tags:
-                continue
-            for dlg_rr in dlg_set:
-                for caller in self.dialog_callers.get(dlg_rr, []):
-                    _emit(script_rr, {
-                        "kind": "dialog-action", "script": script_rr,
-                        "dialog": dlg_rr,
-                        "caller_kind": caller.get("kind", ""),
-                        "caller_resref": caller.get("resref", ""),
-                        "areas": caller.get("areas", []),
-                    })
+                kind = e["kind"]
+                if kind in dlg_script_to_dlgs:
+                    dlg_script_to_dlgs[kind][e["resref"]].add(dlg_rr)
+
+        # Build dialog_item_checks: dialog → item resrefs checked in any script
+        for script_kind, script_to_dlgs in dlg_script_to_dlgs.items():
+            for script_rr, dlg_set in script_to_dlgs.items():
+                if script_rr not in self.script_checks_item_tags:
+                    continue
+                for tag in self.script_checks_item_tags[script_rr]:
+                    for item_rr in tag_to_resrefs.get(tag.lower(), []):
+                        for dlg_rr in dlg_set:
+                            if item_rr not in self.dialog_item_checks[dlg_rr]:
+                                self.dialog_item_checks[dlg_rr].append(item_rr)
+
+        # Emit item_script_checks entries for dialog-action and dialog-condition.
+        # If a dialog has no static caller, still emit an entry so the item page
+        # can link back to the conversation (areas will be empty).
+        item_check_kind = {"action": "dialog-action", "active": "dialog-condition"}
+        for script_kind, script_to_dlgs in dlg_script_to_dlgs.items():
+            entry_kind = item_check_kind[script_kind]
+            for script_rr, dlg_set in script_to_dlgs.items():
+                if script_rr not in self.script_checks_item_tags:
+                    continue
+                for dlg_rr in dlg_set:
+                    callers = self.dialog_callers.get(dlg_rr, [])
+                    if callers:
+                        for caller in callers:
+                            _emit(script_rr, {
+                                "kind": entry_kind, "script": script_rr,
+                                "dialog": dlg_rr,
+                                "caller_kind": caller.get("kind", ""),
+                                "caller_resref": caller.get("resref", ""),
+                                "areas": caller.get("areas", []),
+                            })
+                    else:
+                        _emit(script_rr, {
+                            "kind": entry_kind, "script": script_rr,
+                            "dialog": dlg_rr,
+                            "caller_kind": "", "caller_resref": "", "areas": [],
+                        })
 
         # Deduplicate per item
         for rr in list(self.item_script_checks.keys()):
@@ -8180,10 +8213,11 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             kind = sc.get("kind", "")
             if kind == "area-event":
                 ctx_cell = "Area event"
-            elif kind == "dialog-action":
+            elif kind in ("dialog-action", "dialog-condition"):
                 dlg = sc.get("dialog", "")
-                ctx_cell = (link(f"../conversations/{dlg}.html",
-                                 db.dialog_label(dlg) if dlg else dlg)
+                label = db.dialog_label(dlg) if dlg else dlg
+                suffix = "" if kind == "dialog-action" else " (condition)"
+                ctx_cell = (link(f"../conversations/{dlg}.html", label + suffix)
                             if dlg in db.dialogs else E(f"Dialog: {dlg}"))
             elif kind in ("trigger", "trigger-instance"):
                 tag = sc.get("tag") or sc.get("resref") or ""
@@ -11230,6 +11264,23 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             '<table class="data"><thead><tr>'
             "<th>Script</th><th>Slot</th><th>In module</th><th>Notes</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # ---- Items checked ----
+    checked_items = db.dialog_item_checks.get(resref, [])
+    if checked_items:
+        item_links = []
+        for item_rr in sorted(checked_items, key=lambda r: db.item_name(r).lower()):
+            name = db.item_name(item_rr)
+            item_links.append(
+                link(f"../items/{item_rr}.html", name)
+                if item_rr in db.items else E(name)
+            )
+        sections.append(
+            "<h2>Items checked</h2>"
+            '<p class="muted">These items\' tags are checked via '
+            "<code>GetItemPossessedBy</code> in this conversation's scripts:</p>"
+            "<ul>" + "".join(f"<li>{h}</li>" for h in item_links) + "</ul>"
         )
 
     # ---- Custom tokens summary (non-z-dialog only) ----
