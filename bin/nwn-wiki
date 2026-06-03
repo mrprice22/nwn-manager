@@ -12197,6 +12197,7 @@ def generate_module_index(
       faction_bp_instance_discrepancies.json — placed instances whose FactionID differs from their blueprint
       inaccessible_items.json            — items not reachable by players
       unspawned_creatures.json           — creature blueprints never placed or in an encounter
+      instance_only_conversations.json   — creature instances with Conversation overrides not on the blueprint
     """
     module_index_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now().isoformat(timespec="seconds")
@@ -12809,6 +12810,63 @@ def generate_module_index(
         "creatures": unspawned,
     })
     _module_index_summary.append(("warn", f"[nwn-wiki] module-index: unspawned_creatures.json ({len(unspawned)} blueprint(s))"))
+
+    # -------------------------------------------------------- instance_only_conversations.json
+    # Creature instances whose Conversation field is set in the GIT placement but
+    # either missing or empty on the blueprint.  The wiki reads Conversation from
+    # the blueprint canonical, so these NPCs appear to have no conversation on
+    # their creature detail page while showing one on the area page.
+    # Fix: move the conversation value to the blueprint (.utc.json).
+    inst_conv_mismatches: list[dict] = []
+    seen_inst_conv: set[tuple] = set()  # (area_rr, idx) dedup
+    for area_rr, insts in db.area_creature_instances.items():
+        if area_rr in db.hidden_areas:
+            continue
+        for idx, inst in enumerate(insts):
+            key_inst = (area_rr, idx)
+            if key_inst in seen_inst_conv:
+                continue
+            seen_inst_conv.add(key_inst)
+            c_git = inst["c"]
+            inst_conv = (fld(c_git, "Conversation", "") or "").strip()
+            if not inst_conv:
+                continue
+            bp_rr = (fld(c_git, "TemplateResRef", "") or "").lower()
+            bp = db.creatures.get(bp_rr)
+            bp_conv = (fld(bp, "Conversation", "") or "").strip() if bp else ""
+            if inst_conv == bp_conv:
+                continue  # Blueprint already carries the same value — no mismatch
+            can_rr = db.canonical_for_inst.get((area_rr, idx), bp_rr)
+            npc_name = nwn_text(
+                db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures
+                else (db.creature_name(bp_rr) if bp_rr else "")
+            )
+            inst_conv_mismatches.append({
+                "blueprint_resref": bp_rr,
+                "canonical_resref": can_rr,
+                "npc_name": npc_name,
+                "area_resref": area_rr,
+                "area_name": db.area_name(area_rr),
+                "instance_conversation": inst_conv,
+                "blueprint_conversation": bp_conv,
+                "wiki_url": _cu(can_rr) if can_rr in db.canonical_creatures else "",
+                "area_url": _au(area_rr) if area_rr in db.areas else "",
+            })
+    inst_conv_mismatches.sort(key=lambda e: (e["area_name"].lower(), e["npc_name"].lower()))
+    _write_json(module_index_dir / "instance_only_conversations.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(inst_conv_mismatches),
+        "summary": (
+            f"{len(inst_conv_mismatches)} creature instance(s) whose Conversation field is set "
+            f"on the GIT placement but not (or differently) on the blueprint. "
+            f"Fix: copy the value to the blueprint .utc.json and clear the instance override."
+            if inst_conv_mismatches else
+            "All creature conversations are consistently set on blueprints."
+        ),
+        "instances": inst_conv_mismatches,
+    })
+    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: instance_only_conversations.json ({len(inst_conv_mismatches)} instance(s))"))
 
 
 def _write_json(path: Path, data: Any) -> None:
