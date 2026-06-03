@@ -11450,6 +11450,14 @@ _LOG_LEAVE_RE = re.compile(
 _LOG_HEADER_RE = re.compile(
     r'^Messages for: \w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2} (\d{4})'
 )
+# Anvil ServerLogRedirectorService format (NWNX Anvil):
+# I [2026/06/03 09:15:31.274] [Anvil.Services.ServerLogRedirectorService] Player (CDKEY) Joined as Player 1
+_ANVIL_JOIN_RE = re.compile(
+    r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (\S+) \(\w+\) Joined as (Player|Game Master) \d+'
+)
+_ANVIL_LEAVE_RE = re.compile(
+    r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (\S+) Left as a (Player|Game Master)'
+)
 
 
 def _log_subdir_sort_key(p: Path) -> list:
@@ -11458,16 +11466,20 @@ def _log_subdir_sort_key(p: Path) -> list:
     return [int(x) if x.isdigit() else x for x in parts]
 
 
+_LOG_FILE_GLOBS = ("nwserverLog*.txt", "anvil.log")
+
+
 def _collect_log_files(log_dirs: list[Path]) -> list[Path]:
     files: list[Path] = []
     seen: set[Path] = set()
     for d in log_dirs:
         if not d.is_dir():
             continue
-        for f in sorted(d.glob("nwserverLog*.txt")):
-            if f not in seen:
-                files.append(f)
-                seen.add(f)
+        for glob in _LOG_FILE_GLOBS:
+            for f in sorted(d.glob(glob)):
+                if f not in seen:
+                    files.append(f)
+                    seen.add(f)
         # Sort subdirs in REVERSE numeric order so the oldest rotation (highest
         # number, e.g. logs.12) is processed before newer ones (logs.0).
         subdirs = sorted(
@@ -11476,10 +11488,11 @@ def _collect_log_files(log_dirs: list[Path]) -> list[Path]:
             reverse=True,
         )
         for sub in subdirs:
-            for f in sorted(sub.glob("nwserverLog*.txt")):
-                if f not in seen:
-                    files.append(f)
-                    seen.add(f)
+            for glob in _LOG_FILE_GLOBS:
+                for f in sorted(sub.glob(glob)):
+                    if f not in seen:
+                        files.append(f)
+                        seen.add(f)
     return files
 
 
@@ -11510,12 +11523,14 @@ def _save_activity_cache(cache_path: Path, data: dict) -> None:
 
 
 def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool]:
-    """Parse one NWN server log file.
+    """Parse one NWN server log file (nwserverLog*.txt or Anvil anvil.log).
 
     Returns (sessions, has_open_sessions). Each session has player, role,
     join (datetime), leave (datetime|None), duration_min (float|None).
-    Each log file is one server run so sessions never need to span files.
     """
+    is_anvil = log_path.name == "anvil.log"
+    join_re = _ANVIL_JOIN_RE if is_anvil else _LOG_JOIN_RE
+    leave_re = _ANVIL_LEAVE_RE if is_anvil else _LOG_LEAVE_RE
     year = datetime.now().year
     sessions: list[dict] = []
     open_sessions: dict[str, dict] = {}
@@ -11526,16 +11541,20 @@ def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool]:
         return [], False
 
     for line in text.splitlines():
-        m = _LOG_HEADER_RE.match(line)
-        if m:
-            year = int(m.group(1))
-            continue
-        m = _LOG_JOIN_RE.match(line)
+        if not is_anvil:
+            m = _LOG_HEADER_RE.match(line)
+            if m:
+                year = int(m.group(1))
+                continue
+        m = join_re.match(line)
         if m:
             ts_str, player, role = m.group(1), m.group(2), m.group(3)
             try:
-                norm = re.sub(r' +', ' ', ts_str.strip())
-                ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+                if is_anvil:
+                    ts = datetime.strptime(ts_str, "%Y/%m/%d %H:%M:%S")
+                else:
+                    norm = re.sub(r' +', ' ', ts_str.strip())
+                    ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
             except ValueError:
                 continue
             if player in open_sessions:
@@ -11544,12 +11563,15 @@ def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool]:
                 sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
             open_sessions[player] = {"player": player, "role": role, "join": ts}
             continue
-        m = _LOG_LEAVE_RE.match(line)
+        m = leave_re.match(line)
         if m:
             ts_str, player = m.group(1), m.group(2)
             try:
-                norm = re.sub(r' +', ' ', ts_str.strip())
-                ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+                if is_anvil:
+                    ts = datetime.strptime(ts_str, "%Y/%m/%d %H:%M:%S")
+                else:
+                    norm = re.sub(r' +', ' ', ts_str.strip())
+                    ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
             except ValueError:
                 continue
             if player in open_sessions:

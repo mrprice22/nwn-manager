@@ -621,13 +621,15 @@ cmd_serve() {
   echo "[$PROG] serve: project root: $root"
 
   while true; do
+    local _now
+    _now=$(date '+%Y-%m-%d %H:%M:%S')
     # Trigger when: no players currently online AND a logout occurred within
     # the last poll window.  This fires at most once per poll period per
     # session end, naturally self-clears when the window expires, and
     # survives monitor restarts without any saved state.
     if python3 "$wiki_activity" --check-should-refresh "$poll_secs" \
         "${log_dir_args[@]}" "${cache_args[@]}" 2>/dev/null; then
-      echo "[$PROG] serve: $(date '+%Y-%m-%d %H:%M:%S') — no players + recent logout; refreshing activity page"
+      echo "[$PROG] serve: $_now — no players + recent logout; refreshing activity page"
       if python3 "$wiki_activity" \
           --src unpacked --out docs \
           "${log_dir_args[@]}" "${cache_args[@]}"; then
@@ -648,6 +650,11 @@ cmd_serve() {
       else
         echo "[$PROG] serve: warn: activity page refresh failed" >&2
       fi
+    elif python3 "$wiki_activity" --check-online \
+        "${log_dir_args[@]}" "${cache_args[@]}" 2>/dev/null; then
+      echo "[$PROG] serve: $_now — poll: players online"
+    else
+      echo "[$PROG] serve: $_now — poll: no players, no recent logout"
     fi
     sleep "$poll_secs"
   done
