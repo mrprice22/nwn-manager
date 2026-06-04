@@ -653,8 +653,6 @@ cmd_serve() {
     elif python3 "$wiki_activity" --check-online \
         "${log_dir_args[@]}" "${cache_args[@]}" 2>/dev/null; then
       echo "[$PROG] serve: $_now — poll: players online"
-    else
-      echo "[$PROG] serve: $_now — poll: no players, no recent logout"
     fi
     sleep "$poll_secs"
   done

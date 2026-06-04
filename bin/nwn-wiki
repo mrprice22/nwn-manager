@@ -11675,21 +11675,21 @@ def _manual_doc_body(path: Path) -> tuple[str, str]:
 # =============================================================================
 
 _LOG_JOIN_RE = re.compile(
-    r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\] (\S+) \(\w+\) Joined as (Player|Game Master) \d+'
+    r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\] (.+?) \(\w+\) Joined as (Player|Game Master) \d+'
 )
 _LOG_LEAVE_RE = re.compile(
-    r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\] (\S+) Left as a (Player|Game Master)'
+    r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\] (.+?) Left as a (Player|Game Master)'
 )
 _LOG_HEADER_RE = re.compile(
     r'^Messages for: \w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2} (\d{4})'
 )
 # Anvil ServerLogRedirectorService format (NWNX Anvil):
-# I [2026/06/03 09:15:31.274] [Anvil.Services.ServerLogRedirectorService] Player (CDKEY) Joined as Player 1
+# I [2026/06/03 09:15:31.274] [Anvil.Services.ServerLogRedirectorService] Alek Cain (CDKEY) Joined as Player 1
 _ANVIL_JOIN_RE = re.compile(
-    r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (\S+) \(\w+\) Joined as (Player|Game Master) \d+'
+    r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (.+?) \(\w+\) Joined as (Player|Game Master) \d+'
 )
 _ANVIL_LEAVE_RE = re.compile(
-    r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (\S+) Left as a (Player|Game Master)'
+    r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (.+?) Left as a (Player|Game Master)'
 )
 
 
