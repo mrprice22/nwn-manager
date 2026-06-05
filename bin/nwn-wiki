@@ -12133,12 +12133,19 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
     for s in ps:
         if s.get("duration_min") is not None:
             d = s["join"].date()
-            h = s["join"].hour
             day = s["join"].strftime("%a")
             hrs = s["duration_min"] / 60.0
             date_hours[d] = date_hours.get(d, 0.0) + hrs
-            hour_hours[h] = hour_hours.get(h, 0.0) + hrs
             dow_hours[day] = dow_hours.get(day, 0.0) + hrs
+            # Distribute play-hours across every clock hour the session spans,
+            # correctly handling sessions that cross midnight.
+            cur = s["join"]
+            end = cur + timedelta(hours=hrs)
+            while cur < end:
+                next_hour = cur.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                seg_end = min(next_hour, end)
+                hour_hours[cur.hour] = hour_hours.get(cur.hour, 0.0) + (seg_end - cur).total_seconds() / 3600.0
+                cur = seg_end
 
     # Sweep-line: peak concurrent players per day and overall.
     # Leaves are sorted before joins at identical timestamps so a player
