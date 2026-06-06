@@ -446,6 +446,18 @@ cmd_repack() {
   }
   cd "$root"
 
+  # Module-provided build gate (optional, module-agnostic): if the project ships
+  # an executable tests/smoke-test, run it first and abort the repack on failure
+  # so a non-compliant module never builds or installs. The module owns the
+  # actual checks; nwn-manager only knows to run this entrypoint.
+  if [[ -x "$root/tests/smoke-test" ]]; then
+    echo "[$PROG] running module smoke tests: tests/smoke-test"
+    if ! "$root/tests/smoke-test"; then
+      echo "[$PROG] smoke tests FAILED — aborting repack (nothing built or installed)" >&2
+      return 1
+    fi
+  fi
+
   # Build --erfs flag pointing at the haks the module declares so the
   # script compiler can resolve includes (e.g. zep_inc_main.nss,
   # ITEM_PROPERTY_BOOMERANG, gplotAppraiseOpenStore from CEP / engine
