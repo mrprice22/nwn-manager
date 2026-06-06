@@ -147,6 +147,66 @@ is copied there. Extra arguments are passed through to `nasher pack`
 The CLI sanitizes module paths for `nwn_erf` automatically — no need to
 manually symlink modules whose filenames contain apostrophes or spaces.
 
+### Smoke tests
+
+If your module project ships a file at `tests/smoke-test` that is executable,
+`nwn-manager repack` will run it automatically before building or installing
+anything. A non-zero exit aborts the repack with an error message; zero lets
+the build proceed.
+
+```
+my_module/
+└── tests/
+    └── smoke-test   ← any executable: bash script, Python script, compiled binary, …
+```
+
+The entrypoint is fully module-owned — `nwn-manager` only knows to run it.
+Typical uses: check that required HAK files are present, validate a config
+schema, or run a quick NWScript lint pass.
+
+#### Test-count protocol
+
+For a `x/y smoke tests passed` summary, print each result on its own line
+using the prefixes `ok: ` (pass) or `fail: ` (fail):
+
+```sh
+#!/usr/bin/env bash
+# tests/smoke-test — example
+set -uo pipefail
+rc=0
+
+if [[ -f hak/my_module.hak ]]; then
+  echo "ok: hak present"
+else
+  echo "fail: hak/my_module.hak missing"
+  rc=1
+fi
+
+if [[ -f module/my_module.ifo ]]; then
+  echo "ok: module ifo present"
+else
+  echo "fail: module ifo missing"
+  rc=1
+fi
+
+exit $rc
+```
+
+Output during repack:
+
+```
+[nwn-manager] running module smoke tests: tests/smoke-test
+ok: hak present
+ok: module ifo present
+[nwn-manager] 2/2 smoke tests passed
+```
+
+The `ok:`/`fail:` protocol is opt-in — scripts that exit 0/non-zero without
+those lines still work; the count line is simply omitted.
+
+If `tests/smoke-test` does not exist the gate is silently skipped, so adding
+it is purely opt-in.
+
 ### Generate the wiki
 
 ```sh

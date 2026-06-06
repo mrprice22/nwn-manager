@@ -452,7 +452,17 @@ cmd_repack() {
   # actual checks; nwn-manager only knows to run this entrypoint.
   if [[ -x "$root/tests/smoke-test" ]]; then
     echo "[$PROG] running module smoke tests: tests/smoke-test"
-    if ! "$root/tests/smoke-test"; then
+    local smoke_out smoke_exit
+    smoke_out=$("$root/tests/smoke-test" 2>&1) && smoke_exit=0 || smoke_exit=$?
+    [[ -n $smoke_out ]] && echo "$smoke_out"
+    local pass_count fail_count total
+    pass_count=$(echo "$smoke_out" | grep -cE '^(ok)[: ]' || true)
+    fail_count=$(echo "$smoke_out" | grep -cE '^(fail|not ok)[: ]' || true)
+    total=$(( pass_count + fail_count ))
+    if (( total > 0 )); then
+      echo "[$PROG] $pass_count/$total smoke tests passed"
+    fi
+    if (( smoke_exit != 0 )); then
       echo "[$PROG] smoke tests FAILED — aborting repack (nothing built or installed)" >&2
       return 1
     fi
