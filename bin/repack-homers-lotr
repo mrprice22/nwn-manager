@@ -2,13 +2,9 @@
 # Desktop-launcher target: repack Homer's LotR from ./unpacked/ into a .mod
 # and copy it to the install location recorded in .nasher/source.
 #
-# nasher reports "N errored" for known-broken scripts (zep_cr_*, openstore_*,
-# dmw_do_dialog*, etc.) — all benign, documented in bin/CLAUDE.md. The script
-# exits on any such errors by default; pass --force to proceed anyway.
-#
 # Options:
-#   --verbose   Show full nasher output (default: quiet % progress only)
-#   --force     Continue despite errors or warnings reported by nasher
+#   --verbose   Show full nasher output (default: quiet spinner + phase only)
+#   --force     Continue despite compile or nasher errors (default: abort)
 
 set -o pipefail
 
@@ -86,34 +82,26 @@ else
   fi
 fi
 
-# Separate compile-level errors (expected benign failures in zep_cr_*, openstore_*,
-# dmw_do_dialog*, etc.) from nasher-level failures (pack/install errors).
-# Nasher non-tty format has no leading spaces, unlike tty-indented output.
 compile_err_count=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null) || compile_err_count=0
 fatal_lines=$(grep -E "^Error:" "$tmpout" 2>/dev/null || true)
 
-if [[ $nasher_status -ne 0 || -n "$fatal_lines" ]]; then
-  # Always show full nasher output on error; in verbose mode it was already
-  # streamed live, so only dump it here for the quiet (default) path.
+if [[ $nasher_status -ne 0 || -n "$fatal_lines" || $compile_err_count -gt 0 ]]; then
   if [[ $VERBOSE -eq 0 ]]; then
     echo
-    cat "$tmpout"
+    grep -E "^Compile Error:" "$tmpout" | head -40 | sed 's/^/  /'
+    [[ $compile_err_count -gt 40 ]] && echo "  ... ($((compile_err_count - 40)) more compile errors)"
+    [[ -n "$fatal_lines" ]] && echo "$fatal_lines" | sed 's/^/  /'
   fi
+  echo
   if [[ $FORCE -eq 1 ]]; then
-    echo
-    echo "[WARN] nasher reported errors (--force: proceeding anyway)"
+    echo "[WARN] $compile_err_count compile error(s) (--force: proceeding anyway)"
   else
-    echo
-    echo "[ERROR] nasher reported errors — aborting."
+    echo "[ERROR] $compile_err_count compile error(s) — aborting."
     echo "        Re-run with --force to proceed despite errors."
     echo
     read -rp "Press Enter to close..."
     exit 1
   fi
-fi
-
-if [[ $compile_err_count -gt 0 ]]; then
-  echo "[note] $compile_err_count known compile error(s) suppressed (run --verbose to see)"
 fi
 
 echo
