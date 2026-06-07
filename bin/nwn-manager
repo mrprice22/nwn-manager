@@ -538,8 +538,22 @@ cmd_repack() {
     fi
     local stamp_when stamp_git stamp
     stamp_when=$(date '+%Y-%m-%d %H:%M %Z')
-    stamp_git=$(git -C "$root" describe --tags --always --dirty 2>/dev/null || true)
-    [[ -z $stamp_git ]] && stamp_git=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || true)
+    # Skip automated wiki-refresh commits so they don't obscure when real edits happened.
+    local _last_real
+    _last_real=$(git -C "$root" log --format="%H" --invert-grep \
+      --grep="^Auto Wiki Activity Refresh:" -1 2>/dev/null || true)
+    if [[ -n $_last_real ]]; then
+      stamp_git=$(git -C "$root" describe --tags --always "$_last_real" 2>/dev/null \
+        || git -C "$root" rev-parse --short "$_last_real" 2>/dev/null || true)
+      # Still flag uncommitted working-tree changes.
+      if ! git -C "$root" diff --quiet 2>/dev/null \
+          || ! git -C "$root" diff --cached --quiet 2>/dev/null; then
+        stamp_git="${stamp_git}-dirty"
+      fi
+    else
+      stamp_git=$(git -C "$root" describe --tags --always --dirty 2>/dev/null || true)
+      [[ -z $stamp_git ]] && stamp_git=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || true)
+    fi
     if [[ -n $stamp_git ]]; then
       stamp="$stamp_when (git $stamp_git)"
     else
