@@ -147,6 +147,45 @@ is copied there. Extra arguments are passed through to `nasher pack`
 The CLI sanitizes module paths for `nwn_erf` automatically — no need to
 manually symlink modules whose filenames contain apostrophes or spaces.
 
+Pass `--no-smoke` to skip **all** build gates (the dialog-integrity check below
+and the module's `tests/smoke-test`) for a quick local build:
+
+```sh
+nwn-manager repack --no-smoke
+```
+
+### Dialog-integrity gate (built-in)
+
+Before building, `nwn-manager repack` validates every `unpacked/*.dlg.json` and
+**aborts the build (nothing packed or installed) if any conversation is
+structurally corrupt**. This is built in and applies to every module — no
+per-project setup. Bypass it with `--no-smoke`.
+
+It catches the class of corruption that `nwn_gff` packs without complaint but the
+game engine silently rejects at load — most often a DLG *link* struct that has
+been pasted into the `EntryList`/`ReplyList` *node* lists (e.g. by hand- or
+script-editing the JSON). In game such a dialog never opens: the NPC turns to
+face the PC and nothing happens. The gate stops that from ever shipping.
+
+**FAIL (blocks the build):**
+
+- a `.dlg.json` that does not parse as JSON;
+- a **node** (element of `EntryList`/`ReplyList`) carrying a link-only field
+  `IsChild` or `Index` (those belong only on the link structs inside a node's
+  `RepliesList`/`EntriesList`, and in `StartingList`);
+- a node with neither `Text` nor its child list;
+- a link whose `Index` is missing or out of range.
+
+**WARN (reported, does not block):** a node carrying `Active` (the engine
+tolerates this — Bioware's own bank dialogs ship it), or a node missing optional
+fields such as `AnimLoop`. Run with `CHECK_DLG_VERBOSE=1` to list warnings.
+
+The validator is also runnable on its own against any unpacked tree:
+
+```sh
+check-dlg-integrity path/to/unpacked    # exit 1 if any dialog FAILs
+```
+
 ### Smoke tests
 
 If your module project ships a file at `tests/smoke-test` that is executable,
@@ -206,6 +245,34 @@ those lines still work; the count line is simply omitted.
 
 If `tests/smoke-test` does not exist the gate is silently skipped, so adding
 it is purely opt-in.
+
+### Build stamp (last-edited timestamp on login)
+
+On every `repack`, `nwn-manager` generates a tiny script `nwnmgr_bstamp` and packs
+it into the `.mod`. When called it sends the calling PC a line like:
+
+```
+Module last edited: 2026-06-07 07:34 CDT (git a1b2c3d-dirty)
+```
+
+— the local build time (honoring `TZ` from `server.env` if present) plus the
+project's git revision (`git describe --always --dirty`). This gives players a
+sense of when the module was last updated, and confirms for debugging that the
+expected code base is actually running on the server.
+
+The script is generated transiently (built, packed, then removed) so it never
+clutters the source tree — no git churn, no `.gitignore` entry needed.
+
+**Opt in** from any module event by executing it; it is resolved at runtime, so
+it safely no-ops in builds where it isn't packed (e.g. toolset-only work):
+
+```nwscript
+// e.g. in your module OnClientEnter, after the login flood settles:
+DelayCommand(5.0, ExecuteScript("nwnmgr_bstamp", oPC));
+```
+
+`OBJECT_SELF` inside the stamp is the object you pass to `ExecuteScript`, so pass
+the entering player (`GetEnteringObject()` / the PC) and they receive the message.
 
 ### Generate the wiki
 

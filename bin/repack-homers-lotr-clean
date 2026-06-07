@@ -19,10 +19,12 @@ set -o pipefail
 
 VERBOSE=0
 FORCE=0
+REPACK_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --verbose) VERBOSE=1 ;;
-    --force)   FORCE=1 ;;
+    --verbose)  VERBOSE=1 ;;
+    --force)    FORCE=1 ;;
+    --no-smoke) REPACK_ARGS+=(--no-smoke) ;;  # skip build gates (smoke + dialog check)
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -52,10 +54,10 @@ tmpout=$(mktemp)
 trap 'rm -f "$tmpout"' EXIT
 
 if [[ $VERBOSE -eq 1 ]]; then
-  nwn-manager repack --clean 2>&1 | tee "$tmpout"
+  nwn-manager repack --clean "${REPACK_ARGS[@]}" 2>&1 | tee "$tmpout"
   nasher_status="${PIPESTATUS[0]}"
 else
-  nwn-manager repack --clean >"$tmpout" 2>&1 &
+  nwn-manager repack --clean "${REPACK_ARGS[@]}" >"$tmpout" 2>&1 &
   bg_pid=$!
   spin='|/-\'
   si=0
