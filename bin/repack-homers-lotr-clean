@@ -30,6 +30,13 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# ANSI colors when stdout is a terminal (the app-grid shortcut runs in ptyxis).
+if [[ -t 1 ]]; then
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+else
+  C_RED=''; C_GREEN=''; C_BOLD=''; C_RESET=''
+fi
+
 PROJECT=/var/home/james/GIT/nwn_homers_lotr
 NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
 
@@ -54,7 +61,9 @@ tmpout=$(mktemp)
 trap 'rm -f "$tmpout"' EXIT
 
 if [[ $VERBOSE -eq 1 ]]; then
-  nwn-manager repack --clean "${REPACK_ARGS[@]}" 2>&1 | tee "$tmpout"
+  # CHECK_DLG_VERBOSE makes the dialog-integrity gate list per-dialog warnings,
+  # so verbose shows more detail on what each gate is checking as it runs.
+  CHECK_DLG_VERBOSE=1 nwn-manager repack --clean "${REPACK_ARGS[@]}" 2>&1 | tee "$tmpout"
   nasher_status="${PIPESTATUS[0]}"
 else
   nwn-manager repack --clean "${REPACK_ARGS[@]}" >"$tmpout" 2>&1 &
@@ -102,21 +111,38 @@ else
   fi
 fi
 
+# Build-gate failures (dialog integrity / smoke tests) abort before packing.
+# Surface every offending line in RED, even in quiet mode. Not bypassable with
+# --force (use --no-smoke to skip the gates entirely).
+if grep -qE "dialog-integrity check FAILED|smoke tests FAILED" "$tmpout"; then
+  echo
+  echo "${C_RED}${C_BOLD}Build gates FAILED — nothing built or installed:${C_RESET}"
+  grep -E "^FAIL |^       |^fail:|^not ok|dialog-integrity check FAILED|smoke tests FAILED|^check-dlg-integrity: scanned" "$tmpout" \
+    | while IFS= read -r line; do printf '  %s%s%s\n' "$C_RED" "$line" "$C_RESET"; done
+  echo
+  printf '  %s(bypass the gates with --no-smoke if you must build anyway)%s\n' "$C_RED" "$C_RESET"
+  echo
+  read -rp "Press Enter to close..."
+  exit 1
+fi
+
 compile_err_count=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null) || compile_err_count=0
 fatal_lines=$(grep -E "^Error:" "$tmpout" 2>/dev/null || true)
 
 if [[ $nasher_status -ne 0 || -n "$fatal_lines" || $compile_err_count -gt 0 ]]; then
   if [[ $VERBOSE -eq 0 ]]; then
     echo
-    grep -E "^Compile Error:" "$tmpout" | head -40 | sed 's/^/  /'
-    [[ $compile_err_count -gt 40 ]] && echo "  ... ($((compile_err_count - 40)) more compile errors)"
-    [[ -n "$fatal_lines" ]] && echo "$fatal_lines" | sed 's/^/  /'
+    grep -E "^Compile Error:" "$tmpout" | head -40 \
+      | while IFS= read -r line; do printf '  %s%s%s\n' "$C_RED" "$line" "$C_RESET"; done
+    [[ $compile_err_count -gt 40 ]] && echo "  ${C_RED}... ($((compile_err_count - 40)) more compile errors)${C_RESET}"
+    [[ -n "$fatal_lines" ]] && printf '%s\n' "$fatal_lines" \
+      | while IFS= read -r line; do printf '  %s%s%s\n' "$C_RED" "$line" "$C_RESET"; done
   fi
   echo
   if [[ $FORCE -eq 1 ]]; then
-    echo "[WARN] $compile_err_count compile error(s) (--force: proceeding anyway)"
+    echo "${C_RED}[WARN] $compile_err_count compile error(s) (--force: proceeding anyway)${C_RESET}"
   else
-    echo "[ERROR] $compile_err_count compile error(s) — aborting."
+    echo "${C_RED}${C_BOLD}[ERROR] $compile_err_count compile error(s) — aborting.${C_RESET}"
     echo "        Re-run with --force to proceed despite errors."
     echo
     read -rp "Press Enter to close..."
@@ -132,6 +158,16 @@ if [[ -f homers_lotr_v3.mod ]]; then
   size_mb=$(( size / 1024 / 1024 ))
   if [[ $built -ge $start ]]; then
     echo "[OK] homers_lotr_v3.mod rebuilt (${size_mb} MB)"
+    echo
+    # Green build-gate summary — shown even in quiet mode.
+    smoke_sum=$(grep -oE "[0-9]+/[0-9]+ smoke tests passed" "$tmpout" | tail -1)
+    if [[ -n $smoke_sum ]]; then
+      echo "${C_GREEN}${C_BOLD}✓ ${smoke_sum}${C_RESET}"
+    elif grep -q "smoke tests: tests/smoke-test" "$tmpout"; then
+      echo "${C_GREEN}${C_BOLD}✓ smoke tests passed${C_RESET}"
+    fi
+    dlg_sum=$(grep -E "^check-dlg-integrity: scanned " "$tmpout" | tail -1)
+    [[ -n $dlg_sum ]] && echo "${C_GREEN}✓ ${dlg_sum}${C_RESET}"
     echo
     # Copy 1: OneDrive modules dir (primary — used by the Unpack pipeline)
     ONEDRIVE_MOD_DIR="$HOME/OneDrive/Games/NWNHomersLOTR"
