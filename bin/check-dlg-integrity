@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""check-dlg-integrity — validate unpacked NWN DLG (.dlg.json) structure.
+
+Module-agnostic build gate. Scans every *.dlg.json in the given directory
+(default ./unpacked) and reports structural corruption that nwn_gff will
+happily pack but the game engine refuses to load — most notably DLG link
+structs that have been pasted into the EntryList/ReplyList *node* lists.
+
+Background: a conversation that fails this kind of structural check loads as
+an empty/invalid dialog at runtime. In game the NPC turns to face the PC but
+no line is ever displayed ("PC walks over, NPC faces you, nothing happens").
+nwn_gff converts it without complaint, so the broken module ships silently.
+This gate stops that at build time.
+
+Exit status:
+    0  no FAIL-level problems (warnings may still be printed)
+    1  one or more dialogs have FAIL-level corruption
+    2  usage / environment error
+
+What counts as a FAIL (blocks the build):
+  * the .dlg.json does not parse as JSON
+  * a NODE struct (an element of EntryList or ReplyList) carries a link-only
+    field — `IsChild` or `Index`. Those belong only on the *link* structs
+    inside a node's RepliesList/EntriesList (and in StartingList). Their
+    presence on a node means a link struct was copied into the node list.
+  * a NODE has neither `Text` nor its child list (RepliesList for entries,
+    EntriesList for replies) — i.e. it is not a usable node.
+  * a LINK (in StartingList, or a node's RepliesList/EntriesList) has a
+    missing or out-of-range `Index` into the list it points at.
+
+What counts as a WARN (printed, does not block):
+  * a node carries `Active` (a link-only condition field). The engine
+    tolerates this — Bioware's own bank dialogs ship this way — so it is
+    reported for cleanliness but not failed.
+  * a node is missing optional fields such as `AnimLoop` (many stock
+    campaign dialogs omit these and work fine).
+
+Calibrated so a clean module passes with zero failures while genuinely
+unloadable dialogs are caught.
+"""
+
+import sys
+import os
+import glob
+import json
+
+# Fields that only ever belong on a *link* struct (StartingList entries and
+# the RepliesList/EntriesList pointers inside nodes), never on a node itself.
+LINK_ONLY_ON_NODE_FAIL = ("IsChild", "Index")
+# Link-only field the engine tolerates on a node — warn, don't fail.
+LINK_ONLY_ON_NODE_WARN = ("Active",)
+# Optional node fields whose absence is harmless (warn only).
+OPTIONAL_NODE_FIELDS = ("AnimLoop", "Animation", "Comment", "Delay", "Sound",
+                        "Quest", "Script")
+
+
+def val(x):
+    """Unwrap a {"type":..., "value":...} field to its value."""
+    if isinstance(x, dict) and "value" in x:
+        return x["value"]
+    return x
+
+
+def get_list(d, key):
+    v = d.get(key)
+    if isinstance(v, dict):
+        v = v.get("value")
+    return v if isinstance(v, list) else []
+
+
+def check_links(links, target_len, where, fails):
+    """Validate a list of link structs point in-range into a target node list."""
+    for i, link in enumerate(links):
+        if "Index" not in link:
+            fails.append(f"{where} link #{i}: missing Index")
+            continue
+        idx = val(link.get("Index"))
+        if not isinstance(idx, int) or idx < 0 or idx >= target_len:
+            fails.append(f"{where} link #{i}: Index={idx!r} out of range "
+                         f"(0..{target_len - 1})")
+
+
+def check_file(path):
+    """Return (fails, warns) lists of human-readable messages for one dlg."""
+    fails, warns = [], []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        return [f"JSON parse failure: {e}"], warns
+
+    entries = get_list(d, "EntryList")
+    replies = get_list(d, "ReplyList")
+    ne, nr = len(entries), len(replies)
+
+    # Node lists: entries own RepliesList (-> ReplyList); replies own
+    # EntriesList (-> EntryList).
+    for label, nodes, childkey, target_len in (
+        ("Entry", entries, "RepliesList", nr),
+        ("Reply", replies, "EntriesList", ne),
+    ):
+        for i, node in enumerate(nodes):
+            if not isinstance(node, dict):
+                fails.append(f"{label}#{i}: not a struct")
+                continue
+            bad = [f for f in LINK_ONLY_ON_NODE_FAIL if f in node]
+            if bad:
+                fails.append(f"{label}#{i}: link-only field(s) {bad} on a node "
+                             f"(a link struct was pasted into the node list)")
+            warnf = [f for f in LINK_ONLY_ON_NODE_WARN if f in node]
+            if warnf:
+                warns.append(f"{label}#{i}: link-only field(s) {warnf} on a node "
+                             f"(tolerated, but non-canonical)")
+            if "Text" not in node and childkey not in node:
+                fails.append(f"{label}#{i}: malformed node (no Text and no {childkey})")
+            missing = [f for f in OPTIONAL_NODE_FIELDS if f not in node]
+            if missing:
+                warns.append(f"{label}#{i}: missing optional field(s) {missing}")
+            # Outgoing links from this node.
+            check_links(get_list(node, childkey), target_len,
+                        f"{label}#{i} {childkey}", fails)
+
+    # StartingList links point into EntryList.
+    check_links(get_list(d, "StartingList"), ne, "StartingList", fails)
+
+    return fails, warns
+
+
+def main(argv):
+    target = argv[1] if len(argv) > 1 else "unpacked"
+    if not os.path.isdir(target):
+        print(f"check-dlg-integrity: not a directory: {target}", file=sys.stderr)
+        return 2
+
+    files = sorted(glob.glob(os.path.join(target, "*.dlg.json")))
+    if not files:
+        print(f"check-dlg-integrity: no *.dlg.json under {target}")
+        return 0
+
+    total_fail_files = 0
+    total_warn_files = 0
+    for path in files:
+        fails, warns = check_file(path)
+        name = os.path.basename(path)
+        if fails:
+            total_fail_files += 1
+            print(f"FAIL {name}")
+            for m in fails:
+                print(f"       {m}")
+        if warns:
+            total_warn_files += 1
+            # Only print warnings when verbose, to keep the gate output focused
+            # on actionable failures. Set CHECK_DLG_VERBOSE=1 to see them.
+            if os.environ.get("CHECK_DLG_VERBOSE"):
+                print(f"warn {name}")
+                for m in warns:
+                    print(f"       {m}")
+
+    print(f"check-dlg-integrity: scanned {len(files)} dialog(s) — "
+          f"{total_fail_files} failing, {total_warn_files} with warnings"
+          + ("" if os.environ.get("CHECK_DLG_VERBOSE")
+             else " (set CHECK_DLG_VERBOSE=1 to list warnings)"))
+    return 1 if total_fail_files else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
