@@ -11844,7 +11844,9 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
     }
 
     cache_updated = False
-    open_sessions_out: list[dict] = []  # in-progress sessions, never cached
+    # Track open sessions per file so we can discard stale ones after the loop.
+    # Key: str(log_path), Value: (file_mtime_float, [session, ...])
+    _open_by_file: dict[str, tuple[float, list[dict]]] = {}
 
     for log_path in log_files:
         path_key = str(log_path)
@@ -11857,9 +11859,10 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
         file_sessions, has_open = _parse_one_log_file(log_path)
 
         # Persist all newly closed sessions
+        file_opens: list[dict] = []
         for s in file_sessions:
             if s.get("duration_min") is None:
-                open_sessions_out.append(s)
+                file_opens.append(s)
                 continue
             join_key = (s["player"], s["join"].isoformat())
             if join_key in seen_keys:
@@ -11874,6 +11877,10 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
             })
             cache_updated = True
 
+        if file_opens:
+            file_mtime = fp["mtime"] if fp else 0.0
+            _open_by_file[path_key] = (file_mtime, file_opens)
+
         # Only fingerprint files that are fully closed (no players still online)
         if not has_open and fp is not None:
             cached_fps[path_key] = fp
@@ -11881,6 +11888,24 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
 
     if cache_path is not None and cache_updated:
         _save_activity_cache(cache_path, cache)
+
+    # Only include open sessions from the most recently modified log file.
+    # If a newer file exists (e.g. server restarted after a crash), sessions left
+    # open in an older file are stale — those players are no longer connected.
+    max_log_mtime = 0.0
+    for lp in log_files:
+        try:
+            mt = lp.stat().st_mtime
+            if mt > max_log_mtime:
+                max_log_mtime = mt
+        except OSError:
+            pass
+
+    open_sessions_out: list[dict] = []
+    for file_mtime, file_opens in _open_by_file.values():
+        # Allow up to 60 s of clock skew / filesystem resolution
+        if max_log_mtime - file_mtime <= 60:
+            open_sessions_out.extend(file_opens)
 
     # Convert cached sessions back to datetime objects for rendering
     sessions_out: list[dict] = []
