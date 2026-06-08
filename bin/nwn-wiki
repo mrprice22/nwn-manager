@@ -11692,6 +11692,9 @@ _ANVIL_JOIN_RE = re.compile(
 _ANVIL_LEAVE_RE = re.compile(
     r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (.+?) Left as a (Player|Game Master)'
 )
+# Written once to anvil.log each time the server finishes loading a module (i.e. every restart).
+# Any sessions still open before this line are stale — the server crashed without logging leaves.
+_ANVIL_RESTART_RE = re.compile(r'^Server: Module loaded')
 
 
 def _log_subdir_sort_key(p: Path) -> list:
@@ -11775,6 +11778,11 @@ def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool]:
         return [], False
 
     for line in text.splitlines():
+        if is_anvil and _ANVIL_RESTART_RE.match(line):
+            # Server restarted; sessions that were open before this point never
+            # logged a leave (crash), so discard them rather than reporting as online.
+            open_sessions.clear()
+            continue
         if not is_anvil:
             m = _LOG_HEADER_RE.match(line)
             if m:
