@@ -715,6 +715,15 @@ cmd_serve() {
   local cache_args=()
   [[ -n $activity_cache ]] && cache_args+=(--activity-cache "$activity_cache")
 
+  # The server container is (re)started together with this monitor, so at this
+  # moment no player can be online yet — the module hasn't even loaded.  Pass our
+  # own start time as a floor: any session still "open" in the logs that began
+  # before now is a leftover from the previous run (killed without a clean leave)
+  # and must not be reported as online.  Genuine players re-join after this point.
+  local serve_started
+  serve_started=$(date +%s)
+  local since_args=(--online-since "$serve_started")
+
   local poll_secs=$(( poll_interval * 60 ))
   local publish_label
   publish_label=$([ $auto_publish -eq 1 ] && echo "enabled" || echo "disabled")
@@ -731,11 +740,11 @@ cmd_serve() {
     # session end, naturally self-clears when the window expires, and
     # survives monitor restarts without any saved state.
     if python3 "$wiki_activity" --check-should-refresh "$poll_secs" \
-        "${log_dir_args[@]}" "${cache_args[@]}" 2>/dev/null; then
+        "${log_dir_args[@]}" "${cache_args[@]}" "${since_args[@]}" 2>/dev/null; then
       echo "[$PROG] serve: $_now — no players + recent logout; refreshing activity page"
       if python3 "$wiki_activity" \
           --src unpacked --out docs \
-          "${log_dir_args[@]}" "${cache_args[@]}"; then
+          "${log_dir_args[@]}" "${cache_args[@]}" "${since_args[@]}"; then
         echo "[$PROG] serve: activity page refreshed"
         if [[ $auto_publish -eq 1 ]]; then
           local ts
@@ -754,7 +763,7 @@ cmd_serve() {
         echo "[$PROG] serve: warn: activity page refresh failed" >&2
       fi
     elif python3 "$wiki_activity" --check-online \
-        "${log_dir_args[@]}" "${cache_args[@]}" 2>/dev/null; then
+        "${log_dir_args[@]}" "${cache_args[@]}" "${since_args[@]}" 2>/dev/null; then
       echo "[$PROG] serve: $_now — poll: players online"
     fi
     sleep "$poll_secs"

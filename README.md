@@ -1231,9 +1231,12 @@ They handle the full build-and-install pipeline: pack the `.mod`, copy it to
 OneDrive and the local NWN modules dir, archive a timestamped copy, and optionally
 refresh the nwsync manifest.
 
+A dedicated **Repack Homer's LotR Module (Testing)** app-grid shortcut invokes
+`--no-prod` automatically (see below).
+
 ```sh
-bin/repack-homers-lotr [--verbose] [--force]
-bin/repack-homers-lotr-clean [--verbose] [--force]
+bin/repack-homers-lotr [--verbose] [--force] [--no-prod]
+bin/repack-homers-lotr-clean [--verbose] [--force] [--no-prod]
 ```
 
 | Flag | Behaviour |
@@ -1241,6 +1244,7 @@ bin/repack-homers-lotr-clean [--verbose] [--force]
 | *(none)* | Quiet mode: shows a live `%` progress counter that overwrites itself in-place instead of scrolling every file. Exits with an error if nasher reports any errors or warnings. |
 | `--verbose` | Passes all nasher output straight through to the terminal (old behaviour). Still exits on errors unless `--force` is also given. |
 | `--force` | Continue with the install copies even when nasher reports errors or warnings. Homer's LotR has a known set of benign compile failures (`zep_cr_*`, `openstore_*`, `dmw_do_dialog*`, etc.) that always appear in the tally; use `--force` to acknowledge them and proceed. |
+| `--no-prod` | Skip the copy to the local NWN modules dir (production). OneDrive and the timestamped archive are still written. Use this when building for manual testing on another machine before promoting to the live server. |
 
 `repack-homers-lotr-clean` additionally purges `.nasher/tmp/*.ncs` and passes
 `--clean` to nasher before building, forcing a full recompile. Use it when the

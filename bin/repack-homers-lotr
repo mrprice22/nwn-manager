@@ -5,16 +5,19 @@
 # Options:
 #   --verbose   Show full nasher output (default: quiet spinner + phase only)
 #   --force     Continue despite compile or nasher errors (default: abort)
+#   --no-prod   Skip copy to local NWN modules dir (production); OneDrive and archive still written
 
 set -o pipefail
 
 VERBOSE=0
 FORCE=0
+NO_PROD=0
 REPACK_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --verbose)  VERBOSE=1 ;;
     --force)    FORCE=1 ;;
+    --no-prod)  NO_PROD=1 ;;
     --no-smoke) REPACK_ARGS+=(--no-smoke) ;;  # skip build gates (smoke + dialog check)
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -161,14 +164,18 @@ if [[ -f homers_lotr_v3.mod ]]; then
       echo "[install] WARNING: $ONEDRIVE_MOD_DIR not found, skipping OneDrive copy"
     fi
     echo
-    # Copy 2: local NWN modules dir (for toolset access)
-    NWN_MOD_DIR="$HOME/.local/share/Neverwinter Nights/modules"
-    NWN_MOD_DEST="$NWN_MOD_DIR/Homer's LOTR VEL v3.mod"
-    if [[ -d $NWN_MOD_DIR ]]; then
-      cp "homers_lotr_v3.mod" "$NWN_MOD_DEST"
-      echo "[install] → $NWN_MOD_DEST"
+    # Copy 2: local NWN modules dir (production deploy — skipped with --no-prod)
+    if [[ $NO_PROD -eq 0 ]]; then
+      NWN_MOD_DIR="$HOME/.local/share/Neverwinter Nights/modules"
+      NWN_MOD_DEST="$NWN_MOD_DIR/Homer's LOTR VEL v3.mod"
+      if [[ -d $NWN_MOD_DIR ]]; then
+        cp "homers_lotr_v3.mod" "$NWN_MOD_DEST"
+        echo "[install] → $NWN_MOD_DEST"
+      else
+        echo "[install] WARNING: $NWN_MOD_DIR not found, skipping local NWN copy"
+      fi
     else
-      echo "[install] WARNING: $NWN_MOD_DIR not found, skipping local NWN copy"
+      echo "[install] (--no-prod: skipped local NWN modules dir)"
     fi
     echo
     # Copy 3: timestamped archive in project root

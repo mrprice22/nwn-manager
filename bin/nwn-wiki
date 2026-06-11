@@ -11692,9 +11692,18 @@ _ANVIL_JOIN_RE = re.compile(
 _ANVIL_LEAVE_RE = re.compile(
     r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (.+?) Left as a (Player|Game Master)'
 )
-# Written once to anvil.log each time the server finishes loading a module (i.e. every restart).
-# Any sessions still open before this line are stale — the server crashed without logging leaves.
-_ANVIL_RESTART_RE = re.compile(r'^Server: Module loaded')
+# Written each time the server finishes loading a module (i.e. every restart).
+# Any sessions still open before this line are stale — the server crashed/rebooted
+# without logging leaves.  This line is emitted by the *main* nwserver process, so it
+# normally lands in nwserverLog*.txt, NOT anvil.log; we therefore look for it in every
+# log file (regardless of format) and use it to invalidate stale open sessions across
+# files (e.g. a crashed session dangling in anvil.log, cleared by a restart logged in
+# nwserverLog.txt).  Matched with search() so an optional timestamp prefix is tolerated.
+_RESTART_RE = re.compile(r'Server: Module loaded\b')
+# Timestamp prefixes for the two log formats, used to date a restart marker (and any
+# other line) so restarts can be ordered against session join times across files.
+_ANVIL_TS_RE = re.compile(r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\]')
+_NWSERVER_TS_RE = re.compile(r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\]')
 
 
 def _log_subdir_sort_key(p: Path) -> list:
@@ -11759,11 +11768,13 @@ def _save_activity_cache(cache_path: Path, data: dict) -> None:
         print(f"[nwn-wiki] warn: could not save activity cache: {e}", file=sys.stderr)
 
 
-def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool]:
+def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool, "datetime | None"]:
     """Parse one NWN server log file (nwserverLog*.txt or Anvil anvil.log).
 
-    Returns (sessions, has_open_sessions). Each session has player, role,
-    join (datetime), leave (datetime|None), duration_min (float|None).
+    Returns (sessions, has_open_sessions, restart_ts). Each session has player,
+    role, join (datetime), leave (datetime|None), duration_min (float|None).
+    restart_ts is the timestamp of the latest server restart seen in this file
+    (or None), used to invalidate stale open sessions across files.
     """
     is_anvil = log_path.name == "anvil.log"
     join_re = _ANVIL_JOIN_RE if is_anvil else _LOG_JOIN_RE
@@ -11771,17 +11782,38 @@ def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool]:
     year = datetime.now().year
     sessions: list[dict] = []
     open_sessions: dict[str, dict] = {}
+    last_ts: datetime | None = None     # most recent timestamp seen on any line
+    restart_ts: datetime | None = None  # timestamp of the latest restart marker
 
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return [], False
+        return [], False, None
 
     for line in text.splitlines():
-        if is_anvil and _ANVIL_RESTART_RE.match(line):
-            # Server restarted; sessions that were open before this point never
-            # logged a leave (crash), so discard them rather than reporting as online.
+        # Track the most recent timestamp so a restart marker can be dated even
+        # when its own line carries no timestamp (e.g. bare "Server: Module loaded").
+        am = _ANVIL_TS_RE.match(line)
+        if am:
+            try:
+                last_ts = datetime.strptime(am.group(1), "%Y/%m/%d %H:%M:%S")
+            except ValueError:
+                pass
+        else:
+            nm = _NWSERVER_TS_RE.match(line)
+            if nm:
+                try:
+                    norm = re.sub(r' +', ' ', nm.group(1).strip())
+                    last_ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+                except ValueError:
+                    pass
+
+        if _RESTART_RE.search(line):
+            # Server restarted; sessions open before this point never logged a
+            # leave (crash/reboot), so discard them rather than reporting online.
             open_sessions.clear()
+            if last_ts is not None:
+                restart_ts = last_ts
             continue
         if not is_anvil:
             m = _LOG_HEADER_RE.match(line)
@@ -11825,10 +11857,14 @@ def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool]:
     for player, data in open_sessions.items():
         sessions.append({**data, "leave": None, "duration_min": None})
 
-    return sessions, has_open
+    return sessions, has_open, restart_ts
 
 
-def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) -> dict:
+def parse_nwserver_logs(
+    log_dirs: list[Path],
+    cache_path: Path | None = None,
+    online_floor: "datetime | None" = None,
+) -> dict:
     """Parse NWN server log files; return {"sessions": [...], "file_count": N}.
 
     Each session dict has: player (str), role ("Player"|"Game Master"),
@@ -11836,6 +11872,11 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
 
     If cache_path is given, closed sessions are persisted to a JSON file so
     that hours never decrease even when old log rotations are deleted.
+
+    If online_floor is given, any session still open whose join precedes it is
+    dropped from the "currently online" set — it is a leftover from a previous
+    server run that was killed without logging a leave. Callers that restart the
+    server alongside the monitor (nwn-manager serve) pass their own start time.
     """
     log_files = _collect_log_files(log_dirs)
 
@@ -11856,6 +11897,18 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
     # Track open sessions per file so we can discard stale ones after the loop.
     # Key: str(log_path), Value: (file_mtime_float, [session, ...])
     _open_by_file: dict[str, tuple[float, list[dict]]] = {}
+    # Latest server-restart timestamp across all files. A restart invalidates any
+    # session left open (un-left) before it, even when the restart is logged in a
+    # different file (nwserverLog.txt) than the dangling session (anvil.log).
+    # Persisted in the cache so it survives once the restart's log file stops
+    # changing and gets fingerprint-skipped on later polls.
+    latest_restart_ts: datetime | None = None
+    _cached_restart = cache.get("latest_restart_ts")
+    if _cached_restart:
+        try:
+            latest_restart_ts = datetime.fromisoformat(_cached_restart)
+        except (ValueError, TypeError):
+            latest_restart_ts = None
 
     for log_path in log_files:
         path_key = str(log_path)
@@ -11865,7 +11918,11 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
         if fp is not None and cached_fps.get(path_key) == fp:
             continue
 
-        file_sessions, has_open = _parse_one_log_file(log_path)
+        file_sessions, has_open, restart_ts = _parse_one_log_file(log_path)
+        if restart_ts is not None and (
+            latest_restart_ts is None or restart_ts > latest_restart_ts
+        ):
+            latest_restart_ts = restart_ts
 
         # Persist all newly closed sessions
         file_opens: list[dict] = []
@@ -11895,6 +11952,12 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
             cached_fps[path_key] = fp
             cache_updated = True
 
+    if latest_restart_ts is not None:
+        restart_iso = latest_restart_ts.isoformat()
+        if cache.get("latest_restart_ts") != restart_iso:
+            cache["latest_restart_ts"] = restart_iso
+            cache_updated = True
+
     if cache_path is not None and cache_updated:
         _save_activity_cache(cache_path, cache)
 
@@ -11914,7 +11977,17 @@ def parse_nwserver_logs(log_dirs: list[Path], cache_path: Path | None = None) ->
     for file_mtime, file_opens in _open_by_file.values():
         # Allow up to 60 s of clock skew / filesystem resolution
         if max_log_mtime - file_mtime <= 60:
-            open_sessions_out.extend(file_opens)
+            for s in file_opens:
+                # Drop sessions that began before the last server restart: the
+                # player was disconnected by the reboot and never logged a leave.
+                if latest_restart_ts is not None and s["join"] < latest_restart_ts:
+                    continue
+                # Drop sessions predating the caller's online floor (e.g. the
+                # monitor's own start time): leftovers from a previous run whose
+                # new "Module loaded" marker may not have been logged yet.
+                if online_floor is not None and s["join"] < online_floor:
+                    continue
+                open_sessions_out.append(s)
 
     # Convert cached sessions back to datetime objects for rendering
     sessions_out: list[dict] = []

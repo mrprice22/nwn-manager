@@ -79,6 +79,14 @@ def main() -> int:
              "Defaults to activity-sessions.json inside the first --log-dir.",
     )
     ap.add_argument(
+        "--online-since", type=int, default=None, dest="online_since", metavar="EPOCH",
+        help="Unix timestamp floor for 'currently online' detection. Sessions still "
+             "open in the logs that began before this time are treated as stale "
+             "leftovers from a previous server run (killed without a clean leave) "
+             "and are not reported as online. Set by 'nwn-manager serve' to its own "
+             "start time, since the server is (re)started alongside the monitor.",
+    )
+    ap.add_argument(
         "--check-online", action="store_true",
         help="Exit 0 if at least one player is currently online, 1 if not. "
              "No output files are written.",
@@ -104,7 +112,14 @@ def main() -> int:
         else log_dir_paths[0] / "activity-sessions.json"
     )
 
-    activity = wiki.parse_nwserver_logs(log_dir_paths, cache_path=cache_path)
+    online_floor = (
+        datetime.fromtimestamp(args.online_since)
+        if args.online_since is not None
+        else None
+    )
+    activity = wiki.parse_nwserver_logs(
+        log_dir_paths, cache_path=cache_path, online_floor=online_floor
+    )
 
     if args.check_online:
         online = any(
