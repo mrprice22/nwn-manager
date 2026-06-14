@@ -927,7 +927,8 @@ kill "$SERVE_PID" 2>/dev/null
 
 When a module ships the bestiary kill-tracking system — detected by the presence
 of a `bestiarybook` item blueprint — `nwn-wiki` integrates with the module's live
-`bestiary.sqlite3` campaign database:
+`bestiarydb.sqlite3` campaign database (the filename matches the module's
+campaign DB name, `BST_DB="bestiarydb"`):
 
 - **Seeds** the full creature catalogue (canonical resref, name, CR) into the DB
   so the in-game bestiary book can list every creature, killed or not.

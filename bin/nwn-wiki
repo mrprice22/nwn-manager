@@ -44,7 +44,9 @@ _HAS_ACTIVITY_PAGE: bool = False
 _GENERATED_AT: str = ""  # set in main(); included in every page footer
 
 # Bestiary kill-tracking stats, read from the live NWNX:EE campaign DB
-# (<log-dir>/database/bestiary.sqlite3) when the module uses the bestiary system.
+# (<db-dir>/bestiarydb.sqlite3) when the module uses the bestiary system. The
+# filename must match the module's campaign DB name (BST_DB="bestiarydb" in
+# bst_db.nss) — that is the file the in-game scripts read and write.
 BST_SF_CR = 60  # Server-First Challenge Rating threshold (mirror bst_db.nss)
 _BESTIARY_ACTIVE: bool = False
 _BESTIARY_KILLS: dict[str, dict] = {}  # canonical resref -> {"total","solo","party"}
@@ -12437,7 +12439,8 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
 
 def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
     """Write the full creature catalogue (canonical resref, name, CR) into the
-    bestiary DB (<db_dir>/bestiary.sqlite3) so the in-game book can list every
+    bestiary DB (<db_dir>/bestiarydb.sqlite3 — must match BST_DB in bst_db.nss,
+    the file the in-game scripts use) so the in-game book can list every
     creature, killed or not. Only base (non-variant) canonicals are reachable
     in-game by ResRef, so only those are seeded. Idempotent upsert; tolerant of
     the server holding the DB."""
@@ -12451,7 +12454,7 @@ def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
         except OSError as e:
             print(f"[nwn-wiki] bestiary: cannot create {db_dir}: {e}", file=sys.stderr)
             return
-    db_file = db_dir / "bestiary.sqlite3"
+    db_file = db_dir / "bestiarydb.sqlite3"
     try:
         con = sqlite3.connect(str(db_file), timeout=5.0)
     except sqlite3.Error as e:
@@ -12496,7 +12499,7 @@ def load_bestiary_stats(db_dir: Path) -> None:
     import sqlite3
     _BESTIARY_KILLS = {}
     _SERVER_FIRSTS = []
-    db_file = db_dir / "bestiary.sqlite3"
+    db_file = db_dir / "bestiarydb.sqlite3"
     if not db_file.is_file():
         return
     _BESTIARY_ACTIVE = True
