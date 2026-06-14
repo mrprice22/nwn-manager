@@ -160,6 +160,21 @@ STOCK_ITEM_PROPS: dict[str, list]
 STOCK_ITEM_NAMES, STOCK_ITEM_BASE, STOCK_ITEM_COST, STOCK_ITEM_PROPS = _load_stock_item_names()
 
 
+def _load_stock_creature_names() -> dict[str, str]:
+    """Display names for stock NWN/CEP creatures referenced only by encounter
+    pools (no module .utc). Flat resref -> name map; "_"-prefixed keys are
+    metadata. Unlisted resrefs fall back to the resref itself."""
+    p = DATA_DIR / "stock_creature_names.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    return {k: v for k, v in raw.items()
+            if not k.startswith("_") and isinstance(v, str)}
+
+
+STOCK_CREATURE_NAMES: dict[str, str] = _load_stock_creature_names()
+
+
 def loc(node: Any, lang: int = 0) -> str:
     """Resolve a cexolocstring. Falls back to TLK tables for ID-only refs;
     if the StrRef can't be resolved, yields a `[TLK#N]` placeholder."""
@@ -2251,7 +2266,8 @@ class Db:
                     crr = fld(s, "ResRef", "") or ""
                     if crr:
                         self.creature_encounter_spawns[crr].append(
-                            {"area": area_resref, "encounter_resref": rr}
+                            {"area": area_resref, "encounter_resref": rr,
+                             "cr": fld(s, "CR"), "appearance": fld(s, "Appearance")}
                         )
         self.hidden_areas = {
             rr for rr, a in self.areas.items()
@@ -2298,7 +2314,25 @@ class Db:
         _enc_agg: dict[tuple, int] = {}
         for crr, spawns in self.creature_encounter_spawns.items():
             if crr not in self.canonical_for_bp:
-                continue
+                # Stock NWN/CEP creature: no module .utc on file and never placed
+                # in a .git. Register it as its own canonical so it shows in the
+                # creatures index and bestiary catalogue (CR/appearance from the
+                # encounter CreatureList entry; name from STOCK_CREATURE_NAMES,
+                # falling back to the resref).
+                cr_val = next((sp["cr"] for sp in spawns
+                               if sp.get("cr") is not None), 0)
+                app_val = next((sp["appearance"] for sp in spawns
+                                if sp.get("appearance") is not None), None)
+                synth_c = {
+                    "FirstName": {"type": "cexolocstring",
+                                  "value": {"0": STOCK_CREATURE_NAMES.get(crr, crr)}},
+                    "ChallengeRating": {"type": "float", "value": float(cr_val or 0)},
+                }
+                if app_val is not None:
+                    synth_c["Appearance_Type"] = {"type": "word", "value": app_val}
+                self.canonical_creatures[crr] = {"c": synth_c, "bp_rr": crr}
+                self.canonical_bp_of[crr] = crr
+                self.canonical_for_bp[crr] = crr
             can_rr = self.canonical_for_bp[crr]
             for sp in spawns:
                 area_rr = sp["area"]
@@ -3957,11 +3991,11 @@ class Db:
     def creature_name(self, resref: str) -> str:
         c = self.creatures.get(resref)
         if not c:
-            return resref
+            return STOCK_CREATURE_NAMES.get(resref, resref)
         first = loc(c.get("FirstName"))
         last = loc(c.get("LastName"))
         full = (first + " " + last).strip()
-        return full or resref
+        return full or STOCK_CREATURE_NAMES.get(resref, resref)
 
     def item_name(self, resref: str) -> str:
         i = self.items.get(resref)
@@ -12438,12 +12472,18 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
 # ---------------------------------------------------------------------------
 
 def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
-    """Write the full creature catalogue (canonical resref, name, CR) into the
-    bestiary DB (<db_dir>/bestiarydb.sqlite3 — must match BST_DB in bst_db.nss,
-    the file the in-game scripts use) so the in-game book can list every
-    creature, killed or not. Only base (non-variant) canonicals are reachable
-    in-game by ResRef, so only those are seeded. Idempotent upsert; tolerant of
-    the server holding the DB."""
+    """Write the creature catalogue (resref, name, CR) into the bestiary DB
+    (<db_dir>/bestiarydb.sqlite3 — must match BST_DB in bst_db.nss, the file the
+    in-game scripts use) so the in-game book can list creatures killed or not.
+
+    Seeds only PLAYER-ACCESSIBLE creatures — the same "present" set the creatures
+    index uses (has >=1 placement or encounter, i.e. canonical_locations count
+    > 0), including stock NWN/CEP creatures registered from encounter pools.
+    Blueprint-only creatures (e.g. DM avatars) are excluded. Rows are keyed by the
+    runtime resref (the base blueprint, what GetResRef returns in-game), never the
+    synthetic __v2/__orphan ids, so kills JOIN. The table is rebuilt each run so
+    creatures that become inaccessible are pruned. Tolerant of the server holding
+    the DB."""
     import sqlite3
     # The dir is normally the live server's database/ (already present). Create
     # it only when genuinely absent — mkdir(exist_ok) still raises on a symlink
@@ -12464,10 +12504,21 @@ def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
         con.execute("PRAGMA busy_timeout=5000")
         con.execute("CREATE TABLE IF NOT EXISTS catalogue "
                     "(resref TEXT PRIMARY KEY, name TEXT, cr REAL)")
+        # Accessible = the base blueprint of any canonical that has a location
+        # (placement or encounter). A base counts if it OR any of its variants
+        # is placed/encountered.
+        accessible_bases = set()
+        for c_rr in db.canonical_creatures:
+            if sum(l["count"] for l in db.canonical_locations.get(c_rr, [])) > 0:
+                accessible_bases.add(db.canonical_bp_of.get(c_rr, c_rr))
         rows = []
         for can_rr, entry in db.canonical_creatures.items():
             if db.canonical_bp_of.get(can_rr) != can_rr:
                 continue  # variant; never appears in-game by ResRef
+            if can_rr.startswith("__orphan_"):
+                continue  # synthetic id with no runtime resref — can't be killed by it
+            if can_rr not in accessible_bases:
+                continue  # blueprint-only / un-encounterable
             c = entry["c"]
             bp_rr = entry["bp_rr"]
             bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
@@ -12479,12 +12530,14 @@ def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
             except (TypeError, ValueError):
                 cr = 0.0
             rows.append((can_rr, nwn_text(db.canonical_creature_name(can_rr)), cr))
+        # Rebuild so newly-inaccessible creatures are pruned (catalogue is derived
+        # data; kills / server_first are separate tables and untouched).
+        con.execute("DELETE FROM catalogue")
         con.executemany(
-            "INSERT INTO catalogue(resref,name,cr) VALUES(?,?,?) "
-            "ON CONFLICT(resref) DO UPDATE SET name=excluded.name, cr=excluded.cr",
-            rows)
+            "INSERT INTO catalogue(resref,name,cr) VALUES(?,?,?)", rows)
         con.commit()
-        print(f"[nwn-wiki] bestiary: seeded {len(rows)} catalogue rows into {db_file}")
+        print(f"[nwn-wiki] bestiary: seeded {len(rows)} accessible catalogue rows "
+              f"into {db_file}")
     except sqlite3.Error as e:
         print(f"[nwn-wiki] bestiary: catalogue seed failed: {e}", file=sys.stderr)
     finally:
