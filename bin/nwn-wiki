@@ -12435,25 +12435,22 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
 # Bestiary kill stats (read from / seeded into the live NWNX:EE campaign DB)
 # ---------------------------------------------------------------------------
 
-def _bestiary_db_path(log_dirs: list[Path]) -> Path | None:
-    """Return the existing bestiary SQLite DB under <log-dir>/database/, if any."""
-    for d in log_dirs:
-        p = d / "database" / "bestiary.sqlite3"
-        if p.is_file():
-            return p
-    return None
-
-
-def seed_bestiary_catalogue(db: "Db", log_dirs: list[Path]) -> None:
+def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
     """Write the full creature catalogue (canonical resref, name, CR) into the
-    bestiary DB so the in-game book can list every creature, killed or not. Only
-    base (non-variant) canonicals are reachable in-game by ResRef, so only those
-    are seeded. Idempotent upsert; tolerant of the server holding the DB."""
+    bestiary DB (<db_dir>/bestiary.sqlite3) so the in-game book can list every
+    creature, killed or not. Only base (non-variant) canonicals are reachable
+    in-game by ResRef, so only those are seeded. Idempotent upsert; tolerant of
+    the server holding the DB."""
     import sqlite3
-    if not log_dirs:
-        return
-    db_dir = log_dirs[0] / "database"
-    db_dir.mkdir(parents=True, exist_ok=True)
+    # The dir is normally the live server's database/ (already present). Create
+    # it only when genuinely absent — mkdir(exist_ok) still raises on a symlink
+    # whose target doesn't resolve on this host (e.g. a container mount).
+    if not db_dir.exists():
+        try:
+            db_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"[nwn-wiki] bestiary: cannot create {db_dir}: {e}", file=sys.stderr)
+            return
     db_file = db_dir / "bestiary.sqlite3"
     try:
         con = sqlite3.connect(str(db_file), timeout=5.0)
@@ -12491,7 +12488,7 @@ def seed_bestiary_catalogue(db: "Db", log_dirs: list[Path]) -> None:
         con.close()
 
 
-def load_bestiary_stats(log_dirs: list[Path]) -> None:
+def load_bestiary_stats(db_dir: Path) -> None:
     """Populate the bestiary globals from the live DB (read-only). Missing DB or
     missing tables (no kills yet) leave the stats empty but mark the system active
     so the Server-First page still renders."""
@@ -12499,8 +12496,8 @@ def load_bestiary_stats(log_dirs: list[Path]) -> None:
     import sqlite3
     _BESTIARY_KILLS = {}
     _SERVER_FIRSTS = []
-    db_file = _bestiary_db_path(log_dirs)
-    if db_file is None:
+    db_file = db_dir / "bestiary.sqlite3"
+    if not db_file.is_file():
         return
     _BESTIARY_ACTIVE = True
     try:
@@ -12585,13 +12582,20 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         _MANUAL_PAGES.append({"kind": "file", "title": title, "stem": stem})
         pages_to_write.append((out / "manual" / f"{stem}.html", title, body, ".."))
 
-    # Generated (data-driven) page: Server-First kill leaderboard. Added here so
-    # it joins the Documents dropdown and is written alongside the static pages.
+    # Generated (data-driven) page: Server-First kill leaderboard. Joined to the
+    # Documents dropdown here. Its content is (re)generated only when the bestiary
+    # DB was loaded this run; otherwise, if a prior full build already produced
+    # the page, keep it in the dropdown without rewriting it — this keeps the nav
+    # consistent when nwn-wiki-activity re-renders manual pages without DB access.
+    sf_path = out / "manual" / "ServerFirsts.html"
     if _BESTIARY_ACTIVE:
         _MANUAL_PAGES.append({"kind": "file", "title": "Server Firsts",
                               "stem": "ServerFirsts"})
-        pages_to_write.append((out / "manual" / "ServerFirsts.html",
-                               "Server Firsts", _render_server_first_body(), ".."))
+        pages_to_write.append((sf_path, "Server Firsts",
+                               _render_server_first_body(), ".."))
+    elif sf_path.exists():
+        _MANUAL_PAGES.append({"kind": "file", "title": "Server Firsts",
+                              "stem": "ServerFirsts"})
 
     for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
         doc_files = sorted(
@@ -13775,6 +13779,14 @@ def main() -> int:
                          "logs.1/, … hold nwserverLog1.txt). Repeat for multiple "
                          "log roots. When provided, an Activity page with "
                          "player-activity charts is generated and added to the wiki.")
+    ap.add_argument("--db-dir", default=None, dest="db_dir", metavar="DIR",
+                    help="Directory holding the live NWN:EE campaign SQLite "
+                         "databases (where bestiary.sqlite3 lives). Used to seed "
+                         "the bestiary creature catalogue and read kill stats. "
+                         "On containerized servers this is the host path bound to "
+                         "the server's database/ dir, which usually differs from "
+                         "--log-dir. If omitted, falls back to <log-dir>/database "
+                         "when that is a real directory.")
     ap.add_argument("--activity-cache", default=None, dest="activity_cache",
                     metavar="PATH",
                     help="JSON file for persisting player-session data across log "
@@ -14041,12 +14053,23 @@ def main() -> int:
                   "skipping activity page", file=sys.stderr)
 
     # Bestiary kill stats: only when this module ships the bestiary system
-    # (detected by the book item). Seed the creature catalogue into the live DB
-    # and load aggregate kills + server-first records before pages render.
-    if "bestiarybook" in db.items and args.log_dirs:
-        _bestiary_dirs = [Path(d).resolve() for d in args.log_dirs]
-        seed_bestiary_catalogue(db, _bestiary_dirs)
-        load_bestiary_stats(_bestiary_dirs)
+    # (detected by the book item). Locate the live campaign-DB dir from --db-dir,
+    # falling back to <log-dir>/database when that is a real directory (it is a
+    # dangling container symlink on this server, hence the explicit --db-dir).
+    if "bestiarybook" in db.items:
+        _bestiary_db_dir: Path | None = None
+        if args.db_dir:
+            _bestiary_db_dir = Path(args.db_dir).expanduser()
+        elif args.log_dirs:
+            _cand = Path(args.log_dirs[0]).expanduser() / "database"
+            if _cand.is_dir():
+                _bestiary_db_dir = _cand
+        if _bestiary_db_dir is not None:
+            seed_bestiary_catalogue(db, _bestiary_db_dir)
+            load_bestiary_stats(_bestiary_db_dir)
+        else:
+            print("[nwn-wiki] bestiary: no reachable database dir "
+                  "(set --db-dir); skipping kill stats", file=sys.stderr)
 
     render_manual_pages(src.parent, out)
 

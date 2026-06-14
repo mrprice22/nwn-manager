@@ -923,6 +923,42 @@ nwnee-server ...
 kill "$SERVE_PID" 2>/dev/null
 ```
 
+#### Bestiary kill stats (live DB integration)
+
+When a module ships the bestiary kill-tracking system — detected by the presence
+of a `bestiarybook` item blueprint — `nwn-wiki` integrates with the module's live
+`bestiary.sqlite3` campaign database:
+
+- **Seeds** the full creature catalogue (canonical resref, name, CR) into the DB
+  so the in-game bestiary book can list every creature, killed or not.
+- **Reads** aggregate kill counts (total / solo / party) and the server-first
+  registry, and surfaces them as extra columns on the creatures index, a kill
+  block + Server-First badge on each creature page, and a generated **Server
+  Firsts** leaderboard in the Documents menu.
+
+Point the generator at the directory that holds the live campaign databases with
+`--db-dir`:
+
+```sh
+nwn-manager wiki \
+  --log-dir ~/.local/state/nwnxee-mygame \
+  --db-dir "$HOME/.local/share/Neverwinter Nights/database"
+```
+
+`--db-dir` is separate from `--log-dir` on purpose: with a **containerized
+server**, the logs are bind-mounted to a host-readable path while the SQLite
+databases live under the host directory bound to the container's `database/`
+(often `<NWN_HOME_DIR>/database`). If `--db-dir` is omitted, the generator falls
+back to `<log-dir>/database` only when that is a real directory; otherwise it
+prints a notice and skips the kill stats (the rest of the wiki still builds). DB
+reads are read-only and tolerant of the server holding the file; missing
+tables (no kills yet) simply render as empty.
+
+The standalone activity refresh (`nwn-wiki-activity`, run by `nwn-manager serve`)
+does not access the DB, but keeps the **Server Firsts** entry in the Documents
+dropdown when the page already exists, so navigation stays consistent between
+full builds.
+
 #### TLK resolution (StrRef references)
 
 NWN GFF blobs reference player-visible strings indirectly. A

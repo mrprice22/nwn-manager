@@ -19,11 +19,19 @@ cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; 
 # shellcheck disable=SC1091
 [[ -f "$PROJECT/server.env" ]] && . "$PROJECT/server.env" && export TZ
 
+# The server runs in a container: --log-dir holds the host-readable logs, but the
+# campaign SQLite DBs (incl. bestiary.sqlite3) live under NWN_HOME_DIR/database
+# (the host path bound to the container's database/). Point --db-dir there so the
+# bestiary catalogue is seeded and kill stats are read. NWN_HOME_DIR comes from
+# server.env (sourced above); fall back to the standard NWN user dir.
+DB_DIR="${NWN_HOME_DIR:-$HOME/.local/share/Neverwinter Nights}/database"
+
 nwn-manager wiki \
   --base-url https://homers-lotr-wiki.jamesprice-slightlyepic.workers.dev/ \
   --exclude-conv-option "[Admin Options]" \
   --exclude-conv-option "[Options of the Homeless]" \
   --log-dir "$HOME/.local/state/nwnxee-homer" \
+  --db-dir "$DB_DIR" \
   --2da-dir "$PROJECT/hak_2da" \
   --path-from thewelloferu
 status=$?
