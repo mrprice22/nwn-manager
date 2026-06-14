@@ -43,6 +43,13 @@ _MANUAL_PAGES: list[dict] = []
 _HAS_ACTIVITY_PAGE: bool = False
 _GENERATED_AT: str = ""  # set in main(); included in every page footer
 
+# Bestiary kill-tracking stats, read from the live NWNX:EE campaign DB
+# (<log-dir>/database/bestiary.sqlite3) when the module uses the bestiary system.
+BST_SF_CR = 60  # Server-First Challenge Rating threshold (mirror bst_db.nss)
+_BESTIARY_ACTIVE: bool = False
+_BESTIARY_KILLS: dict[str, dict] = {}  # canonical resref -> {"total","solo","party"}
+_SERVER_FIRSTS: list[dict] = []        # [{"resref","cr","name","cname","at"}]
+
 # Per-module theme assets loaded from <project-root>/wiki-theme/ by load_wiki_theme().
 _THEME_FAVICON: str = ""     # filename in assets/, e.g. "favicon.png"
 _THEME_HEADER_IMG: str = ""  # filename in assets/, e.g. "header.png"
@@ -6280,6 +6287,15 @@ def render_creatures_index(db: Db, out: Path) -> None:
         else:
             variant_note = ""
         total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
+        if _BESTIARY_ACTIVE:
+            k = _BESTIARY_KILLS.get(can_rr)
+            kills_cells = (
+                f"<td>{k['total'] if k else '—'}</td>"
+                f"<td>{k['solo'] if k else '—'}</td>"
+                f"<td>{k['party'] if k else '—'}</td>"
+            )
+        else:
+            kills_cells = ""
         row = (
             f"<tr><td>{link(f'{can_rr}.html', db.canonical_creature_name(can_rr))}"
             f"{variant_note}</td>"
@@ -6288,7 +6304,8 @@ def render_creatures_index(db: Db, out: Path) -> None:
             f"<td>{E(cls_str)}</td>"
             f"<td>{E(_f('MaxHitPoints', ''))}</td>"
             f"<td>{E(_f('ChallengeRating', ''))}</td>"
-            f"<td>{E(db.faction_name(_f('FactionID', '')))}</td></tr>"
+            f"<td>{E(db.faction_name(_f('FactionID', '')))}</td>"
+            f"{kills_cells}</tr>"
         )
         if total_count:
             rows_present.append(row)
@@ -6301,10 +6318,13 @@ def render_creatures_index(db: Db, out: Path) -> None:
         f" ({n_variants} equipment/class variant{'s' if n_variants != 1 else ''})"
         if n_variants else ""
     )
+    kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
+                  if _BESTIARY_ACTIVE else "")
     TABLE_HEAD = (
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>Count</th><th>Race</th><th>Class</th>"
         "<th>HP</th><th>CR</th><th>Faction</th>"
+        f"{kills_head}"
         "</tr></thead><tbody>"
     )
     toc_parts = [
@@ -7022,6 +7042,27 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
             f'<br><small class="muted">{E(diff_detail)}</small></dd>'
         )
     sections.append('</dl>')
+
+    # Bestiary kill stats (when the module runs the kill-tracking system).
+    if _BESTIARY_ACTIVE:
+        sf = next((s for s in _SERVER_FIRSTS if s["resref"] == canonical_rr), None)
+        if sf:
+            sections.append(
+                '<p class="server-first-badge"><strong>&#9733; Server First:</strong> '
+                f"first slain by {E(sf['name'])}"
+                + (f" on {E(sf['at'])}" if sf["at"] else "") + ".</p>"
+            )
+        k = _BESTIARY_KILLS.get(canonical_rr)
+        if k:
+            sections.append(
+                "<h2>Kills</h2>"
+                '<table class="data"><thead><tr>'
+                "<th>Total</th><th>Solo</th><th>Party</th></tr></thead><tbody>"
+                f"<tr><td>{k['total']}</td><td>{k['solo']}</td>"
+                f"<td>{k['party']}</td></tr></tbody></table>"
+            )
+        else:
+            sections.append("<h2>Kills</h2><p>Not yet slain by any adventurer.</p>")
 
     # "Where to find" section
     locs = db.canonical_locations.get(canonical_rr, [])
@@ -12390,6 +12431,138 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
     print(f"[nwn-wiki] rendered activity page ({n_sessions} sessions, {n_players} players)")
 
 
+# ---------------------------------------------------------------------------
+# Bestiary kill stats (read from / seeded into the live NWNX:EE campaign DB)
+# ---------------------------------------------------------------------------
+
+def _bestiary_db_path(log_dirs: list[Path]) -> Path | None:
+    """Return the existing bestiary SQLite DB under <log-dir>/database/, if any."""
+    for d in log_dirs:
+        p = d / "database" / "bestiary.sqlite3"
+        if p.is_file():
+            return p
+    return None
+
+
+def seed_bestiary_catalogue(db: "Db", log_dirs: list[Path]) -> None:
+    """Write the full creature catalogue (canonical resref, name, CR) into the
+    bestiary DB so the in-game book can list every creature, killed or not. Only
+    base (non-variant) canonicals are reachable in-game by ResRef, so only those
+    are seeded. Idempotent upsert; tolerant of the server holding the DB."""
+    import sqlite3
+    if not log_dirs:
+        return
+    db_dir = log_dirs[0] / "database"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_file = db_dir / "bestiary.sqlite3"
+    try:
+        con = sqlite3.connect(str(db_file), timeout=5.0)
+    except sqlite3.Error as e:
+        print(f"[nwn-wiki] bestiary: cannot open {db_file}: {e}", file=sys.stderr)
+        return
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("CREATE TABLE IF NOT EXISTS catalogue "
+                    "(resref TEXT PRIMARY KEY, name TEXT, cr REAL)")
+        rows = []
+        for can_rr, entry in db.canonical_creatures.items():
+            if db.canonical_bp_of.get(can_rr) != can_rr:
+                continue  # variant; never appears in-game by ResRef
+            c = entry["c"]
+            bp_rr = entry["bp_rr"]
+            bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+            cr_raw = fld(c, "ChallengeRating")
+            if cr_raw is None and bp is not None:
+                cr_raw = fld(bp, "ChallengeRating")
+            try:
+                cr = float(cr_raw or 0)
+            except (TypeError, ValueError):
+                cr = 0.0
+            rows.append((can_rr, nwn_text(db.canonical_creature_name(can_rr)), cr))
+        con.executemany(
+            "INSERT INTO catalogue(resref,name,cr) VALUES(?,?,?) "
+            "ON CONFLICT(resref) DO UPDATE SET name=excluded.name, cr=excluded.cr",
+            rows)
+        con.commit()
+        print(f"[nwn-wiki] bestiary: seeded {len(rows)} catalogue rows into {db_file}")
+    except sqlite3.Error as e:
+        print(f"[nwn-wiki] bestiary: catalogue seed failed: {e}", file=sys.stderr)
+    finally:
+        con.close()
+
+
+def load_bestiary_stats(log_dirs: list[Path]) -> None:
+    """Populate the bestiary globals from the live DB (read-only). Missing DB or
+    missing tables (no kills yet) leave the stats empty but mark the system active
+    so the Server-First page still renders."""
+    global _BESTIARY_KILLS, _SERVER_FIRSTS, _BESTIARY_ACTIVE
+    import sqlite3
+    _BESTIARY_KILLS = {}
+    _SERVER_FIRSTS = []
+    db_file = _bestiary_db_path(log_dirs)
+    if db_file is None:
+        return
+    _BESTIARY_ACTIVE = True
+    try:
+        con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as e:
+        print(f"[nwn-wiki] bestiary: cannot read {db_file}: {e}", file=sys.stderr)
+        return
+    try:
+        for resref, total, solo, party in con.execute(
+            "SELECT resref, SUM(solo_kills+party_kills), SUM(solo_kills), "
+            "SUM(party_kills) FROM kills GROUP BY resref"
+        ).fetchall():
+            _BESTIARY_KILLS[resref] = {"total": int(total or 0),
+                                       "solo": int(solo or 0),
+                                       "party": int(party or 0)}
+    except sqlite3.Error:
+        pass  # kills table not created yet (no kills recorded)
+    try:
+        for resref, cr, name, at, cname in con.execute(
+            "SELECT s.resref, s.cr, s.first_name, s.first_at, "
+            "COALESCE(c.name, s.resref) FROM server_first s "
+            "LEFT JOIN catalogue c ON c.resref = s.resref "
+            "ORDER BY s.cr DESC, s.first_at ASC"
+        ).fetchall():
+            _SERVER_FIRSTS.append({"resref": resref, "cr": cr or 0,
+                                   "name": name or "", "cname": cname or resref,
+                                   "at": at or ""})
+    except sqlite3.Error:
+        pass  # server_first table not created yet
+    con.close()
+    print(f"[nwn-wiki] bestiary: {len(_BESTIARY_KILLS)} creatures with kills, "
+          f"{len(_SERVER_FIRSTS)} server-first record(s)")
+
+
+def _render_server_first_body() -> str:
+    """Inner HTML for the generated Server-First leaderboard manual page."""
+    parts = [
+        "<h1>Server First Kills</h1>",
+        f"<p>The first adventurer (or party) to slay each fearsome creature of "
+        f"Challenge Rating {BST_SF_CR} or higher, recorded server-wide.</p>",
+    ]
+    if not _SERVER_FIRSTS:
+        parts.append("<p><em>No server-first kills have been recorded yet — "
+                     "the legends are still unwritten.</em></p>")
+        return "\n".join(parts)
+    rows = []
+    for sf in _SERVER_FIRSTS:
+        rr = sf["resref"]
+        cname = link(f"../creatures/{rr}.html", sf["cname"])
+        cr = int(round(sf["cr"]))
+        rows.append(
+            f"<tr><td>{cname}</td><td>{cr}</td>"
+            f"<td>{E(sf['name'])}</td><td>{E(sf['at'])}</td></tr>"
+        )
+    parts.append(
+        '<table class="data"><thead><tr>'
+        "<th>Creature</th><th>CR</th><th>First slain by</th><th>When (UTC)</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    return "\n".join(parts)
+
+
 def render_manual_pages(project_root: Path, out: Path) -> None:
     """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each."""
     global _MANUAL_PAGES
@@ -12411,6 +12584,14 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         stem = doc_path.stem
         _MANUAL_PAGES.append({"kind": "file", "title": title, "stem": stem})
         pages_to_write.append((out / "manual" / f"{stem}.html", title, body, ".."))
+
+    # Generated (data-driven) page: Server-First kill leaderboard. Added here so
+    # it joins the Documents dropdown and is written alongside the static pages.
+    if _BESTIARY_ACTIVE:
+        _MANUAL_PAGES.append({"kind": "file", "title": "Server Firsts",
+                              "stem": "ServerFirsts"})
+        pages_to_write.append((out / "manual" / "ServerFirsts.html",
+                               "Server Firsts", _render_server_first_body(), ".."))
 
     for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
         doc_files = sorted(
@@ -13858,6 +14039,14 @@ def main() -> int:
         else:
             print("[nwn-wiki] log-dir specified but no player sessions found; "
                   "skipping activity page", file=sys.stderr)
+
+    # Bestiary kill stats: only when this module ships the bestiary system
+    # (detected by the book item). Seed the creature catalogue into the live DB
+    # and load aggregate kills + server-first records before pages render.
+    if "bestiarybook" in db.items and args.log_dirs:
+        _bestiary_dirs = [Path(d).resolve() for d in args.log_dirs]
+        seed_bestiary_catalogue(db, _bestiary_dirs)
+        load_bestiary_stats(_bestiary_dirs)
 
     render_manual_pages(src.parent, out)
 
