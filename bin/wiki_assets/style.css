@@ -593,6 +593,11 @@ p.note strong, p.note em { color: var(--fg); }
 .items-content { flex: 1; min-width: 0; }
 /* Keep anchored rows from hiding under the sticky site header */
 tr[id] { scroll-margin-top: 4em; }
+section[id] { scroll-margin-top: 4em; }
+
+/* Creature artwork galleries (Pictures page + inline on creature pages) */
+.creature-pic { max-width: 100%; height: auto; display: block; border-radius: 4px; }
+.creature-pics figure, .items-content figure { margin: 0 0 1em; }
 
 /* NWN canonical damage / effect text colours.
  * Source: https://nwn.wiki/spaces/NWN1/pages/38177018/Colour+Tokens

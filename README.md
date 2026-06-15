@@ -750,6 +750,41 @@ any colour or the white pill treatment in your theme:
 
 The `wiki-theme/` folder is optional and ignored if absent.
 
+#### Creature pictures (`creature-pics/`)
+
+Place a `creature-pics/` folder at the project root (next to `docs/` and
+`unpacked/`) to attach artwork to creatures in the generated wiki. Each image is
+matched to a creature by its **display name**, and the wiki gains a new
+**Creatures → Pictures** page plus inline galleries on the matched creature
+detail pages.
+
+```
+creature-pics/
+  Gimli.png                  -> creature(s) named "Gimli"
+  Heir of Haldor.png         -> "Heir of Haldor"
+  Theoden's Chosen_01.JPG    -> "Theoden's Chosen", shown 1st
+  Theoden's Chosen_02.png    -> "Theoden's Chosen", shown 2nd
+```
+
+Rules:
+
+- **Matching** — the filename (without extension) is compared to each creature's
+  display name, **case-insensitively**. A name may match more than one creature
+  (e.g. several "Gimli" blueprints); the image links to all of them.
+- **Multiple images** — append `_01`, `_02`, … to the name to set the order in
+  which images for the same creature are shown. Files without a numeric suffix
+  sort first.
+- **Supported formats** — `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`
+  (extension case is ignored).
+- **Grouping** — the Pictures page groups images by creature, sorted by
+  descending Challenge Rating, with a floating left-hand name index.
+- **Unmatched names** — a filename that matches no creature prints a warning and
+  is still shown on the Pictures page under an **Unmatched** group.
+
+Images are copied into `docs/creatures/pics/` on each build, so they are
+committed alongside the rest of the generated wiki. The `creature-pics/` folder
+is optional and ignored if absent.
+
 #### Player activity charts
 
 Pass `--log-dir` to generate an **Activity** page with charts derived from

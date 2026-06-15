@@ -25,6 +25,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -51,6 +52,12 @@ BST_SF_CR = 60  # Server-First Challenge Rating threshold (mirror bst_db.nss)
 _BESTIARY_ACTIVE: bool = False
 _BESTIARY_KILLS: dict[str, dict] = {}  # canonical resref -> {"total","solo","party"}
 _SERVER_FIRSTS: list[dict] = []        # [{"resref","cr","name","cname","at"}]
+
+# Creature artwork loaded from <project-root>/creature-pics/ by scan_creature_pics().
+# Filenames are matched to creature display names; a trailing "_NN" sets order.
+CREATURE_PIC_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+_CREATURE_PICS: dict[str, list[str]] = {}     # canonical resref -> [image filename, ...]
+_CREATURE_PIC_GROUPS: list[dict] = []         # [{"name","matches","images","cr"}], sorted
 
 # Per-module theme assets loaded from <project-root>/wiki-theme/ by load_wiki_theme().
 _THEME_FAVICON: str = ""     # filename in assets/, e.g. "favicon.png"
@@ -4864,6 +4871,7 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
           <a href="{E(root_rel)}/creatures/by-area/index.html">By Area</a>
           <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
           <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
+          <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>
         </div>
       </div>
       <div class="nav-dropdown">
@@ -4924,6 +4932,92 @@ def load_wiki_theme(project_root: Path, out: Path) -> None:
             loaded.append("css=theme.css")
     if loaded:
         print(f"[nwn-wiki] loaded wiki-theme ({', '.join(loaded)}) from {theme_dir}")
+
+
+def _creature_cr_value(db: Db, can_rr: str) -> float:
+    """Numeric ChallengeRating for a canonical creature, or -1 if absent/blank."""
+    entry = db.canonical_creatures.get(can_rr)
+    if not entry:
+        return -1.0
+    c = entry["c"]
+    bp_rr = entry["bp_rr"]
+    bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+    raw = fld(c, "ChallengeRating")
+    if raw is None and bp is not None:
+        raw = fld(bp, "ChallengeRating")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def scan_creature_pics(project_root: Path, db: Db) -> None:
+    """Index <project_root>/creature-pics/ artwork against creature names.
+
+    Populates the module-level globals _CREATURE_PICS (canonical resref ->
+    [image filename]) and _CREATURE_PIC_GROUPS (display groups for the Pictures
+    page, sorted by descending CR with unmatched groups last).
+
+    Filename rules: the stem (minus extension) is matched case-insensitively to
+    a creature's display name. A trailing "_NN" sets the display order of
+    multiple images for the same creature (e.g. "Gimli_01.png", "Gimli_02.png").
+    """
+    global _CREATURE_PICS, _CREATURE_PIC_GROUPS
+    _CREATURE_PICS = {}
+    _CREATURE_PIC_GROUPS = []
+    pics_dir = project_root / "creature-pics"
+    if not pics_dir.is_dir():
+        return
+
+    # Build a case-insensitive name -> [canonical resref] index once.
+    name_index: dict[str, list[str]] = defaultdict(list)
+    for can_rr in db.canonical_creatures:
+        name_index[db.canonical_creature_name(can_rr).strip().lower()].append(can_rr)
+
+    suffix_re = re.compile(r"^(?P<base>.*?)_(?P<num>\d+)$")
+    # base_name (original case) -> {"matches": [...], "images": [(order, filename)]}
+    groups: dict[str, dict] = {}
+    for f in sorted(pics_dir.iterdir(), key=lambda p: p.name.lower()):
+        if not f.is_file() or f.suffix.lower() not in CREATURE_PIC_EXTS:
+            continue
+        stem = f.stem
+        m = suffix_re.match(stem)
+        if m:
+            base_name = m.group("base")
+            order = int(m.group("num"))
+        else:
+            base_name = stem
+            order = 0
+        key = base_name.strip().lower()
+        g = groups.setdefault(base_name, {"matches": name_index.get(key, []),
+                                          "images": []})
+        g["images"].append((order, f.name))
+
+    for base_name, g in groups.items():
+        if not g["matches"]:
+            print(f"warn: creature-pics: '{base_name}' matches no creature; "
+                  f"shown under 'Unmatched'", file=sys.stderr)
+        images = [fn for _o, fn in sorted(g["images"], key=lambda t: (t[0], t[1].lower()))]
+        if g["matches"]:
+            cr = max(_creature_cr_value(db, rr) for rr in g["matches"])
+        else:
+            cr = -1.0
+        _CREATURE_PIC_GROUPS.append({
+            "name": base_name,
+            "matches": g["matches"],
+            "images": images,
+            "cr": cr,
+        })
+        for rr in g["matches"]:
+            _CREATURE_PICS.setdefault(rr, []).extend(images)
+
+    # Descending CR; unmatched (cr < 0) sink to the bottom; tie-break by name.
+    _CREATURE_PIC_GROUPS.sort(
+        key=lambda grp: (grp["matches"] == [], -grp["cr"], grp["name"].lower())
+    )
+    if _CREATURE_PIC_GROUPS:
+        print(f"[nwn-wiki] indexed creature-pics: {len(_CREATURE_PIC_GROUPS)} "
+              f"group(s) from {pics_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -6404,6 +6498,75 @@ def render_creatures_index(db: Db, out: Path) -> None:
                root_rel=".."))
 
 
+def _pic_src(filename: str, prefix: str = "pics") -> str:
+    """URL for a creature-pics image; filenames may contain spaces/apostrophes."""
+    return f"{prefix}/{urllib.parse.quote(filename)}"
+
+
+def _pic_figures(images: list[str], alt: str, prefix: str = "pics") -> str:
+    """Render a list of image filenames as full-width <figure><img> blocks."""
+    return "".join(
+        f'<figure><img class="creature-pic" src="{E(_pic_src(fn, prefix))}" '
+        f'alt="{E(alt)}" loading="lazy"></figure>'
+        for fn in images
+    )
+
+
+def render_creature_pictures(db: Db, out: Path) -> None:
+    """Gallery page grouping creature artwork (from creature-pics/) by NPC,
+    sorted by descending CR, with a floating left-hand name navigation."""
+    if not _CREATURE_PIC_GROUPS:
+        return
+
+    def _slug(name: str) -> str:
+        s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        return s or "pic"
+
+    # Disambiguate any colliding slugs.
+    used: dict[str, int] = {}
+    for grp in _CREATURE_PIC_GROUPS:
+        base = _slug(grp["name"])
+        n = used.get(base, 0)
+        used[base] = n + 1
+        grp["_slug"] = base if n == 0 else f"{base}-{n + 1}"
+
+    toc_parts = [
+        '<div><a href="index.html">All Creatures</a></div>',
+        '<div class="toc-group-heading">Pictures</div>',
+    ]
+    for grp in _CREATURE_PIC_GROUPS:
+        toc_parts.append(f'<div><a href="#{E(grp["_slug"])}">{nwn_html(grp["name"])}</a></div>')
+    sidebar = '<aside class="items-toc items-toc--wide">' + "".join(toc_parts) + "</aside>"
+
+    sections = [
+        "<h1>Creature Pictures</h1>",
+        f"<p>{len(_CREATURE_PIC_GROUPS)} creature"
+        f"{'s' if len(_CREATURE_PIC_GROUPS) != 1 else ''} with artwork, "
+        f"sorted by descending Challenge Rating.</p>",
+    ]
+    for grp in _CREATURE_PIC_GROUPS:
+        name = grp["name"]
+        sections.append(f'<section id="{E(grp["_slug"])}">')
+        sections.append(f"<h2>{nwn_html(name)}</h2>")
+        if grp["matches"]:
+            links = ", ".join(
+                link(f"{rr}.html", db.canonical_creature_name(rr))
+                for rr in sorted(grp["matches"],
+                                 key=lambda r: db.canonical_creature_name(r).lower())
+            )
+            sections.append(f'<p class="muted">Appears as: {links}</p>')
+        else:
+            sections.append('<p class="muted">No matching creature in the module.</p>')
+        sections.append('<div class="creature-pics">'
+                        + _pic_figures(grp["images"], name) + "</div>")
+        sections.append("</section>")
+
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "pictures.html",
+          page("Creature Pictures",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel=".."))
+
 
 def _creature_detail_sections(
     db: Db,
@@ -7078,6 +7241,12 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
             f'<br><small class="muted">{E(diff_detail)}</small></dd>'
         )
     sections.append('</dl>')
+
+    # Creature artwork (from creature-pics/), just after the meta box.
+    pics = _CREATURE_PICS.get(canonical_rr)
+    if pics:
+        sections.append('<div class="creature-pics">'
+                        + _pic_figures(pics, name) + "</div>")
 
     # Bestiary kill stats (when the module runs the kill-tracking system).
     if _BESTIARY_ACTIVE:
@@ -14106,6 +14275,18 @@ def main() -> int:
     # Load per-module theme from wiki-theme/ next to the unpacked/ directory.
     load_wiki_theme(src.parent, out)
 
+    # Index creature artwork from creature-pics/ and copy the files into the
+    # output tree (creatures/pics/). Done after db is built so names resolve.
+    scan_creature_pics(src.parent, db)
+    if _CREATURE_PIC_GROUPS:
+        pics_src = src.parent / "creature-pics"
+        pics_out = out / "creatures" / "pics"
+        pics_out.mkdir(parents=True, exist_ok=True)
+        wanted = {fn for grp in _CREATURE_PIC_GROUPS for fn in grp["images"]}
+        for f in pics_src.iterdir():
+            if f.is_file() and f.name in wanted:
+                shutil.copy2(f, pics_out / f.name)
+
     # Module title
     title = args.module_name
     if not title and db.ifo:
@@ -14251,6 +14432,7 @@ def main() -> int:
         for c in conts:
             render_container_page(db, resref, c, out)
     render_creatures_index(db, out)
+    render_creature_pictures(db, out)
     render_creatures_by_area(db, out)
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
     render_creatures_by_race(db, out)
