@@ -12573,12 +12573,25 @@ def load_bestiary_stats(db_dir: Path) -> None:
     except sqlite3.Error:
         pass  # kills table not created yet (no kills recorded)
     try:
-        for resref, cr, name, at, cname, player_name in con.execute(
-            "SELECT s.resref, s.cr, s.first_name, s.first_at, "
-            "COALESCE(c.name, s.resref), s.first_player_name FROM server_first s "
-            "LEFT JOIN catalogue c ON c.resref = s.resref "
-            "ORDER BY s.cr DESC, s.first_at ASC"
-        ).fetchall():
+        try:
+            rows = con.execute(
+                "SELECT s.resref, s.cr, s.first_name, s.first_at, "
+                "COALESCE(c.name, s.resref), s.first_player_name FROM server_first s "
+                "LEFT JOIN catalogue c ON c.resref = s.resref "
+                "ORDER BY s.cr DESC, s.first_at ASC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # first_player_name column absent (pre-migration DB); fall back without it
+            rows = [
+                (rr, cr, nm, at, cn, "")
+                for rr, cr, nm, at, cn in con.execute(
+                    "SELECT s.resref, s.cr, s.first_name, s.first_at, "
+                    "COALESCE(c.name, s.resref) FROM server_first s "
+                    "LEFT JOIN catalogue c ON c.resref = s.resref "
+                    "ORDER BY s.cr DESC, s.first_at ASC"
+                ).fetchall()
+            ]
+        for resref, cr, name, at, cname, player_name in rows:
             _SERVER_FIRSTS.append({"resref": resref, "cr": cr or 0,
                                    "name": name or "", "cname": cname or resref,
                                    "at": at or "", "player_name": player_name or ""})
@@ -12606,6 +12619,11 @@ def backfill_server_first_player_names(db_dir: Path, sessions: list) -> None:
     try:
         con = sqlite3.connect(str(db_file), timeout=5.0)
         con.execute("PRAGMA busy_timeout=5000")
+        try:
+            con.execute("ALTER TABLE server_first ADD COLUMN first_player_name TEXT")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         con.executemany(
             "UPDATE server_first SET first_player_name = ? "
             "WHERE first_cdkey = ? AND first_player_name IS NULL",
