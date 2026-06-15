@@ -49,12 +49,18 @@ Usage:
                             --poll-interval <min>  Check interval in
                                                    minutes (default: 5)
                             --auto-publish         On player session end:
-                                                   refresh activity.html,
+                                                   refresh activity.html
+                                                   (and ServerFirsts.html
+                                                   if --db-dir set),
                                                    git commit, and push
                             --activity-cache <path> JSON session cache
                                                    (default: first
                                                    log-dir/activity-
                                                    sessions.json)
+                            --db-dir <dir>         Campaign database dir
+                                                   (bestiarydb.sqlite3).
+                                                   Refreshes ServerFirsts
+                                                   page alongside activity
 
   $PROG -h | --help       Show this help.
 
@@ -674,6 +680,7 @@ cmd_serve() {
   local poll_interval=5
   local auto_publish=0
   local activity_cache=""
+  local db_dir=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -691,6 +698,10 @@ cmd_serve() {
       --activity-cache)
         [[ -n ${2:-} ]] || { echo "error: --activity-cache requires a path" >&2; exit 2; }
         activity_cache=$2; shift 2
+        ;;
+      --db-dir)
+        [[ -n ${2:-} ]] || { echo "error: --db-dir requires a directory" >&2; exit 2; }
+        db_dir=$2; shift 2
         ;;
       *) echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -714,6 +725,8 @@ cmd_serve() {
   done
   local cache_args=()
   [[ -n $activity_cache ]] && cache_args+=(--activity-cache "$activity_cache")
+  local db_dir_args=()
+  [[ -n $db_dir ]] && db_dir_args+=(--db-dir "$db_dir")
 
   # The server container is (re)started together with this monitor, so at this
   # moment no player can be online yet — the module hasn't even loaded.  Pass our
@@ -744,14 +757,20 @@ cmd_serve() {
       echo "[$PROG] serve: $_now — no players + recent logout; refreshing activity page"
       if python3 "$wiki_activity" \
           --src unpacked --out docs \
-          "${log_dir_args[@]}" "${cache_args[@]}" "${since_args[@]}"; then
+          "${log_dir_args[@]}" "${cache_args[@]}" "${since_args[@]}" "${db_dir_args[@]}"; then
         echo "[$PROG] serve: activity page refreshed"
         if [[ $auto_publish -eq 1 ]]; then
           local ts
           ts=$(date '+%Y-%m-%d %H:%M:%S')
-          if [[ -z "$(git -C "$root" status --porcelain -- docs/activity.html 2>/dev/null)" ]]; then
-            echo "[$PROG] serve: no changes to activity.html; skipping commit"
-          elif git -C "$root" add -- docs/activity.html \
+          local changed_files=(docs/activity.html)
+          [[ -n $db_dir ]] && changed_files+=(docs/manual/ServerFirsts.html)
+          local any_changed=0
+          for f in "${changed_files[@]}"; do
+            [[ -n "$(git -C "$root" status --porcelain -- "$f" 2>/dev/null)" ]] && any_changed=1
+          done
+          if [[ $any_changed -eq 0 ]]; then
+            echo "[$PROG] serve: no changes to wiki pages; skipping commit"
+          elif git -C "$root" add -- "${changed_files[@]}" \
             && git -C "$root" commit -m "Auto Wiki Activity Refresh: $ts" \
             && git -C "$root" push; then
             echo "[$PROG] serve: committed and pushed activity update ($ts)"

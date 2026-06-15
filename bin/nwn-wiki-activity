@@ -79,6 +79,13 @@ def main() -> int:
              "Defaults to activity-sessions.json inside the first --log-dir.",
     )
     ap.add_argument(
+        "--db-dir", default=None, dest="db_dir", metavar="DIR",
+        help="Path to the campaign database directory containing bestiarydb.sqlite3. "
+             "When provided, the Server Firsts page is also refreshed alongside "
+             "activity.html and existing server-first records are back-filled with "
+             "player names derived from the log sessions.",
+    )
+    ap.add_argument(
         "--online-since", type=int, default=None, dest="online_since", metavar="EPOCH",
         help="Unix timestamp floor for 'currently online' detection. Sessions still "
              "open in the logs that began before this time are treated as stale "
@@ -153,9 +160,17 @@ def main() -> int:
     wiki._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
     wiki._MANUAL_PAGES = []
     wiki.load_wiki_theme(src.parent, out)
+
+    if args.db_dir:
+        db_dir = Path(args.db_dir).resolve()
+        wiki.load_bestiary_stats(db_dir)
+        wiki.backfill_server_first_player_names(db_dir, activity["sessions"])
+
     # Populate _MANUAL_PAGES so the Documents nav dropdown matches the rest of
     # the wiki. render_manual_pages is idempotent; re-writing existing pages is
     # harmless, and the call is skipped entirely when docs.manual/ is absent.
+    # When --db-dir was provided and _BESTIARY_ACTIVE is True, this also
+    # regenerates ServerFirsts.html with up-to-date data.
     wiki.render_manual_pages(src.parent, out)
 
     wiki.render_activity_page(activity, out, tz_label=wiki._tz_label_from_env())

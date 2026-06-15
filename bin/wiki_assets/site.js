@@ -4,7 +4,7 @@ document.addEventListener("DOMContentLoaded", () => {
     .then(r => r.json())
     .then(({generated_at}) => {
       const el = document.getElementById('wiki-generated-at');
-      if (el) el.textContent = 'last updated ' + generated_at;
+      if (el && !el.textContent.trim()) el.textContent = 'last updated ' + generated_at;
     })
     .catch(() => {});
 });
