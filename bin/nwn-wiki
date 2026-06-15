@@ -12027,12 +12027,37 @@ def _log_file_fingerprint(path: Path) -> dict | None:
 _ACTIVITY_CACHE_VERSION = 2  # bump to invalidate stale caches (v2: sessions store cdkey)
 
 
+def _migrate_activity_cache(data: dict) -> dict:
+    """Bring an older-version cache up to the current schema in place.
+
+    Session history is irreplaceable (it preserves hours after the source logs
+    rotate away), so a version mismatch must NEVER discard sessions — every
+    schema bump so far has been purely additive. Default any newly-added fields
+    on existing sessions and carry fingerprints / restart marker forward.
+    """
+    sessions = data.get("sessions")
+    if not isinstance(sessions, list):
+        sessions = []
+    for s in sessions:
+        if isinstance(s, dict):
+            s.setdefault("cdkey", None)      # added in v2
+            s.setdefault("role", "Player")
+    data["sessions"] = sessions
+    if not isinstance(data.get("file_fingerprints"), dict):
+        data["file_fingerprints"] = {}
+    data["version"] = _ACTIVITY_CACHE_VERSION
+    return data
+
+
 def _load_activity_cache(cache_path: Path) -> dict:
     if cache_path.is_file():
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data.get("version") == _ACTIVITY_CACHE_VERSION:
-                return data
+            if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+                if data.get("version") == _ACTIVITY_CACHE_VERSION:
+                    return data
+                # Older (or future-but-compatible) version: migrate, don't wipe.
+                return _migrate_activity_cache(data)
         except Exception:
             pass
     return {"version": _ACTIVITY_CACHE_VERSION, "sessions": [], "file_fingerprints": {}}
@@ -12040,7 +12065,18 @@ def _load_activity_cache(cache_path: Path) -> dict:
 
 def _save_activity_cache(cache_path: Path, data: dict) -> None:
     try:
-        cache_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Keep one recoverable generation in case a write (or a future schema
+        # change) ever loses data; the session history cannot be rebuilt once
+        # the source logs have rotated away.
+        if cache_path.is_file():
+            try:
+                shutil.copy2(cache_path, cache_path.with_suffix(cache_path.suffix + ".bak"))
+            except OSError:
+                pass
+        # Atomic replace so an interrupted write can't truncate the cache.
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(cache_path)
     except OSError as e:
         print(f"[nwn-wiki] warn: could not save activity cache: {e}", file=sys.stderr)
 

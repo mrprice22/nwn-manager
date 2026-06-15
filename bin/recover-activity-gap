@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""One-off recovery: backfill the May 19 – June 1 2026 player-activity gap.
+
+Background
+----------
+The activity-sessions.json cache is the only place hours survive once the
+source server logs rotate away. Commit e88767f bumped the cache schema version
+1 -> 2 and the old loader *discarded* the cache on a version mismatch, so the
+next refresh rebuilt it from only the logs still on disk. The logs covering
+May 19 – June 1 had already rotated off disk, so that window was lost from the
+charts (and every player's cumulative hours dropped). The loader bug is fixed
+separately (nwn-wiki: _load_activity_cache now migrates instead of wiping).
+
+The lost window survives *only* as rendered bars in older committed copies of
+docs/activity.html in the wiki repo. This script reconstructs approximate
+sessions from such a pre-wipe activity.html and injects them into the cache.
+
+What is recoverable (and what is not)
+-------------------------------------
+- The "Daily play-hours" bar chart gives per-day totals for the gap days. Those
+  days are entirely missing from the current cache and do not overlap any data
+  still on disk, so they are a clean, isolated ground truth.
+- The "Play-hours per player" bar chart gives per-player *cumulative* totals.
+  Those are contaminated by activity AFTER the snapshot was taken, so they
+  cannot be used as absolute gap hours -- only as relative weights for splitting
+  each gap day's hours across players.
+
+So: per-day gap totals are restored faithfully (to chart rounding), the combined
+total is restored, and per-player bars are restored to roughly their old
+standings. Limitations: bar labels lose precision above 10 (integer only), the
+per-player split is proportional rather than real, and because synthetic
+sessions are all stamped at one evening time the peak-concurrency and
+hour-of-day charts for the gap window are NOT reliably restored.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Latest pre-wipe commit known to still contain the gap days in its daily chart
+# (2026-06-14 22:13, just before the cache was wiped at 22:44). Override with
+# --git-rev / --html if a more complete snapshot is found.
+_DEFAULT_GIT_REV = "e0a38b98684"
+_DEFAULT_WIKI_REPO = Path.home() / "GIT" / "nwn_homers_lotr"
+_DEFAULT_CACHE = Path.home() / ".local/state/nwnxee-homer/activity-sessions.json"
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
+
+
+def _load_nwn_wiki():
+    """Load nwn-wiki as a module to reuse its cache load/save helpers."""
+    path = Path(__file__).resolve().parent / "nwn-wiki"
+    loader = importlib.machinery.SourceFileLoader("nwn_wiki", str(path))
+    spec = importlib.util.spec_from_loader("nwn_wiki", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _read_source_html(args) -> str:
+    if args.html:
+        return Path(args.html).read_text(encoding="utf-8")
+    out = subprocess.run(
+        ["git", "-C", str(args.repo), "show", f"{args.git_rev}:docs/activity.html"],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        sys.exit(f"error: git show failed: {out.stderr.strip()}")
+    return out.stdout
+
+
+def _svg_charts(html: str) -> dict[str, str]:
+    """Map chart title -> svg source. The title is the first <text> in each svg."""
+    charts: dict[str, str] = {}
+    for svg in re.findall(r"<svg.*?</svg>", html, re.S):
+        m = re.search(r"<text[^>]*>([^<]*)</text>", svg)
+        if m:
+            charts[m.group(1)] = svg
+    return charts
+
+
+def _texts(svg: str) -> list[tuple[float, float, str, str]]:
+    """Return (x, y, anchor, content) for every <text> element."""
+    out = []
+    for m in re.finditer(r'<text x="([\d.]+)" y="([\d.]+)"([^>]*)>([^<]*)</text>', svg):
+        x, y, attrs, txt = float(m.group(1)), float(m.group(2)), m.group(3), m.group(4)
+        am = re.search(r'text-anchor="(\w+)"', attrs)
+        out.append((x, y, am.group(1) if am else "start", txt))
+    return out
+
+
+def _parse_player_weights(svg: str, title: str) -> dict[str, float]:
+    """Play-hours per player (hbar): name is end-anchored at left, value is
+    start-anchored to the right of the bar, on the same row (y)."""
+    rows: dict[float, dict] = {}
+    for x, y, anchor, txt in _texts(svg):
+        if txt == title:
+            continue
+        key = round(y / 5) * 5  # bucket to bar rows
+        cell = rows.setdefault(key, {})
+        if anchor == "end":
+            cell["name"] = txt
+        elif anchor == "start" and re.fullmatch(r"[\d.]+", txt):
+            cell["val"] = float(txt)
+    weights: dict[str, float] = {}
+    for cell in rows.values():
+        if "name" in cell and "val" in cell and cell["val"] > 0:
+            weights[cell["name"]] = cell["val"]
+    return weights
+
+
+def _parse_daily_hours(svg: str, year: int) -> dict[datetime, float]:
+    """Daily play-hours (vbar, rotated labels): date labels sit at the bottom
+    (fixed y), value labels float above each bar. Pair them by bar-center x."""
+    date_labels: list[tuple[float, datetime]] = []
+    value_labels: list[tuple[float, float]] = []
+    bottom_y = max((y for _, y, _, _ in _texts(svg)), default=0) - 4
+    for x, y, anchor, txt in _texts(svg):
+        dm = re.fullmatch(r"([A-Z][a-z]{2}) (\d{1,2})", txt)
+        if dm and dm.group(1) in _MONTHS:
+            d = datetime(year, _MONTHS[dm.group(1)], int(dm.group(2)))
+            date_labels.append((x, d))
+        elif anchor == "middle" and re.fullmatch(r"[\d.]+", txt) and y < bottom_y - 10:
+            value_labels.append((x, float(txt)))
+    out: dict[datetime, float] = {}
+    for x, d in date_labels:
+        best = min(value_labels, key=lambda v: abs(v[0] - x), default=None)
+        if best is not None and abs(best[0] - x) <= 6 and best[1] > 0:
+            out[d] = best[1]
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--html", default=None,
+                    help="pre-wipe activity.html file (overrides --git-rev/--repo)")
+    ap.add_argument("--git-rev", default=_DEFAULT_GIT_REV,
+                    help=f"wiki commit to read docs/activity.html from "
+                         f"(default {_DEFAULT_GIT_REV})")
+    ap.add_argument("--repo", type=Path, default=_DEFAULT_WIKI_REPO,
+                    help=f"wiki git repo (default {_DEFAULT_WIKI_REPO})")
+    ap.add_argument("--activity-cache", type=Path, default=_DEFAULT_CACHE,
+                    help=f"cache to backfill (default {_DEFAULT_CACHE})")
+    ap.add_argument("--evening-hour", type=int, default=20,
+                    help="hour-of-day to stamp synthetic sessions at (default 20)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would be injected without writing the cache")
+    args = ap.parse_args()
+
+    wiki = _load_nwn_wiki()
+
+    cache = wiki._load_activity_cache(args.activity_cache)
+    sessions: list[dict] = cache.setdefault("sessions", [])
+
+    # Real dates currently present, and the interior range we may fill.
+    real_dates = {
+        datetime.fromisoformat(s["join"]).date()
+        for s in sessions
+        if s.get("join") and s.get("duration_min") is not None
+    }
+    if not real_dates:
+        sys.exit("error: cache has no real sessions to anchor the gap against")
+    cache_min, cache_max = min(real_dates), max(real_dates)
+    year = cache_max.year
+
+    html = _read_source_html(args)
+    charts = _svg_charts(html)
+    player_title = next((t for t in charts if "per player" in t), None)
+    daily_title = next((t for t in charts if t.startswith("Daily play-hours")), None)
+    if not player_title or not daily_title:
+        sys.exit("error: could not locate the per-player and daily charts in the HTML")
+
+    weights = _parse_player_weights(charts[player_title], player_title)
+    daily = _parse_daily_hours(charts[daily_title], year)
+
+    # Gap = interior dates the snapshot knows about but the cache is missing.
+    gap = {
+        d: hrs for d, hrs in daily.items()
+        if cache_min < d.date() < cache_max and d.date() not in real_dates
+    }
+    if not gap:
+        print("No interior gap dates to backfill — nothing to do.")
+        return 0
+    if not weights:
+        sys.exit("error: no per-player weights parsed; cannot attribute hours")
+
+    wsum = sum(weights.values())
+    gap_dates = sorted(gap)
+    total_gap_hours = sum(gap.values())
+    print(f"Source: {'file ' + args.html if args.html else args.git_rev}")
+    print(f"Cache real-date range: {cache_min} .. {cache_max}")
+    print(f"Gap days to backfill ({len(gap_dates)}): "
+          f"{gap_dates[0].date()} .. {gap_dates[-1].date()}, "
+          f"{total_gap_hours:.1f} h total across {len(weights)} players")
+
+    seen = {
+        (s["player"], s["join"])
+        for s in sessions if s.get("join") and s.get("duration_min") is not None
+    }
+    new_sessions: list[dict] = []
+    per_player_added: dict[str, float] = {}
+    for d, day_hours in sorted(gap.items()):
+        join_dt = d.replace(hour=args.evening_hour, minute=0, second=0, microsecond=0)
+        for name, w in weights.items():
+            dur_min = day_hours * 60.0 * (w / wsum)
+            if dur_min <= 0:
+                continue
+            join_iso = join_dt.isoformat()
+            if (name, join_iso) in seen:
+                continue
+            seen.add((name, join_iso))
+            new_sessions.append({
+                "player": name,
+                "cdkey": None,
+                "role": "Player",
+                "join": join_iso,
+                "leave": (join_dt + timedelta(minutes=dur_min)).isoformat(),
+                "duration_min": round(dur_min, 2),
+                "synthetic": True,  # provenance: reconstructed from pre-wipe charts
+            })
+            per_player_added[name] = per_player_added.get(name, 0.0) + dur_min / 60.0
+
+    print(f"\nWould inject {len(new_sessions)} synthetic sessions "
+          f"({sum(per_player_added.values()):.1f} h):")
+    for name, h in sorted(per_player_added.items(), key=lambda x: -x[1]):
+        print(f"  {h:6.1f} h  {name}")
+
+    if args.dry_run:
+        print("\n[dry-run] cache not modified.")
+        return 0
+
+    sessions.extend(new_sessions)
+    wiki._save_activity_cache(args.activity_cache, cache)
+    print(f"\nWrote {args.activity_cache} "
+          f"(backup at {args.activity_cache}.bak). "
+          f"Re-run the wiki refresh to regenerate activity.html.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
