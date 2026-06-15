@@ -11827,15 +11827,18 @@ def _log_file_fingerprint(path: Path) -> dict | None:
         return None
 
 
+_ACTIVITY_CACHE_VERSION = 2  # bump to invalidate stale caches (v2: sessions store cdkey)
+
+
 def _load_activity_cache(cache_path: Path) -> dict:
     if cache_path.is_file():
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data.get("version") == 1:
+            if isinstance(data, dict) and data.get("version") == _ACTIVITY_CACHE_VERSION:
                 return data
         except Exception:
             pass
-    return {"version": 1, "sessions": [], "file_fingerprints": {}}
+    return {"version": _ACTIVITY_CACHE_VERSION, "sessions": [], "file_fingerprints": {}}
 
 
 def _save_activity_cache(cache_path: Path, data: dict) -> None:
@@ -11958,7 +11961,7 @@ def parse_nwserver_logs(
     log_files = _collect_log_files(log_dirs)
 
     cache = _load_activity_cache(cache_path) if cache_path else {
-        "version": 1, "sessions": [], "file_fingerprints": {},
+        "version": _ACTIVITY_CACHE_VERSION, "sessions": [], "file_fingerprints": {},
     }
     cached_sessions: list[dict] = cache.setdefault("sessions", [])
     cached_fps: dict = cache.setdefault("file_fingerprints", {})
@@ -12013,6 +12016,7 @@ def parse_nwserver_logs(
             seen_keys.add(join_key)
             cached_sessions.append({
                 "player": s["player"],
+                "cdkey": s.get("cdkey"),
                 "role": s.get("role", "Player"),
                 "join": s["join"].isoformat(),
                 "leave": s["leave"].isoformat() if s.get("leave") else None,
@@ -12076,6 +12080,7 @@ def parse_nwserver_logs(
             continue
         sessions_out.append({
             "player": s["player"],
+            "cdkey": s.get("cdkey"),
             "role": s.get("role", "Player"),
             "join": join_dt,
             "leave": leave_dt,
@@ -14193,6 +14198,11 @@ def main() -> int:
                 _bestiary_db_dir = _cand
         if _bestiary_db_dir is not None:
             seed_bestiary_catalogue(db, _bestiary_db_dir)
+            # Migrate/back-fill server-first player names from log cdkeys BEFORE
+            # reading stats, so the Player column is populated in this same build.
+            if activity is not None:
+                backfill_server_first_player_names(
+                    _bestiary_db_dir, activity["sessions"])
             load_bestiary_stats(_bestiary_db_dir)
         else:
             print("[nwn-wiki] bestiary: no reachable database dir "
@@ -14207,6 +14217,8 @@ def main() -> int:
             _act_cmd += ["--log-dir", str(_d)]
         if args.activity_cache:
             _act_cmd += ["--activity-cache", str(args.activity_cache)]
+        if "bestiarybook" in db.items and args.db_dir:
+            _act_cmd += ["--db-dir", str(Path(args.db_dir).expanduser())]
         subprocess.run(_act_cmd, check=True)
 
     print("[nwn-wiki] rendering pages")
