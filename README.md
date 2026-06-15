@@ -900,6 +900,8 @@ nwn-manager serve \
 | `--poll-interval <min>` | `5` | How often to check for player activity, in minutes. |
 | `--auto-publish` | off | When enabled: after the last player leaves, refresh `activity.html`, `git commit`, and `git push`. |
 | `--activity-cache <path>` | `<first log-dir>/activity-sessions.json` | JSON cache file to persist session history across log rotations. |
+| `--db-dir <dir>` | *(none)* | Campaign database dir (`bestiarydb.sqlite3`); refreshes the ServerFirsts page alongside activity. |
+| `--backup-cmd <cmd>` | *(none)* | Command run at each idle moment (no players online). Expected to self-gate (e.g. once/day). Used to snapshot server state opportunistically while the server is quiet. Failures only warn — they never interrupt monitoring. |
 
 **How it works**
 
@@ -929,6 +931,27 @@ holds and no further refreshes fire until the next session ends.
 
 This keeps the public wiki up to date without rebuilding the entire site
 after every session.
+
+##### Activity cache resilience
+
+The `activity-sessions.json` cache is the **only** place session history
+survives once the source logs rotate off disk, so it is treated as
+irreplaceable:
+
+- **Non-destructive schema upgrades.** When the cache's on-disk version is
+  older than the current one, it is *migrated* (missing fields defaulted)
+  rather than discarded. An additive schema bump never drops history.
+- **Backup on write.** Each save first copies the existing cache to
+  `activity-sessions.json.bak` and writes atomically (temp file + rename),
+  so an interrupted or buggy write can't truncate the history.
+
+If a window of history is ever lost but a pre-loss copy of `activity.html`
+exists in git, `bin/recover-activity-gap` can reconstruct approximate
+sessions for the missing days from that page's rendered charts (per-day
+totals from the daily chart, split across players by the per-player chart)
+and inject them back into the cache. It self-backs-up and supports
+`--dry-run`. This is a best-effort, aggregate reconstruction — exact
+per-session data and peak-concurrency for the gap cannot be recovered.
 
 **Hook into server startup**
 
