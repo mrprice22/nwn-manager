@@ -436,6 +436,15 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.95em;
 }
+p.note {
+  background: var(--card);
+  border-left: 4px solid var(--accent);
+  color: var(--muted);
+  padding: 0.6em 0.9em;
+  margin: 0.5em 0 1em;
+  font-size: 0.92em;
+}
+p.note strong, p.note em { color: var(--fg); }
 .reason-missing     { color: #888; font-size: 0.9em; }
 .reason-undroppable { color: #b07820; font-size: 0.9em; font-style: italic; }
 .badge-no-drop {
