@@ -420,6 +420,14 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.95em;
 }
+.note-retaliation {
+  background: #eef4fb;
+  border-left: 4px solid #3a6ea5;
+  color: #1d3a5c;
+  padding: 0.6em 0.9em;
+  margin: 0.5em 0 1em;
+  font-size: 0.95em;
+}
 
 /* Duplicate destination tag warnings */
 .warn-dup-tag {
