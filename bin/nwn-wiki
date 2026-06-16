@@ -27,7 +27,7 @@ import sys
 import time
 import urllib.parse
 from collections import Counter, defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -7034,6 +7034,46 @@ def _creature_detail_sections(
                     '(Saving Throw Bonus: Specific); class-table progression '
                     'and feat bonuses (Great Fortitude, etc.) are applied at runtime.</p>')
 
+    # Damage-gate warning: a non-stock OnDamaged handler can change how this
+    # creature takes damage (e.g. heal back all damage from the "wrong" weapon).
+    dmg_script = (_f("ScriptDamaged", "") or "").strip()
+    dmg_req_tags = db.script_damage_req_tags.get(dmg_script) if dmg_script else None
+    if db.is_custom_damage_script(dmg_script) and (
+        dmg_script in db.script_mitigates_damage or dmg_req_tags
+    ):
+        req_links: list[str] = []
+        for tag in sorted(db.script_damage_req_tags.get(dmg_script, set())):
+            resrefs = db.item_tag_groups.get(tag.lower(), [])
+            if resrefs:
+                req_links.extend(
+                    link(f"{items_dir}/{irr}.html", db.item_name(irr))
+                    for irr in resrefs
+                )
+            else:
+                req_links.append(f"<code>{E(tag)}</code>")
+        banner = (
+            '<p class="warn-damage-gate"><strong>Note: this creature uses a custom '
+            "damage script.</strong> Its <code>OnDamaged</code> handler "
+            f"(<code>{E(dmg_script)}</code>) changes how it takes damage — reported "
+            "damage may be healed back or ignored."
+        )
+        if req_links:
+            banner += (
+                " It can only be reliably harmed by a character wielding: "
+                + ", ".join(req_links) + "."
+            )
+        banner += "</p>"
+        sections.append(banner)
+
+    # Retaliation: a custom OnDamaged handler that strikes back at attackers.
+    ret_info = db.script_retaliation.get(dmg_script) if dmg_script else None
+    if db.is_custom_damage_script(dmg_script) and ret_info:
+        sections.append(
+            '<p class="note-retaliation"><strong>Retaliation.</strong> '
+            f"{E(_retaliation_sentence(ret_info))} "
+            f'<span class="muted">(<code>OnDamaged</code>: <code>{E(dmg_script)}</code>)</span></p>'
+        )
+
     # ----- Combined equipment combat properties display ----------------------
     # (cprop_by_pid and cprop_dodge_ac are built earlier, before ac_total.)
     cprop_rows: list[str] = []
@@ -7354,46 +7394,6 @@ def _creature_detail_sections(
     if spell_blocks:
         sections.append("<h2>Spells</h2>")
         sections.extend(spell_blocks)
-
-    # Damage-gate warning: a non-stock OnDamaged handler can change how this
-    # creature takes damage (e.g. heal back all damage from the "wrong" weapon).
-    dmg_script = (_f("ScriptDamaged", "") or "").strip()
-    dmg_req_tags = db.script_damage_req_tags.get(dmg_script) if dmg_script else None
-    if db.is_custom_damage_script(dmg_script) and (
-        dmg_script in db.script_mitigates_damage or dmg_req_tags
-    ):
-        req_links: list[str] = []
-        for tag in sorted(db.script_damage_req_tags.get(dmg_script, set())):
-            resrefs = db.item_tag_groups.get(tag.lower(), [])
-            if resrefs:
-                req_links.extend(
-                    link(f"{items_dir}/{irr}.html", db.item_name(irr))
-                    for irr in resrefs
-                )
-            else:
-                req_links.append(f"<code>{E(tag)}</code>")
-        banner = (
-            '<p class="warn-damage-gate"><strong>Note: this creature uses a custom '
-            "damage script.</strong> Its <code>OnDamaged</code> handler "
-            f"(<code>{E(dmg_script)}</code>) changes how it takes damage — reported "
-            "damage may be healed back or ignored."
-        )
-        if req_links:
-            banner += (
-                " It can only be reliably harmed by a character wielding: "
-                + ", ".join(req_links) + "."
-            )
-        banner += "</p>"
-        sections.append(banner)
-
-    # Retaliation: a custom OnDamaged handler that strikes back at attackers.
-    ret_info = db.script_retaliation.get(dmg_script) if dmg_script else None
-    if db.is_custom_damage_script(dmg_script) and ret_info:
-        sections.append(
-            '<p class="note-retaliation"><strong>Retaliation.</strong> '
-            f"{E(_retaliation_sentence(ret_info))} "
-            f'<span class="muted">(<code>OnDamaged</code>: <code>{E(dmg_script)}</code>)</span></p>'
-        )
 
     # Scripts
     sections.append("<h2>Scripts</h2>")
@@ -12838,23 +12838,30 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
     )
     if len(date_range) > 60:
         date_range = date_range[-60:]
-    date_labels = [d.strftime("%b %-d") for d in date_range]
-    date_hour_values = [round(date_hours.get(d, 0.0), 2) for d in date_range]
+
+    _daily_cutoff = date(2026, 5, 17)
+    _conc_cutoff = date(2026, 6, 1)
+
+    date_range_daily = [d for d in date_range if d > _daily_cutoff]
+    daily_labels = [d.strftime("%b %-d") for d in date_range_daily]
+    date_hour_values = [round(date_hours.get(d, 0.0), 2) for d in date_range_daily]
     chart_daily_hours = svg_vbar_chart(
-        date_labels, date_hour_values,
+        daily_labels, date_hour_values,
         "Daily play-hours",
         ylabel="hours",
-        width=max(700, len(date_range) * 20 + 80),
+        width=max(700, len(date_range_daily) * 20 + 80),
         height=270,
         rotate_labels=True,
         bar_color="#5a2b78",
     )
-    conc_values = [daily_peak_conc.get(d, 0) for d in date_range]
+    date_range_conc = [d for d in date_range if d > _conc_cutoff]
+    conc_labels = [d.strftime("%b %-d") for d in date_range_conc]
+    conc_values = [daily_peak_conc.get(d, 0) for d in date_range_conc]
     chart_concurrent = svg_vbar_chart(
-        date_labels, conc_values,
+        conc_labels, conc_values,
         "Peak concurrent players per day",
         ylabel="players",
-        width=max(700, len(date_range) * 20 + 80),
+        width=max(700, len(date_range_conc) * 20 + 80),
         height=270,
         rotate_labels=True,
     )
