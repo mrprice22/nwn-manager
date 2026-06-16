@@ -412,6 +412,14 @@ svg .convo-node text {
   margin: 0.5em 0 1em;
   font-size: 0.95em;
 }
+.warn-damage-gate {
+  background: #fff6e8;
+  border-left: 4px solid #cc6600;
+  color: #6b3a00;
+  padding: 0.6em 0.9em;
+  margin: 0.5em 0 1em;
+  font-size: 0.95em;
+}
 
 /* Duplicate destination tag warnings */
 .warn-dup-tag {

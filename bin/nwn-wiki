@@ -1889,6 +1889,15 @@ class Db:
         self.item_is_key_for: dict[str, list[dict]] = defaultdict(list)
         # script resref → set of item tags checked via GetItemPossessedBy
         self.script_checks_item_tags: dict[str, set[str]] = defaultdict(set)
+        # script resref → set of item tags that a damage-affecting script (OnDamaged)
+        # requires the damager to wield/hold (e.g. dunharrowking.nss heals back all
+        # damage unless the attacker's weapon Tag == "narsil"). Surfaced on creature
+        # pages as a "can only be damaged by" requirement.
+        self.script_damage_req_tags: dict[str, set[str]] = defaultdict(set)
+        # script resrefs that mitigate the creature's own incoming damage (self-heal,
+        # HP restore, or self-applied damage immunity). Used together with
+        # script_damage_req_tags to decide whether to warn on the creature page.
+        self.script_mitigates_damage: set[str] = set()
         # item resref → list of {kind, script, event, area(s), …} for script-based key checks
         self.item_script_checks: dict[str, list[dict]] = defaultdict(list)
         # dialog resref → sorted list of item resrefs whose tags are checked in that dialog
@@ -1931,6 +1940,10 @@ class Db:
         self.store_tag_groups: dict[str, list[str]] = defaultdict(list)
         # area_tag_groups: tag_lower → [resref, ...]  (populated during load())
         self.area_tag_groups: dict[str, list[str]] = defaultdict(list)
+        # item_tag_groups: tag_lower → [resref, ...]  (populated during load()).
+        # Used to resolve an item Tag (e.g. a damage-gate requirement parsed from a
+        # script) back to the item blueprint(s) so the wiki can link to its page.
+        self.item_tag_groups: dict[str, list[str]] = defaultdict(list)
         # _dialog_key_registry: conversation_key → [resref, ...]  (populated during load())
         self._dialog_key_registry: dict[tuple, list[str]] = defaultdict(list)
         # script resref → [{"creature_resref": str, "waypoint_tag": str}] raw pairs
@@ -1980,6 +1993,9 @@ class Db:
                 self.creatures[resref] = obj
             elif kind == "uti":
                 self.items[resref] = obj
+                _item_tag = (fld(obj, "Tag") or resref).strip().lower()
+                if _item_tag:
+                    self.item_tag_groups[_item_tag].append(resref)
             elif kind == "utd":
                 self.doors[resref] = obj
             elif kind == "utt":
@@ -2677,10 +2693,44 @@ class Db:
     _RE_ITEM_POSSESSED_BY = re.compile(
         r'\bGetItemPossessedBy\s*\((?:[^,()]+|\([^)]*\))+,\s*"([A-Za-z0-9_]+)"'
     )
+    # Damage-gate by equipped item tag: a script (typically OnDamaged) that compares
+    # the tag of an item in an equip slot against a literal, e.g.
+    #   GetTag(GetItemInSlot(INVENTORY_SLOT_RIGHTHAND, oPC)) != "narsil"
+    # Either operand order is accepted. The captured literal is the required item tag.
+    _RE_DAMAGE_SLOT_TAG = re.compile(
+        r'GetTag\s*\(\s*GetItemInSlot\s*\([^()]*\)\s*\)\s*(?:==|!=)\s*"([A-Za-z0-9_]+)"'
+        r'|"([A-Za-z0-9_]+)"\s*(?:==|!=)\s*GetTag\s*\(\s*GetItemInSlot\s*\([^()]*\)\s*\)'
+    )
+    # Self-mitigation signals: a damage script that restores the creature's own HP
+    # or grants it damage immunity/reduction in response to being hit. These (and a
+    # weapon/equip gate, _RE_DAMAGE_SLOT_TAG) distinguish a damage-altering handler
+    # from a plain retaliation/AI OnDamaged script.
+    _RE_SELF_HEAL = re.compile(r'\bEffectHeal\s*\(')
+    _RE_SET_HP_SELF = re.compile(r'\bSetCurrentHitPoints\s*\(\s*OBJECT_SELF')
+    _RE_SELF_DMG_IMMUNITY = re.compile(
+        r'\bEffectDamage(?:ImmunityIncrease|Reduction|Resistance)\s*\('
+    )
     _RE_CREATE_CREATURE = re.compile(
         r'\bCreateObject\s*\(\s*OBJECT_TYPE_CREATURE\s*,\s*"([A-Za-z0-9_]+)"'
     )
     _RE_ANY_LITERAL_STR = re.compile(r'"([A-Za-z0-9_]+)"')
+
+    # Stock OnDamaged handlers that do NOT alter how a creature takes damage.
+    # Anything else that ships in the module (i.e. present in script_paths) and is
+    # wired as ScriptDamaged is treated as a custom damage-affecting handler.
+    _STOCK_DAMAGE_SCRIPTS = frozenset({
+        "", "x2_def_ondamage", "nw_c2_default6", "nw_c2_defaultb",
+    })
+
+    def is_custom_damage_script(self, resref: str) -> bool:
+        """True when `resref` is a non-stock OnDamaged handler that ships in this
+        module (so it may change how the creature takes damage)."""
+        if not resref:
+            return False
+        rr = resref.strip()
+        if rr.lower() in self._STOCK_DAMAGE_SCRIPTS:
+            return False
+        return rr in self.script_paths
 
     def _build_nwstr_dispatch(self, texts: list[str]) -> dict[str, dict[str, str]]:
         """Build {func_name -> {arg_val -> return_val}} for string functions
@@ -2877,6 +2927,17 @@ class Db:
             # GetItemPossessedBy(obj, "tag") — item-tag checks for key/quest logic.
             for m in self._RE_ITEM_POSSESSED_BY.finditer(text):
                 self.script_checks_item_tags[resref].add(m.group(1))
+            # GetTag(GetItemInSlot(...)) compared to a literal — a weapon/equip gate
+            # that changes how a creature takes damage (see _RE_DAMAGE_SLOT_TAG).
+            for m in self._RE_DAMAGE_SLOT_TAG.finditer(text):
+                self.script_damage_req_tags[resref].add(m.group(1) or m.group(2))
+            # Self-mitigation: restores own HP or grants self damage immunity on hit.
+            if self._RE_SET_HP_SELF.search(text) or (
+                "OBJECT_SELF" in text
+                and (self._RE_SELF_HEAL.search(text)
+                     or self._RE_SELF_DMG_IMMUNITY.search(text))
+            ):
+                self.script_mitigates_damage.add(resref)
             # Detect creature spawns at waypoints (two strategies):
             # 1. Window scan: GetWaypointByTag("tag")/GetObjectByTag("tag") within
             #    10 lines before CreateObject(OBJECT_TYPE_CREATURE, "resref", ...).
@@ -7194,6 +7255,37 @@ def _creature_detail_sections(
     if spell_blocks:
         sections.append("<h2>Spells</h2>")
         sections.extend(spell_blocks)
+
+    # Damage-gate warning: a non-stock OnDamaged handler can change how this
+    # creature takes damage (e.g. heal back all damage from the "wrong" weapon).
+    dmg_script = (_f("ScriptDamaged", "") or "").strip()
+    dmg_req_tags = db.script_damage_req_tags.get(dmg_script) if dmg_script else None
+    if db.is_custom_damage_script(dmg_script) and (
+        dmg_script in db.script_mitigates_damage or dmg_req_tags
+    ):
+        req_links: list[str] = []
+        for tag in sorted(db.script_damage_req_tags.get(dmg_script, set())):
+            resrefs = db.item_tag_groups.get(tag.lower(), [])
+            if resrefs:
+                req_links.extend(
+                    link(f"{items_dir}/{irr}.html", db.item_name(irr))
+                    for irr in resrefs
+                )
+            else:
+                req_links.append(f"<code>{E(tag)}</code>")
+        banner = (
+            '<p class="warn-damage-gate"><strong>Note: this creature uses a custom '
+            "damage script.</strong> Its <code>OnDamaged</code> handler "
+            f"(<code>{E(dmg_script)}</code>) changes how it takes damage — reported "
+            "damage may be healed back or ignored."
+        )
+        if req_links:
+            banner += (
+                " It can only be reliably harmed by a character wielding: "
+                + ", ".join(req_links) + "."
+            )
+        banner += "</p>"
+        sections.append(banner)
 
     # Scripts
     sections.append("<h2>Scripts</h2>")
@@ -13658,6 +13750,22 @@ def generate_module_index(
         }
         if is_variant:
             rec["is_variant_of"] = bp_rr
+        dmg_script = (fld(c, "ScriptDamaged") if fld(c, "ScriptDamaged") not in (None, "")
+                      else fld(bp, "ScriptDamaged")) or ""
+        dmg_script = dmg_script.strip()
+        if db.is_custom_damage_script(dmg_script) and (
+            dmg_script in db.script_mitigates_damage
+            or db.script_damage_req_tags.get(dmg_script)
+        ):
+            rec["custom_damage_script"] = dmg_script
+            reqs = []
+            for tag in sorted(db.script_damage_req_tags.get(dmg_script, set())):
+                for irr in db.item_tag_groups.get(tag.lower(), []):
+                    reqs.append({"tag": tag, "resref": irr, "name": db.item_name(irr)})
+                if not db.item_tag_groups.get(tag.lower()):
+                    reqs.append({"tag": tag, "resref": None, "name": None})
+            if reqs:
+                rec["damage_requirements"] = reqs
         creature_index.append(rec)
     _write_json(module_index_dir / "creature_index.json", {
         "generated_at": now,
