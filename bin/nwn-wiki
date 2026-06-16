@@ -2262,14 +2262,18 @@ class Db:
                     self.area_containers[area_resref].append({"idx": idx, "p": p})
 
         # Encounter spawn pools: walk every encounter placement, pull its
-        # CreatureList (preferring the blueprint's, falling back to the
-        # placement's), and record which creatures can spawn where.
+        # CreatureList (preferring the placement's, falling back to the
+        # blueprint's), and record which creatures can spawn where. At runtime
+        # NWN spawns from the area-instance (.git) CreatureList — the toolset
+        # copies the blueprint list in on placement but a builder can edit it
+        # afterwards, so the instance is authoritative and the blueprint is only
+        # the fallback for an unedited placement that carries no list of its own.
         for area_resref, encs in self.area_encounters.items():
             for e in encs:
                 rr = fld(e, "TemplateResRef", "")
                 blueprint = self.encounters.get(rr, {})
-                spawns = (list_items(blueprint.get("CreatureList"))
-                          or list_items(e.get("CreatureList")))
+                spawns = (list_items(e.get("CreatureList"))
+                          or list_items(blueprint.get("CreatureList")))
                 for s in spawns:
                     crr = fld(s, "ResRef", "") or ""
                     if crr:
@@ -5623,7 +5627,8 @@ def render_areas_index(db: Db, out: Path, *,
         for e in db.area_encounters.get(resref, []):
             rr = fld(e, "TemplateResRef", "")
             blueprint = db.encounters.get(rr, {})
-            spawns = list_items(blueprint.get("CreatureList")) or list_items(e.get("CreatureList"))
+            # Instance (.git) CreatureList is what spawns at runtime; blueprint is fallback.
+            spawns = list_items(e.get("CreatureList")) or list_items(blueprint.get("CreatureList"))
             for s in spawns:
                 srr = fld(s, "ResRef", "")
                 bp = db.creatures.get(srr, {})
@@ -6039,7 +6044,8 @@ def render_area_page(db: Db, resref: str, out: Path,
                 ename = loc(blueprint.get("LocalizedName")) or loc(e.get("LocalizedName")) or rr
                 max_c = fld(blueprint, "MaxCreatures", fld(e, "MaxCreatures", ""))
                 diff = fld(blueprint, "DifficultyIndex", fld(e, "DifficultyIndex", ""))
-                spawns = list_items(blueprint.get("CreatureList")) or list_items(e.get("CreatureList"))
+                # Instance (.git) CreatureList is what spawns at runtime; blueprint is fallback.
+                spawns = list_items(e.get("CreatureList")) or list_items(blueprint.get("CreatureList"))
                 spawn_cells = []
                 for s in spawns:
                     srr = fld(s, "ResRef", "")

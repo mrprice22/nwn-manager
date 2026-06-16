@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""bst-prune-summon-kills — remove a PC's own-summon kills from the bestiary DB.
+
+A player's summoned creature dying is not a bestiary kill (see the master-chain
+guard in bst_ondeath.nss, which prevents new ones from being recorded). This is a
+one-time cleanup of rows recorded before that guard existed.
+
+Summon resrefs are derived, not hand-listed:
+  * module summons   — every EffectSummonCreature("X") resref found in <module>/unpacked/*.nss
+                       (custom feats/spells, e.g. mummyreaper, epicdragonknight, ...)
+  * stock summons    — any kills.resref using the stock summoned-creature prefix "nw_s_"
+                       (e.g. nw_s_slaadred), which the standard NWN summon spells use.
+This catches summons without touching module monsters whose resref happens to be
+un-catalogued (e.g. azagoth001) — those are kept.
+
+Dry-run by default; pass --apply to delete. Tolerant of the server holding the DB.
+
+Usage:
+  bst-prune-summon-kills [--db-dir DIR] [--module-dir DIR] [--apply]
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+
+# EffectSummonCreature("resref", ...) — first string arg is the creature resref.
+_RE_SUMMON = re.compile(r'EffectSummonCreature\s*\(\s*"([^"]+)"', re.IGNORECASE)
+
+# Stock NWN summoned-creature blueprint prefix (Summon Creature I-IX, planar ally,
+# Gate, Elemental Swarm, Black Blade of Disaster, animal companion/familiar, ...).
+STOCK_SUMMON_PREFIX = "nw_s_"
+
+
+def module_summon_resrefs(module_dir: Path) -> set[str]:
+    """Scan <module_dir>/unpacked/*.nss for EffectSummonCreature resrefs."""
+    src = module_dir / "unpacked"
+    found: set[str] = set()
+    if not src.is_dir():
+        print(f"[prune] warning: no unpacked dir at {src}", file=sys.stderr)
+        return found
+    for f in src.glob("*.nss"):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _RE_SUMMON.finditer(text):
+            found.add(m.group(1).lower())
+    return found
+
+
+def main() -> int:
+    default_home = os.environ.get("NWN_HOME_DIR") \
+        or str(Path.home() / ".local/share/Neverwinter Nights")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db-dir", default=str(Path(default_home) / "database"),
+                    help="Directory holding bestiarydb.sqlite3 "
+                         "(default: $NWN_HOME_DIR/database).")
+    ap.add_argument("--module-dir", default="/var/home/james/GIT/nwn_homers_lotr",
+                    help="Module project dir (scanned for unpacked/*.nss summons).")
+    ap.add_argument("--apply", action="store_true",
+                    help="Delete the matched rows (default: dry-run only).")
+    args = ap.parse_args()
+
+    db_file = Path(args.db_dir) / "bestiarydb.sqlite3"
+    if not db_file.is_file():
+        print(f"[prune] error: no bestiary DB at {db_file}", file=sys.stderr)
+        return 1
+
+    mod_summons = module_summon_resrefs(Path(args.module_dir))
+    if mod_summons:
+        print(f"[prune] module EffectSummonCreature resrefs: "
+              f"{', '.join(sorted(mod_summons))}")
+
+    con = sqlite3.connect(str(db_file), timeout=5.0)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        kill_resrefs = {r[0] for r in con.execute("SELECT DISTINCT resref FROM kills")}
+        # A kills resref is a summon if it is a known module summon OR uses the
+        # stock summoned-creature prefix.
+        targets = sorted(
+            rr for rr in kill_resrefs
+            if rr in mod_summons or rr.lower().startswith(STOCK_SUMMON_PREFIX)
+        )
+        if not targets:
+            print("[prune] no summon kills found — nothing to do.")
+            return 0
+
+        print(f"\n[prune] {len(targets)} summon resref(s) with kills to remove:")
+        ph = ",".join("?" * len(targets))
+        for rr, k in con.execute(
+                f"SELECT resref, SUM(solo_kills+party_kills) FROM kills "
+                f"WHERE resref IN ({ph}) GROUP BY resref ORDER BY resref", targets):
+            print(f"    kills        {rr:20} {k}")
+        for (rr,) in con.execute(
+                f"SELECT DISTINCT resref FROM server_first "
+                f"WHERE resref IN ({ph}) ORDER BY resref", targets):
+            print(f"    server_first {rr}")
+
+        if not args.apply:
+            print("\n[prune] dry-run — re-run with --apply to delete the above.")
+            return 0
+
+        con.execute(f"DELETE FROM kills WHERE resref IN ({ph})", targets)
+        nk = con.total_changes
+        con.execute(f"DELETE FROM server_first WHERE resref IN ({ph})", targets)
+        con.commit()
+        con.execute("VACUUM")
+        print(f"\n[prune] deleted summon rows from kills/server_first ({nk} kill rows).")
+        return 0
+    except sqlite3.Error as e:
+        print(f"[prune] error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        con.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
