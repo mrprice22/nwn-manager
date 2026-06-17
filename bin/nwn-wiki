@@ -14809,12 +14809,7 @@ def main() -> int:
                 for m in msgs:
                     print(f"    {color}{m}{_C_RESET}")
     
-    # Write Cloudflare _redirects so the legacy workers.dev URL forwards to the custom domain.
-    redirects_path = out / "_redirects"
-    redirects_path.write_text(
-        "https://homers-lotr-wiki.jamesprice-slightlyepic.workers.dev/*"
-        "  https://homerslotr.com/:splat  301\n"
-    )    
+    
     print(f"[nwn-wiki] done — {out}/index.html")
     return 0
 

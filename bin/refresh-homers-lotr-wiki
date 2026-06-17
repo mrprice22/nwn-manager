@@ -27,7 +27,7 @@ cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; 
 DB_DIR="${NWN_HOME_DIR:-$HOME/.local/share/Neverwinter Nights}/database"
 
 nwn-manager wiki \
-  --base-url https://homers-lotr-wiki.jamesprice-slightlyepic.workers.dev/ \
+  --base-url https://homerslotr.com/ \
   --exclude-conv-option "[Admin Options]" \
   --exclude-conv-option "[Options of the Homeless]" \
   --log-dir "$HOME/.local/state/nwnxee-homer" \
