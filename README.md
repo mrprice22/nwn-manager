@@ -571,6 +571,34 @@ e.g. `townhall01` — not the in-game display name). The resref is shown in the
 (`areas/<resref>.html`). Omit `--path-from` entirely to suppress the
 shortest-path sections.
 
+#### Custom index page
+
+Place an `index.html` or `index.md` file at the project root (next to
+`unpacked/`) to replace the generated module-overview landing page with
+your own content. The wiki generator uses this file as the body of
+`docs/index.html` instead of emitting the default module stats, description,
+and area map.
+
+```
+my_module/
+  index.md     → replaces the default docs/index.html landing page
+  unpacked/
+  docs/
+```
+
+Rules:
+
+- **Format** — `.html` takes precedence over `.md` when both exist. An `.md`
+  file is converted to HTML exactly like a `docs.manual/` page (the first `#
+  Heading` sets the page title). An `.html` file is used as a body fragment
+  — the nav header and footer are still added by the generator.
+- **Map** — the area map is **not** suppressed; it moves to its own dedicated
+  `/map/index.html` page (reachable from the **Map** nav link) whether or not
+  an override is present. Only the landing page body changes.
+- **No flag needed** — the override is picked up automatically on every `nwn-manager wiki` run.
+
+The file is optional; if absent the default generated landing page is rendered.
+
 #### Manual documents
 
 If your project contains a `docs.manual/` folder at the project root (the

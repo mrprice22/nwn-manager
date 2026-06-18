@@ -4959,7 +4959,7 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
   <header class="site-header">
     {brand}
     <nav>
-      <a href="{E(root_rel)}/index.html">Map</a>
+      <a href="{E(root_rel)}/map/index.html">Map</a>
       <a href="{E(root_rel)}/areas/index.html">Areas</a>
       <div class="nav-dropdown">
         <span class="nav-dropdown-label">Creatures &#9660;</span>
@@ -5124,7 +5124,20 @@ def scan_creature_pics(project_root: Path, db: Db) -> None:
 def render_index(db: Db, out: Path, module_title: str,
                  positions: dict[str, tuple[float, float]],
                  sizes: dict[str, tuple[float, float]],
-                 base_url: str = "") -> None:
+                 base_url: str = "", project_root: Path | None = None) -> None:
+    # Author-supplied landing page replaces the generated overview/map index.
+    # .html takes precedence over .md. Body fragment only (same handling as
+    # docs.manual pages) — page() adds the nav header/footer. The map still
+    # lives on its own dedicated /map page (see render_map_page).
+    if project_root is not None:
+        override = next((project_root / f"index.{ext}" for ext in ("html", "md")
+                         if (project_root / f"index.{ext}").is_file()), None)
+        if override is not None:
+            _, body_html = _manual_doc_body(override)
+            write(out / "index.html", page(module_title, body_html, root_rel="."))
+            print(f"[nwn-wiki] index: using override {override}")
+            return
+
     # Module overview block
     ifo = db.ifo or {}
     start_area = fld(ifo, "Mod_Entry_Area", "")
@@ -5198,16 +5211,38 @@ def render_index(db: Db, out: Path, module_title: str,
         )
 
     overview.append('<h2>Area map</h2>')
-    overview.append('<p class="map-hint">Click an area to open its page. Lines: '
-                    '<span class="legend trigger">trigger</span> '
-                    '<span class="legend door">door</span> '
-                    '<span class="legend convo">conversation teleport</span>. '
-                    '<span class="legend pseudo">★</span> = a global-trigger '
-                    'conversation node (e.g. Rest Menu).</p>')
+    overview.append(_MAP_HINT_HTML)
     overview.append(render_map_svg(db, positions, sizes, base_url=base_url))
 
     body = "\n".join(overview)
     write(out / "index.html", page(module_title, body, root_rel="."))
+
+
+# Shared between the home index and the dedicated /map page so the legend stays
+# in sync. Excludes the <h2> so each caller can title its own heading.
+_MAP_HINT_HTML = (
+    '<p class="map-hint">Click an area to open its page. Lines: '
+    '<span class="legend trigger">trigger</span> '
+    '<span class="legend door">door</span> '
+    '<span class="legend convo">conversation teleport</span>. '
+    '<span class="legend pseudo">★</span> = a global-trigger '
+    'conversation node (e.g. Rest Menu).</p>'
+)
+
+
+def render_map_page(db: Db, out: Path,
+                    positions: dict[str, tuple[float, float]],
+                    sizes: dict[str, tuple[float, float]],
+                    base_url: str = "") -> None:
+    """Dedicated Map page (map/index.html) rendering the same area-map SVG as the
+    home index. Targeted by the header 'Map' nav link so the map remains reachable
+    even when the index is replaced by an author-supplied override."""
+    body = "\n".join([
+        '<h1>Area map</h1>',
+        _MAP_HINT_HTML,
+        render_map_svg(db, positions, sizes, base_url=base_url),
+    ])
+    write(out / "map" / "index.html", page("Map", body, root_rel=".."))
 
 
 def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
@@ -5523,12 +5558,16 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
           'var wrap=document.getElementById("area-map-wrap");'
           'var svg=document.getElementById("area-map-svg");'
           'if(!wrap||!svg)return;'
-          'wrap.scrollLeft=(wrap.scrollWidth-wrap.clientWidth)/2;'
-          'wrap.scrollTop=(wrap.scrollHeight-wrap.clientHeight)/2;'
-          # Zoom
+          # Zoom. Capture the 1:1 baseline size before any resize, then default
+          # the view to 20% out (zoom=0.8); the "1:1" reset returns to baseline.
           'var baseW=parseFloat(svg.getAttribute("width"));'
           'var baseH=parseFloat(svg.getAttribute("height"));'
-          'var zoom=1;'
+          'var zoom=0.8;'
+          'svg.setAttribute("width",Math.round(baseW*zoom));'
+          'svg.setAttribute("height",Math.round(baseH*zoom));'
+          # Center now that the SVG is at its initial (20%-out) size.
+          'wrap.scrollLeft=(wrap.scrollWidth-wrap.clientWidth)/2;'
+          'wrap.scrollTop=(wrap.scrollHeight-wrap.clientHeight)/2;'
           'function applyZoom(z,px,py){'
             'z=Math.max(0.2,Math.min(5,z));'
             'if(z===zoom)return;'
@@ -14717,7 +14756,9 @@ def main() -> int:
 
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
-    render_index(db, out, title, positions, sizes, base_url=args.base_url)
+    render_index(db, out, title, positions, sizes, base_url=args.base_url,
+                 project_root=src.parent)
+    render_map_page(db, out, positions, sizes, base_url=args.base_url)
     render_areas_index(db, out,
                        area_paths=area_paths if args.path_from else None,
                        path_from_resref=args.path_from or "",
