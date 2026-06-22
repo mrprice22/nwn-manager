@@ -255,6 +255,12 @@ PLACEABLES: dict[int, str] = {}  # populated by overlays only — stock placeabl
                                   # rows are rarely interesting and we don't bundle them.
 IPRP_FEATS = _load_lookup("iprp_feats")
 FEATS = _load_lookup("feat")
+# Snapshot of the stock feat names before load_2da_overrides() relabels FEATS
+# from a module's feat.2da. Used to recognise Weapon Focus / Epic Weapon Focus
+# feats by their consistent stock names (some HAKs abbreviate the labels, e.g.
+# "WeapFocRapier", which would defeat name matching against the live FEATS).
+# Feat IDs are fixed by the engine, so matching stock names by id is reliable.
+STOCK_FEAT_NAMES = dict(FEATS)
 SKILLS = _load_lookup("skills")
 SPELLS = _load_lookup("spells")
 
@@ -1433,15 +1439,29 @@ def _class_bab(class_id: int, level: int) -> int:
     return (eff * 3) // 4
 
 
-def creature_bab(classes: list[dict]) -> int:
-    """Sum BAB across all class entries on a creature."""
+def creature_bab(classes: list[dict], max_level: int = 0) -> int:
+    """Sum base attack bonus across a creature's class entries.
+
+    When `max_level` > 0 (the server level cap), the creature's total class
+    levels are clamped to it, consuming ClassList in order — so a boss whose
+    blueprint stacks far more HD than the cap doesn't accrue unbounded BAB
+    (e.g. a Fighter60/WeaponMaster10/ArcaneArcher60 on a level-40 server is
+    treated as Fighter40, giving BAB 20). `_class_bab` already counts only
+    pre-epic (≤20) levels per class."""
     total = 0
+    remaining = max_level if max_level and max_level > 0 else None
     for cl in classes:
         cid = fld(cl, "Class")
         lvl = fld(cl, "ClassLevel", 0) or 0
         if cid is None:
             continue
-        total += _class_bab(int(cid), int(lvl))
+        lvl = int(lvl)
+        if remaining is not None:
+            if remaining <= 0:
+                break
+            lvl = min(lvl, remaining)
+            remaining -= lvl
+        total += _class_bab(int(cid), lvl)
     return total
 
 
@@ -1462,6 +1482,38 @@ def attack_schedule(bab: int, ability_mod: int = 0,
         return [ability_mod + bonus]
     n = min(4, 1 + (bab - 1) // 5)
     return [bab - 5 * i + ability_mod + bonus for i in range(n)]
+
+
+# Feats granting a flat to-hit bonus regardless of weapon (feat id → bonus).
+# Epic Prowess applies to all attacks; Superior Weapon Focus is the Weapon
+# Master's +1 with its chosen weapon (treated as applying to the wielded weapon).
+# Epic Superior Weapon Focus (1071) is intentionally excluded — the engine does
+# not grant a second flat +1 for it on top of Superior Weapon Focus.
+_UNIVERSAL_ATTACK_FEATS = {584: 1, 884: 1}
+
+
+def feat_attack_bonus(feat_ids: Iterable[int], weapon_name: str = "") -> int:
+    """To-hit bonus a creature's feats add for the weapon it's wielding.
+
+    Universal feats (Epic Prowess, Superior / Epic Superior Weapon Focus) always
+    count. (Epic) Weapon Focus is weapon-specific: only counted when the feat's
+    friendly name names the wielded weapon (e.g. 'Epic Weapon Focus (rapier)'
+    with `weapon_name='Rapier'`) — +2 for the epic form, +1 otherwise. Weapon
+    Specialization and crit feats add no to-hit and are ignored."""
+    feat_ids = list(feat_ids)
+    bonus = sum(_UNIVERSAL_ATTACK_FEATS[f] for f in feat_ids
+                if f in _UNIVERSAL_ATTACK_FEATS)
+    # Normalise to alphanumerics so this matches whether FEATS holds the friendly
+    # name ("Epic Weapon Focus (rapier)") or a 2DA-override LABEL
+    # ("FEAT_EPIC_WEAPON_FOCUS_RAPIER") — both reduce to "epicweaponfocusrapier".
+    _norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    wnorm = _norm(weapon_name)
+    if wnorm:
+        for fid in feat_ids:
+            fn = _norm(STOCK_FEAT_NAMES.get(fid, ""))
+            if "weaponfocus" in fn and "superior" not in fn and wnorm in fn:
+                bonus += 2 if "epic" in fn else 1
+    return bonus
 
 
 def ability_mod(score: int | None) -> int:
@@ -1954,6 +2006,15 @@ class Db:
         # from cluttering map edges while still surfacing them on the
         # conversation page. Set via --exclude-conv-option on the CLI.
         self.exclude_option_texts: list[str] = []
+        # Combat-stat dials (module/server-specific), set from the CLI in main().
+        #   max_character_level: server level cap; a creature's total class
+        #     levels are clamped to this when summing base attack bonus (so a
+        #     130-HD boss on a level-40 server gets BAB for ~40 levels, not 130).
+        #     0 disables the cap. See README "Combat-stat configuration".
+        #   max_ability_bonus: cap on the ability-score bonus an item may grant
+        #     (NWN default +12; some modules raise it, e.g. +24).
+        self.max_character_level: int = 40
+        self.max_ability_bonus: int = 12
         # Areas whose Comments field contains "WIKI_HIDDEN" (case-insensitive).
         # These areas, their stores, and their creature placements are omitted
         # from all wiki output (map, index pages, cross-references).
@@ -6936,26 +6997,67 @@ def _creature_detail_sections(
     equip = _list("Equip_ItemList")
     inv = list_items(c.get("ItemList"))
 
-    # Effective ability scores = stored UTC score + racial adjustment. The UTC
-    # stores pre-racial scores; the engine adds the race's +/- at runtime (e.g.
-    # Elf +2 Dex / -2 Con), so the wiki must too — this drives AC, saves, and
-    # attack as well as the table below.
+    def _equip_resref(e: dict) -> str:
+        # Blueprint equip entries reference an external UTI via EquippedRes;
+        # GIT instances inline the item but still carry TemplateResRef.
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _equip_item(e: dict) -> dict | None:
+        irr = _equip_resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        # GIT instances embed the full item struct (BaseItem, PropertiesList,
+        # LocalizedName, …) directly into the equip entry.
+        return e if "BaseItem" in e else None
+
+    # Effective ability scores = stored UTC score + racial adjustment + item
+    # bonus. The UTC stores pre-racial scores; the engine adds the race's +/- at
+    # runtime (e.g. Elf +2 Dex / -2 Con) plus any Ability Bonus from equipped
+    # gear (capped per the module's max). This drives AC, saves, and attack as
+    # well as the table below. (Temporary spell buffs aren't statically known.)
     _race_id = _f("Race")
     _race_adj = (RACE_ABILITY_ADJ.get(int(_race_id), {})
                  if _race_id is not None else {})
+
+    _ABIL_NAME_KEY = {"Strength": "Str", "Dexterity": "Dex", "Constitution": "Con",
+                      "Intelligence": "Int", "Wisdom": "Wis", "Charisma": "Cha"}
+    _item_abil: dict[str, int] = {}
+    for _e in equip:
+        _it = _equip_item(_e)
+        if _it is None:
+            continue
+        for _p in list_items(_it.get("PropertiesList")):
+            if fld(_p, "PropertyName") != 0:  # 0 = Ability Bonus
+                continue
+            _pf = itemprop_format(_p)
+            _key = _ABIL_NAME_KEY.get(_pf["subtype"])
+            if not _key:
+                continue
+            _val = _prop_value_num(_pf["cost"]) if _pf["cost"] else 0
+            if _val > _item_abil.get(_key, 0):  # same-ability enhancement: max
+                _item_abil[_key] = _val
+    _abil_cap = db.max_ability_bonus
+    if _abil_cap and _abil_cap > 0:
+        _item_abil = {k: min(v, _abil_cap) for k, v in _item_abil.items()}
 
     def _ability(ab: str) -> int | None:
         base = _f(ab)
         if base is None:
             return None
-        return int(base) + _race_adj.get(ab, 0)
+        return int(base) + _race_adj.get(ab, 0) + _item_abil.get(ab, 0)
 
     def _abil_cell(ab: str) -> str:
         val = _ability(ab)
         if val is None:
             return ""
         adj = _race_adj.get(ab, 0)
-        note = (f" <small class=\"muted\">({adj:+d} racial)</small>" if adj else "")
+        item = _item_abil.get(ab, 0)
+        notes = []
+        if adj:
+            notes.append(f"{adj:+d} racial")
+        if item:
+            notes.append(f"+{item} item")
+        note = (f" <small class=\"muted\">({', '.join(notes)})</small>" if notes else "")
         return f"{val}{note}"
 
     sections: list[str] = [
@@ -7005,7 +7107,7 @@ def _creature_detail_sections(
     ref = (_f("refbonus", 0) or 0) + dex_mod
     will = (_f("willbonus", 0) or 0) + wis_mod
 
-    bab = creature_bab(classes)
+    bab = creature_bab(classes, db.max_character_level)
 
     # Find equipped armor / shield / weapons via slot bitmasks.
     equip_by_slot: dict[int, dict] = {}
@@ -7013,19 +7115,6 @@ def _creature_detail_sections(
         slot = fld(e, "__struct_id")
         if isinstance(slot, int):
             equip_by_slot[slot] = e
-
-    def _equip_resref(e: dict) -> str:
-        # Blueprint equip entries reference an external UTI via EquippedRes;
-        # GIT instances inline the item but still carry TemplateResRef.
-        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
-
-    def _equip_item(e: dict) -> dict | None:
-        irr = _equip_resref(e)
-        if irr and irr in db.items:
-            return db.items[irr]
-        # GIT instances embed the full item struct (BaseItem, PropertiesList,
-        # LocalizedName, …) directly into the equip entry.
-        return e if "BaseItem" in e else None
 
     def _equipped_item(slot: int) -> dict | None:
         e = equip_by_slot.get(slot)
@@ -7304,6 +7393,19 @@ def _creature_detail_sections(
             for _sub, (_val, _cstr) in sorted(_dr_max.items()):
                 cprop_rows.append(f"<tr><th>Damage Resistance: {E(_sub)}</th><td>{E(_cstr)}</td></tr>")
 
+        # Damage Reduction (ID 22) — physical soak X / bypassed by +Y; best only.
+        if 22 in cprop_by_pid:
+            _best_dr: tuple[int, str, str] | None = None
+            for _pf, _cv in cprop_by_pid[22]:
+                if _best_dr is None or _cv > _best_dr[0]:
+                    _best_dr = (_cv, _pf["subtype"], _pf["cost"])
+            if _best_dr:
+                _, _byp, _soak = _best_dr
+                _drtxt = (_soak or "").strip()
+                if _byp:
+                    _drtxt = f"{_drtxt}, bypass {_byp}" if _drtxt else f"bypass {_byp}"
+                cprop_rows.append(f"<tr><th>Damage Reduction</th><td>{E(_drtxt or '—')}</td></tr>")
+
         # Immunity: Damage Type (ID 20) — max % per damage type
         if 20 in cprop_by_pid:
             _imm_max: dict[str, tuple[int, str]] = {}
@@ -7319,6 +7421,19 @@ def _creature_detail_sections(
         if 37 in cprop_by_pid:
             _misc = sorted({_pf["subtype"] or "?" for _pf, _ in cprop_by_pid[37]})
             cprop_rows.append(f"<tr><th>Misc Immunity</th><td>{E(', '.join(_misc))}</td></tr>")
+
+        # Immunity: Specific Spell (ID 53) — list every spell the creature is
+        # immune to (spell name lives in the formatted cost field).
+        if 53 in cprop_by_pid:
+            _imm_spells = sorted({_pf["cost"] for _pf, _ in cprop_by_pid[53] if _pf["cost"]})
+            if _imm_spells:
+                cprop_rows.append(f"<tr><th>Immunity: Spells</th><td>{E(', '.join(_imm_spells))}</td></tr>")
+
+        # Immunity: Spells by Level (ID 78) — list the level thresholds
+        if 78 in cprop_by_pid:
+            _imm_lvls = sorted({_pf["cost"] for _pf, _ in cprop_by_pid[78] if _pf["cost"]})
+            if _imm_lvls:
+                cprop_rows.append(f"<tr><th>Immunity: Spell Level</th><td>{E(', '.join(_imm_lvls))}</td></tr>")
 
         # Regeneration (ID 51) — stacks without limit
         if 51 in cprop_by_pid:
@@ -7370,17 +7485,18 @@ def _creature_detail_sections(
         kind = "Ranged" if ranged else "Melee"
         ab_iprop = item_attack_bonus(item)
         dmg_flat, dmg_extras = item_damage_bonus(item)
-        # Creature weapons (claw/bite) and finessable light weapons use Dex via
-        # Weapon Finesse. The engine applies this unconditionally (even when Str
-        # is higher), so we match it whenever the feat + a finessable weapon are
-        # present, rather than only when Dex would be the better stat.
+        # Weapon Finesse lets creature weapons (claw/bite) and finessable light
+        # weapons use the Dex modifier — but the engine uses the *better* of Str
+        # and Dex, so only switch to Dex when it actually beats Str.
         _is_cweap = slot in _CWEAP_SLOTS
         _finesse = (
-            WEAPON_FINESSE_FEAT in feat_ids
+            WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
             and (_is_cweap or int(base_row or -1) in FINESSE_BASEITEMS)
         )
         _melee_ab = dex_mod if _finesse else str_mod
-        atk_mod = (dex_mod if ranged else _melee_ab) + ab_iprop
+        _wname = baseitem_name(base_row) if base_row is not None else ""
+        _feat_ab = feat_attack_bonus(feat_ids, _wname)
+        atk_mod = (dex_mod if ranged else _melee_ab) + ab_iprop + _feat_ab
         # Monk unarmed/creature-weapon flurry: faster schedule with ≥1 monk level.
         _monk_lvl = _monk_levels if (_is_cweap and _monk_levels >= 1 and not ranged) else 0
         attacks = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_level=_monk_lvl)
@@ -7420,10 +7536,10 @@ def _creature_detail_sections(
         )
     elif bab > 0:
         # Unarmed — show the schedule with Str-mod damage so the reader still
-        # has something to work with. Unarmed is finessable, and ≥1 monk level
-        # gives the faster unarmed flurry.
-        _u_finesse = WEAPON_FINESSE_FEAT in feat_ids
-        _u_ability = dex_mod if _u_finesse else str_mod
+        # has something to work with. Unarmed is finessable (Dex when it beats
+        # Str), and ≥1 monk level gives the faster unarmed flurry.
+        _u_finesse = WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+        _u_ability = (dex_mod if _u_finesse else str_mod) + feat_attack_bonus(feat_ids, "unarmed")
         attacks = attack_schedule(
             bab, ability_mod=_u_ability,
             monk_unarmed_level=(_monk_levels if _monk_levels >= 1 else 0))
@@ -14614,6 +14730,18 @@ def main() -> int:
                     help="Width of each Challenge Rating range bucket on the "
                          "Creatures → By Challenge Rating page (default: 10, "
                          "producing CR 0–9, CR 10–19, …).")
+    ap.add_argument("--max-character-level", type=int, default=40, metavar="N",
+                    dest="max_character_level",
+                    help="Server level cap used when deriving a creature's base "
+                         "attack bonus: its total class levels are clamped to N "
+                         "(in ClassList order) so an over-HD boss doesn't get "
+                         "unbounded BAB. 0 = no cap. Default: 40 (NWN default).")
+    ap.add_argument("--max-ability-bonus", type=int, default=12, metavar="N",
+                    dest="max_ability_bonus",
+                    help="Cap on the ability-score bonus a single item may grant, "
+                         "applied when folding equipped-item ability bonuses into "
+                         "a creature's effective scores. Default: 12 (NWN default; "
+                         "some modules raise it, e.g. 24).")
     args = ap.parse_args()
 
     global _GENERATED_AT
@@ -14686,6 +14814,11 @@ def main() -> int:
     if db.exclude_option_texts:
         print(f"[nwn-wiki] excluding map edges from dialog subtrees under: "
               + ", ".join(repr(t) for t in db.exclude_option_texts))
+    db.max_character_level = args.max_character_level
+    db.max_ability_bonus = args.max_ability_bonus
+    print(f"[nwn-wiki] combat dials: max-character-level="
+          f"{db.max_character_level or 'uncapped'}, "
+          f"max-ability-bonus=+{db.max_ability_bonus}")
     db.load()
     db.index()
     db.index_dialogs()

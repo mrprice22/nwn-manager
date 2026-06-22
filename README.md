@@ -338,20 +338,28 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
 
   **Caveats** for the combat numbers (also surfaced inline on the page):
 
-  - Saves shown = the UTC's stored bonus + ability mod. The good-save
-    class progression and feat bonuses (Great Fortitude, Lightning
-    Reflexes, etc.) are added by the engine at load time, so the wiki
+  - Ability scores fold in racial adjustments (`racialtypes.2da`) and
+    equipped-item Ability Bonus (capped — see
+    [Combat-stat configuration](#combat-stat-configuration)). Temporary
+    spell buffs (Bull's Strength, etc.) can't be known statically and are
+    not included.
+  - Saves shown = the UTC's stored bonus + ability mod + item save
+    bonuses. The good-save class progression and feat bonuses (Great
+    Fortitude, etc.) are added by the engine at load time, so the wiki
     can't reproduce them exactly.
-  - AC is best-effort: armor / shield base AC and AC-bonus iprops are
-    parsed, but scripted bumps, dodge stacking, Tumble, and shield-bash
-    interactions only resolve at runtime.
-  - BAB uses the standard stock-class progression (full / 3⁄4 / 1⁄2).
-    Custom-HAK prestige classes whose `AttackBonusTable` differs from
-    their assumed factor will be off — supply `--2da-dir` with the
-    matching `classes.2da` if it matters, or bundle a permanent overlay
-    (see below).
-  - Spell resistance is inferred from feats only; SR granted by scripts
-    or items is not summed into the AC/SR display.
+  - AC folds in Dex (incl. racial), natural + Armor Skin, armor/shield
+    base + enchant, item dodge (cap +20), haste (+4), and Tumble (+1 per
+    5 ranks). Scripted bumps still only resolve at runtime.
+  - BAB uses the real per-class progression cached from `cls_atk_*.2da`
+    (`class_bab.json`), counts only pre-epic (≤20) levels, and clamps a
+    creature's total levels to `--max-character-level`. Attack rolls add
+    Weapon Focus / Epic Weapon Focus (matched to the wielded weapon),
+    Epic Prowess and Superior Weapon Focus, and apply Weapon Finesse when
+    Dex beats Str. Custom-HAK prestige classes whose `AttackBonusTable`
+    differs from stock will be off — supply `--2da-dir` with the matching
+    `classes.2da` (or re-run `bin/wiki_data/build_class_bab.py`).
+  - Spell resistance is inferred from feats/items only; SR granted by
+    scripts is not summed into the AC/SR display.
 - `factions.html` — module-level faction data.
 - `quests/index.html` — the module's journal quests (the `module.jrl`
   categories): an overview table plus a detail page per quest. Each entry on a
@@ -445,6 +453,26 @@ nwn-wiki --src unpacked --out docs --cr-bucket-size 5
 With `--cr-bucket-size 5` the page uses CR 0–4, CR 5–9, CR 10–14, … buckets.
 Creatures with a missing or non-numeric CR appear in an "Unknown CR" bucket at
 the bottom.
+
+#### Combat-stat configuration
+
+Two derived combat numbers depend on server/module rules rather than the
+blueprint alone, so they're exposed as dials (defaults match stock NWN). Set
+them to match your server:
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--max-character-level N` | `40` | Server level cap. A creature's total class levels are clamped to `N` (consumed in `ClassList` order) when deriving **base attack bonus**, so an over-HD boss doesn't accrue unbounded BAB. With `N=40`, a Fighter60/WeaponMaster10/ArcaneArcher60 is treated as Fighter40 → BAB 20. `0` disables the cap. |
+| `--max-ability-bonus N` | `12` | Cap on the ability-score bonus a single equipped item may grant when folded into a creature's effective Str/Dex/… (which drive AC, saves, and attack). NWN's default is `+12`; some modules raise it (e.g. `+24`). |
+
+```sh
+# Homer's LotR server: level cap 40, item ability bonus cap +24
+nwn-manager wiki -- --max-character-level 40 --max-ability-bonus 24
+# or directly:
+nwn-wiki --src unpacked --out docs --max-character-level 40 --max-ability-bonus 24
+```
+
+(The `refresh-homers-lotr-wiki` runner already passes this module's values.)
 
 #### Quests: grouping and ordering
 

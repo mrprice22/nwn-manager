@@ -33,6 +33,8 @@ nwn-manager wiki \
   --log-dir "$HOME/.local/state/nwnxee-homer" \
   --db-dir "$DB_DIR" \
   --2da-dir "$PROJECT/hak_2da" \
+  --max-character-level 40 \
+  --max-ability-bonus 24 \
   --path-from thewelloferu
 status=$?
 
