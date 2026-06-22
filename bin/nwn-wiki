@@ -7424,8 +7424,28 @@ def _creature_detail_sections(
 
         # Immunity: Specific Spell (ID 53) — list every spell the creature is
         # immune to (spell name lives in the formatted cost field).
+        # Entries like "Breath, Petrification" / "Gaze, Petrification" are grouped
+        # by spell name and shown as "Petrification (Breath, Gaze)".
         if 53 in cprop_by_pid:
-            _imm_spells = sorted({_pf["cost"] for _pf, _ in cprop_by_pid[53] if _pf["cost"]})
+            _DELIVERY_PREFIXES = {"Breath", "Gaze", "Touch"}
+            _spell_deliveries: dict[str, list[str]] = {}
+            for _pf, _ in cprop_by_pid[53]:
+                _cost = _pf["cost"]
+                if not _cost:
+                    continue
+                _parts = _cost.split(", ", 1)
+                if len(_parts) == 2 and _parts[0] in _DELIVERY_PREFIXES:
+                    _sname, _prefix = _parts[1], _parts[0]
+                else:
+                    _sname, _prefix = _cost, None
+                if _sname not in _spell_deliveries:
+                    _spell_deliveries[_sname] = []
+                if _prefix and _prefix not in _spell_deliveries[_sname]:
+                    _spell_deliveries[_sname].append(_prefix)
+            _imm_spells = [
+                f"{_sn} ({', '.join(sorted(_ps))})" if _ps else _sn
+                for _sn, _ps in sorted(_spell_deliveries.items())
+            ]
             if _imm_spells:
                 cprop_rows.append(f"<tr><th>Immunity: Spells</th><td>{E(', '.join(_imm_spells))}</td></tr>")
 
