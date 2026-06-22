@@ -7571,6 +7571,88 @@ def _creature_detail_sections(
             "</p>"
         )
 
+    # ----- Spells (memorized + known) ---------------------------------------
+    spell_blocks: list[str] = []
+    for cl in classes:
+        cid = fld(cl, "Class")
+        if cid is None:
+            continue
+        # Detect any per-level memorized / known list on this class entry.
+        per_level: list[tuple[int, str, list[dict]]] = []
+        for lvl in range(10):
+            mem = list_items(cl.get(f"MemorizedList{lvl}"))
+            if mem:
+                per_level.append((lvl, "Memorized", mem))
+            known = list_items(cl.get(f"KnownList{lvl}"))
+            if known:
+                per_level.append((lvl, "Known", known))
+        if not per_level:
+            continue
+        cls_label = class_name(int(cid))
+        block = [f"<h3>{E(cls_label)}</h3>"]
+        rows: list[str] = []
+        for lvl, kind, lst in per_level:
+            _sc_order: list[tuple] = []
+            _sc_count: dict[tuple, int] = {}
+            for s in lst:
+                sid = fld(s, "Spell")
+                meta = fld(s, "SpellMetaMagic", 0) or 0
+                key = (sid, meta)
+                if key not in _sc_count:
+                    _sc_count[key] = 0
+                    _sc_order.append(key)
+                _sc_count[key] += 1
+            spell_cells: list[str] = []
+            for (sid, meta) in _sc_order:
+                n = _sc_count[(sid, meta)]
+                label = colorize_damage_words(spell_name(sid))
+                if meta:
+                    label = f"{label} <small>[mm:{meta}]</small>"
+                if n > 1:
+                    label = f"{label} ×{n}"
+                spell_cells.append(label)
+            label = ("Cantrips" if lvl == 0 else f"Level {lvl}") + f" ({kind})"
+            rows.append(
+                f"<tr><th>{E(label)}</th>"
+                f"<td>{', '.join(spell_cells)}</td></tr>"
+            )
+        block.append(
+            '<table class="data"><tbody>' + "\n".join(rows) + "</tbody></table>"
+        )
+        spell_blocks.append("\n".join(block))
+
+    # SpecAbilityList — innate spell-likes (SR feats, monster abilities).
+    # Group identical (spell, caster_level) entries; many UTCs list the same
+    # ability ten times to give it ten uses/day.
+    spec_abil = list_items(c.get("SpecAbilityList"))
+    if not spec_abil and bp is not None:
+        spec_abil = list_items(bp.get("SpecAbilityList"))
+    if spec_abil:
+        bucket: dict[tuple[Any, Any], int] = defaultdict(int)
+        for s in spec_abil:
+            key = (fld(s, "Spell"), fld(s, "SpellCasterLevel", ""))
+            bucket[key] += 1
+        rows = []
+        for (sid, slvl), n in sorted(
+                bucket.items(),
+                key=lambda kv: spell_name(kv[0][0]).lower()):
+            uses = f"{n}/day" if n > 1 else "1/day"
+            rows.append(
+                f"<tr><td>{colorize_damage_words(E(spell_name(sid)))}</td>"
+                f"<td>{E(slvl)}</td>"
+                f"<td>{E(uses)}</td></tr>"
+            )
+        spell_blocks.append(
+            "<h3>Special abilities</h3>"
+            '<table class="data"><thead><tr>'
+            "<th>Spell/ability</th><th>Caster level</th><th>Uses</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    if spell_blocks:
+        sections.append("<h2>Spells</h2>")
+        sections.extend(spell_blocks)
+
     # Equipment
     if equip:
         sections.append("<h2>Equipment</h2>")
@@ -7656,77 +7738,6 @@ def _creature_detail_sections(
                 "<th>Skill</th><th>Ranks</th>"
                 "</tr></thead><tbody>" + "\n".join(skill_rows) + "</tbody></table>"
             )
-
-    # ----- Spells (memorized + known) ---------------------------------------
-    spell_blocks: list[str] = []
-    for cl in classes:
-        cid = fld(cl, "Class")
-        if cid is None:
-            continue
-        # Detect any per-level memorized / known list on this class entry.
-        per_level: list[tuple[int, str, list[dict]]] = []
-        for lvl in range(10):
-            mem = list_items(cl.get(f"MemorizedList{lvl}"))
-            if mem:
-                per_level.append((lvl, "Memorized", mem))
-            known = list_items(cl.get(f"KnownList{lvl}"))
-            if known:
-                per_level.append((lvl, "Known", known))
-        if not per_level:
-            continue
-        cls_label = class_name(int(cid))
-        block = [f"<h3>{E(cls_label)}</h3>"]
-        rows: list[str] = []
-        for lvl, kind, lst in per_level:
-            spell_cells: list[str] = []
-            for s in lst:
-                sid = fld(s, "Spell")
-                meta = fld(s, "SpellMetaMagic", 0) or 0
-                label = colorize_damage_words(spell_name(sid))
-                if meta:
-                    label = f"{label} <small>[mm:{meta}]</small>"
-                spell_cells.append(label)
-            label = ("Cantrips" if lvl == 0 else f"Level {lvl}") + f" ({kind})"
-            rows.append(
-                f"<tr><th>{E(label)}</th>"
-                f"<td>{', '.join(spell_cells)}</td></tr>"
-            )
-        block.append(
-            '<table class="data"><tbody>' + "\n".join(rows) + "</tbody></table>"
-        )
-        spell_blocks.append("\n".join(block))
-
-    # SpecAbilityList — innate spell-likes (SR feats, monster abilities).
-    # Group identical (spell, caster_level) entries; many UTCs list the same
-    # ability ten times to give it ten uses/day.
-    spec_abil = list_items(c.get("SpecAbilityList"))
-    if not spec_abil and bp is not None:
-        spec_abil = list_items(bp.get("SpecAbilityList"))
-    if spec_abil:
-        bucket: dict[tuple[Any, Any], int] = defaultdict(int)
-        for s in spec_abil:
-            key = (fld(s, "Spell"), fld(s, "SpellCasterLevel", ""))
-            bucket[key] += 1
-        rows = []
-        for (sid, slvl), n in sorted(
-                bucket.items(),
-                key=lambda kv: spell_name(kv[0][0]).lower()):
-            uses = f"{n}/day" if n > 1 else "1/day"
-            rows.append(
-                f"<tr><td>{colorize_damage_words(E(spell_name(sid)))}</td>"
-                f"<td>{E(slvl)}</td>"
-                f"<td>{E(uses)}</td></tr>"
-            )
-        spell_blocks.append(
-            "<h3>Special abilities</h3>"
-            '<table class="data"><thead><tr>'
-            "<th>Spell/ability</th><th>Caster level</th><th>Uses</th>"
-            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
-        )
-
-    if spell_blocks:
-        sections.append("<h2>Spells</h2>")
-        sections.extend(spell_blocks)
 
     # Scripts
     sections.append("<h2>Scripts</h2>")
