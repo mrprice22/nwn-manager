@@ -1,0 +1,24 @@
+{
+  "_source": "stock NWN :: racialtypes.2da (*Adjust cols)",
+  "0": {
+    "Con": 2,
+    "Cha": -2
+  },
+  "1": {
+    "Dex": 2,
+    "Con": -2
+  },
+  "2": {
+    "Str": -2,
+    "Con": 2
+  },
+  "3": {
+    "Str": -2,
+    "Dex": 2
+  },
+  "5": {
+    "Str": 2,
+    "Int": -2,
+    "Cha": -2
+  }
+}

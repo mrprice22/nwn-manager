@@ -299,6 +299,43 @@ def _load_weapons() -> dict[int, dict[str, str]]:
 WEAPONS = _load_weapons()
 
 
+def _load_class_bab() -> dict[int, list[int]]:
+    """Load class_bab.json → {class_id: [bab_at_lvl1, bab_at_lvl2, ...]}.
+    Per-class base attack bonus progression from stock cls_atk_*.2da."""
+    p = DATA_DIR / "class_bab.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    return {int(k): v for k, v in raw.items()
+            if not k.startswith("_") and isinstance(v, list)}
+
+
+CLASS_BAB: dict[int, list[int]] = _load_class_bab()
+
+
+def _load_race_adjust() -> dict[int, dict[str, int]]:
+    """Load race_adjust.json → {race_id: {'Str': n, 'Dex': n, ...}}.
+    Racial ability-score adjustments the engine applies on top of the stored
+    UTC scores (e.g. Elf +2 Dex / -2 Con). A racialtypes.2da override (custom
+    races) is merged on top in load_2da_overrides()."""
+    p = DATA_DIR / "race_adjust.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    out: dict[int, dict[str, int]] = {}
+    for k, v in raw.items():
+        if k.startswith("_") or not isinstance(v, dict):
+            continue
+        try:
+            out[int(k)] = {ab: int(n) for ab, n in v.items()}
+        except (ValueError, TypeError):
+            pass
+    return out
+
+
+RACE_ABILITY_ADJ: dict[int, dict[str, int]] = _load_race_adjust()
+
+
 def _load_parts_chest() -> dict[int, int]:
     """Load parts_chest.2da → {torso_id: base_ac}.
     ACBONUS values may be fractional (CEP encodes model subtype in decimals);
@@ -545,6 +582,45 @@ def load_2da_overrides(d: Path) -> None:
                 target[ridx] = label
                 n_loaded += 1
         print(f"  override: {fname} → {n_loaded} rows")
+
+    # Racial ability-score adjustments from a racialtypes.2da override (so
+    # module-custom races get correct +/- ability mods). Mirrors the stock
+    # race_adjust.json; a present override row replaces the stock entry.
+    rp = d / "racialtypes.2da"
+    if rp.is_file():
+        try:
+            headers, rows = parse_2da(rp)
+            hl = [h.lower() for h in headers]
+            adj_idx = {
+                ab: (hl.index(f"{ab.lower()}adjust") + 1
+                     if f"{ab.lower()}adjust" in hl else None)
+                for ab in ("Str", "Dex", "Con", "Int", "Wis", "Cha")
+            }
+            if any(v is not None for v in adj_idx.values()):
+                for row in rows:
+                    if not row:
+                        continue
+                    try:
+                        ridx = int(row[0])
+                    except ValueError:
+                        continue
+                    vals: dict[str, int] = {}
+                    for ab, idx in adj_idx.items():
+                        if idx is None or idx >= len(row):
+                            continue
+                        cell = row[idx]
+                        if not cell or cell == "****":
+                            continue
+                        try:
+                            n = int(cell)
+                        except ValueError:
+                            continue
+                        if n:
+                            vals[ab] = n
+                    if vals or ridx in RACE_ABILITY_ADJ:
+                        RACE_ABILITY_ADJ[ridx] = vals
+        except Exception as e:
+            print(f"  warn: could not parse {rp} adjusts: {e}", file=sys.stderr)
 
     # iprp cost/subtype tables: merge from any iprp_*.2da that matches a known
     # IPROP_TABLES key. Custom 2das fully override stock entries for existing
@@ -1341,19 +1417,20 @@ def _yn(flag: bool) -> str:
 # Where information is missing (custom HAKs, scripted bonuses) we surface the
 # raw fields so the reader can spot it.
 
-# Stock NWN class id → BAB factor. Full BAB classes get +1 per level, 3/4
-# classes get floor(0.75 * level), 1/2 classes get floor(0.5 * level).
-# Falls back to 3/4 for unknown ids.
-_FULL_BAB_CLASSES = {0, 4, 6, 7, 29, 31, 32, 33, 36, 38}
-_HALF_BAB_CLASSES = {9, 10, 34, 37}
-
-
 def _class_bab(class_id: int, level: int) -> int:
-    if class_id in _FULL_BAB_CLASSES:
-        return level
-    if class_id in _HALF_BAB_CLASSES:
-        return level // 2
-    return (level * 3) // 4
+    """Base attack bonus a class contributes at the given level, looked up from
+    the stock per-class progression (class_bab.json / cls_atk_*.2da).
+
+    Only *pre-epic* levels (≤20) add BAB: epic levels grant no base attack bonus
+    in NWN, so multiclass epic creatures don't keep gaining to-hit per level.
+    Unknown classes (no cached table) fall back to a 3/4 progression."""
+    if level <= 0:
+        return 0
+    eff = min(level, 20)
+    arr = CLASS_BAB.get(class_id)
+    if arr:
+        return arr[min(eff, len(arr)) - 1]
+    return (eff * 3) // 4
 
 
 def creature_bab(classes: list[dict]) -> int:
@@ -1369,9 +1446,18 @@ def creature_bab(classes: list[dict]) -> int:
 
 
 def attack_schedule(bab: int, ability_mod: int = 0,
-                    bonus: int = 0) -> list[int]:
-    """Iterative attack bonuses. NWN caps at 4 attacks/round from BAB; haste
-    and dual-wield add separate bonus attacks we don't try to model."""
+                    bonus: int = 0, *, monk_unarmed_level: int = 0) -> list[int]:
+    """Iterative attack bonuses. NWN caps at 4 attacks/round from BAB; the extra
+    attack from haste / dual-wield is intentionally not modelled (it isn't shown
+    on the in-game character sheet either).
+
+    A monk attacking unarmed (or with creature/claw weapons) instead uses the
+    monk progression: attacks spaced 3 apart (not 5) and a higher count that
+    scales with monk level (1 + level//3), so e.g. a level-16 monk gets six
+    unarmed attacks. `monk_unarmed_level` > 0 selects this mode."""
+    if monk_unarmed_level > 0:
+        n = max(1, 1 + monk_unarmed_level // 3)
+        return [max(bab, 0) - 3 * i + ability_mod + bonus for i in range(n)]
     if bab <= 0:
         return [ability_mod + bonus]
     n = min(4, 1 + (bab - 1) // 5)
@@ -1417,6 +1503,17 @@ SLOT_NAMES = {
 WEAPON_SLOTS = {SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B}
 ARMOR_SLOTS = {SLOT_CHEST, SLOT_LEFT}  # left can hold a shield
 SHIELD_BASEITEMS = {14, 56, 57}  # Small / Large / Tower shields (stock 2da rows)
+
+# Stock 2da row ids used in combat-stat derivation.
+TUMBLE_SKILL_ID = 21       # skills.2da row; Tumble grants +1 dodge AC per 5 ranks
+ARMOR_SKIN_FEAT = 490      # feat.2da FEAT_EPIC_ARMOR_SKIN → +2 natural AC
+WEAPON_FINESSE_FEAT = 42   # feat.2da FEAT_WEAPON_FINESSE → light weapons use Dex
+MONK_CLASS_ID = 5          # classes.2da row; monk unarmed gets a faster schedule
+
+# Stock light/finessable weapon base-item rows (Weapon Finesse uses Dex on
+# these); creature weapons (claw/bite) are also finessable and handled by slot.
+FINESSE_BASEITEMS = frozenset({22, 37, 38, 40, 42, 51, 60, 111})
+# Dagger, Light Hammer, Handaxe, Kama, Kukri, Rapier, Sickle, Whip.
 
 # BaseItem sets for items-index grouping.
 _ARMOR_BASEITEMS:      frozenset[int] = frozenset({16})
@@ -1653,21 +1750,31 @@ def item_ac_bonus(item: dict | None) -> tuple[int, list[str]]:
 
 
 def item_attack_bonus(item: dict | None) -> int:
-    """Sum 'Attack Bonus' / 'Enhancement Bonus' iprops on a weapon."""
+    """To-hit bonus from a weapon's Enhancement Bonus (#6) and Attack Bonus (#56).
+
+    These do NOT stack on the attack roll: NWN's enhancement bonus is internally
+    attack+damage bundled, and a separate Attack Bonus property uses the *higher*
+    of the two for to-hit, not the sum (see enhancement-attack-bonus-conflict-
+    report.txt). Same-type props don't stack either, so take the max within each
+    type, then the max across the two. Conditional attack bonuses vs.
+    alignment/racial group (#57/#58) are situational and excluded here."""
     if not item:
         return 0
-    total = 0
+    enh = atk = 0
     for p in list_items(item.get("PropertiesList")):
         pname_id = fld(p, "PropertyName")
         if pname_id is None:
             continue
-        pname = (IPROP_DEFS.get(int(pname_id), {}).get("name") or "").lower()
-        if "attack bonus" in pname or "enhancement bonus" in pname:
-            try:
-                total += int(fld(p, "CostValue", 0) or 0)
-            except (TypeError, ValueError):
-                pass
-    return total
+        try:
+            cv = int(fld(p, "CostValue", 0) or 0)
+        except (TypeError, ValueError):
+            cv = 0
+        pid = int(pname_id)
+        if pid == 6:      # Enhancement Bonus
+            enh = max(enh, cv)
+        elif pid == 56:   # Attack Bonus (unconditional)
+            atk = max(atk, cv)
+    return max(enh, atk)
 
 
 def item_damage_bonus(item: dict | None) -> tuple[int, list[str]]:
@@ -6829,15 +6936,37 @@ def _creature_detail_sections(
     equip = _list("Equip_ItemList")
     inv = list_items(c.get("ItemList"))
 
+    # Effective ability scores = stored UTC score + racial adjustment. The UTC
+    # stores pre-racial scores; the engine adds the race's +/- at runtime (e.g.
+    # Elf +2 Dex / -2 Con), so the wiki must too — this drives AC, saves, and
+    # attack as well as the table below.
+    _race_id = _f("Race")
+    _race_adj = (RACE_ABILITY_ADJ.get(int(_race_id), {})
+                 if _race_id is not None else {})
+
+    def _ability(ab: str) -> int | None:
+        base = _f(ab)
+        if base is None:
+            return None
+        return int(base) + _race_adj.get(ab, 0)
+
+    def _abil_cell(ab: str) -> str:
+        val = _ability(ab)
+        if val is None:
+            return ""
+        adj = _race_adj.get(ab, 0)
+        note = (f" <small class=\"muted\">({adj:+d} racial)</small>" if adj else "")
+        return f"{val}{note}"
+
     sections: list[str] = [
         '<h2>Abilities</h2>',
         '<table class="data"><tr>'
-        f"<th>Str</th><td>{E(_f('Str', ''))}</td>"
-        f"<th>Dex</th><td>{E(_f('Dex', ''))}</td>"
-        f"<th>Con</th><td>{E(_f('Con', ''))}</td>"
-        f"<th>Int</th><td>{E(_f('Int', ''))}</td>"
-        f"<th>Wis</th><td>{E(_f('Wis', ''))}</td>"
-        f"<th>Cha</th><td>{E(_f('Cha', ''))}</td>"
+        f"<th>Str</th><td>{_abil_cell('Str')}</td>"
+        f"<th>Dex</th><td>{_abil_cell('Dex')}</td>"
+        f"<th>Con</th><td>{_abil_cell('Con')}</td>"
+        f"<th>Int</th><td>{_abil_cell('Int')}</td>"
+        f"<th>Wis</th><td>{_abil_cell('Wis')}</td>"
+        f"<th>Cha</th><td>{_abil_cell('Cha')}</td>"
         "</tr></table>",
     ]
 
@@ -6860,10 +6989,10 @@ def _creature_detail_sections(
         sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
 
     # ----- Combat: saves / AC / BAB / attacks -------------------------------
-    str_score = _f("Str", 10) or 10
-    dex_score = _f("Dex", 10) or 10
-    con_score = _f("Con", 10) or 10
-    wis_score = _f("Wis", 10) or 10
+    str_score = _ability("Str") or 10
+    dex_score = _ability("Dex") or 10
+    con_score = _ability("Con") or 10
+    wis_score = _ability("Wis") or 10
     str_mod = ability_mod(str_score)
     dex_mod = ability_mod(dex_score)
     con_mod = ability_mod(con_score)
@@ -6958,15 +7087,24 @@ def _creature_detail_sections(
 
     armor_ac_bonus, armor_notes = item_ac_bonus(armor_item)
     shield_ac_bonus, shield_notes = item_ac_bonus(shield_item)
+    feat_ids = [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
     natural_ac = _f("NaturalAC", 0) or 0
+    # Armor Skin (epic feat 490) grants +2 natural AC on top of stored NaturalAC.
+    _armor_skin_ac = 2 if ARMOR_SKIN_FEAT in feat_ids else 0
+    # Tumble grants +1 dodge AC per 5 ranks. SkillList[i].Rank is the *invested*
+    # rank (no Dex), which is exactly what the engine uses for the Tumble bonus.
+    _tumble_rank = 0
+    if TUMBLE_SKILL_ID < len(skills):
+        _tumble_rank = int(fld(skills[TUMBLE_SKILL_ID], "Rank", 0) or 0)
+    _tumble_ac = _tumble_rank // 5
     # Non-armor/non-shield accessories give dodge-type AC (ID 1); capped at +20.
     # Haste grants +4 dodge that stacks with item dodge (separate per NWN rules).
     _item_dodge = min(sum(cprop_dodge_ac), 20) if cprop_dodge_ac else 0
     _haste_ac = 4 if 35 in cprop_by_pid else 0
-    ac_total = (10 + dex_mod + int(natural_ac)
+    ac_total = (10 + dex_mod + int(natural_ac) + _armor_skin_ac
                 + armor_base_ac + armor_ac_bonus
                 + shield_base_ac + shield_ac_bonus
-                + _item_dodge + _haste_ac)
+                + _item_dodge + _haste_ac + _tumble_ac)
 
     ac_breakdown = [
         "10 base",
@@ -6974,6 +7112,8 @@ def _creature_detail_sections(
     ]
     if natural_ac:
         ac_breakdown.append(f"+{natural_ac} natural (NaturalAC)")
+    if _armor_skin_ac:
+        ac_breakdown.append(f"+{_armor_skin_ac} natural (Armor Skin)")
     if armor_base_ac:
         ac_breakdown.append(f"+{armor_base_ac} armor")
     if armor_ac_bonus:
@@ -6986,6 +7126,8 @@ def _creature_detail_sections(
         ac_breakdown.append(f"+{_item_dodge} dodge (items)")
     if _haste_ac:
         ac_breakdown.append(f"+{_haste_ac} dodge (haste)")
+    if _tumble_ac:
+        ac_breakdown.append(f"+{_tumble_ac} dodge (Tumble, {_tumble_rank} ranks)")
     ac_extra = armor_notes + shield_notes
 
     # Item saving throw bonuses (ID 41 = Saving Throw Bonus: Specific).
@@ -7005,11 +7147,10 @@ def _creature_detail_sections(
 
     # Monk Wisdom AC bonus: applies when creature has ≥1 monk level and wears
     # neither armor nor a shield (NWN rules).
-    _MONK_CLASS_ID = 5
     _monk_levels = sum(
         int(fld(cl, "ClassLevel", 0) or 0)
         for cl in classes
-        if int(fld(cl, "Class", -1) or -1) == _MONK_CLASS_ID
+        if int(fld(cl, "Class", -1) or -1) == MONK_CLASS_ID
     )
     _monk_wis_ac = 0
     # Cloth/robe (torso base AC == 0) doesn't block the monk WIS bonus.
@@ -7022,7 +7163,7 @@ def _creature_detail_sections(
     # Spell resistance: take max across all sources (they don't stack).
     # Improved Spell Resistance I–X are feat IDs 699–708 → SR 12, 14, …, 30.
     # Diamond Soul (feat 215) grants SR = 10 + monk level.
-    feat_ids = [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
+    # (feat_ids is computed earlier, in the AC block.)
     _ISR_FEAT_BASE = 699
     _feat_sr = max(
         (12 + 2 * (fid - _ISR_FEAT_BASE) for fid in feat_ids
@@ -7229,8 +7370,20 @@ def _creature_detail_sections(
         kind = "Ranged" if ranged else "Melee"
         ab_iprop = item_attack_bonus(item)
         dmg_flat, dmg_extras = item_damage_bonus(item)
-        atk_mod = (dex_mod if ranged else str_mod) + ab_iprop
-        attacks = attack_schedule(bab, ability_mod=atk_mod)
+        # Creature weapons (claw/bite) and finessable light weapons use Dex via
+        # Weapon Finesse. The engine applies this unconditionally (even when Str
+        # is higher), so we match it whenever the feat + a finessable weapon are
+        # present, rather than only when Dex would be the better stat.
+        _is_cweap = slot in _CWEAP_SLOTS
+        _finesse = (
+            WEAPON_FINESSE_FEAT in feat_ids
+            and (_is_cweap or int(base_row or -1) in FINESSE_BASEITEMS)
+        )
+        _melee_ab = dex_mod if _finesse else str_mod
+        atk_mod = (dex_mod if ranged else _melee_ab) + ab_iprop
+        # Monk unarmed/creature-weapon flurry: faster schedule with ≥1 monk level.
+        _monk_lvl = _monk_levels if (_is_cweap and _monk_levels >= 1 and not ranged) else 0
+        attacks = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_level=_monk_lvl)
         atk_str = "/".join(f"{a:+d}" for a in attacks)
         dmg_str = weapon_damage_string(
             base_row, str_mod=str_mod, is_ranged=ranged,
@@ -7267,8 +7420,13 @@ def _creature_detail_sections(
         )
     elif bab > 0:
         # Unarmed — show the schedule with Str-mod damage so the reader still
-        # has something to work with.
-        attacks = attack_schedule(bab, ability_mod=str_mod)
+        # has something to work with. Unarmed is finessable, and ≥1 monk level
+        # gives the faster unarmed flurry.
+        _u_finesse = WEAPON_FINESSE_FEAT in feat_ids
+        _u_ability = dex_mod if _u_finesse else str_mod
+        attacks = attack_schedule(
+            bab, ability_mod=_u_ability,
+            monk_unarmed_level=(_monk_levels if _monk_levels >= 1 else 0))
         atk_str = "/".join(f"{a:+d}" for a in attacks)
         sections.append(
             "<h3>Weapons</h3>"

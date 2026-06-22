@@ -171,6 +171,50 @@ def build(nwn_dir: Path, out_dir: Path) -> None:
             )
             print(f"    wrote {wpath.name}: {len(weapons)} rows")
 
+        # Racial ability-score adjustments. The engine adds these to the UTC's
+        # stored Str/Dex/... at runtime (e.g. Elf +2 Dex / -2 Con), so the wiki
+        # must too. Keyed by race id; non-zero adjustments only.
+        try:
+            twoda = extract_stock_2da(nwn_dir, "racialtypes.2da", tmp)
+        except Exception as e:
+            print(f"    warn: race adjust: could not re-extract racialtypes.2da: {e}",
+                  file=sys.stderr)
+        else:
+            headers, rows = parse_2da(twoda)
+            adj_cols = {ab: col_index(headers, f"{ab}Adjust")
+                        for ab in ("Str", "Dex", "Con", "Int", "Wis", "Cha")}
+            adjusts: dict[str, dict[str, int]] = {}
+            for row in rows:
+                if not row:
+                    continue
+                try:
+                    ridx = int(row[0])
+                except ValueError:
+                    continue
+                vals: dict[str, int] = {}
+                for ab, idx in adj_cols.items():
+                    if idx is None or idx >= len(row):
+                        continue
+                    cell = row[idx]
+                    if not cell or cell == "****":
+                        continue
+                    try:
+                        n = int(cell)
+                    except ValueError:
+                        continue
+                    if n:
+                        vals[ab] = n
+                if vals:
+                    adjusts[str(ridx)] = vals
+            apath = out_dir / "race_adjust.json"
+            apath.write_text(
+                json.dumps({"_source": "stock NWN :: racialtypes.2da (*Adjust cols)",
+                            **adjusts},
+                           indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print(f"    wrote {apath.name}: {len(adjusts)} rows")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
