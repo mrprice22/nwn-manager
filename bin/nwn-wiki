@@ -1465,18 +1465,41 @@ def creature_bab(classes: list[dict], max_level: int = 0) -> int:
     return total
 
 
+def creature_class_bab(classes: list[dict], target_cid: int,
+                       max_level: int = 0) -> int:
+    """Pre-epic BAB contributed by one class, using the same ClassList-order
+    server-cap clamp as creature_bab (so epic/over-cap levels add nothing)."""
+    remaining = max_level if max_level and max_level > 0 else None
+    total = 0
+    for cl in classes:
+        cid = fld(cl, "Class")
+        lvl = fld(cl, "ClassLevel", 0) or 0
+        if cid is None:
+            continue
+        lvl = int(lvl)
+        if remaining is not None:
+            if remaining <= 0:
+                break
+            lvl = min(lvl, remaining)
+            remaining -= lvl
+        if int(cid) == target_cid:
+            total += _class_bab(int(cid), lvl)
+    return total
+
+
 def attack_schedule(bab: int, ability_mod: int = 0,
-                    bonus: int = 0, *, monk_unarmed_level: int = 0) -> list[int]:
+                    bonus: int = 0, *, monk_unarmed_bab: int = 0) -> list[int]:
     """Iterative attack bonuses. NWN caps at 4 attacks/round from BAB; the extra
     attack from haste / dual-wield is intentionally not modelled (it isn't shown
     on the in-game character sheet either).
 
     A monk attacking unarmed (or with creature/claw weapons) instead uses the
-    monk progression: attacks spaced 3 apart (not 5) and a higher count that
-    scales with monk level (1 + level//3), so e.g. a level-16 monk gets six
-    unarmed attacks. `monk_unarmed_level` > 0 selects this mode."""
-    if monk_unarmed_level > 0:
-        n = max(1, 1 + monk_unarmed_level // 3)
+    monk progression: attacks spaced 3 apart (not 5), with the count derived from
+    the monk's pre-epic (cap-clamped) unarmed BAB (monkBAB // 3) — so a level-20+
+    monk (BAB 15) gets five unarmed attacks and epic levels add no further
+    attacks. `monk_unarmed_bab` > 0 selects this mode."""
+    if monk_unarmed_bab > 0:
+        n = max(1, monk_unarmed_bab // 3)
         return [max(bab, 0) - 3 * i + ability_mod + bonus for i in range(n)]
     if bab <= 0:
         return [ability_mod + bonus]
@@ -7275,6 +7298,9 @@ def _creature_detail_sections(
         for cl in classes
         if int(fld(cl, "Class", -1) or -1) == MONK_CLASS_ID
     )
+    # Pre-epic, cap-clamped monk BAB drives the unarmed flurry attack count
+    # (count = monkBAB // 3); epic/over-cap monk levels add no extra attacks.
+    _monk_bab = creature_class_bab(classes, MONK_CLASS_ID, db.max_character_level)
     _monk_wis_ac = 0
     # Cloth/robe (torso base AC == 0) doesn't block the monk WIS bonus.
     if _monk_levels >= 1 and armor_base_ac == 0 and shield_item is None:
@@ -7420,8 +7446,8 @@ def _creature_detail_sections(
             for _pf, _cv in cprop_by_pid[0]:
                 _sub = _pf["subtype"] or "?"
                 _ab_max[_sub] = max(_ab_max.get(_sub, 0), _cv)
-            for _sub, _val in sorted(_ab_max.items()):
-                cprop_rows.append(f"<tr><th>{E(_sub)} Bonus</th><td>+{_val}</td></tr>")
+            _ab_parts = [f"{_sub} +{_val}" for _sub, _val in sorted(_ab_max.items())]
+            cprop_rows.append(f"<tr><th>Ability Bonuses</th><td>{E(', '.join(_ab_parts))}</td></tr>")
 
         # Skill Bonus (ID 52) — max per skill
         if 52 in cprop_by_pid:
@@ -7429,8 +7455,8 @@ def _creature_detail_sections(
             for _pf, _cv in cprop_by_pid[52]:
                 _sub = _pf["subtype"] or "?"
                 _sk_max[_sub] = max(_sk_max.get(_sub, 0), _cv)
-            for _sub, _val in sorted(_sk_max.items()):
-                cprop_rows.append(f"<tr><th>Skill: {E(_sub)}</th><td>+{_val}</td></tr>")
+            _sk_parts = [f"{_sub} +{_val}" for _sub, _val in sorted(_sk_max.items())]
+            cprop_rows.append(f"<tr><th>Skill Bonuses</th><td>{E(', '.join(_sk_parts))}</td></tr>")
 
         # Damage Resistance (ID 23) — max per damage type
         if 23 in cprop_by_pid:
@@ -7440,8 +7466,8 @@ def _creature_detail_sections(
                 _cstr = _pf["cost"] or str(_cv)
                 if _sub not in _dr_max or _cv > _dr_max[_sub][0]:
                     _dr_max[_sub] = (_cv, _cstr)
-            for _sub, (_val, _cstr) in sorted(_dr_max.items()):
-                cprop_rows.append(f"<tr><th>Damage Resistance: {E(_sub)}</th><td>{E(_cstr)}</td></tr>")
+            _dr_parts = [f"{_sub} {_cstr}" for _sub, (_, _cstr) in sorted(_dr_max.items())]
+            cprop_rows.append(f"<tr><th>Damage Resistance</th><td>{E(', '.join(_dr_parts))}</td></tr>")
 
         # Damage Reduction (ID 22) — physical soak X / bypassed by +Y; best only.
         if 22 in cprop_by_pid:
@@ -7520,14 +7546,17 @@ def _creature_detail_sections(
             _tr = sum(cv for _, cv in cprop_by_pid[73])
             cprop_rows.append(f"<tr><th>Turn Resistance</th><td>+{_tr}</td></tr>")
 
-        # Flag properties — present/absent
+        # Flag properties — present/absent, rolled into one Misc Abilities row.
+        _misc_abil: list[str] = []
         if 35 in cprop_by_pid:
-            cprop_rows.append("<tr><th>Haste</th><td>Yes (+4 dodge AC, stacks; factored into main AC)</td></tr>")
+            _misc_abil.append("Haste (+4 dodge AC, factored into main AC)")
         for _fp_id, _fp_name in (
             (75, "Freedom of Movement"), (71, "True Seeing"), (26, "Darkvision"),
         ):
             if _fp_id in cprop_by_pid:
-                cprop_rows.append(f"<tr><th>{E(_fp_name)}</th><td>Yes</td></tr>")
+                _misc_abil.append(_fp_name)
+        if _misc_abil:
+            cprop_rows.append(f"<tr><th>Misc Abilities</th><td>{E(', '.join(_misc_abil))}</td></tr>")
 
     if cprop_rows:
         sections.append(
@@ -7568,8 +7597,8 @@ def _creature_detail_sections(
         _feat_ab = feat_attack_bonus(feat_ids, _wname)
         atk_mod = (dex_mod if ranged else _melee_ab) + ab_iprop + _feat_ab
         # Monk unarmed/creature-weapon flurry: faster schedule with ≥1 monk level.
-        _monk_lvl = _monk_levels if (_is_cweap and _monk_levels >= 1 and not ranged) else 0
-        attacks = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_level=_monk_lvl)
+        _monk_atk_bab = _monk_bab if (_is_cweap and _monk_levels >= 1 and not ranged) else 0
+        attacks = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_bab=_monk_atk_bab)
         atk_str = "/".join(f"{a:+d}" for a in attacks)
         dmg_str = weapon_damage_string(
             base_row, str_mod=str_mod, is_ranged=ranged,
@@ -7612,7 +7641,7 @@ def _creature_detail_sections(
         _u_ability = (dex_mod if _u_finesse else str_mod) + feat_attack_bonus(feat_ids, "unarmed")
         attacks = attack_schedule(
             bab, ability_mod=_u_ability,
-            monk_unarmed_level=(_monk_levels if _monk_levels >= 1 else 0))
+            monk_unarmed_bab=(_monk_bab if _monk_levels >= 1 else 0))
         atk_str = "/".join(f"{a:+d}" for a in attacks)
         sections.append(
             "<h3>Weapons</h3>"
