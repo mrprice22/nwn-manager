@@ -1561,6 +1561,38 @@ TUMBLE_SKILL_ID = 21       # skills.2da row; Tumble grants +1 dodge AC per 5 ran
 ARMOR_SKIN_FEAT = 490      # feat.2da FEAT_EPIC_ARMOR_SKIN → +2 natural AC
 WEAPON_FINESSE_FEAT = 42   # feat.2da FEAT_WEAPON_FINESSE → light weapons use Dex
 MONK_CLASS_ID = 5          # classes.2da row; monk unarmed gets a faster schedule
+EPIC_TOUGHNESS_BASE = 754  # feat.2da Epic Toughness I; I..X = 754..763, +20 HP/tier
+
+
+def epic_toughness_hp(feat_ids: Iterable[int]) -> int:
+    """HP NWN:EE adds on spawn from Epic Toughness, on top of the blueprint's
+    stored MaxHitPoints (the toolset's stored value excludes it). Modelled as
+    20 × the highest tier owned (the tiers form a prereq ladder). Returns 0 if
+    none are present."""
+    tiers = [fid - EPIC_TOUGHNESS_BASE + 1 for fid in feat_ids
+             if EPIC_TOUGHNESS_BASE <= fid <= EPIC_TOUGHNESS_BASE + 9]
+    return 20 * max(tiers) if tiers else 0
+
+
+def creature_feat_ids(c: dict | None, bp: dict | None = None) -> list[int]:
+    """Feat ids from a creature's FeatList (instance first, blueprint fallback)."""
+    feats = list_items((c or {}).get("FeatList")) or (
+        list_items(bp.get("FeatList")) if bp else [])
+    return [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
+
+
+def creature_max_hp(c: dict | None, bp: dict | None = None) -> int | None:
+    """Effective max HP the way the engine reports it: stored MaxHitPoints plus
+    Epic Toughness HP applied on spawn (see epic_toughness_hp). Returns None when
+    no HP field is set so callers can render an empty cell."""
+    raw = fld(c, "MaxHitPoints") or fld(c, "HitPoints")
+    if raw in (None, "") and bp is not None:
+        raw = fld(bp, "MaxHitPoints") or fld(bp, "HitPoints")
+    try:
+        base = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return base + epic_toughness_hp(creature_feat_ids(c, bp))
 
 # Stock light/finessable weapon base-item rows (Weapon Finesse uses Dex on
 # these); creature weapons (claw/bite) are also finessable and handled by slot.
@@ -6271,13 +6303,13 @@ def render_area_page(db: Db, resref: str, out: Path,
                 f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
                 for cl in classes
             )
-            hp = fld(c, "MaxHitPoints", fld(c, "HitPoints", ""))
+            bp = db.creatures.get(rr.lower())
+            _eff_hp = creature_max_hp(c, bp)
+            hp = _eff_hp if _eff_hp is not None else ""
             cr = fld(c, "ChallengeRating", "")
             conv = fld(c, "Conversation", "")
-            if not conv:
-                bp = db.creatures.get(rr.lower())
-                if bp:
-                    conv = fld(bp, "Conversation", "") or ""
+            if not conv and bp:
+                conv = fld(bp, "Conversation", "") or ""
             can_rr = db.canonical_for_inst.get((resref, idx), rr)
             inst_url = f"../creatures/{can_rr}.html"
             name_cell = f'<a href="{E(inst_url)}">{nwn_html(disp)}</a>'
@@ -6378,7 +6410,8 @@ def render_area_page(db: Db, resref: str, out: Path,
                 f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
                 for cl in classes2
             )
-            hp2 = fld(bp2, "MaxHitPoints", "")
+            _eff_hp2 = creature_max_hp(bp2)
+            hp2 = _eff_hp2 if _eff_hp2 is not None else ""
             cr2 = fld(bp2, "ChallengeRating", "")
             conv2 = fld(bp2, "Conversation", "")
             ss_rows.append(
@@ -6722,6 +6755,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
             )
         else:
             variant_note = ""
+        _eff_hp = creature_max_hp(c, bp)
         total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
         if _BESTIARY_ACTIVE:
             k = _BESTIARY_KILLS.get(can_rr)
@@ -6738,7 +6772,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
             f"<td>{total_count if total_count else '—'}</td>"
             f"<td>{E(race_name(_f('Race')))}</td>"
             f"<td>{E(cls_str)}</td>"
-            f"<td>{E(_f('MaxHitPoints', ''))}</td>"
+            f"<td>{E(_eff_hp if _eff_hp is not None else '')}</td>"
             f"<td>{E(_f('ChallengeRating', ''))}</td>"
             f"<td>{E(db.faction_name(_f('FactionID', '')))}</td>"
             f"{kills_cells}</tr>"
@@ -7248,6 +7282,12 @@ def _creature_detail_sections(
         if _monk_wis_ac:
             ac_total += _monk_wis_ac
             ac_breakdown.append(f"+{_monk_wis_ac} Wis (monk)")
+        # Monk "Monk AC Bonus" feat (260): +1 dodge AC per 5 monk levels.
+        # Separate from the item-dodge +20 cap, like the Wisdom/haste bonuses.
+        _monk_lvl_ac = _monk_levels // 5
+        if _monk_lvl_ac:
+            ac_total += _monk_lvl_ac
+            ac_breakdown.append(f"+{_monk_lvl_ac} dodge (monk level)")
 
     # Spell resistance: take max across all sources (they don't stack).
     # Improved Spell Resistance I–X are feat IDs 699–708 → SR 12, 14, …, 30.
@@ -7263,7 +7303,17 @@ def _creature_detail_sections(
     _item_sr = max((cv for _, cv in cprop_by_pid.get(39, [])), default=0)
     sr_total = max(_feat_sr, _diamond_soul_sr, _item_sr)
 
-    _hp_display = _fmt_hp(_f('MaxHitPoints', _f('HitPoints', '')))
+    _hp_raw = _f('MaxHitPoints', _f('HitPoints', ''))
+    try:
+        _base_hp = int(_hp_raw)
+    except (TypeError, ValueError):
+        _base_hp = None
+    _et_hp = epic_toughness_hp(feat_ids)
+    if _base_hp is not None and _et_hp:
+        _hp_display = (f"{_fmt_hp(_base_hp + _et_hp)} "
+                       f"({_fmt_hp(_base_hp)} + {_et_hp} Epic Toughness)")
+    else:
+        _hp_display = _fmt_hp(_hp_raw)
 
     sections.append("<h2>Combat</h2>")
     _combat_rows = (
@@ -7782,6 +7832,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
         for cl in classes
     )
     conv = _meta("Conversation", "")
+    _eff_hp_meta = creature_max_hp(c, bp)
 
     sections = [
         f"<h1>{nwn_html(name)}</h1>",
@@ -7791,7 +7842,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
         f"<dt>Race</dt><dd>{_race_link(_meta('Race'), root_rel='..')}</dd>",
         f"<dt>Appearance</dt><dd>{E(appearance_name(_meta('Appearance_Type')))}</dd>",
         f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
-        f"<dt>HP</dt><dd>{E(_fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
+        f"<dt>HP</dt><dd>{E(_fmt_hp(_eff_hp_meta) if _eff_hp_meta is not None else _fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
         f"<dt>CR</dt><dd>{E(_meta('ChallengeRating', ''))}</dd>",
         f"<dt>Faction</dt><dd>{_faction_cell(db, canonical_rr, _meta('FactionID', ''), root_rel='..')}</dd>",
         f"<dt>Conversation</dt><dd>{_conv_link(db, conv, root_rel='..') if conv else '—'}</dd>",
@@ -8023,11 +8074,12 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
                 badges.append('<span class="badge">script</span>')
             method = " + ".join(badges) if badges else "—"
             count = placed + enc + script
+            _eff_hp2 = creature_max_hp(c2, bp2)
             rows.append(
                 f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
                 f"<td>{E(race_name(_f2('Race')))}</td>"
                 f"<td>{E(cls_str2)}</td>"
-                f"<td>{E(_f2('MaxHitPoints', ''))}</td>"
+                f"<td>{E(_eff_hp2 if _eff_hp2 is not None else '')}</td>"
                 f"<td>{E(_f2('ChallengeRating', ''))}</td>"
                 f"<td>{method}</td>"
                 f"<td>{count}</td></tr>"
@@ -8155,11 +8207,12 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
                 f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
                 for cl in classes3
             )
+            _eff_hp3 = creature_max_hp(c2, bp2)
             rows.append(
                 f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
                 f"<td>{E(race_name(_f3('Race')))}</td>"
                 f"<td>{E(cls_str3)}</td>"
-                f"<td>{E(_f3('MaxHitPoints', ''))}</td>"
+                f"<td>{E(_eff_hp3 if _eff_hp3 is not None else '')}</td>"
                 f"<td>{E(_f3('ChallengeRating', ''))}</td>"
                 f"<td>{E(db.faction_name(_f3('FactionID', '')))}</td></tr>"
             )
@@ -8279,11 +8332,12 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
                 for cl in classes4
             )
             total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
+            _eff_hp4 = creature_max_hp(c2, bp2)
             rows.append(
                 f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
                 f"<td>{total_count if total_count else '&#x2014;'}</td>"
                 f"<td>{E(cls_str4)}</td>"
-                f"<td>{E(_f4('MaxHitPoints', ''))}</td>"
+                f"<td>{E(_eff_hp4 if _eff_hp4 is not None else '')}</td>"
                 f"<td>{E(_f4('ChallengeRating', ''))}</td>"
                 f"<td>{E(db.faction_name(_f4('FactionID', '')))}</td></tr>"
             )
@@ -10804,11 +10858,7 @@ def render_factions(db: Db, out: Path) -> None:
             idx = inst["idx"]
             name = db.creature_instance_name(area_rr, idx) or db.creature_name(crr) or crr
             classes = list_items(c.get("ClassList")) or list_items(bp.get("ClassList"))
-            try:
-                hp = int(fld(c, "MaxHitPoints") or fld(c, "HitPoints")
-                         or fld(bp, "MaxHitPoints") or fld(bp, "HitPoints") or 0)
-            except (TypeError, ValueError):
-                hp = 0
+            hp = creature_max_hp(c, bp) or 0
             cr = fld(c, "ChallengeRating") or fld(bp, "ChallengeRating") or ""
             race = fld(c, "Race") if fld(c, "Race") not in (None, "") else fld(bp, "Race")
             faction_entries[fid].append({
@@ -10832,10 +10882,7 @@ def render_factions(db: Db, out: Path) -> None:
         if fid is None:
             continue
         classes = list_items(bp.get("ClassList"))
-        try:
-            hp = int(fld(bp, "MaxHitPoints") or fld(bp, "HitPoints") or 0)
-        except (TypeError, ValueError):
-            hp = 0
+        hp = creature_max_hp(bp) or 0
         cr = fld(bp, "ChallengeRating") or ""
         name = db.creature_name(crr) or crr
         lvls = _total_levels(classes)
@@ -14181,8 +14228,7 @@ def generate_module_index(
         bp = db.creatures.get(bp_rr, c)
         name = nwn_text(db.canonical_creature_name(can_rr))
         cr_raw = fld(c, "ChallengeRating") or fld(bp, "ChallengeRating") or ""
-        hp = _try_int(fld(c, "MaxHitPoints") or fld(c, "HitPoints")
-                      or fld(bp, "MaxHitPoints") or fld(bp, "HitPoints"))
+        hp = creature_max_hp(c, bp if bp is not c else None) or 0
         race_raw = fld(c, "Race") if fld(c, "Race") not in (None, "") else fld(bp, "Race")
         fid = _int_fid(fld(c, "FactionID") if fld(c, "FactionID") not in (None, "")
                        else fld(bp, "FactionID"))
