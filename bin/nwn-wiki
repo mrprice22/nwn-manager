@@ -1293,6 +1293,15 @@ def _variant_diff_items(
     if br != vr and vr is not None:
         diffs.append(f"Race: {race_name(br)} → {race_name(vr)}")
 
+    # Display name (a renamed placement of an otherwise-identical blueprint)
+    def _disp(fc: dict, fbp: dict | None) -> str:
+        f = loc(fc.get("FirstName")) or (loc(fbp.get("FirstName")) if fbp else None)
+        l = loc(fc.get("LastName")) or (loc(fbp.get("LastName")) if fbp else None)
+        return ((f or "") + " " + (l or "")).strip()
+    vname, bname = _disp(c, bp), _disp(base_c, base_bp)
+    if vname and vname != bname:
+        diffs.append(f'Named "{vname}" (vs "{bname}")' if bname else f'Named "{vname}"')
+
     return diffs
 
 
@@ -2319,7 +2328,14 @@ class Db:
         if not conv_resref and bp is not None:
             conv_resref = (fld(bp, "Conversation", "") or "").strip().lower()
         conv_key = _conversation_key(self.dialogs[conv_resref]) if conv_resref in self.dialogs else ()
-        key = (_creature_key(c, bp), conv_key)
+        # Display name is part of identity: a blueprint placed under different
+        # FirstName overrides (e.g. cultmember002 as both "Numarok The Black Hand"
+        # and "Numanan Numerocks Second Hand") should get one wiki page per name
+        # rather than collapsing to a single combat-identical canonical.
+        first = loc(c.get("FirstName")) or (loc(bp.get("FirstName")) if bp else None)
+        last = loc(c.get("LastName")) or (loc(bp.get("LastName")) if bp else None)
+        name_key = ((first or "") + " " + (last or "")).strip().lower()
+        key = (_creature_key(c, bp), conv_key, name_key)
         registry = self._creature_key_registry.setdefault(bp_rr, {})
 
         if key in registry:
@@ -6808,7 +6824,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
     n_variants = sum(1 for r in db.canonical_creatures
                      if db.canonical_bp_of.get(r) != r)
     variant_note_str = (
-        f" ({n_variants} equipment/class variant{'s' if n_variants != 1 else ''})"
+        f" ({n_variants} equipment/class/name variant{'s' if n_variants != 1 else ''})"
         if n_variants else ""
     )
     kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
