@@ -8458,7 +8458,7 @@ def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
 
 def _inaccessible_reason_html(rr: str, db: "Db") -> str:
     if db.item_carried_by.get(rr):
-        return '<span class="reason-undroppable">Undroppable / Cursed / Plot</span>'
+        return '<span class="reason-undroppable">Carried but not droppable</span>'
     return '<span class="reason-missing">Not found anywhere</span>'
 
 
@@ -8785,11 +8785,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     _carriers = db.item_carried_by.get(resref, [])
     _any_droppable = any(e.get("dropable") for e in _carriers)
     _any_pickpocketable = any(e.get("pickpocketable") for e in _carriers)
-    if is_plot:
-        _drop_label = "No"
-        _drop_reason = " — plot item"
-        _drop_tt = "title=\"Plot items cannot be dropped, sold, or stolen by any creature.\""
-    elif is_cursed:
+    if is_cursed:
         _drop_label = "No"
         _drop_reason = " — cursed"
         _drop_tt = "title=\"Cursed items are stuck in a creature&#39;s inventory and will not appear as loot.\""
@@ -8841,6 +8837,12 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         ),
         f"<dt>GP Value</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
         f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
+        *([
+            '<dt title="Plot items cannot be sold to merchants, but can be '
+            'dropped and looted normally.">Plot item</dt><dd>Yes '
+            '<small class="muted">— cannot be sold to merchants; drops/loots '
+            'normally</small></dd>'
+        ] if is_plot else []),
         f"<dt {_drop_tt}>Drops on death</dt><dd>{_drop_label}"
         f"{'<small class=\"muted\">' + _drop_reason + '</small>' if _drop_reason else ''}</dd>",
         '</dl>',
@@ -8896,7 +8898,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "Items with creature base types cannot be equipped or used by player characters — "
             "they are intended for use by NPCs and monsters only.</p>"
         )
-    if _carriers and not _any_droppable and not is_plot and not is_cursed:
+    if _carriers and not _any_droppable and not is_cursed:
         if _any_pickpocketable:
             sections.append(
                 '<p class="warn-no-drop"><strong>Note: this item does not drop on death.</strong> '
