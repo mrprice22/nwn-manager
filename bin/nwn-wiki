@@ -1631,6 +1631,18 @@ def creature_max_hp(c: dict | None, bp: dict | None = None) -> int | None:
 FINESSE_BASEITEMS = frozenset({22, 37, 38, 40, 42, 51, 60, 111})
 # Dagger, Light Hammer, Handaxe, Kama, Kukri, Rapier, Sickle, Whip.
 
+# Physical damage type(s) a base weapon deals, keyed by baseitems.2da WeaponType.
+# weapons.json carries no physical-damage-type column, so this map is the only
+# source. Elemental/divine damage instead comes from item properties.
+_PHYSICAL_DAMAGE_TYPES = ("Bludgeoning", "Piercing", "Slashing")
+_WEAPONTYPE_TO_PHYS: dict[int, frozenset[str]] = {
+    1: frozenset({"Piercing"}),
+    2: frozenset({"Bludgeoning"}),
+    3: frozenset({"Slashing"}),
+    4: frozenset({"Slashing", "Piercing"}),
+    5: frozenset({"Bludgeoning", "Piercing"}),
+}
+
 # BaseItem sets for items-index grouping.
 _ARMOR_BASEITEMS:      frozenset[int] = frozenset({16})
 _HELMET_BASEITEMS:     frozenset[int] = frozenset({17})
@@ -1922,6 +1934,105 @@ def item_damage_bonus(item: dict | None) -> tuple[int, list[str]]:
         elif "massive criticals" in pname or "on hit" in pname or "vampiric" in pname:
             extras.append(itemprop_oneliner(p))
     return flat, extras
+
+
+def weapon_enhancement(item: dict | None) -> int:
+    """Highest Enhancement Bonus (item-property #6) on the item.
+
+    Unlike item_attack_bonus (which folds in Attack Bonus #56 for to-hit), this
+    is the value that matters for bypassing a creature's Damage Reduction: NWN
+    DR of 'X/+Y' is ignored only by a weapon whose *enhancement* is ≥ Y."""
+    if not item:
+        return 0
+    enh = 0
+    for p in list_items(item.get("PropertiesList")):
+        if fld(p, "PropertyName") != 6:
+            continue
+        try:
+            cv = int(fld(p, "CostValue", 0) or 0)
+        except (TypeError, ValueError):
+            cv = 0
+        enh = max(enh, cv)
+    return enh
+
+
+def _weapon_extra_damage_types(item: dict | None) -> set[str]:
+    """Elemental / divine / etc. damage types a weapon adds via item properties
+    (Damage Bonus #6-style subtypes and On Hit). Physical Damage Bonus adds to
+    existing physical damage and carries no new type, so it is excluded here.
+    Returns canonical _DAMAGE_TYPE_LABELS names."""
+    if not item:
+        return set()
+    _names = set(_DAMAGE_TYPE_LABELS.values())
+    out: set[str] = set()
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pdef = IPROP_DEFS.get(int(pname_id), {})
+        pname = (pdef.get("name") or "").lower()
+        if "damage bonus" not in pname:
+            continue
+        sub_id = fld(p, "Subtype")
+        if sub_id in (None, 0, 7):  # 0/7 = Physical (no new damage type)
+            continue
+        sub = itemprop_format(p)["subtype"]
+        if sub in _names:
+            out.add(sub)
+    return out
+
+
+def _item_accessible(db: "Db", rr: str) -> bool:
+    """True when players can obtain this item: sold in a store, found in a
+    container, dropped/pickpocketed off a creature, or granted by a script.
+    Mirrors the item_index.json accessibility rule."""
+    return (
+        rr in db.item_sold_at
+        or rr in db.item_in_container
+        or any(e.get("dropable") or e.get("pickpocketable")
+               for e in db.item_carried_by.get(rr, []))
+        or rr in db.item_from_script
+    )
+
+
+def extract_item_offense(db: "Db", item: dict, resref: str) -> dict:
+    """Offensive capability of a single item, as plain data for the
+    counter-gear matcher. Weapons report the damage types they can deal
+    (physical from the base item + elemental from properties), enhancement
+    bonus (for DR bypass) and to-hit bonus; non-weapons report is_weapon=False."""
+    _raw = fld(item, "BaseItem", None)
+    bi = -1 if _raw is None else int(_raw)
+    name = db.item_name(resref)
+    stats = WEAPONS.get(bi)
+    try:
+        _wtype = int(stats.get("WeaponType")) if stats and stats.get("WeaponType") not in (None, "", "*") else 0
+    except (TypeError, ValueError):
+        _wtype = 0
+    is_weapon = bool((stats and _wtype) or bi in _CEP_WEAPON_BASEITEMS)
+    physical = set(_WEAPONTYPE_TO_PHYS.get(_wtype, frozenset())) if is_weapon else set()
+    extra = _weapon_extra_damage_types(item) if is_weapon else set()
+    damage_dtypes = physical | extra
+    try:
+        _cost = int(fld(item, "Cost", 0) or 0)
+    except (TypeError, ValueError):
+        _cost = 0
+    return {
+        "resref": resref,
+        "name": nwn_text(name),
+        "base_item_id": bi,
+        "base_item_name": baseitem_name(bi) if bi >= 0 else "",
+        "category": _item_category(item, nwn_text(name)),
+        "is_weapon": is_weapon,
+        "is_ranged": is_ranged_weapon(bi) if is_weapon else False,
+        "physical_dtypes": sorted(physical),
+        "extra_dtypes": sorted(extra),
+        "damage_dtypes": sorted(damage_dtypes),
+        "enhancement": weapon_enhancement(item),
+        "attack_bonus": item_attack_bonus(item),
+        "cost": _cost,
+        "tag": (fld(item, "Tag", "") or resref).lower(),
+        "accessible": _item_accessible(db, resref),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -7039,18 +7150,22 @@ def _retaliation_sentence(info: dict) -> str:
     return f"When struck, this creature will {core}."
 
 
-def _creature_detail_sections(
-    db: Db,
-    c: dict,
-    *,
-    bp: dict | None = None,
-    root_rel: str = "..",
-) -> list[str]:
-    """Body sections (abilities, combat, weapons, equipment, inventory,
-    feats, skills, spells, scripts) shared by blueprint and instance pages.
-    When `bp` is provided, fields missing from the instance struct fall
-    back to the blueprint — most GIT placements keep the UTC defaults."""
-    items_dir = f"{root_rel}/items"
+_ABIL_NAME_KEY = {"Strength": "Str", "Dexterity": "Dex", "Constitution": "Con",
+                  "Intelligence": "Int", "Wisdom": "Wis", "Charisma": "Cha"}
+_CWEAP_SLOTS = frozenset({SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B})
+
+
+def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
+    """Compute a creature's effective combat defenses once, as plain data, so
+    both the HTML detail page and the counter-gear analysis read from the same
+    source of truth (the NWN combat rules here are subtle — duplicating them
+    would drift).  When `bp` is provided, fields missing from the instance
+    struct fall back to the blueprint.
+
+    Returns a dict carrying the rendered-display values the creature page needs
+    (ac_total/ac_breakdown, fort/ref/will, sr, hp_display, cprop_by_pid, …) as
+    well as structured defenses for analysis (dr, resistances, immunities,
+    spell_immunities, regen, vampiric, hard_required_tags, mitigates_damage)."""
 
     def _f(key: str, default: Any = None) -> Any:
         v = fld(c, key, None)
@@ -7068,33 +7183,25 @@ def _creature_detail_sections(
     feats = _list("FeatList")
     skills = _list("SkillList")
     equip = _list("Equip_ItemList")
-    inv = list_items(c.get("ItemList"))
 
     def _equip_resref(e: dict) -> str:
-        # Blueprint equip entries reference an external UTI via EquippedRes;
-        # GIT instances inline the item but still carry TemplateResRef.
         return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
 
     def _equip_item(e: dict) -> dict | None:
         irr = _equip_resref(e)
         if irr and irr in db.items:
             return db.items[irr]
-        # GIT instances embed the full item struct (BaseItem, PropertiesList,
-        # LocalizedName, …) directly into the equip entry.
         return e if "BaseItem" in e else None
 
     # Effective ability scores = stored UTC score + racial adjustment + item
     # bonus. The UTC stores pre-racial scores; the engine adds the race's +/- at
     # runtime (e.g. Elf +2 Dex / -2 Con) plus any Ability Bonus from equipped
-    # gear (capped per the module's max). This drives AC, saves, and attack as
-    # well as the table below. (Temporary spell buffs aren't statically known.)
+    # gear (capped per the module's max).
     _race_id = _f("Race")
-    _race_adj = (RACE_ABILITY_ADJ.get(int(_race_id), {})
-                 if _race_id is not None else {})
+    race_adj = (RACE_ABILITY_ADJ.get(int(_race_id), {})
+                if _race_id is not None else {})
 
-    _ABIL_NAME_KEY = {"Strength": "Str", "Dexterity": "Dex", "Constitution": "Con",
-                      "Intelligence": "Int", "Wisdom": "Wis", "Charisma": "Cha"}
-    _item_abil: dict[str, int] = {}
+    item_abil: dict[str, int] = {}
     for _e in equip:
         _it = _equip_item(_e)
         if _it is None:
@@ -7107,82 +7214,39 @@ def _creature_detail_sections(
             if not _key:
                 continue
             _val = _prop_value_num(_pf["cost"]) if _pf["cost"] else 0
-            if _val > _item_abil.get(_key, 0):  # same-ability enhancement: max
-                _item_abil[_key] = _val
+            if _val > item_abil.get(_key, 0):  # same-ability enhancement: max
+                item_abil[_key] = _val
     _abil_cap = db.max_ability_bonus
     if _abil_cap and _abil_cap > 0:
-        _item_abil = {k: min(v, _abil_cap) for k, v in _item_abil.items()}
+        item_abil = {k: min(v, _abil_cap) for k, v in item_abil.items()}
 
     def _ability(ab: str) -> int | None:
         base = _f(ab)
         if base is None:
             return None
-        return int(base) + _race_adj.get(ab, 0) + _item_abil.get(ab, 0)
+        return int(base) + race_adj.get(ab, 0) + item_abil.get(ab, 0)
 
-    def _abil_cell(ab: str) -> str:
-        val = _ability(ab)
-        if val is None:
-            return ""
-        adj = _race_adj.get(ab, 0)
-        item = _item_abil.get(ab, 0)
-        notes = []
-        if adj:
-            notes.append(f"{adj:+d} racial")
-        if item:
-            notes.append(f"+{item} item")
-        note = (f" <small class=\"muted\">({', '.join(notes)})</small>" if notes else "")
-        return f"{val}{note}"
+    ability_scores = {ab: _ability(ab) for ab in
+                      ("Str", "Dex", "Con", "Int", "Wis", "Cha")}
 
-    sections: list[str] = [
-        '<h2>Abilities</h2>',
-        '<table class="data"><tr>'
-        f"<th>Str</th><td>{_abil_cell('Str')}</td>"
-        f"<th>Dex</th><td>{_abil_cell('Dex')}</td>"
-        f"<th>Con</th><td>{_abil_cell('Con')}</td>"
-        f"<th>Int</th><td>{_abil_cell('Int')}</td>"
-        f"<th>Wis</th><td>{_abil_cell('Wis')}</td>"
-        f"<th>Cha</th><td>{_abil_cell('Cha')}</td>"
-        "</tr></table>",
-    ]
-
-    if classes:
-        cls_rows = "".join(
-            f"<tr><td>{E(class_name(fld(cl, 'Class')))}</td>"
-            f"<td>{E(fld(cl, 'ClassLevel', ''))}</td></tr>"
-            for cl in classes
-        )
-        sections.append(
-            "<h2>Classes</h2>"
-            '<table class="data"><thead><tr><th>Class</th><th>Level</th></tr></thead>'
-            f"<tbody>{cls_rows}</tbody></table>"
-        )
-
-    desc = loc(c.get("Description"))
-    if not desc and bp is not None:
-        desc = loc(bp.get("Description"))
-    if desc:
-        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
-
-    # ----- Combat: saves / AC / BAB / attacks -------------------------------
-    str_score = _ability("Str") or 10
-    dex_score = _ability("Dex") or 10
-    con_score = _ability("Con") or 10
-    wis_score = _ability("Wis") or 10
+    # ----- Combat: saves / AC / BAB -----------------------------------------
+    str_score = ability_scores["Str"] or 10
+    dex_score = ability_scores["Dex"] or 10
+    con_score = ability_scores["Con"] or 10
+    wis_score = ability_scores["Wis"] or 10
     str_mod = ability_mod(str_score)
     dex_mod = ability_mod(dex_score)
     con_mod = ability_mod(con_score)
     wis_mod = ability_mod(wis_score)
 
-    # Saves: NWN UTC stores per-save *bonus* fields (fortbonus, refbonus,
-    # willbonus); the per-class progression is added at runtime. We surface
-    # the override + ability mod so the reader has a floor.
+    # Saves: NWN UTC stores per-save *bonus* fields; the per-class progression
+    # is added at runtime. We surface the override + ability mod as a floor.
     fort = (_f("fortbonus", 0) or 0) + con_mod
     ref = (_f("refbonus", 0) or 0) + dex_mod
     will = (_f("willbonus", 0) or 0) + wis_mod
 
     bab = creature_bab(classes, db.max_character_level)
 
-    # Find equipped armor / shield / weapons via slot bitmasks.
     equip_by_slot: dict[int, dict] = {}
     for e in equip:
         slot = fld(e, "__struct_id")
@@ -7193,13 +7257,11 @@ def _creature_detail_sections(
         e = equip_by_slot.get(slot)
         return _equip_item(e) if e else None
 
-    # ----- Combined equipment combat properties (built here; data used for AC/saves) -----
+    # ----- Combined equipment combat properties -----------------------------
     # Creature weapons (R/L/bite) share the same item blueprint; skip duplicates
-    # to avoid triple-counting properties (e.g. vampiric regen).
-    # AC Bonus (ID 1) on armor/shield slots = armor/shield type (handled separately
-    # below); on all other slots it is dodge-type and tracked in cprop_dodge_ac.
+    # to avoid triple-counting properties. AC Bonus (ID 1) on armor/shield slots
+    # is the armor/shield type (handled separately); on other slots it is dodge.
     _seen_cweap_resrefs: set[str] = set()
-    _CWEAP_SLOTS = frozenset({SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B})
     _ARMOR_SHIELD_SLOTS = frozenset({SLOT_CHEST, SLOT_LEFT})
     cprop_by_pid: dict[int, list[tuple[dict, int]]] = {}
     cprop_dodge_ac: list[int] = []
@@ -7251,16 +7313,11 @@ def _creature_detail_sections(
     shield_ac_bonus, shield_notes = item_ac_bonus(shield_item)
     feat_ids = [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
     natural_ac = _f("NaturalAC", 0) or 0
-    # Armor Skin (epic feat 490) grants +2 natural AC on top of stored NaturalAC.
     _armor_skin_ac = 2 if ARMOR_SKIN_FEAT in feat_ids else 0
-    # Tumble grants +1 dodge AC per 5 ranks. SkillList[i].Rank is the *invested*
-    # rank (no Dex), which is exactly what the engine uses for the Tumble bonus.
     _tumble_rank = 0
     if TUMBLE_SKILL_ID < len(skills):
         _tumble_rank = int(fld(skills[TUMBLE_SKILL_ID], "Rank", 0) or 0)
     _tumble_ac = _tumble_rank // 5
-    # Non-armor/non-shield accessories give dodge-type AC (ID 1); capped at +20.
-    # Haste grants +4 dodge that stacks with item dodge (separate per NWN rules).
     _item_dodge = min(sum(cprop_dodge_ac), 20) if cprop_dodge_ac else 0
     _haste_ac = 4 if 35 in cprop_by_pid else 0
     ac_total = (10 + dex_mod + int(natural_ac) + _armor_skin_ac
@@ -7292,49 +7349,38 @@ def _creature_detail_sections(
         ac_breakdown.append(f"+{_tumble_ac} dodge (Tumble, {_tumble_rank} ranks)")
     ac_extra = armor_notes + shield_notes
 
-    # Item saving throw bonuses (ID 41 = Saving Throw Bonus: Specific).
-    # Universal applies to all saves; Fort/Ref/Will add to the specific save.
-    # Same-type bonuses don't stack — take max per save type.
+    # Item saving throw bonuses (ID 41) — max per save type (don't stack).
     _iprp_save_univ = max((cv for _pf, cv in cprop_by_pid.get(41, [])
                            if not _pf["subtype"] or _pf["subtype"] == "Universal"), default=0)
     _iprp_save_fort = max((cv for _pf, cv in cprop_by_pid.get(41, [])
                            if _pf["subtype"] == "Fortitude"), default=0)
-    _iprp_save_ref  = max((cv for _pf, cv in cprop_by_pid.get(41, [])
-                           if _pf["subtype"] == "Reflex"), default=0)
+    _iprp_save_ref = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                          if _pf["subtype"] == "Reflex"), default=0)
     _iprp_save_will = max((cv for _pf, cv in cprop_by_pid.get(41, [])
                            if _pf["subtype"] == "Will"), default=0)
     fort = fort + _iprp_save_univ + _iprp_save_fort
-    ref  = ref  + _iprp_save_univ + _iprp_save_ref
+    ref = ref + _iprp_save_univ + _iprp_save_ref
     will = will + _iprp_save_univ + _iprp_save_will
 
-    # Monk Wisdom AC bonus: applies when creature has ≥1 monk level and wears
-    # neither armor nor a shield (NWN rules).
+    # Monk Wisdom AC bonus: ≥1 monk level and neither armor nor shield.
     _monk_levels = sum(
         int(fld(cl, "ClassLevel", 0) or 0)
         for cl in classes
         if int(fld(cl, "Class", -1) or -1) == MONK_CLASS_ID
     )
-    # Pre-epic, cap-clamped monk BAB drives the unarmed flurry attack count
-    # (count = monkBAB // 3); epic/over-cap monk levels add no extra attacks.
     _monk_bab = creature_class_bab(classes, MONK_CLASS_ID, db.max_character_level)
     _monk_wis_ac = 0
-    # Cloth/robe (torso base AC == 0) doesn't block the monk WIS bonus.
     if _monk_levels >= 1 and armor_base_ac == 0 and shield_item is None:
         _monk_wis_ac = max(wis_mod, 0)
         if _monk_wis_ac:
             ac_total += _monk_wis_ac
             ac_breakdown.append(f"+{_monk_wis_ac} Wis (monk)")
-        # Monk "Monk AC Bonus" feat (260): +1 dodge AC per 5 monk levels.
-        # Separate from the item-dodge +20 cap, like the Wisdom/haste bonuses.
         _monk_lvl_ac = _monk_levels // 5
         if _monk_lvl_ac:
             ac_total += _monk_lvl_ac
             ac_breakdown.append(f"+{_monk_lvl_ac} dodge (monk level)")
 
-    # Spell resistance: take max across all sources (they don't stack).
-    # Improved Spell Resistance I–X are feat IDs 699–708 → SR 12, 14, …, 30.
-    # Diamond Soul (feat 215) grants SR = 10 + monk level.
-    # (feat_ids is computed earlier, in the AC block.)
+    # Spell resistance: max across sources (they don't stack).
     _ISR_FEAT_BASE = 699
     _feat_sr = max(
         (12 + 2 * (fid - _ISR_FEAT_BASE) for fid in feat_ids
@@ -7352,10 +7398,190 @@ def _creature_detail_sections(
         _base_hp = None
     _et_hp = epic_toughness_hp(feat_ids)
     if _base_hp is not None and _et_hp:
-        _hp_display = (f"{_fmt_hp(_base_hp + _et_hp)} "
-                       f"({_fmt_hp(_base_hp)} + {_et_hp} Epic Toughness)")
+        hp_display = (f"{_fmt_hp(_base_hp + _et_hp)} "
+                      f"({_fmt_hp(_base_hp)} + {_et_hp} Epic Toughness)")
     else:
-        _hp_display = _fmt_hp(_hp_raw)
+        hp_display = _fmt_hp(_hp_raw)
+    hp_value = (_base_hp + _et_hp) if _base_hp is not None else None
+
+    # ----- Structured defenses (for analysis/export) ------------------------
+    # The HTML "combined combat properties" table is built separately in
+    # _creature_detail_sections from cprop_by_pid; these mirror the same
+    # max-per-subtype rules into plain data.
+    dr: dict | None = None
+    if 22 in cprop_by_pid:
+        _best = None
+        for _pf, _cv in cprop_by_pid[22]:
+            if _best is None or _cv > _best[0]:
+                _best = (_cv, _pf["subtype"], _pf["cost"])
+        if _best:
+            dr = {"soak": (_best[2] or "").strip(), "bypass": (_best[1] or "").strip()}
+
+    resistances: dict[str, int] = {}
+    for _pf, _cv in cprop_by_pid.get(23, []):
+        _sub = _pf["subtype"] or "?"
+        if _cv > resistances.get(_sub, 0):
+            resistances[_sub] = _cv
+
+    immunities: dict[str, int] = {}
+    for _pf, _cv in cprop_by_pid.get(20, []):
+        _sub = _pf["subtype"] or "?"
+        _pct = _prop_value_num(_pf["cost"]) if _pf["cost"] else _cv
+        if _pct > immunities.get(_sub, 0):
+            immunities[_sub] = _pct
+
+    spell_immunities = sorted({_pf["cost"] for _pf, _ in cprop_by_pid.get(53, [])
+                               if _pf["cost"]})
+    regen = sum(cv for _, cv in cprop_by_pid.get(51, []))
+    vampiric = sum(cv for _, cv in cprop_by_pid.get(67, []))
+
+    # Damage gate: a non-stock OnDamaged handler can change how this creature
+    # takes damage (require a specific weapon tag, self-heal, etc.).
+    dmg_script = (_f("ScriptDamaged", "") or "").strip()
+    _is_custom = bool(dmg_script) and db.is_custom_damage_script(dmg_script)
+    hard_required_tags = (sorted(db.script_damage_req_tags.get(dmg_script, set()))
+                          if _is_custom else [])
+    mitigates_damage = bool(_is_custom and dmg_script in db.script_mitigates_damage)
+    retaliation = db.script_retaliation.get(dmg_script) if _is_custom else None
+
+    return {
+        "ability_scores": ability_scores,
+        "race_adj": race_adj,
+        "item_abil": item_abil,
+        "str_mod": str_mod, "dex_mod": dex_mod,
+        "con_mod": con_mod, "wis_mod": wis_mod,
+        "bab": bab,
+        "feat_ids": feat_ids,
+        "equip_by_slot": equip_by_slot,
+        "monk_levels": _monk_levels, "monk_bab": _monk_bab,
+        "ac": ac_total, "ac_breakdown": ac_breakdown, "ac_extra": ac_extra,
+        "fort": fort, "ref": ref, "will": will,
+        "sr": sr_total, "sr_feat": _feat_sr,
+        "sr_diamond_soul": _diamond_soul_sr, "sr_item": _item_sr,
+        "hp_display": hp_display, "hp": hp_value,
+        "cprop_by_pid": cprop_by_pid, "cprop_dodge_ac": cprop_dodge_ac,
+        "dr": dr, "resistances": resistances, "immunities": immunities,
+        "spell_immunities": spell_immunities, "regen": regen, "vampiric": vampiric,
+        "dmg_script": dmg_script, "hard_required_tags": hard_required_tags,
+        "mitigates_damage": mitigates_damage, "retaliation": retaliation,
+    }
+
+
+def _creature_detail_sections(
+    db: Db,
+    c: dict,
+    *,
+    bp: dict | None = None,
+    root_rel: str = "..",
+) -> list[str]:
+    """Body sections (abilities, combat, weapons, equipment, inventory,
+    feats, skills, spells, scripts) shared by blueprint and instance pages.
+    When `bp` is provided, fields missing from the instance struct fall
+    back to the blueprint — most GIT placements keep the UTC defaults."""
+    items_dir = f"{root_rel}/items"
+
+    def _f(key: str, default: Any = None) -> Any:
+        v = fld(c, key, None)
+        if v is None and bp is not None:
+            v = fld(bp, key, default)
+        return default if v is None else v
+
+    def _list(key: str) -> list[dict]:
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    classes = _list("ClassList")
+    feats = _list("FeatList")
+    skills = _list("SkillList")
+    equip = _list("Equip_ItemList")
+    inv = list_items(c.get("ItemList"))
+
+    def _equip_resref(e: dict) -> str:
+        # Blueprint equip entries reference an external UTI via EquippedRes;
+        # GIT instances inline the item but still carry TemplateResRef.
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _equip_item(e: dict) -> dict | None:
+        irr = _equip_resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        # GIT instances embed the full item struct (BaseItem, PropertiesList,
+        # LocalizedName, …) directly into the equip entry.
+        return e if "BaseItem" in e else None
+
+    # Combat defenses (AC, saves, SR, HP, resistances, damage gate) are computed
+    # once by extract_creature_defenses() so this page and the counter-gear
+    # analysis stay in lockstep; see that function for the NWN rule details.
+    D = extract_creature_defenses(db, c, bp)
+    race_adj = D["race_adj"]
+    item_abil = D["item_abil"]
+    ability_scores = D["ability_scores"]
+
+    def _abil_cell(ab: str) -> str:
+        val = ability_scores.get(ab)
+        if val is None:
+            return ""
+        adj = race_adj.get(ab, 0)
+        item = item_abil.get(ab, 0)
+        notes = []
+        if adj:
+            notes.append(f"{adj:+d} racial")
+        if item:
+            notes.append(f"+{item} item")
+        note = (f" <small class=\"muted\">({', '.join(notes)})</small>" if notes else "")
+        return f"{val}{note}"
+
+    sections: list[str] = [
+        '<h2>Abilities</h2>',
+        '<table class="data"><tr>'
+        f"<th>Str</th><td>{_abil_cell('Str')}</td>"
+        f"<th>Dex</th><td>{_abil_cell('Dex')}</td>"
+        f"<th>Con</th><td>{_abil_cell('Con')}</td>"
+        f"<th>Int</th><td>{_abil_cell('Int')}</td>"
+        f"<th>Wis</th><td>{_abil_cell('Wis')}</td>"
+        f"<th>Cha</th><td>{_abil_cell('Cha')}</td>"
+        "</tr></table>",
+    ]
+
+    if classes:
+        cls_rows = "".join(
+            f"<tr><td>{E(class_name(fld(cl, 'Class')))}</td>"
+            f"<td>{E(fld(cl, 'ClassLevel', ''))}</td></tr>"
+            for cl in classes
+        )
+        sections.append(
+            "<h2>Classes</h2>"
+            '<table class="data"><thead><tr><th>Class</th><th>Level</th></tr></thead>'
+            f"<tbody>{cls_rows}</tbody></table>"
+        )
+
+    desc = loc(c.get("Description"))
+    if not desc and bp is not None:
+        desc = loc(bp.get("Description"))
+    if desc:
+        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
+
+    # ----- Combat: read the precomputed defenses (see extract_creature_defenses) -----
+    str_mod = D["str_mod"]
+    dex_mod = D["dex_mod"]
+    bab = D["bab"]
+    feat_ids = D["feat_ids"]
+    equip_by_slot = D["equip_by_slot"]
+    _monk_levels = D["monk_levels"]
+    _monk_bab = D["monk_bab"]
+    cprop_by_pid = D["cprop_by_pid"]
+    cprop_dodge_ac = D["cprop_dodge_ac"]
+    ac_total = D["ac"]
+    ac_breakdown = D["ac_breakdown"]
+    ac_extra = D["ac_extra"]
+    fort, ref, will = D["fort"], D["ref"], D["will"]
+    sr_total = D["sr"]
+    _feat_sr = D["sr_feat"]
+    _diamond_soul_sr = D["sr_diamond_soul"]
+    _item_sr = D["sr_item"]
+    _hp_display = D["hp_display"]
 
     sections.append("<h2>Combat</h2>")
     _combat_rows = (
@@ -14016,6 +14242,283 @@ def _module_index_url_helpers(
     return _cu, _iu, _au, _su
 
 
+def _counter_gear_markdown(data: dict) -> str:
+    """Render the counter_gear.json payload as a human-readable report."""
+    L: list[str] = []
+    L.append(f"# Counter-gear analysis — {data['module']}")
+    L.append("")
+    L.append(f"_Generated {data['generated_at']}. Build-agnostic: objective creature "
+             "requirements vs. obtainable items only (no player build/level modelled)._")
+    L.append("")
+    creatures = data["creatures"]
+    L.append("## Summary")
+    L.append("")
+    L.append(f"- Creatures analysed: **{len(creatures)}**")
+    L.append(f"- Unbeatable (no obtainable counter): **{len(data['unbeatable'])}**")
+    L.append(f"- Needs manual review: **{len(data['manual_review'])}**")
+    L.append(f"- Damage types dealt by obtainable weapons: "
+             f"{', '.join(data['damage_types']) or '(none found)'}")
+    L.append("")
+
+    if data["unbeatable"]:
+        L.append("## ⛔ Unbeatable creatures")
+        L.append("")
+        for u in data["unbeatable"]:
+            L.append(f"- **{u['name']}** (`{u['canonical_resref']}`) — "
+                     + "; ".join(u["reasons"]))
+        L.append("")
+
+    if data["manual_review"]:
+        L.append("## ⚠️ Needs manual review")
+        L.append("")
+        for u in data["manual_review"]:
+            L.append(f"- **{u['name']}** (`{u['canonical_resref']}`) — "
+                     + "; ".join(u["notes"]))
+        L.append("")
+
+    L.append("## Best-in-slot (by coverage)")
+    L.append("")
+    if not data["bis_by_slot"]:
+        L.append("_No obtainable offensive gear matched any creature._")
+        L.append("")
+    for slot, items in data["bis_by_slot"].items():
+        L.append(f"### {slot}")
+        L.append("")
+        L.append("| Item | Enhancement | Damage types | Covers creatures |")
+        L.append("| --- | --- | --- | --- |")
+        for it in items:
+            L.append(f"| {it['name']} | +{it['enhancement']} | "
+                     f"{', '.join(it['damage_types']) or '—'} | {it['covers_creatures']} |")
+        L.append("")
+
+    L.append("## Per-creature counter-gear")
+    L.append("")
+    for c in creatures:
+        flag = ""
+        if c["unbeatable"]:
+            flag = " ⛔ UNBEATABLE"
+        elif c["needs_manual_review"]:
+            flag = " ⚠️ review"
+        L.append(f"### {c['name']} (CR {c['cr']}){flag}")
+        d = c["defenses"]
+        dr = d.get("dr")
+        dr_txt = (f"{dr.get('soak') or ''} {('bypass ' + dr['bypass']) if dr.get('bypass') else ''}".strip()
+                  if dr else "—")
+        L.append(f"- HP {c['hp'] if c['hp'] is not None else '?'} · AC {d['ac']} · "
+                 f"Fort {d['fort']:+d}/Ref {d['ref']:+d}/Will {d['will']:+d}"
+                 f" · SR {d['sr']} · DR {dr_txt or '—'}")
+        req = c["defeat_requirements"]
+        if req["immune_types"]:
+            L.append(f"- Immune to: {', '.join(req['immune_types'])}")
+        if req["mandatory_weapon_tags"]:
+            L.append(f"- **Requires weapon tag:** {', '.join(req['mandatory_weapon_tags'])}")
+        if req["min_enhancement_to_bypass_dr"]:
+            L.append(f"- Needs +{req['min_enhancement_to_bypass_dr']} enhancement to bypass DR")
+        for u in c["unbeatable_reasons"]:
+            L.append(f"- ⛔ {u}")
+        for n in c["review_notes"]:
+            L.append(f"- ⚠️ {n}")
+        for slot, items in c["recommended_gear"].items():
+            top = ", ".join(f"{i['name']} (+{i['enhancement']})" for i in items[:5])
+            L.append(f"- {slot}: {top}")
+        L.append("")
+    return "\n".join(L)
+
+
+def generate_counter_gear_index(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+    _iu,
+) -> None:
+    """Link each creature to the obtainable items needed to defeat it.
+
+    Build-agnostic, objective requirements only: for every canonical creature we
+    derive its damage-relevant defences (full damage-type immunities, DR bypass
+    threshold, and any hard weapon-tag gate from a custom OnDamaged handler) and
+    list the *obtainable* weapons that satisfy them. We flag creatures that no
+    obtainable item can harm (unbeatable) and aggregate module-wide best-in-slot
+    patterns. Writes counter_gear.json + counter_gear.md."""
+    # ---- obtainable offensive items ---------------------------------------
+    accessible_weapons: list[dict] = []
+    for rr, item in db.items.items():
+        if not _item_accessible(db, rr):
+            continue
+        off = extract_item_offense(db, item, rr)
+        if off["is_weapon"] and off["damage_dtypes"]:
+            accessible_weapons.append(off)
+    module_weapon_dtypes: set[str] = set()
+    for off in accessible_weapons:
+        module_weapon_dtypes.update(off["damage_dtypes"])
+
+    def _tag_has_obtainable(tag: str) -> bool:
+        return any(_item_accessible(db, irr)
+                   for irr in db.item_tag_groups.get(tag.lower(), []))
+
+    creatures_out: list[dict] = []
+    unbeatable_out: list[dict] = []
+    review_out: list[dict] = []
+    # slot -> resref -> covered-creature count; plus best offense record per resref
+    bis_count: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    bis_meta: dict[str, dict] = {}
+
+    for can_rr in sorted(db.canonical_creatures,
+                         key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        if can_rr.startswith("__orphan_"):
+            continue
+        entry = db.canonical_creatures[can_rr]
+        c = entry["c"]
+        bp_rr = entry["bp_rr"]
+        bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+        name = nwn_text(db.canonical_creature_name(can_rr))
+        cr_raw = fld(c, "ChallengeRating") or (fld(bp, "ChallengeRating") if bp else "") or ""
+        D = extract_creature_defenses(db, c, bp)
+
+        immune_types = sorted(t for t, pct in D["immunities"].items() if pct >= 100)
+        damageable = module_weapon_dtypes - set(immune_types)
+        dr = D["dr"]
+        min_enh = _prop_value_num(dr["bypass"]) if dr and dr.get("bypass") else 0
+        mandatory_tags = sorted({t.lower() for t in D["hard_required_tags"]})
+
+        # ---- candidate gear -----------------------------------------------
+        recommended: dict[str, list[dict]] = defaultdict(list)
+        for off in accessible_weapons:
+            deals = sorted(set(off["damage_dtypes"]) & damageable)
+            if not deals:
+                continue
+            satisfies_tag = (not mandatory_tags) or (off["tag"] in mandatory_tags)
+            if mandatory_tags and not satisfies_tag:
+                continue
+            clears_dr = (min_enh == 0) or (off["enhancement"] >= min_enh)
+            reasons = []
+            if satisfies_tag and mandatory_tags:
+                reasons.append(f"matches required weapon tag '{off['tag']}'")
+            reasons.append("deals " + "/".join(deals))
+            if min_enh:
+                reasons.append(f"+{off['enhancement']} vs DR bypass +{min_enh}"
+                               + ("" if clears_dr else " (does NOT clear DR)"))
+            slot = "Right hand"  # offensive (weapon) slot; milestone-1 scope
+            recommended[slot].append({
+                "resref": off["resref"],
+                "name": off["name"],
+                "wiki_url": _iu(off["resref"]),
+                "enhancement": off["enhancement"],
+                "damage_types": deals,
+                "tag": off["tag"],
+                "satisfies_tag": bool(satisfies_tag and mandatory_tags),
+                "clears_dr": clears_dr,
+                "cost": off["cost"],
+                "reason": "; ".join(reasons),
+            })
+        for slot in recommended:
+            recommended[slot].sort(
+                key=lambda r: (r["satisfies_tag"], r["clears_dr"], r["enhancement"],
+                               len(r["damage_types"]), -r["cost"]),
+                reverse=True,
+            )
+            recommended[slot] = recommended[slot][:8]
+
+        # ---- unbeatable / review detection --------------------------------
+        unbeatable_reasons: list[str] = []
+        if mandatory_tags and not any(_tag_has_obtainable(t) for t in mandatory_tags):
+            unbeatable_reasons.append(
+                "requires a weapon tagged "
+                + " or ".join(f"'{t}'" for t in mandatory_tags)
+                + " but no obtainable item has that tag")
+        if module_weapon_dtypes and not damageable:
+            unbeatable_reasons.append(
+                "immune to every damage type any obtainable weapon deals ("
+                + ", ".join(sorted(module_weapon_dtypes)) + ")")
+
+        review_notes: list[str] = []
+        if not unbeatable_reasons and D["mitigates_damage"]:
+            review_notes.append(
+                f"OnDamaged handler '{D['dmg_script']}' self-heals or grants itself "
+                "damage immunity — verify available DPS exceeds the mitigation")
+
+        rec = {
+            "canonical_resref": can_rr,
+            "blueprint_resref": bp_rr,
+            "name": name,
+            "wiki_url": _cu(can_rr),
+            "cr": str(cr_raw),
+            "hp": D["hp"],
+            "defenses": {
+                "ac": D["ac"], "fort": D["fort"], "ref": D["ref"], "will": D["will"],
+                "sr": D["sr"], "dr": dr,
+                "resistances": D["resistances"], "immunities": D["immunities"],
+                "spell_immunities": D["spell_immunities"],
+                "regen": D["regen"], "vampiric": D["vampiric"],
+            },
+            "defeat_requirements": {
+                "damageable_types": sorted(damageable),
+                "immune_types": immune_types,
+                "min_enhancement_to_bypass_dr": min_enh,
+                "mandatory_weapon_tags": mandatory_tags,
+                "hard_gate": bool(mandatory_tags),
+            },
+            "recommended_gear": dict(recommended),
+            "unbeatable": bool(unbeatable_reasons),
+            "unbeatable_reasons": unbeatable_reasons,
+            "needs_manual_review": bool(review_notes),
+            "review_notes": review_notes,
+        }
+        creatures_out.append(rec)
+        if unbeatable_reasons:
+            unbeatable_out.append({"canonical_resref": can_rr, "name": name,
+                                   "reasons": unbeatable_reasons})
+        if review_notes:
+            review_out.append({"canonical_resref": can_rr, "name": name,
+                               "notes": review_notes})
+
+        # ---- best-in-slot accumulation (skip unbeatable to avoid skew) -----
+        if not unbeatable_reasons:
+            for slot, items in recommended.items():
+                for it in items:
+                    bis_count[slot][it["resref"]] += 1
+                    bis_meta[it["resref"]] = it
+
+    # ---- best-in-slot aggregation -----------------------------------------
+    bis_by_slot: dict[str, list[dict]] = {}
+    for slot, counts in bis_count.items():
+        rows = []
+        for irr, n in counts.items():
+            meta = bis_meta[irr]
+            rows.append({
+                "resref": irr,
+                "name": meta["name"],
+                "wiki_url": meta["wiki_url"],
+                "enhancement": meta["enhancement"],
+                "damage_types": meta["damage_types"],
+                "covers_creatures": n,
+            })
+        rows.sort(key=lambda r: (r["covers_creatures"], r["enhancement"],
+                                 len(r["damage_types"]), -bis_meta[r["resref"]]["cost"]),
+                  reverse=True)
+        bis_by_slot[slot] = rows[:10]
+
+    payload = {
+        "generated_at": now,
+        "module": module_title,
+        "build_agnostic": True,
+        "damage_types": sorted(module_weapon_dtypes),
+        "creatures": creatures_out,
+        "unbeatable": unbeatable_out,
+        "manual_review": review_out,
+        "bis_by_slot": bis_by_slot,
+    }
+    _write_json(module_index_dir / "counter_gear.json", payload)
+    (module_index_dir / "counter_gear.md").write_text(
+        _counter_gear_markdown(payload), encoding="utf-8")
+    sev = "warn" if unbeatable_out else "info"
+    _module_index_summary.append((sev,
+        f"[nwn-wiki] module-index: counter_gear.json "
+        f"({len(creatures_out)} creatures, {len(unbeatable_out)} unbeatable, "
+        f"{len(review_out)} review)"))
+
+
 def generate_module_index(
     db: "Db",
     module_index_dir: Path,
@@ -14339,6 +14842,9 @@ def generate_module_index(
         "creatures": creature_index,
     })
     _module_index_summary.append(("info", f"[nwn-wiki] module-index: creature_index.json ({len(creature_index)} canonical creatures)"))
+
+    # ------------------------------------------------------------------ counter_gear.json
+    generate_counter_gear_index(db, module_index_dir, module_title, now, _cu, _iu)
 
     # ------------------------------------------------------------------ appearance_faction_report.json
     # Group canonical creatures by (appearance_id, faction_id) so that LLMs can
