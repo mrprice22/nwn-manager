@@ -2035,6 +2035,89 @@ def extract_item_offense(db: "Db", item: dict, resref: str) -> dict:
     }
 
 
+# Base item → the human-readable equip slot it occupies, for grouping defensive
+# counter-gear recommendations. Mirrors _ACCESSORY_BASEITEM_MAP plus armor /
+# helmet / shield rows. Items whose base item isn't here are not defensive slots.
+_DEFENSE_BASEITEM_SLOT: dict[int, str] = {
+    16: "Chest (armor)", 17: "Head", 14: "Left hand (shield)",
+    56: "Left hand (shield)", 57: "Left hand (shield)",
+    19: "Neck", 21: "Belt", 26: "Boots", 36: "Arms (gauntlets)",
+    78: "Arms (bracers)", 52: "Ring", 80: "Cloak",
+}
+
+
+def extract_item_defense(db: "Db", item: dict, resref: str) -> dict:
+    """Defensive capability of a single non-weapon item, as plain data for the
+    counter-gear survivability matcher. Reads the same item-property semantics
+    proven in extract_creature_defenses (AC #1, immunity #20, DR #22, resist #23,
+    save #41, regen #51) so the two never drift. Returns slots it can fill, AC it
+    grants, per-damage-type resist/immunity, save bonuses, regen, and cost.
+    Items that grant none of these (or aren't a defensive base item) return
+    `relevant=False`."""
+    _raw = fld(item, "BaseItem", None)
+    bi = -1 if _raw is None else int(_raw)
+    slot = _DEFENSE_BASEITEM_SLOT.get(bi)
+
+    # AC: deflection/dodge/natural item props, plus armor/shield base AC.
+    ac_bonus, _ = item_ac_bonus(item)
+    if bi == 16:
+        ac_bonus += _torso_base_ac(item)
+    elif bi in SHIELD_BASEITEMS:
+        s_stats = WEAPONS.get(bi)
+        if s_stats:
+            try:
+                ac_bonus += int(s_stats.get("BaseAC", "0") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    resist: dict[str, int] = {}
+    immune: dict[str, int] = {}
+    saves: dict[str, int] = {}
+    regen = 0
+    for p in list_items(item.get("PropertiesList")):
+        pid_raw = fld(p, "PropertyName")
+        if pid_raw is None:
+            continue
+        pid = int(pid_raw)
+        pf = itemprop_format(p)
+        cv = _prop_value_num(pf["cost"]) if pf["cost"] else 0
+        sub = pf["subtype"] or ""
+        if pid == 23 and sub:                      # Damage Resistance
+            if cv > resist.get(sub, 0):
+                resist[sub] = cv
+        elif pid == 20 and sub:                    # Damage Immunity (%)
+            pct = _prop_value_num(pf["cost"]) if pf["cost"] else cv
+            if pct > immune.get(sub, 0):
+                immune[sub] = pct
+        elif pid == 41:                            # Saving Throw bonus
+            kind = sub or "Universal"
+            if cv > saves.get(kind, 0):
+                saves[kind] = cv
+        elif pid == 51:                            # Regeneration
+            regen += cv
+
+    try:
+        cost = int(fld(item, "Cost", 0) or 0)
+    except (TypeError, ValueError):
+        cost = 0
+
+    relevant = bool(slot and (ac_bonus or resist or immune or saves or regen))
+    return {
+        "resref": resref,
+        "name": nwn_text(db.item_name(resref)),
+        "base_item_id": bi,
+        "slot": slot or "",
+        "relevant": relevant,
+        "ac_bonus": ac_bonus,
+        "resist": resist,
+        "immune": immune,
+        "saves": saves,
+        "regen": regen,
+        "cost": cost,
+        "accessible": _item_accessible(db, resref),
+    }
+
+
 # ---------------------------------------------------------------------------
 # NWScript function-body extractor (brace counting)
 # ---------------------------------------------------------------------------
@@ -7464,6 +7547,117 @@ def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
         "spell_immunities": spell_immunities, "regen": regen, "vampiric": vampiric,
         "dmg_script": dmg_script, "hard_required_tags": hard_required_tags,
         "mitigates_damage": mitigates_damage, "retaliation": retaliation,
+    }
+
+
+def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> dict:
+    """Compute a creature's *offensive* threat (what the player must survive), as
+    plain data for the counter-gear survivability matcher. Reuses the ability
+    mods / BAB / feats / equipment already resolved by extract_creature_defenses
+    (passed in as `D`) so the combat math is computed once. Returns:
+
+      attack_bonus       best (first-iterative) to-hit across its weapons
+      ac_target          AC at which the creature misses ~half the time
+      damage_types_dealt damage types its attacks deal (weapon physical + extras)
+      save_threats       special abilities the player must save against, with an
+                         *estimated* DC (innate spell level is not in our caches,
+                         so it is derived from caster level — labelled an estimate)
+    """
+    equip_by_slot: dict[int, dict] = D["equip_by_slot"]
+    str_mod, dex_mod = D["str_mod"], D["dex_mod"]
+    bab, feat_ids = D["bab"], D["feat_ids"]
+    monk_bab, monk_levels = D["monk_bab"], D["monk_levels"]
+
+    def _resref(e: dict) -> str:
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _item(e: dict) -> dict | None:
+        irr = _resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        return e if "BaseItem" in e else None
+
+    best_atk: int | None = None
+    dtypes: set[str] = set()
+    have_weapon = False
+    for slot in (SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B):
+        e = equip_by_slot.get(slot)
+        if not e:
+            continue
+        item = _item(e)
+        if item is None:
+            continue
+        base_row = fld(item, "BaseItem")
+        bi = int(base_row) if base_row is not None else -1
+        if slot == SLOT_LEFT and bi in SHIELD_BASEITEMS:
+            continue
+        off = extract_item_offense(db, item, _resref(e) or "")
+        if not off["is_weapon"]:
+            continue
+        have_weapon = True
+        dtypes.update(off["damage_dtypes"])
+        ranged = off["is_ranged"]
+        _is_cweap = slot in _CWEAP_SLOTS
+        _finesse = (WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+                    and (_is_cweap or bi in FINESSE_BASEITEMS))
+        _melee_ab = dex_mod if _finesse else str_mod
+        _feat_ab = feat_attack_bonus(feat_ids, baseitem_name(bi) if bi >= 0 else "")
+        atk_mod = (dex_mod if ranged else _melee_ab) + off["attack_bonus"] + _feat_ab
+        _monk_atk_bab = monk_bab if (_is_cweap and monk_levels >= 1 and not ranged) else 0
+        sched = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_bab=_monk_atk_bab)
+        if sched and (best_atk is None or sched[0] > best_atk):
+            best_atk = sched[0]
+
+    if not have_weapon:
+        dtypes = {"Bludgeoning"}  # unarmed
+        if bab > 0:
+            _u_finesse = WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+            _u_ability = (dex_mod if _u_finesse else str_mod) + feat_attack_bonus(feat_ids, "unarmed")
+            sched = attack_schedule(
+                bab, ability_mod=_u_ability,
+                monk_unarmed_bab=(monk_bab if monk_levels >= 1 else 0))
+            if sched:
+                best_atk = sched[0]
+
+    attack_bonus = best_atk if best_atk is not None else 0
+
+    # ----- Special abilities: what the player must save against --------------
+    spec = list_items(c.get("SpecAbilityList"))
+    if not spec and bp is not None:
+        spec = list_items(bp.get("SpecAbilityList"))
+    scores = D.get("ability_scores", {})
+    _mental = max((ability_mod(scores.get(a)) for a in ("Int", "Wis", "Cha")
+                   if scores.get(a) is not None), default=0)
+    seen: set[tuple] = set()
+    save_threats: list[dict] = []
+    for s in spec:
+        sid = fld(s, "Spell")
+        if sid is None:
+            continue
+        cl = fld(s, "SpellCasterLevel", 0) or 0
+        try:
+            cl = int(cl)
+        except (TypeError, ValueError):
+            cl = 0
+        key = (sid, cl)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Innate spell level isn't in our caches; estimate it from caster level
+        # (≈ half, capped at 9) for a build-agnostic DC ballpark.
+        lvl_est = max(1, min(9, (cl + 1) // 2))
+        save_threats.append({
+            "name": nwn_text(spell_name(sid)),
+            "caster_level": cl,
+            "dc_est": 10 + lvl_est + _mental,
+        })
+    save_threats.sort(key=lambda t: t["dc_est"], reverse=True)
+
+    return {
+        "attack_bonus": attack_bonus,
+        "ac_target": attack_bonus + 10,
+        "damage_types_dealt": sorted(dtypes),
+        "save_threats": save_threats,
     }
 
 
@@ -14248,7 +14442,10 @@ def _counter_gear_markdown(data: dict) -> str:
     L.append(f"# Counter-gear analysis — {data['module']}")
     L.append("")
     L.append(f"_Generated {data['generated_at']}. Build-agnostic: objective creature "
-             "requirements vs. obtainable items only (no player build/level modelled)._")
+             "requirements vs. obtainable items only (no player build/level modelled). "
+             "Recommends the **cheapest sufficient** gear (offense + survival), not "
+             "best-in-slot — a leveling guide. Save DCs are estimates (innate spell "
+             "level isn't in the data)._")
     L.append("")
     creatures = data["creatures"]
     L.append("## Summary")
@@ -14276,19 +14473,43 @@ def _counter_gear_markdown(data: dict) -> str:
                      + "; ".join(u["notes"]))
         L.append("")
 
-    L.append("## Best-in-slot (by coverage)")
+    # ---- progression ladder ------------------------------------------------
+    L.append("## Progression ladder (by Challenge Rating)")
     L.append("")
-    if not data["bis_by_slot"]:
-        L.append("_No obtainable offensive gear matched any creature._")
-        L.append("")
-    for slot, items in data["bis_by_slot"].items():
-        L.append(f"### {slot}")
-        L.append("")
-        L.append("| Item | Enhancement | Damage types | Covers creatures |")
-        L.append("| --- | --- | --- | --- |")
-        for it in items:
-            L.append(f"| {it['name']} | +{it['enhancement']} | "
-                     f"{', '.join(it['damage_types']) or '—'} | {it['covers_creatures']} |")
+    L.append("_Each tier's kit is the cheapest gear that handles that band of "
+             "creatures — clear it to afford/loot the next tier's kit._")
+    L.append("")
+    for t in data.get("progression_tiers", []):
+        prof = t["defeat_profile"]
+        kit = t["recommended_kit"]
+        lo, hi = prof["ac_target_range"]
+        L.append(f"### {t['label']} — {t['creature_count']} creatures")
+        bits = []
+        typ = prof["min_enhancement_to_bypass_dr"]
+        mx = prof.get("max_enhancement_to_bypass_dr", 0)
+        if typ:
+            note = f"weapon ≥ +{typ} (DR)"
+            if mx > typ:
+                note += f"; outliers need +{mx}"
+            bits.append(note)
+        elif mx:
+            bits.append(f"weapon: no DR for most; outliers need +{mx}")
+        bits.append(f"AC target {lo}–{hi}")
+        if prof["resist_priority"]:
+            bits.append("resist " + "/".join(prof["resist_priority"]))
+        if prof["has_special_attacks"]:
+            bits.append("save gear (special attacks)")
+        L.append(f"- Profile: {' · '.join(bits)}")
+        w = kit["weapon"]
+        if w:
+            L.append(f"- Weapon: {w['name']} (+{w['enhancement']}, {_fmt_gp(w['cost'])})")
+        for r in kit["resist"]:
+            L.append(f"- {r['slot']}: {r['name']} ({r['reason']}, {_fmt_gp(r['cost'])})")
+        if kit["ac"]:
+            L.append(f"- {kit['ac']['slot']}: {kit['ac']['name']} "
+                     f"({kit['ac']['reason']}, {_fmt_gp(kit['ac']['cost'])})")
+        for s in kit.get("save", []):
+            L.append(f"- {s['slot']}: {s['name']} ({s['reason']}, {_fmt_gp(s['cost'])})")
         L.append("")
 
     L.append("## Per-creature counter-gear")
@@ -14307,6 +14528,14 @@ def _counter_gear_markdown(data: dict) -> str:
         L.append(f"- HP {c['hp'] if c['hp'] is not None else '?'} · AC {d['ac']} · "
                  f"Fort {d['fort']:+d}/Ref {d['ref']:+d}/Will {d['will']:+d}"
                  f" · SR {d['sr']} · DR {dr_txt or '—'}")
+        sv = c.get("survival", {})
+        off_bits = [f"attacks +{sv.get('attack_bonus', 0)}"]
+        if sv.get("damage_types_dealt"):
+            off_bits.append("deals " + "/".join(sv["damage_types_dealt"]))
+        if sv.get("save_threats"):
+            st = sv["save_threats"][0]
+            off_bits.append(f"special DC ~{st['dc_est']} est. (+{len(sv['save_threats'])} abilities)")
+        L.append(f"- Offense: {' · '.join(off_bits)}")
         req = c["defeat_requirements"]
         if req["immune_types"]:
             L.append(f"- Immune to: {', '.join(req['immune_types'])}")
@@ -14318,11 +14547,61 @@ def _counter_gear_markdown(data: dict) -> str:
             L.append(f"- ⛔ {u}")
         for n in c["review_notes"]:
             L.append(f"- ⚠️ {n}")
-        for slot, items in c["recommended_gear"].items():
-            top = ", ".join(f"{i['name']} (+{i['enhancement']})" for i in items[:5])
-            L.append(f"- {slot}: {top}")
+        # Offensive weapon (cheapest sufficient) + aspirational reach.
+        weps = c["recommended_gear"].get("Right hand", [])
+        if weps:
+            picks = ", ".join(f"{i['name']} (+{i['enhancement']}, {_fmt_gp(i['cost'])})"
+                              for i in weps)
+            L.append(f"- Weapon (cheapest sufficient): {picks}")
+        rw = c.get("reach_weapon")
+        if rw:
+            L.append(f"- Weapon (reach upgrade): {rw['name']} (+{rw['enhancement']}, {_fmt_gp(rw['cost'])})")
+        # Survival gear.
+        if sv.get("resist"):
+            res = "; ".join(f"{r['name']} [{r['slot']}] ({r['reason']}, {_fmt_gp(r['cost'])})"
+                            for r in sv["resist"])
+            L.append(f"- Survive (resist): {res}")
+        if sv.get("ac"):
+            ac = "; ".join(f"{r['name']} [{r['slot']}] ({r['reason']}, {_fmt_gp(r['cost'])})"
+                           for r in sv["ac"])
+            L.append(f"- Survive (AC → {sv.get('ac_target')}): {ac}")
+        elif sv.get("ac_note"):
+            L.append(f"- Survive (AC): {sv['ac_note']}")
+        if sv.get("saves"):
+            sav = "; ".join(f"{r['name']} [{r['slot']}] ({r['reason']}, {_fmt_gp(r['cost'])})"
+                            for r in sv["saves"])
+            L.append(f"- Survive (saves): {sav}")
         L.append("")
     return "\n".join(L)
+
+
+# Challenge-Rating buckets for the progression ladder. (lo, hi] half-open; the
+# last bucket's hi is open-ended.
+_CR_TIERS: list[tuple[float, float, str]] = [
+    (0, 5, "CR 0–5"),
+    (5, 10, "CR 5–10"),
+    (10, 20, "CR 10–20"),
+    (20, 40, "CR 20–40"),
+    (40, 80, "CR 40–80"),
+    (80, float("inf"), "CR 80+"),
+]
+
+
+def _parse_cr(cr_raw: object) -> float:
+    """Numeric Challenge Rating, or 0.0 when unparseable."""
+    try:
+        return float(cr_raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fmt_gp(cost: int) -> str:
+    """Compact gold display: 1234 → '1.2k gp', 1500000 → '1.5M gp'."""
+    if cost >= 1_000_000:
+        return f"{cost / 1_000_000:.1f}M gp"
+    if cost >= 1_000:
+        return f"{cost / 1_000:.1f}k gp"
+    return f"{cost} gp"
 
 
 def generate_counter_gear_index(
@@ -14335,12 +14614,13 @@ def generate_counter_gear_index(
 ) -> None:
     """Link each creature to the obtainable items needed to defeat it.
 
-    Build-agnostic, objective requirements only: for every canonical creature we
-    derive its damage-relevant defences (full damage-type immunities, DR bypass
-    threshold, and any hard weapon-tag gate from a custom OnDamaged handler) and
-    list the *obtainable* weapons that satisfy them. We flag creatures that no
-    obtainable item can harm (unbeatable) and aggregate module-wide best-in-slot
-    patterns. Writes counter_gear.json + counter_gear.md."""
+    Build-agnostic, objective requirements only. For every canonical creature we
+    derive (a) its damage-relevant defences and the *cheapest obtainable weapon*
+    that can hurt it — a leveling guide, not a best-in-slot list — and (b) its
+    offensive threat (damage types dealt, attack bonus, special-ability saves)
+    plus the cheapest defensive gear that mitigates each, since defeating a
+    creature also means surviving it. Creatures are bucketed by Challenge Rating
+    into a progression ladder. Writes counter_gear.json + counter_gear.md."""
     # ---- obtainable offensive items ---------------------------------------
     accessible_weapons: list[dict] = []
     for rr, item in db.items.items():
@@ -14353,6 +14633,37 @@ def generate_counter_gear_index(
     for off in accessible_weapons:
         module_weapon_dtypes.update(off["damage_dtypes"])
 
+    # ---- obtainable defensive items (for survivability) -------------------
+    accessible_defense: list[dict] = []
+    for rr, item in db.items.items():
+        if not _item_accessible(db, rr):
+            continue
+        d = extract_item_defense(db, item, rr)
+        if d["relevant"]:
+            accessible_defense.append(d)
+    # Survival indexes, cheapest-first (the leveling-guide philosophy: the
+    # cheapest gear that helps, partial mitigation is fine — players have heals).
+    # Ties break toward the stronger item so equal-cost picks favour more bonus.
+    defense_by_resist: dict[str, list[dict]] = defaultdict(list)
+    for d in accessible_defense:
+        for dt in set(d["resist"]) | set(d["immune"]):
+            defense_by_resist[dt].append(d)
+    for dt in defense_by_resist:
+        defense_by_resist[dt].sort(
+            key=lambda d, _dt=dt: (d["cost"], -d["immune"].get(_dt, 0), -d["resist"].get(_dt, 0)))
+    defense_ac = sorted((d for d in accessible_defense if d["ac_bonus"] > 0),
+                        key=lambda d: (d["cost"], -d["ac_bonus"]))
+    defense_save: dict[str, list[dict]] = defaultdict(list)
+    for d in accessible_defense:
+        for kind in d["saves"]:
+            defense_save[kind].append(d)
+    for kind in defense_save:
+        defense_save[kind].sort(key=lambda d, _k=kind: (d["cost"], -d["saves"].get(_k, 0)))
+
+    def _def_entry(d: dict, reason: str) -> dict:
+        return {"resref": d["resref"], "name": d["name"], "wiki_url": _iu(d["resref"]),
+                "slot": d["slot"], "cost": d["cost"], "reason": reason}
+
     def _tag_has_obtainable(tag: str) -> bool:
         return any(_item_accessible(db, irr)
                    for irr in db.item_tag_groups.get(tag.lower(), []))
@@ -14360,9 +14671,6 @@ def generate_counter_gear_index(
     creatures_out: list[dict] = []
     unbeatable_out: list[dict] = []
     review_out: list[dict] = []
-    # slot -> resref -> covered-creature count; plus best offense record per resref
-    bis_count: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    bis_meta: dict[str, dict] = {}
 
     for can_rr in sorted(db.canonical_creatures,
                          key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
@@ -14375,6 +14683,7 @@ def generate_counter_gear_index(
         name = nwn_text(db.canonical_creature_name(can_rr))
         cr_raw = fld(c, "ChallengeRating") or (fld(bp, "ChallengeRating") if bp else "") or ""
         D = extract_creature_defenses(db, c, bp)
+        O = extract_creature_offense(db, c, bp, D)
 
         immune_types = sorted(t for t, pct in D["immunities"].items() if pct >= 100)
         damageable = module_weapon_dtypes - set(immune_types)
@@ -14382,8 +14691,13 @@ def generate_counter_gear_index(
         min_enh = _prop_value_num(dr["bypass"]) if dr and dr.get("bypass") else 0
         mandatory_tags = sorted({t.lower() for t in D["hard_required_tags"]})
 
-        # ---- candidate gear -----------------------------------------------
-        recommended: dict[str, list[dict]] = defaultdict(list)
+        # ---- offensive gear: cheapest *sufficient* weapon -----------------
+        # Sufficient = deals a non-immune damage type and satisfies any weapon-tag
+        # gate. Clearing DR is preferred (DR is soak, not immunity — a weapon that
+        # doesn't clear it still does reduced damage), as is a real priced melee
+        # weapon over a 0-gp stock filler. We list the cheapest few (the leveling
+        # pick) plus one aspirational "reach" upgrade — never a best-in-slot dump.
+        sufficient: list[dict] = []
         for off in accessible_weapons:
             deals = sorted(set(off["damage_dtypes"]) & damageable)
             if not deals:
@@ -14397,28 +14711,77 @@ def generate_counter_gear_index(
                 reasons.append(f"matches required weapon tag '{off['tag']}'")
             reasons.append("deals " + "/".join(deals))
             if min_enh:
-                reasons.append(f"+{off['enhancement']} vs DR bypass +{min_enh}"
-                               + ("" if clears_dr else " (does NOT clear DR)"))
-            slot = "Right hand"  # offensive (weapon) slot; milestone-1 scope
-            recommended[slot].append({
-                "resref": off["resref"],
-                "name": off["name"],
-                "wiki_url": _iu(off["resref"]),
-                "enhancement": off["enhancement"],
-                "damage_types": deals,
-                "tag": off["tag"],
+                reasons.append(f"+{off['enhancement']} {'clears' if clears_dr else 'does NOT clear'} DR +{min_enh}")
+            sufficient.append({
+                "resref": off["resref"], "name": off["name"],
+                "wiki_url": _iu(off["resref"]), "enhancement": off["enhancement"],
+                "damage_types": deals, "tag": off["tag"],
                 "satisfies_tag": bool(satisfies_tag and mandatory_tags),
-                "clears_dr": clears_dr,
-                "cost": off["cost"],
-                "reason": "; ".join(reasons),
+                "clears_dr": clears_dr, "is_ranged": off["is_ranged"],
+                "cost": off["cost"], "reason": "; ".join(reasons),
             })
-        for slot in recommended:
-            recommended[slot].sort(
-                key=lambda r: (r["satisfies_tag"], r["clears_dr"], r["enhancement"],
-                               len(r["damage_types"]), -r["cost"]),
-                reverse=True,
-            )
-            recommended[slot] = recommended[slot][:8]
+        # Free (0-gp) stock weapons sink below real priced gear; melee before
+        # ranged; DR-clearers before non-clearers; then cheapest.
+        def _wkey(r: dict) -> tuple:
+            return (not r["clears_dr"], r["is_ranged"],
+                    r["cost"] if r["cost"] > 0 else float("inf"), -r["enhancement"])
+        sufficient.sort(key=_wkey)
+        weapon_recs = sufficient[:3]
+        reach = None
+        if sufficient:
+            best = max(sufficient, key=lambda r: (r["clears_dr"], r["enhancement"], -r["cost"]))
+            if best["resref"] not in {r["resref"] for r in weapon_recs}:
+                reach = best
+        recommended: dict[str, list[dict]] = {}
+        if weapon_recs:
+            recommended["Right hand"] = weapon_recs
+        if D["ac"] >= 40 and weapon_recs:
+            weapon_recs[0]["reason"] += (
+                f"; high AC {D['ac']} — more enhancement helps to-hit")
+
+        # ---- survivability: defensive gear vs this creature ---------------
+        resist_recs: list[dict] = []
+        for dt in O["damage_types_dealt"]:
+            cands = defense_by_resist.get(dt)
+            if not cands:
+                continue
+            d = cands[0]
+            amt = (f"immune {d['immune'][dt]}%" if dt in d["immune"]
+                   else f"resist {d['resist'][dt]}/-")
+            resist_recs.append(_def_entry(d, f"{amt} vs {dt}"))
+        ac_recs: list[dict] = []
+        ac_note = ""
+        if O["attack_bonus"] >= 10:
+            seen_slots: set[str] = set()
+            for d in defense_ac:
+                if d["slot"] in seen_slots:
+                    continue
+                seen_slots.add(d["slot"])
+                ac_recs.append(_def_entry(d, f"+{d['ac_bonus']} AC"))
+                if len(ac_recs) >= 4:
+                    break
+        else:
+            ac_note = f"low attack (+{O['attack_bonus']}) — little AC needed"
+        save_recs: list[dict] = []
+        if O["save_threats"]:
+            # Innate save type is unknown, so cover all three with the best
+            # obtainable item for each (Universal items would count too if any
+            # existed in this module — none do).
+            for kind in ("Fortitude", "Reflex", "Will", "Universal"):
+                lst = defense_save.get(kind)
+                if lst:
+                    d = lst[0]
+                    save_recs.append(_def_entry(d, f"+{d['saves'].get(kind, 0)} {kind}"))
+        survival = {
+            "attack_bonus": O["attack_bonus"],
+            "ac_target": O["ac_target"],
+            "damage_types_dealt": O["damage_types_dealt"],
+            "save_threats": O["save_threats"],
+            "resist": resist_recs,
+            "ac": ac_recs,
+            "ac_note": ac_note,
+            "saves": save_recs,
+        }
 
         # ---- unbeatable / review detection --------------------------------
         unbeatable_reasons: list[str] = []
@@ -14459,7 +14822,9 @@ def generate_counter_gear_index(
                 "mandatory_weapon_tags": mandatory_tags,
                 "hard_gate": bool(mandatory_tags),
             },
-            "recommended_gear": dict(recommended),
+            "recommended_gear": recommended,
+            "reach_weapon": reach,
+            "survival": survival,
             "unbeatable": bool(unbeatable_reasons),
             "unbeatable_reasons": unbeatable_reasons,
             "needs_manual_review": bool(review_notes),
@@ -14473,31 +14838,78 @@ def generate_counter_gear_index(
             review_out.append({"canonical_resref": can_rr, "name": name,
                                "notes": review_notes})
 
-        # ---- best-in-slot accumulation (skip unbeatable to avoid skew) -----
-        if not unbeatable_reasons:
-            for slot, items in recommended.items():
-                for it in items:
-                    bis_count[slot][it["resref"]] += 1
-                    bis_meta[it["resref"]] = it
+    # ---- progression ladder: bucket creatures by Challenge Rating ---------
+    def _kit_weapon(min_e: int) -> dict | None:
+        """Cheapest real (priced) weapon clearing DR +min_e; falling back to the
+        cheapest clearing weapon of any cost, then to the highest-enhancement
+        weapon available (best effort when nothing reaches min_e)."""
+        clearing = [w for w in accessible_weapons if w["enhancement"] >= min_e]
+        priced = [w for w in clearing if w["cost"] > 0]
+        if priced:
+            return min(priced, key=lambda w: w["cost"])
+        if clearing:
+            return min(clearing, key=lambda w: w["cost"])
+        return max(accessible_weapons, key=lambda w: w["enhancement"], default=None)
 
-    # ---- best-in-slot aggregation -----------------------------------------
-    bis_by_slot: dict[str, list[dict]] = {}
-    for slot, counts in bis_count.items():
-        rows = []
-        for irr, n in counts.items():
-            meta = bis_meta[irr]
-            rows.append({
-                "resref": irr,
-                "name": meta["name"],
-                "wiki_url": meta["wiki_url"],
-                "enhancement": meta["enhancement"],
-                "damage_types": meta["damage_types"],
-                "covers_creatures": n,
-            })
-        rows.sort(key=lambda r: (r["covers_creatures"], r["enhancement"],
-                                 len(r["damage_types"]), -bis_meta[r["resref"]]["cost"]),
-                  reverse=True)
-        bis_by_slot[slot] = rows[:10]
+    progression_tiers: list[dict] = []
+    for lo, hi, label in _CR_TIERS:
+        members = [r for r in creatures_out if not r["unbeatable"]
+                   and lo <= _parse_cr(r["cr"]) < hi]
+        if not members:
+            continue
+        # Use a typical (75th-percentile) DR requirement for the kit so a single
+        # heavy-DR outlier doesn't push a top-tier weapon onto the whole band;
+        # the max is surfaced separately as the "tough outliers" threshold.
+        enhs = sorted(r["defeat_requirements"]["min_enhancement_to_bypass_dr"] for r in members)
+        typical_enh = enhs[int(0.75 * (len(enhs) - 1))] if enhs else 0
+        max_enh = enhs[-1] if enhs else 0
+        ac_targets = [r["survival"]["ac_target"] for r in members]
+        resist_counter: dict[str, int] = defaultdict(int)
+        for r in members:
+            for dt in r["survival"]["damage_types_dealt"]:
+                resist_counter[dt] += 1
+        top_resist = [dt for dt, _ in sorted(
+            resist_counter.items(), key=lambda kv: (-kv[1], kv[0]))[:3]]
+        has_saves = any(r["survival"]["save_threats"] for r in members)
+
+        kit_weapon = _kit_weapon(typical_enh)
+        kit_resist = []
+        for dt in top_resist:
+            cands = defense_by_resist.get(dt)
+            if cands:
+                d = cands[0]
+                amt = (f"immune {d['immune'][dt]}%" if dt in d["immune"]
+                       else f"resist {d['resist'][dt]}/-")
+                kit_resist.append(_def_entry(d, f"{amt} vs {dt}"))
+        kit_ac = _def_entry(defense_ac[0], f"+{defense_ac[0]['ac_bonus']} AC") if defense_ac else None
+        kit_save = []
+        if has_saves:
+            for kind in ("Fortitude", "Reflex", "Will", "Universal"):
+                lst = defense_save.get(kind)
+                if lst:
+                    d = lst[0]
+                    kit_save.append(_def_entry(d, f"+{d['saves'].get(kind, 0)} {kind}"))
+
+        progression_tiers.append({
+            "label": label,
+            "creature_count": len(members),
+            "defeat_profile": {
+                "min_enhancement_to_bypass_dr": typical_enh,
+                "max_enhancement_to_bypass_dr": max_enh,
+                "ac_target_range": [min(ac_targets), max(ac_targets)],
+                "resist_priority": top_resist,
+                "has_special_attacks": has_saves,
+            },
+            "recommended_kit": {
+                "weapon": ({"resref": kit_weapon["resref"], "name": kit_weapon["name"],
+                            "wiki_url": _iu(kit_weapon["resref"]),
+                            "enhancement": kit_weapon["enhancement"],
+                            "cost": kit_weapon["cost"]} if kit_weapon else None),
+                "resist": kit_resist,
+                "ac": kit_ac,
+                "save": kit_save,
+            },
+        })
 
     payload = {
         "generated_at": now,
@@ -14507,7 +14919,7 @@ def generate_counter_gear_index(
         "creatures": creatures_out,
         "unbeatable": unbeatable_out,
         "manual_review": review_out,
-        "bis_by_slot": bis_by_slot,
+        "progression_tiers": progression_tiers,
     }
     _write_json(module_index_dir / "counter_gear.json", payload)
     (module_index_dir / "counter_gear.md").write_text(
