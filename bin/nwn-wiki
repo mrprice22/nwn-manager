@@ -61,9 +61,9 @@ _CREATURE_PICS: dict[str, list[str]] = {}     # canonical resref -> [image filen
 _CREATURE_PIC_GROUPS: list[dict] = []         # [{"name","matches","images","cr"}], sorted
 
 # Per-module theme assets loaded from <project-root>/wiki-theme/ by load_wiki_theme().
-_THEME_FAVICON: str = ""     # filename in assets/, e.g. "favicon.png"
-_THEME_HEADER_IMG: str = ""  # filename in assets/, e.g. "header.png"
-_THEME_EXTRA_CSS: str = ""   # filename in assets/, e.g. "theme.css"
+_THEME_FAVICON: str = ""           # filename in assets/, e.g. "favicon.png"
+_THEME_HEADER_IMGS: list[str] = [] # filenames in assets/, e.g. ["header.png", "header_02.png"]
+_THEME_EXTRA_CSS: str = ""         # filename in assets/, e.g. "theme.css"
 
 # Lookup warning registry: message → sorted list of referencing items/creatures.
 # Populated by _warn_once(); avoids flooding stderr on large modules.
@@ -5375,9 +5375,12 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
                  if _THEME_EXTRA_CSS else "")
     favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(_THEME_FAVICON)}">'
                if _THEME_FAVICON else "")
-    if _THEME_HEADER_IMG:
+    if _THEME_HEADER_IMGS:
+        imgs_attr = json.dumps([f"{root_rel}/assets/{n}" for n in _THEME_HEADER_IMGS]).replace('"', "&quot;")
+        first = E(f"{root_rel}/assets/{_THEME_HEADER_IMGS[0]}")
         brand = (f'<a class="brand" href="{E(root_rel)}/index.html">'
-                 f'<img class="site-header-img" src="{E(root_rel)}/assets/{E(_THEME_HEADER_IMG)}" alt="Home"></a>')
+                 f'<img class="site-header-img" src="{first}"'
+                 f' data-header-images="{imgs_attr}" alt="Home"></a>')
     else:
         brand = f'<a class="brand" href="{E(root_rel)}/index.html">Module Wiki</a>'
     return f"""<!doctype html>
@@ -5437,7 +5440,7 @@ def write(path: Path, content: str) -> None:
 
 def load_wiki_theme(project_root: Path, out: Path) -> None:
     """Copy files from <project_root>/wiki-theme/ into output assets and set theme globals."""
-    global _THEME_FAVICON, _THEME_HEADER_IMG, _THEME_EXTRA_CSS
+    global _THEME_FAVICON, _THEME_HEADER_IMGS, _THEME_EXTRA_CSS
     theme_dir = project_root / "wiki-theme"
     if not theme_dir.is_dir():
         return
@@ -5454,8 +5457,8 @@ def load_wiki_theme(project_root: Path, out: Path) -> None:
         if stem == "favicon" and ext in favicon_exts:
             _THEME_FAVICON = f.name
             loaded.append(f"favicon={f.name}")
-        elif stem == "header" and ext in img_exts:
-            _THEME_HEADER_IMG = f.name
+        elif stem.startswith("header") and ext in img_exts:
+            _THEME_HEADER_IMGS.append(f.name)
             loaded.append(f"header={f.name}")
         elif f.name == "theme.css":
             _THEME_EXTRA_CSS = f.name

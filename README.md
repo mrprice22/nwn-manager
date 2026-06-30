@@ -734,7 +734,7 @@ treated specially:
 |------|--------|
 | `theme.css` | Loaded as a second stylesheet after the built-in `style.css`. Use it to override CSS custom properties or add new rules. |
 | `favicon.png` / `favicon.ico` / `favicon.svg` | Set as the site favicon via a `<link rel="icon">` tag on every page. |
-| `header.png` / `header.jpg` / `header.webp` / etc. | Replaces the plain "Module Wiki" brand text in the site header with a clickable banner image that takes the visitor back to the index. |
+| `header.png` / `header.jpg` / `header.webp` / etc. | Replaces the plain "Module Wiki" brand text in the site header with a clickable banner image that takes the visitor back to the index. Add more images as `header_02.png`, `header_03.png`, etc. (any filename starting with `header`); the site will randomly cycle through all of them on each page load. |
 
 Any other files in `wiki-theme/` are copied to `assets/` as-is (useful
 for custom fonts or images referenced from `theme.css`).
