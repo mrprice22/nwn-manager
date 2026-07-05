@@ -54,6 +54,14 @@ _BESTIARY_ACTIVE: bool = False
 _BESTIARY_KILLS: dict[str, dict] = {}  # canonical resref -> {"total","solo","party"}
 _SERVER_FIRSTS: list[dict] = []        # [{"resref","cr","name","cname","at"}]
 
+# Boss respawn tracker ("Roll of the Fallen") registry, parsed from the module's
+# brd_db.nss BRD_SeedBoss(...) seed rows by load_boss_registry(). Single source
+# of truth shared with the in-game Well of Eru board — the wiki Bosses page is
+# generated from the same rows the game seeds into respawndb on module load, so
+# the two can never drift. Empty for modules without the tracker (no nav link).
+_BOSS_REGISTRY: list[dict] = []   # [{"resref","name","tag","area","area_name","cr"}]
+_BOSS_ALIASES: dict[str, str] = {}  # variant blueprint resref -> canonical resref
+
 # Creature artwork loaded from <project-root>/creature-pics/ by scan_creature_pics().
 # Filenames are matched to creature display names; a trailing "_NN" sets order.
 CREATURE_PIC_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -5404,6 +5412,7 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
           <a href="{E(root_rel)}/creatures/by-area/index.html">By Area</a>
           <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
           <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
+          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if _BOSS_REGISTRY else ''}
           <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>
         </div>
       </div>
@@ -7072,6 +7081,133 @@ def render_creatures_index(db: Db, out: Path) -> None:
           page("Creatures",
                '<div class="items-layout">' + body + "</div>",
                root_rel=".."))
+
+
+# --- Boss respawn tracker ("Roll of the Fallen") ---------------------------
+# The module's brd_db.nss seeds a curated boss registry into the respawndb
+# campaign DB on every module load; the same seed rows are the wiki's boss
+# list. Regexes mirror tests/check_boss_registry.py in the module repo.
+
+_BOSS_SEED_RE = re.compile(
+    r'BRD_SeedBoss\(\s*"(?P<resref>[^"]*)"\s*,\s*"(?P<name>[^"]*)"\s*,'
+    r'\s*"(?P<tag>[^"]*)"\s*,\s*"(?P<area>[^"]*)"\s*,\s*"(?P<area_name>[^"]*)"\s*,'
+    r'\s*(?P<cr>[0-9.]+)f?\s*,\s*(?P<respawn>\d+)\s*,\s*"(?P<type>[^"]*)"\s*\)'
+)
+_BOSS_ALIAS_RE = re.compile(
+    r'BRD_SeedAlias\(\s*"(?P<resref>[^"]*)"\s*,\s*"(?P<canonical>[^"]*)"\s*\)'
+)
+
+
+def load_boss_registry(db: Db) -> None:
+    """Populate _BOSS_REGISTRY/_BOSS_ALIASES from the module's brd_db.nss.
+    No-op (empty registry, no Bosses page/nav link) when the module doesn't
+    use the boss respawn tracker."""
+    global _BOSS_REGISTRY, _BOSS_ALIASES
+    _BOSS_REGISTRY = []
+    _BOSS_ALIASES = {}
+    p = db.script_paths.get("brd_db")
+    if not p:
+        return
+    text = _strip_nss_comments(p.read_text())
+    for m in _BOSS_SEED_RE.finditer(text):
+        d = m.groupdict()
+        d["cr"] = float(d["cr"])
+        _BOSS_REGISTRY.append(d)
+    for m in _BOSS_ALIAS_RE.finditer(text):
+        _BOSS_ALIASES[m.group("resref")] = m.group("canonical")
+    if _BOSS_REGISTRY:
+        print(f"[nwn-wiki] boss registry: {len(_BOSS_REGISTRY)} bosses"
+              f" ({len(_BOSS_ALIASES)} variant aliases) from brd_db.nss")
+
+
+def render_bosses_index(db: Db, out: Path) -> None:
+    """creatures/bosses.html — every boss tracked by the in-game Roll of the
+    Fallen board, same columns as the creatures index, sorted by CR desc."""
+    if not _BOSS_REGISTRY:
+        return
+    rows = []
+    for boss in sorted(_BOSS_REGISTRY, key=lambda b: (-b["cr"], b["name"].lower())):
+        rr = boss["resref"]
+        entry = db.canonical_creatures.get(rr)
+        if entry:
+            name_cell = link(f"{rr}.html", db.canonical_creature_name(rr))
+            c = entry["c"]
+            bp_rr = entry["bp_rr"]
+            bp = db.creatures.get(bp_rr) if bp_rr != rr else None
+
+            def _f(key, default=None):
+                v = fld(c, key)
+                if v is None and bp is not None:
+                    v = fld(bp, key)
+                return default if v is None else v
+
+            classes = (list_items(c.get("ClassList"))
+                       or (list_items(bp.get("ClassList")) if bp else []))
+            cls_str = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes
+            )
+            race = race_name(_f("Race"))
+            hp = creature_max_hp(c, bp)
+            cr = _f("ChallengeRating", boss["cr"])
+            faction = db.faction_name(_f("FactionID", ""))
+        else:
+            # Registry row without a matching creature page — registry/module
+            # drift; render unlinked and surface it in lookup_warnings.json.
+            _warn_once(f"boss registry resref '{rr}' has no creature page "
+                       f"(check BRD_SeedBoss rows in brd_db.nss)")
+            name_cell = E(boss["name"])
+            cls_str, race, hp, faction = "", "", None, ""
+            cr = boss["cr"]
+        area_rr = boss["area"]
+        if area_rr in db.areas and area_rr not in db.hidden_areas:
+            lair_cell = link(f"../areas/{area_rr}.html", boss["area_name"])
+        else:
+            lair_cell = E(boss["area_name"])
+        if _BESTIARY_ACTIVE:
+            # Sum kills across the boss's variant blueprints (e.g. the five
+            # leveled Xanith .utcs all count as one boss on the board).
+            variant_rrs = [rr] + [v for v, canon in _BOSS_ALIASES.items()
+                                  if canon == rr]
+            ks = [_BESTIARY_KILLS[v] for v in variant_rrs if v in _BESTIARY_KILLS]
+            if ks:
+                kills_cells = (
+                    f"<td>{sum(k['total'] for k in ks)}</td>"
+                    f"<td>{sum(k['solo'] for k in ks)}</td>"
+                    f"<td>{sum(k['party'] for k in ks)}</td>"
+                )
+            else:
+                kills_cells = "<td>—</td><td>—</td><td>—</td>"
+        else:
+            kills_cells = ""
+        rows.append(
+            f"<tr><td>{name_cell}</td>"
+            f"<td>{lair_cell}</td>"
+            f"<td>{E(race)}</td>"
+            f"<td>{E(cls_str)}</td>"
+            f"<td>{E(hp if hp is not None else '')}</td>"
+            f"<td>{E(cr)}</td>"
+            f"<td>{E(faction)}</td>"
+            f"{kills_cells}</tr>"
+        )
+    kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
+                  if _BESTIARY_ACTIVE else "")
+    n = len(_BOSS_REGISTRY)
+    body = (
+        "<h1>Bosses</h1>"
+        f"<p>The {n} great powers of Middle-earth tracked by the "
+        '<a href="../manual/Customizations.html#boss-respawn-tracker">Roll of the '
+        "Fallen</a> board in the Well of Eru. This list is generated from the same "
+        "registry the game loads, so it always matches the in-game board.</p>"
+        "<p>Think a boss is missing and should be tracked? Suggest it on Discord "
+        "or via the roadmap so it can be considered for the list.</p>"
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>Lair</th><th>Race</th><th>Class</th>"
+        "<th>HP</th><th>CR</th><th>Faction</th>"
+        f"{kills_head}"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "creatures" / "bosses.html", page("Bosses", body, root_rel=".."))
 
 
 def _pic_src(filename: str, prefix: str = "pics") -> str:
@@ -16090,6 +16226,10 @@ def main() -> int:
             _act_cmd += ["--db-dir", str(Path(args.db_dir).expanduser())]
         subprocess.run(_act_cmd, check=True)
 
+    # Boss respawn tracker registry — must load before any page renders so the
+    # conditional "Bosses" nav link appears consistently on every page.
+    load_boss_registry(db)
+
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
     render_index(db, out, title, positions, sizes, base_url=args.base_url,
@@ -16111,6 +16251,7 @@ def main() -> int:
         for c in conts:
             render_container_page(db, resref, c, out)
     render_creatures_index(db, out)
+    render_bosses_index(db, out)
     render_creature_pictures(db, out)
     render_creatures_by_area(db, out)
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
@@ -16167,6 +16308,32 @@ def main() -> int:
         "count": len(warnings_out),
         "warnings": warnings_out,
     })
+
+    # Boss respawn tracker registry (parsed from brd_db.nss BRD_SeedBoss rows —
+    # the same list the game seeds into respawndb, and the creatures/bosses.html
+    # page renders). Written for LLM-assist consumers.
+    if _BOSS_REGISTRY:
+        _write_json(module_index_dir / "bosses.json", {
+            "_description": "Bosses tracked by the in-game 'Roll of the Fallen' "
+                            "respawn board, parsed from the BRD_SeedBoss rows in "
+                            "unpacked/brd_db.nss (single source of truth shared "
+                            "with the game). See creatures/bosses.html.",
+            "count": len(_BOSS_REGISTRY),
+            "aliases": _BOSS_ALIASES,
+            "bosses": [
+                {
+                    "resref": b["resref"],
+                    "name": b["name"],
+                    "tag": b["tag"],
+                    "area_resref": b["area"],
+                    "area_name": b["area_name"],
+                    "cr": b["cr"],
+                    "has_creature_page": b["resref"] in db.canonical_creatures,
+                    "kills": _BESTIARY_KILLS.get(b["resref"]),
+                }
+                for b in sorted(_BOSS_REGISTRY, key=lambda b: -b["cr"])
+            ],
+        })
     if warnings_out:
         _module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json ({len(warnings_out)} lookup failure(s)) — {warnings_path}"))
     else:
