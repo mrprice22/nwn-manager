@@ -52,6 +52,10 @@ _GENERATED_AT: str = ""  # set in main(); included in every page footer
 BST_SF_CR = 60  # Server-First Challenge Rating threshold (mirror bst_db.nss)
 _BESTIARY_ACTIVE: bool = False
 _BESTIARY_KILLS: dict[str, dict] = {}  # canonical resref -> {"total","solo","party"}
+# canonical resref -> per-character kill rows, sorted by total desc:
+#   [{"uuid","name","solo","party","total","last"}]  ("uuid" is internal only —
+#   never rendered into HTML; pages show char_name.)
+_BESTIARY_TOP: dict[str, list[dict]] = {}
 _SERVER_FIRSTS: list[dict] = []        # [{"resref","cr","name","cname","at"}]
 
 # Boss respawn tracker ("Roll of the Fallen") registry, parsed from the module's
@@ -8501,6 +8505,42 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
             )
         else:
             sections.append("<h2>Kills</h2><p>Not yet slain by any adventurer.</p>")
+        # Top Killers leaderboard — per-character kill counts for this
+        # creature. Merge boss variant blueprints into their canonical (same
+        # summing the Bosses index does) so e.g. the leveled Xanith .utcs
+        # don't split a character's count. Omitted when nobody has a kill.
+        variant_rrs = [canonical_rr] + [v for v, canon in _BOSS_ALIASES.items()
+                                        if canon == canonical_rr]
+        merged: dict[str, dict] = {}
+        for v_rr in variant_rrs:
+            for r in _BESTIARY_TOP.get(v_rr, []):
+                m = merged.get(r["uuid"])
+                if m is None:
+                    merged[r["uuid"]] = dict(r)
+                else:
+                    m["solo"] += r["solo"]
+                    m["party"] += r["party"]
+                    m["total"] += r["total"]
+                    if r["last"] >= m["last"]:
+                        m["last"] = r["last"]
+                        m["name"] = r["name"] or m["name"]
+        top = sorted(merged.values(),
+                     key=lambda r: (-r["total"], r["name"].lower()))[:10]
+        if top:
+            tk_rows = "\n".join(
+                f"<tr><td>{i}</td><td>{E(r['name'])}</td>"
+                f"<td>{r['solo']}</td><td>{r['party']}</td>"
+                f"<td>{r['total']}</td>"
+                f"<td>{E(_utc_to_local(r['last'])[:10] if r['last'] else '')}</td></tr>"
+                for i, r in enumerate(top, 1)
+            )
+            sections.append(
+                "<h3>Top Killers</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>#</th><th>Character</th><th>Solo</th><th>Party</th>"
+                "<th>Total</th><th>Last Kill</th>"
+                "</tr></thead><tbody>" + tk_rows + "</tbody></table>"
+            )
 
     # "Where to find" section
     locs = db.canonical_locations.get(canonical_rr, [])
@@ -14006,9 +14046,10 @@ def load_bestiary_stats(db_dir: Path) -> None:
     """Populate the bestiary globals from the live DB (read-only). Missing DB or
     missing tables (no kills yet) leave the stats empty but mark the system active
     so the Server-First page still renders."""
-    global _BESTIARY_KILLS, _SERVER_FIRSTS, _BESTIARY_ACTIVE
+    global _BESTIARY_KILLS, _BESTIARY_TOP, _SERVER_FIRSTS, _BESTIARY_ACTIVE
     import sqlite3
     _BESTIARY_KILLS = {}
+    _BESTIARY_TOP = {}
     _SERVER_FIRSTS = []
     db_file = db_dir / "bestiarydb.sqlite3"
     if not db_file.is_file():
@@ -14029,6 +14070,39 @@ def load_bestiary_stats(db_dir: Path) -> None:
                                        "party": int(party or 0)}
     except sqlite3.Error:
         pass  # kills table not created yet (no kills recorded)
+    # Per-character rows for the "Top Killers" tables on creature pages.
+    # Loaded once here (never per-page SQL). Fold variant resrefs through the
+    # DB's resref_alias table so a character's kills of a variant blueprint
+    # count toward the canonical creature (kills are normally written already
+    # canonical by Bst_Canonical, so this is a safety net).
+    try:
+        try:
+            alias = dict(con.execute(
+                "SELECT resref, canonical FROM resref_alias").fetchall())
+        except sqlite3.Error:
+            alias = {}
+        per_char: dict[tuple[str, str], dict] = {}
+        for resref, uuid, name, solo, party, last in con.execute(
+            "SELECT resref, uuid, char_name, solo_kills, party_kills, "
+            "last_kill FROM kills"
+        ).fetchall():
+            rr = alias.get(resref, resref)
+            row = per_char.setdefault((rr, uuid), {
+                "uuid": uuid, "name": name or "", "solo": 0, "party": 0,
+                "last": ""})
+            row["solo"] += int(solo or 0)
+            row["party"] += int(party or 0)
+            if (last or "") >= row["last"]:
+                row["last"] = last or ""
+                if name:  # most recent char_name wins (renames)
+                    row["name"] = name
+        for (rr, _uuid), row in per_char.items():
+            row["total"] = row["solo"] + row["party"]
+            _BESTIARY_TOP.setdefault(rr, []).append(row)
+        for rows_ in _BESTIARY_TOP.values():
+            rows_.sort(key=lambda r: (-r["total"], r["name"].lower()))
+    except sqlite3.Error:
+        pass  # kills table not created yet
     try:
         try:
             rows = con.execute(
