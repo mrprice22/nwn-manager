@@ -668,6 +668,69 @@ the file. If there is no heading, the filename stem is title-cased
 simply doesn't appear. Only one level of sub-folders is supported (files
 nested deeper are ignored).
 
+#### Manual documents: menu and order overrides
+
+By default every `docs.manual/` page lands in the **Documents ▾** dropdown,
+in the alphabetical order described above. A few optional directives, found
+anywhere in the page's own source, let a page (or a whole sub-folder) opt
+into a different menu or a fixed position.
+
+Since manual pages are plain committed files rather than a toolset field,
+the two formats spell a directive differently so it stays invisible on the
+rendered page:
+
+- **`.md` files** — write the directive on its own line, e.g. `@menu
+  'Activity'`. The line is stripped before the page is rendered.
+- **`.html` files** — wrap the directive in an HTML comment, e.g. `<!-- @menu
+  'Activity' -->`. Comments are already invisible in the browser, so nothing
+  needs to be stripped.
+
+**`@menu 'Name'` — place this page under a different top-level menu.**
+
+```
+@menu 'Activity'
+```
+
+- `Name` may be single-quoted, double-quoted, or left bare, and `@menu` is
+  case-insensitive.
+- `'Documents'` (or omitting `@menu` entirely) is the unchanged default.
+- `'Activity'` merges the page into the existing **Activity ▾** dropdown,
+  *above* the built-in "Player Activity" and "Server Firsts" links.
+- Any other name creates a brand-new top-level dropdown with that label,
+  appended after Activity/Documents in the nav. Static single-link items
+  (Map, Areas, Stores, Conversations, Factions, Quests) can't be targeted —
+  only dropdown-style menus can receive manual pages.
+- For a sub-folder, `@menu` is read from the first file in the folder (in
+  its existing alphabetical order) that declares one — the whole folder's
+  submenu moves together, matching the "first one found wins" rule used for
+  quest `@group-order` below.
+
+**`@order N` — pin this page's position within its target menu.**
+
+```
+@menu 'Activity'
+@order 1
+```
+
+- Lower numbers sort first; pages without `@order` fall back to alphabetical
+  order, after any explicitly-ordered ones.
+
+**`@menu-order N` — control where a *custom* menu sits among other custom
+menus in the nav.** Only meaningful for menu names other than "Documents"/
+"Activity", which always keep their fixed nav position:
+
+```
+@menu 'Guides'
+@menu-order 1
+```
+
+- Set it on any page targeting that menu — the first one found is used.
+- Custom menus without `@menu-order` sort alphabetically after all
+  numbered ones.
+
+The directives are all parsed from the same page source, so a page can
+combine `@menu` + `@order` + `@menu-order` freely.
+
 The wiki is **never** rebuilt automatically. `repack` does not trigger
 it; run `nwn-manager wiki` explicitly when you want fresh output.
 

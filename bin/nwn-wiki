@@ -40,7 +40,8 @@ ASSETS_DIR = SCRIPT_DIR / "wiki_assets"
 #   {"kind": "file", "title": str, "stem": str}
 #   {"kind": "dir",  "title": str, "dirname": str,
 #    "items": [{"title": str, "stem": str}, ...]}
-_MANUAL_PAGES: list[dict] = []
+_MANUAL_MENUS: dict[str, list[dict]] = {}  # menu name -> ordered manual-page entries
+_MANUAL_MENU_ORDER: dict[str, int] = {}  # custom menu name -> first @menu-order seen
 _HAS_ACTIVITY_PAGE: bool = False
 _HAS_SERVER_FIRSTS: bool = False  # set in render_manual_pages(); drives Activity nav
 _GENERATED_AT: str = ""  # set in main(); included in every page footer
@@ -5316,36 +5317,10 @@ def md_to_html(text: str) -> str:
     return "\n".join(out)
 
 
-def _activity_dropdown(root_rel: str) -> str:
-    """Return the Activity nav dropdown HTML (Player Activity + Server Firsts).
-
-    Both pages are refreshed more often than the rest of the wiki (via
-    nwn-wiki-activity). Shown only when at least one of the two exists.
-    """
-    if not (_HAS_ACTIVITY_PAGE or _HAS_SERVER_FIRSTS):
-        return ""
+def _manual_menu_rows(entries: list[dict], root_rel: str) -> list[str]:
+    """Return nav row HTML (links / submenus) for a list of manual-page entries."""
     rows: list[str] = []
-    if _HAS_ACTIVITY_PAGE:
-        rows.append(f'<a href="{E(root_rel)}/activity.html">Player Activity</a>')
-    if _HAS_SERVER_FIRSTS:
-        rows.append(
-            f'<a href="{E(root_rel)}/manual/ServerFirsts.html">Server Firsts</a>'
-        )
-    inner = "\n".join(rows)
-    return (
-        '<div class="nav-dropdown">'
-        '<span class="nav-dropdown-label">Activity &#9660;</span>'
-        f'<div class="nav-dropdown-menu">{inner}</div>'
-        '</div>'
-    )
-
-
-def _docs_dropdown(root_rel: str) -> str:
-    """Return the Documents nav dropdown HTML, or empty string if none."""
-    if not _MANUAL_PAGES:
-        return ""
-    rows: list[str] = []
-    for entry in _MANUAL_PAGES:
+    for entry in entries:
         if entry["kind"] == "file":
             rows.append(
                 f'<a href="{E(root_rel)}/manual/{E(entry["stem"])}.html">'
@@ -5363,13 +5338,66 @@ def _docs_dropdown(root_rel: str) -> str:
                 f'<div class="nav-submenu-menu">{sub_items}</div>'
                 f'</div>'
             )
+    return rows
+
+
+def _activity_dropdown(root_rel: str) -> str:
+    """Return the Activity nav dropdown HTML (manual pages targeting @menu
+    'Activity', then Player Activity + Server Firsts).
+
+    Player Activity / Server Firsts are refreshed more often than the rest of
+    the wiki (via nwn-wiki-activity). Shown only when at least one entry exists.
+    """
+    manual_rows = _manual_menu_rows(_MANUAL_MENUS.get("Activity", []), root_rel)
+    if not (_HAS_ACTIVITY_PAGE or _HAS_SERVER_FIRSTS or manual_rows):
+        return ""
+    rows: list[str] = list(manual_rows)
+    if _HAS_ACTIVITY_PAGE:
+        rows.append(f'<a href="{E(root_rel)}/activity.html">Player Activity</a>')
+    if _HAS_SERVER_FIRSTS:
+        rows.append(
+            f'<a href="{E(root_rel)}/manual/ServerFirsts.html">Server Firsts</a>'
+        )
     inner = "\n".join(rows)
+    return (
+        '<div class="nav-dropdown">'
+        '<span class="nav-dropdown-label">Activity &#9660;</span>'
+        f'<div class="nav-dropdown-menu">{inner}</div>'
+        '</div>'
+    )
+
+
+def _docs_dropdown(root_rel: str) -> str:
+    """Return the Documents nav dropdown HTML, or empty string if none."""
+    entries = _MANUAL_MENUS.get("Documents", [])
+    if not entries:
+        return ""
+    inner = "\n".join(_manual_menu_rows(entries, root_rel))
     return (
         '<div class="nav-dropdown">'
         '<span class="nav-dropdown-label">Documents &#9660;</span>'
         f'<div class="nav-dropdown-menu">{inner}</div>'
         '</div>'
     )
+
+
+def _custom_manual_dropdowns(root_rel: str) -> str:
+    """Return nav dropdown HTML for any custom @menu names (excluding the
+    built-in Documents/Activity dropdowns), ordered by @menu-order then
+    first-seen position."""
+    custom_names = [n for n in _MANUAL_MENUS if n not in ("Documents", "Activity")]
+    custom_names.sort(key=lambda n: (_MANUAL_MENU_ORDER.get(n, 10**9),
+                                      list(_MANUAL_MENUS).index(n)))
+    blocks: list[str] = []
+    for name in custom_names:
+        inner = "\n".join(_manual_menu_rows(_MANUAL_MENUS[name], root_rel))
+        blocks.append(
+            '<div class="nav-dropdown">'
+            f'<span class="nav-dropdown-label">{E(name)} &#9660;</span>'
+            f'<div class="nav-dropdown-menu">{inner}</div>'
+            '</div>'
+        )
+    return "\n".join(blocks)
 
 
 def _md_title(text: str, stem: str) -> str:
@@ -5435,6 +5463,7 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
       <a href="{E(root_rel)}/quests/index.html">Quests</a>
       {_activity_dropdown(root_rel)}
       {_docs_dropdown(root_rel)}
+      {_custom_manual_dropdowns(root_rel)}
     </nav>
   </header>
   <main>
@@ -13179,15 +13208,68 @@ def _html_title(text: str, stem: str) -> str:
     return stem.replace("-", " ").replace("_", " ").title()
 
 
-def _manual_doc_body(path: Path) -> tuple[str, str]:
+# Builder-authored directives that override where a docs.manual/ page (or an
+# entire subfolder) lands in the site nav, mirroring the quest @group/@order
+# scheme (see _RE_QUEST_GROUP et al. above). Found by regex search anywhere in
+# the raw file text:
+#   @menu 'Name'     place this page/folder under the "Name" top-level
+#                    dropdown instead of "Documents". 'Documents' and
+#                    'Activity' fold into those existing dropdowns; any other
+#                    name creates a new top-level dropdown.
+#   @order N         sort position of this entry within its target menu
+#                    (integer; lower = earlier; ties fall back to alphabetical)
+#   @menu-order N    sort position of a custom menu among other custom menus
+#                    in the nav (set on any entry targeting that menu; first
+#                    found wins) — meaningless for 'Documents'/'Activity',
+#                    which keep their fixed nav position.
+# In .md files, write the directive as its own bare line — it is stripped
+# before Markdown conversion (md_to_html HTML-escapes plain text, so an
+# unstripped line would otherwise render as literal visible text). In .html
+# files, wrap it in an HTML comment (e.g. <!-- @menu 'Activity' -->) — the
+# body is inserted verbatim, so a comment is already invisible in the browser
+# and needs no stripping.
+_RE_MANUAL_MENU = re.compile(
+    r"@menu\s+(?:'([^']*)'|\"([^\"]*)\"|([^\n]+))", re.IGNORECASE)
+_RE_MANUAL_ORDER = re.compile(r"@order\s+(\d+)", re.IGNORECASE)
+_RE_MANUAL_MENU_ORDER = re.compile(r"@menu-order\s+(\d+)", re.IGNORECASE)
+# Whole directive lines, stripped from .md source before Markdown conversion.
+_RE_MANUAL_DIRECTIVE = re.compile(
+    r"^[ \t]*@(?:menu-order|menu|order)\b[^\n]*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _manual_menu(text: str) -> str:
+    """The @menu name declared in a manual page's source, or 'Documents' if none."""
+    m = _RE_MANUAL_MENU.search(text or "")
+    if not m:
+        return "Documents"
+    return (m.group(1) or m.group(2) or m.group(3) or "").strip() or "Documents"
+
+
+def _manual_sort_order(text: str) -> int | None:
+    """Sort position of this entry within its target menu, via @order N.
+    Returns None when not present (callers fall back to alphabetical)."""
+    m = _RE_MANUAL_ORDER.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def _manual_menu_order(text: str) -> int | None:
+    """Sort position of this entry's target menu among other custom menus,
+    via @menu-order N. Returns None when not present."""
+    m = _RE_MANUAL_MENU_ORDER.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def _manual_doc_body(path: Path, text: str | None = None) -> tuple[str, str]:
     """Return (title, body_html) for a .md or .html manual doc."""
-    text = path.read_text(encoding="utf-8")
+    if text is None:
+        text = path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".html":
         # Extract <body> content if present, otherwise use full text as body
         m = re.search(r"<body[^>]*>(.*?)</body>", text, re.IGNORECASE | re.DOTALL)
         body = m.group(1) if m else text
         return _html_title(text, path.stem), body
-    return _md_title(text, path.stem), md_to_html(text)
+    cleaned = _RE_MANUAL_DIRECTIVE.sub("", text)
+    return _md_title(cleaned, path.stem), md_to_html(cleaned)
 
 
 # =============================================================================
@@ -14236,25 +14318,35 @@ def _render_server_first_body() -> str:
 
 def render_manual_pages(project_root: Path, out: Path) -> None:
     """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each."""
-    global _MANUAL_PAGES, _HAS_SERVER_FIRSTS
-    _MANUAL_PAGES = []
+    global _MANUAL_MENUS, _MANUAL_MENU_ORDER, _HAS_SERVER_FIRSTS
+    _MANUAL_MENUS = {}
+    _MANUAL_MENU_ORDER = {}
     manual_dir = project_root / "docs.manual"
     if not manual_dir.is_dir():
         return
 
-    # Pass 1: collect all page metadata and content so _MANUAL_PAGES is complete
-    # before any page HTML is written (the dropdown in every page must list all docs).
+    # Pass 1: collect all page metadata and content so _MANUAL_MENUS is complete
+    # before any page HTML is written (the dropdowns on every page must list all docs).
     # (out_path, title, body, root_rel, page_updated_at)
     pages_to_write: list[tuple[Path, str, str, str, str]] = []
+
+    def note_menu_order(menu_name: str, menu_order: int | None) -> None:
+        if menu_order is not None and menu_name not in _MANUAL_MENU_ORDER:
+            _MANUAL_MENU_ORDER[menu_name] = menu_order
 
     top_files = sorted(
         p for p in manual_dir.iterdir()
         if p.is_file() and p.suffix.lower() in (".md", ".html")
     )
     for doc_path in top_files:
-        title, body = _manual_doc_body(doc_path)
+        raw_text = doc_path.read_text(encoding="utf-8")
+        menu_name = _manual_menu(raw_text)
+        order = _manual_sort_order(raw_text)
+        note_menu_order(menu_name, _manual_menu_order(raw_text))
+        title, body = _manual_doc_body(doc_path, text=raw_text)
         stem = doc_path.stem
-        _MANUAL_PAGES.append({"kind": "file", "title": title, "stem": stem})
+        _MANUAL_MENUS.setdefault(menu_name, []).append(
+            {"kind": "file", "title": title, "stem": stem, "_order": order})
         pages_to_write.append((out / "manual" / f"{stem}.html", title, body, "..", ""))
 
     # Generated (data-driven) page: Server-First kill leaderboard. Surfaced via the
@@ -14282,17 +14374,35 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         dirname = sub_dir.name
         folder_title = dirname.replace("-", " ").replace("_", " ")
         items: list[dict] = []
+        # Folder-level @menu/@order/@menu-order are taken from the first file
+        # (in sorted order) that declares them — first found wins, mirroring
+        # the quest @group-order rule.
+        folder_menu: str | None = None
+        folder_order: int | None = None
         for doc_path in doc_files:
-            title, body = _manual_doc_body(doc_path)
+            raw_text = doc_path.read_text(encoding="utf-8")
+            if folder_menu is None and _RE_MANUAL_MENU.search(raw_text):
+                folder_menu = _manual_menu(raw_text)
+            if folder_order is None:
+                folder_order = _manual_sort_order(raw_text)
+            note_menu_order(_manual_menu(raw_text), _manual_menu_order(raw_text))
+            title, body = _manual_doc_body(doc_path, text=raw_text)
             stem = doc_path.stem
             items.append({"title": title, "stem": stem})
             pages_to_write.append((
                 out / "manual" / dirname / f"{stem}.html", title, body, "../..", "",
             ))
-        _MANUAL_PAGES.append({"kind": "dir", "title": folder_title,
-                               "dirname": dirname, "items": items})
+        _MANUAL_MENUS.setdefault(folder_menu or "Documents", []).append(
+            {"kind": "dir", "title": folder_title, "dirname": dirname,
+             "items": items, "_order": folder_order})
 
-    # Pass 2: write all pages now that _MANUAL_PAGES is fully populated.
+    # Sort each menu's entries by @order (list.sort is stable, so entries
+    # without @order keep their original alphabetical/insertion order,
+    # trailing after any explicitly-ordered ones).
+    for entries in _MANUAL_MENUS.values():
+        entries.sort(key=lambda e: e["_order"] if e["_order"] is not None else 10**9)
+
+    # Pass 2: write all pages now that _MANUAL_MENUS is fully populated.
     for out_path, title, body, root_rel, page_ts in pages_to_write:
         write(out_path, page(title, body, root_rel=root_rel, page_updated_at=page_ts))
 
