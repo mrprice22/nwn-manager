@@ -5,3 +5,6 @@
 *.erf
 *.hak
 __pycache__/
+# Nimble/Atlas dependency source checkouts (e.g. neverwinter.nim and its
+# transitive deps), vendored in-place at build time — not project source.
+/githubcom_*/
