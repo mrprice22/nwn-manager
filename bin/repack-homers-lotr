@@ -48,10 +48,10 @@ trap 'rm -f "$tmpout"' EXIT
 if [[ $VERBOSE -eq 1 ]]; then
   # CHECK_DLG_VERBOSE makes the dialog-integrity gate list per-dialog warnings,
   # so verbose shows more detail on what each gate is checking as it runs.
-  CHECK_DLG_VERBOSE=1 nwn-manager repack "${REPACK_ARGS[@]}" 2>&1 | tee "$tmpout"
+  CHECK_DLG_VERBOSE=1 nwn-manager repack --no-install "${REPACK_ARGS[@]}" 2>&1 | tee "$tmpout"
   nasher_status="${PIPESTATUS[0]}"
 else
-  nwn-manager repack "${REPACK_ARGS[@]}" >"$tmpout" 2>&1 &
+  nwn-manager repack --no-install "${REPACK_ARGS[@]}" >"$tmpout" 2>&1 &
   bg_pid=$!
   spin='|/-\'
   si=0

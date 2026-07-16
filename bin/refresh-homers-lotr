@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Desktop-launcher target: unpack Homer's LotR .mod into the unpacked/ source
 # tree. Selects the most recently modified .mod from the git project directory
-# or the OneDrive modules directory.
+# or the OneDrive modules directory. Among files tied for newest mtime, the
+# canonical name (homers_lotr_v3.mod) wins over any stray/manually-renamed
+# build — otherwise .nasher/source (and thus the next repack's install target)
+# can drift to whatever alt-named .mod happens to sort first.
 # Wiki regeneration is a separate step — use "Regenerate Homer's LotR Wiki".
 #
 # Options:
@@ -25,13 +28,32 @@ CANDIDATE_DIRS=(
   "$PROJECT"
   "$HOME/OneDrive/Games/NWNHomersLOTR"
 )
+CANONICAL_NAME="homers_lotr_v3.mod"
 
 export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 
 cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
 
-MOD=$(find "${CANDIDATE_DIRS[@]}" -maxdepth 1 -name "*.mod" -type f 2>/dev/null \
-  | xargs ls -t 2>/dev/null | head -1)
+# Newest mtime wins; among files tied for newest, prefer the canonical name.
+mapfile -t MOD_ENTRIES < <(
+  find "${CANDIDATE_DIRS[@]}" -maxdepth 1 -name "*.mod" -type f -print0 2>/dev/null \
+    | xargs -0 stat -c '%Y %n' 2>/dev/null \
+    | sort -rn
+)
+
+MOD=""
+if [[ ${#MOD_ENTRIES[@]} -gt 0 ]]; then
+  top_mtime="${MOD_ENTRIES[0]%% *}"
+  MOD="${MOD_ENTRIES[0]#* }"
+  for entry in "${MOD_ENTRIES[@]}"; do
+    [[ "${entry%% *}" == "$top_mtime" ]] || break
+    path="${entry#* }"
+    if [[ $(basename "$path") == "$CANONICAL_NAME" ]]; then
+      MOD="$path"
+      break
+    fi
+  done
+fi
 
 if [[ -z $MOD ]]; then
   echo "error: no .mod file found in:"

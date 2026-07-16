@@ -28,7 +28,8 @@ Usage:
 
   $PROG repack [args...]  Build .mod from ./unpacked/ via 'nasher
                           pack'. If a path is recorded in
-                          .nasher/source, copy the built .mod there.
+                          .nasher/source, copy the built .mod there
+                          (skip with --no-install).
                           Extra args pass through to nasher.
 
   $PROG wiki [--out <dir>] [args...]
@@ -461,11 +462,13 @@ cmd_repack() {
   # built-in dialog-integrity check). Strip it from the args before the rest
   # are forwarded to nasher.
   local no_smoke=0
+  local no_install=0
   local pass_through=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --no-smoke) no_smoke=1 ;;
-      *)          pass_through+=("$1") ;;
+      --no-smoke)   no_smoke=1 ;;
+      --no-install) no_install=1 ;;
+      *)            pass_through+=("$1") ;;
     esac
     shift
   done
@@ -604,7 +607,7 @@ EOF
   fi
   echo "[$PROG] built: $built"
 
-  if [[ -f .nasher/source ]]; then
+  if [[ $no_install -eq 0 && -f .nasher/source ]]; then
     local install
     install=$(cat .nasher/source)
     if [[ ! -d $(dirname "$install") ]]; then
