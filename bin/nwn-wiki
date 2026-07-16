@@ -8524,11 +8524,13 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
                     if r["last"] >= m["last"]:
                         m["last"] = r["last"]
                         m["name"] = r["name"] or m["name"]
+                        m["player"] = r["player"] or m["player"]
         top = sorted(merged.values(),
                      key=lambda r: (-r["total"], r["name"].lower()))[:10]
         if top:
             tk_rows = "\n".join(
-                f"<tr><td>{i}</td><td>{E(r['name'])}</td>"
+                f"<tr><td>{i}</td><td>{E(r.get('player', ''))}</td>"
+                f"<td>{E(r['name'])}</td>"
                 f"<td>{r['solo']}</td><td>{r['party']}</td>"
                 f"<td>{r['total']}</td>"
                 f"<td>{E(_utc_to_local(r['last'])[:10] if r['last'] else '')}</td></tr>"
@@ -8537,7 +8539,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
             sections.append(
                 "<h3>Top Killers</h3>"
                 '<table class="data"><thead><tr>'
-                "<th>#</th><th>Character</th><th>Solo</th><th>Party</th>"
+                "<th>#</th><th>Player</th><th>Character</th><th>Solo</th><th>Party</th>"
                 "<th>Total</th><th>Last Kill</th>"
                 "</tr></thead><tbody>" + tk_rows + "</tbody></table>"
             )
@@ -14042,12 +14044,18 @@ def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
         con.close()
 
 
-def load_bestiary_stats(db_dir: Path) -> None:
+def load_bestiary_stats(db_dir: Path, sessions: list | None = None) -> None:
     """Populate the bestiary globals from the live DB (read-only). Missing DB or
     missing tables (no kills yet) leave the stats empty but mark the system active
-    so the Server-First page still renders."""
+    so the Server-First page still renders. `sessions` (parsed log sessions, if
+    available) supplies a cdkey->player-name mapping for the Top Killers table's
+    Player column; kills only store cdkey, not the account/player name."""
     global _BESTIARY_KILLS, _BESTIARY_TOP, _SERVER_FIRSTS, _BESTIARY_ACTIVE
     import sqlite3
+    cdkey_to_name: dict = {}
+    for s in (sessions or []):
+        if s.get("cdkey") and s.get("player"):
+            cdkey_to_name[s["cdkey"]] = s["player"]
     _BESTIARY_KILLS = {}
     _BESTIARY_TOP = {}
     _SERVER_FIRSTS = []
@@ -14082,20 +14090,22 @@ def load_bestiary_stats(db_dir: Path) -> None:
         except sqlite3.Error:
             alias = {}
         per_char: dict[tuple[str, str], dict] = {}
-        for resref, uuid, name, solo, party, last in con.execute(
-            "SELECT resref, uuid, char_name, solo_kills, party_kills, "
+        for resref, uuid, cdkey, name, solo, party, last in con.execute(
+            "SELECT resref, uuid, cdkey, char_name, solo_kills, party_kills, "
             "last_kill FROM kills"
         ).fetchall():
             rr = alias.get(resref, resref)
             row = per_char.setdefault((rr, uuid), {
-                "uuid": uuid, "name": name or "", "solo": 0, "party": 0,
-                "last": ""})
+                "uuid": uuid, "name": name or "", "player": "", "solo": 0,
+                "party": 0, "last": ""})
             row["solo"] += int(solo or 0)
             row["party"] += int(party or 0)
             if (last or "") >= row["last"]:
                 row["last"] = last or ""
                 if name:  # most recent char_name wins (renames)
                     row["name"] = name
+                if cdkey and cdkey_to_name.get(cdkey):
+                    row["player"] = cdkey_to_name[cdkey]
         for (rr, _uuid), row in per_char.items():
             row["total"] = row["solo"] + row["party"]
             _BESTIARY_TOP.setdefault(rr, []).append(row)
@@ -16282,7 +16292,9 @@ def main() -> int:
             if activity is not None:
                 backfill_server_first_player_names(
                     _bestiary_db_dir, activity["sessions"])
-            load_bestiary_stats(_bestiary_db_dir)
+            load_bestiary_stats(
+                _bestiary_db_dir,
+                activity["sessions"] if activity is not None else None)
         else:
             print("[nwn-wiki] bestiary: no reachable database dir "
                   "(set --db-dir); skipping kill stats", file=sys.stderr)
