@@ -644,7 +644,7 @@ docs.manual/
 ```
 
 **Sub-folders** — each sub-directory becomes a submenu that opens to the
-right when hovered. The sub-folder name (with hyphens/underscores replaced
+left when hovered. The sub-folder name (with hyphens/underscores replaced
 by spaces) is the submenu label, and every `.md` inside it is a link within
 that submenu:
 
@@ -821,6 +821,14 @@ quickest way to restyle the site without touching the generator:
   --link-hover:  #e8c060;
 }
 ```
+
+One non-colour custom property is also exposed:
+
+- `--nav-grace` (default `0.75s`) — how long a nav dropdown/submenu stays
+  open and clickable after the mouse leaves before it fades. This grace makes
+  it easier to travel from a menu to one of its submenus without it snapping
+  shut. Override it in `theme.css` (e.g. `:root { --nav-grace: 0.4s; }`) to
+  make menus close faster or slower.
 
 The SVG area map embeds its own `<style>` block (so it stays usable as
 a standalone download). To override map colours in a theme stylesheet,

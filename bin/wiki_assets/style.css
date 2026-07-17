@@ -12,6 +12,9 @@
   --friendly: #2d6a3a;
   --link: #5a3210;
   --link-hover: #a05a1c;
+  /* Grace period a nav dropdown/submenu stays open after the mouse leaves,
+     before it fades — gives room to travel to a submenu. Tune freely. */
+  --nav-grace: 0.75s;
 }
 
 * { box-sizing: border-box; }
@@ -499,7 +502,8 @@ p.note strong, p.note em { color: var(--fg); }
   white-space: nowrap;
 }
 .nav-dropdown-menu {
-  display: none;
+  visibility: hidden;
+  opacity: 0;
   position: absolute;
   top: 100%;
   left: 0;
@@ -508,8 +512,16 @@ p.note strong, p.note em { color: var(--fg); }
   min-width: 11em;
   z-index: 100;
   padding: 0.25em 0;
+  /* Delayed hide: menu stays visible/clickable for --nav-grace after the mouse
+     leaves, then fades — grace for travelling to a submenu. See --nav-grace. */
+  transition: opacity 0.12s ease var(--nav-grace),
+              visibility 0s linear var(--nav-grace);
 }
-.nav-dropdown:hover .nav-dropdown-menu { display: block; }
+.nav-dropdown:hover .nav-dropdown-menu {
+  visibility: visible;
+  opacity: 1;
+  transition-delay: 0s;  /* appear instantly on hover; delay applies to close only */
+}
 .nav-dropdown-menu a {
   display: block;
   padding: 0.35em 0.85em;
@@ -537,17 +549,27 @@ p.note strong, p.note em { color: var(--fg); }
 }
 .nav-submenu-label::after { content: " \25b8"; }
 .nav-submenu-menu {
-  display: none;
+  visibility: hidden;
+  opacity: 0;
   position: absolute;
-  left: 100%;
+  /* Open leftward: the Documents/custom dropdowns sit on the right of the nav,
+     so a rightward submenu would be clipped by the window edge. */
+  right: 100%;
+  left: auto;
   top: 0;
   background: var(--accent);
   border: 1px solid var(--accent-soft);
   min-width: 11em;
   z-index: 102;
   padding: 0.25em 0;
+  transition: opacity 0.12s ease var(--nav-grace),
+              visibility 0s linear var(--nav-grace);
 }
-.nav-submenu:hover .nav-submenu-menu { display: block; }
+.nav-submenu:hover .nav-submenu-menu {
+  visibility: visible;
+  opacity: 1;
+  transition-delay: 0s;
+}
 .nav-submenu-menu a {
   display: block;
   padding: 0.35em 0.85em;

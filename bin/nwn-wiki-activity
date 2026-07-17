@@ -166,6 +166,10 @@ def main() -> int:
         wiki.backfill_server_first_player_names(db_dir, activity["sessions"])
         wiki.load_bestiary_stats(db_dir)
 
+    # Populate the boss registry (no full Db here) so the conditional "Bosses"
+    # nav link matches the main build on the pages this subprocess (re)writes.
+    wiki.load_boss_registry_from_src(src)
+
     # Populate _MANUAL_PAGES so the Documents nav dropdown matches the rest of
     # the wiki. render_manual_pages is idempotent; re-writing existing pages is
     # harmless, and the call is skipped entirely when docs.manual/ is absent.
