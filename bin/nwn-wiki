@@ -5341,6 +5341,28 @@ def _manual_menu_rows(entries: list[dict], root_rel: str) -> list[str]:
     return rows
 
 
+def _quests_nav(root_rel: str) -> str:
+    """Return the Quests nav entry: a plain link to the generated quest index,
+    or a dropdown when manual pages target @menu 'Quests'.
+
+    Modules that declare no @menu 'Quests' page keep the single "Quests" link
+    exactly as before; declaring one turns the entry into a dropdown and the
+    generated index becomes "Journal Entries" inside it.
+    """
+    index_link = f'{E(root_rel)}/quests/index.html'
+    rows = _manual_menu_rows(_MANUAL_MENUS.get("Quests", []), root_rel)
+    if not rows:
+        return f'<a href="{index_link}">Quests</a>'
+    rows.append(f'<a href="{index_link}">Journal Entries</a>')
+    inner = "\n".join(rows)
+    return (
+        '<div class="nav-dropdown">'
+        '<span class="nav-dropdown-label">Quests &#9660;</span>'
+        f'<div class="nav-dropdown-menu">{inner}</div>'
+        '</div>'
+    )
+
+
 def _activity_dropdown(root_rel: str) -> str:
     """Return the Activity nav dropdown HTML (manual pages targeting @menu
     'Activity', then Player Activity + Server Firsts).
@@ -5383,9 +5405,10 @@ def _docs_dropdown(root_rel: str) -> str:
 
 def _custom_manual_dropdowns(root_rel: str) -> str:
     """Return nav dropdown HTML for any custom @menu names (excluding the
-    built-in Documents/Activity dropdowns), ordered by @menu-order then
+    built-in Documents/Activity/Quests dropdowns), ordered by @menu-order then
     first-seen position."""
-    custom_names = [n for n in _MANUAL_MENUS if n not in ("Documents", "Activity")]
+    custom_names = [n for n in _MANUAL_MENUS
+                    if n not in ("Documents", "Activity", "Quests")]
     custom_names.sort(key=lambda n: (_MANUAL_MENU_ORDER.get(n, 10**9),
                                       list(_MANUAL_MENUS).index(n)))
     blocks: list[str] = []
@@ -5460,7 +5483,7 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
       <a href="{E(root_rel)}/stores/index.html">Stores</a>
       <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
       <a href="{E(root_rel)}/factions.html">Factions</a>
-      <a href="{E(root_rel)}/quests/index.html">Quests</a>
+      {_quests_nav(root_rel)}
       {_activity_dropdown(root_rel)}
       {_docs_dropdown(root_rel)}
       {_custom_manual_dropdowns(root_rel)}
@@ -13225,9 +13248,11 @@ def _html_title(text: str, stem: str) -> str:
 # scheme (see _RE_QUEST_GROUP et al. above). Found by regex search anywhere in
 # the raw file text:
 #   @menu 'Name'     place this page/folder under the "Name" top-level
-#                    dropdown instead of "Documents". 'Documents' and
-#                    'Activity' fold into those existing dropdowns; any other
-#                    name creates a new top-level dropdown.
+#                    dropdown instead of "Documents". 'Documents', 'Activity'
+#                    and 'Quests' fold into those existing built-in nav
+#                    entries; any other name creates a new top-level dropdown.
+#                    ('Quests' is a plain link to the generated quest index
+#                    until at least one page targets it — see _quests_nav.)
 #   @order N         sort position of this entry within its target menu
 #                    (integer; lower = earlier; ties fall back to alphabetical)
 #   @menu-order N    sort position of a custom menu among other custom menus
