@@ -9580,7 +9580,10 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 "(Dropable=1 on the item instance). It will not appear in any loot bag.</p>"
             )
 
-    desc = loc(i.get("Description"))
+    # Prefer the identified description (what players see in-game for identified
+    # items, which is nearly all module content); fall back to the unidentified
+    # Description only when there is no DescIdentified.
+    desc = loc(i.get("DescIdentified")) or loc(i.get("Description"))
     if desc:
         sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
 
