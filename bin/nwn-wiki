@@ -13997,13 +13997,32 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         xlabel="hours",
         bar_color="#5a2b78",
     )
-    if len(date_range) > 60:
-        date_range = date_range[-60:]
-
     _daily_cutoff = date(2026, 5, 17)
     _conc_cutoff = date(2026, 6, 1)
 
-    date_range_daily = [d for d in date_range if d > _daily_cutoff]
+    # Daily charts show at most the most recent DAILY_WINDOW days. Once the data
+    # runs longer than that, the days that fall off the daily chart aren't lost:
+    # a weekly roll-up of the *whole* range is rendered underneath it.
+    DAILY_WINDOW = 35
+
+    def _weekly(days: list, value_of, combine) -> tuple[list[str], list]:
+        """Roll a per-day series up into Mon-anchored weeks.
+
+        `value_of(day)` yields that day's value; `combine(list)` reduces a week's
+        worth of values (sum for hours, max for a peak). Returns (labels, values).
+        """
+        buckets: dict = {}
+        for d in days:
+            wk = d - timedelta(days=d.weekday())
+            buckets.setdefault(wk, []).append(value_of(d))
+        weeks = sorted(buckets)
+        return (
+            [w.strftime("%b %-d") for w in weeks],
+            [combine(buckets[w]) for w in weeks],
+        )
+
+    date_range_daily_all = [d for d in date_range if d > _daily_cutoff]
+    date_range_daily = date_range_daily_all[-DAILY_WINDOW:]
     daily_labels = [d.strftime("%b %-d") for d in date_range_daily]
     date_hour_values = [round(date_hours.get(d, 0.0), 2) for d in date_range_daily]
     chart_daily_hours = svg_vbar_chart(
@@ -14015,7 +14034,25 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         rotate_labels=True,
         bar_color="#5a2b78",
     )
-    date_range_conc = [d for d in date_range if d > _conc_cutoff]
+    chart_weekly_hours = ""
+    if len(date_range_daily_all) > DAILY_WINDOW:
+        wk_labels, wk_values = _weekly(
+            date_range_daily_all,
+            lambda d: date_hours.get(d, 0.0),
+            lambda vs: round(sum(vs), 2),
+        )
+        chart_weekly_hours = svg_vbar_chart(
+            wk_labels, wk_values,
+            "Weekly play-hours (week beginning)",
+            ylabel="hours",
+            width=max(700, len(wk_labels) * 20 + 80),
+            height=270,
+            rotate_labels=True,
+            bar_color="#5a2b78",
+        )
+
+    date_range_conc_all = [d for d in date_range if d > _conc_cutoff]
+    date_range_conc = date_range_conc_all[-DAILY_WINDOW:]
     conc_labels = [d.strftime("%b %-d") for d in date_range_conc]
     conc_values = [daily_peak_conc.get(d, 0) for d in date_range_conc]
     chart_concurrent = svg_vbar_chart(
@@ -14026,6 +14063,21 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         height=270,
         rotate_labels=True,
     )
+    chart_weekly_conc = ""
+    if len(date_range_conc_all) > DAILY_WINDOW:
+        wk_labels, wk_values = _weekly(
+            date_range_conc_all,
+            lambda d: daily_peak_conc.get(d, 0),
+            max,
+        )
+        chart_weekly_conc = svg_vbar_chart(
+            wk_labels, wk_values,
+            "Peak concurrent players per week (week beginning)",
+            ylabel="players",
+            width=max(700, len(wk_labels) * 20 + 80),
+            height=270,
+            rotate_labels=True,
+        )
     chart_hour = svg_vbar_chart(
         [str(h) for h in range(24)],
         [round(hour_hours.get(h, 0.0), 2) for h in range(24)],
@@ -14077,8 +14129,17 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         f'<div style="overflow-x:auto;">{chart_time}</div>\n'
         "<h2>Daily play-hours</h2>\n"
         f'<div style="overflow-x:auto;">{chart_daily_hours}</div>\n'
-        "<h2>Concurrent players</h2>\n"
+        + (
+            f'<div style="overflow-x:auto;">{chart_weekly_hours}</div>\n'
+            if chart_weekly_hours else ""
+        )
+        + "<h2>Concurrent players</h2>\n"
         f'<div style="overflow-x:auto;">{chart_concurrent}</div>\n'
+        + (
+            f'<div style="overflow-x:auto;">{chart_weekly_conc}</div>\n'
+            if chart_weekly_conc else ""
+        )
+        +
         "<h2>Active time of day</h2>\n"
         f'<div style="overflow-x:auto;">{chart_hour}</div>\n'
         "<h2>Day of week</h2>\n"
