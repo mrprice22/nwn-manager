@@ -12,15 +12,21 @@
 # Deleting them forces a genuine full recompile from current .nss sources.
 #
 # Options:
-#   --verbose   Show full nasher output (default: quiet spinner + phase only)
-#   --force     Continue despite compile or nasher errors (default: abort)
-#   --no-prod   Skip copy to local NWN modules dir (production); OneDrive and archive still written
+#   --verbose        Show full nasher output (default: quiet spinner + phase only)
+#   --force          Continue despite compile or nasher errors (default: abort)
+#   --no-prod        Skip copy to local NWN modules dir (production); OneDrive and archive still written
+#   --project DIR    Build that season's repo instead of the default (unnumbered,
+#                    newest) one. Artifact name, install path and OneDrive dest
+#                    are all derived from DIR's nasher.cfg + server.env.
+#   --show-config    Print the resolved paths and exit without building
 
 set -o pipefail
 
 VERBOSE=0
 FORCE=0
 NO_PROD=0
+SHOW_CONFIG=0
+REPACK_PROJECT=${NWN_PROJECT:-}
 REPACK_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,6 +34,9 @@ while [[ $# -gt 0 ]]; do
     --force)    FORCE=1 ;;
     --no-prod)  NO_PROD=1 ;;
     --no-smoke) REPACK_ARGS+=(--no-smoke) ;;  # skip build gates (smoke + dialog check)
+    --project)  REPACK_PROJECT=${2:?--project needs a directory}; shift ;;
+    --project=*) REPACK_PROJECT=${1#*=} ;;
+    --show-config) SHOW_CONFIG=1 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -40,14 +49,33 @@ else
   C_RED=''; C_GREEN=''; C_BOLD=''; C_RESET=''
 fi
 
-PROJECT=/var/home/james/GIT/nwn_homers_lotr
-NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
+NWN_MANAGER_BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 
+# Resolve PROJECT / MODFILE / NWN_MOD_DEST / ONEDRIVE_MOD_DEST from the target
+# repo's nasher.cfg + server.env, so one wrapper serves every season.
+# shellcheck disable=SC1091
+. "$NWN_MANAGER_BIN/repack-project.sh"
+repack_resolve_project || { read -rp "Press Enter..."; exit 1; }
+
+if [[ $SHOW_CONFIG -eq 1 ]]; then
+  echo "[repack] resolved configuration:"
+  repack_print_project
+  exit 0
+fi
+
+# A repack aimed anywhere but the default repo installs into a different
+# season's paths — say so before it does.
+if [[ $PROJECT != "$REPACK_DEFAULT_PROJECT" ]]; then
+  echo "[repack] non-default project:"
+  repack_print_project
+  echo
+fi
+
 cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
 
-rm -f homers_lotr_v3.mod
+rm -f "$MODFILE"
 
 # Purge stale compiled scripts so nasher recompiles from current .nss sources.
 # nasher --clean only resets the cache JSON; .nasher/tmp/*.ncs persist and
@@ -155,12 +183,12 @@ fi
 
 echo
 echo "=========================================================================="
-if [[ -f homers_lotr_v3.mod ]]; then
-  built=$(stat -c %Y homers_lotr_v3.mod)
-  size=$(stat -c %s homers_lotr_v3.mod)
+if [[ -f $MODFILE ]]; then
+  built=$(stat -c %Y "$MODFILE")
+  size=$(stat -c %s "$MODFILE")
   size_mb=$(( size / 1024 / 1024 ))
   if [[ $built -ge $start ]]; then
-    echo "[OK] homers_lotr_v3.mod rebuilt (${size_mb} MB)"
+    echo "[OK] $MODFILE rebuilt (${size_mb} MB)"
     echo
     # Green build-gate summary — shown even in quiet mode.
     smoke_sum=$(grep -oE "[0-9]+/[0-9]+ smoke tests passed" "$tmpout" | tail -1)
@@ -173,10 +201,8 @@ if [[ -f homers_lotr_v3.mod ]]; then
     [[ -n $dlg_sum ]] && echo "${C_GREEN}✓ ${dlg_sum}${C_RESET}"
     echo
     # Copy 1: OneDrive modules dir (primary — used by the Unpack pipeline)
-    ONEDRIVE_MOD_DIR="$HOME/OneDrive/Games/NWNHomersLOTR"
-    ONEDRIVE_MOD_DEST="$ONEDRIVE_MOD_DIR/homers_lotr_v3.mod"
     if [[ -d $ONEDRIVE_MOD_DIR ]]; then
-      cp "homers_lotr_v3.mod" "$ONEDRIVE_MOD_DEST"
+      cp "$MODFILE" "$ONEDRIVE_MOD_DEST"
       echo "[install] → $ONEDRIVE_MOD_DEST"
     else
       echo "[install] WARNING: $ONEDRIVE_MOD_DIR not found, skipping OneDrive copy"
@@ -184,10 +210,9 @@ if [[ -f homers_lotr_v3.mod ]]; then
     echo
     # Copy 2: local NWN modules dir (production deploy — skipped with --no-prod)
     if [[ $NO_PROD -eq 0 ]]; then
-      NWN_MOD_DIR="$HOME/.local/share/Neverwinter Nights/modules"
-      NWN_MOD_DEST="$NWN_MOD_DIR/Homer's LOTR VEL v3.mod"
+      # The destination filename IS the module name: it must match NWN_MODULE.
       if [[ -d $NWN_MOD_DIR ]]; then
-        cp "homers_lotr_v3.mod" "$NWN_MOD_DEST"
+        cp "$MODFILE" "$NWN_MOD_DEST"
         echo "[install] → $NWN_MOD_DEST"
       else
         echo "[install] WARNING: $NWN_MOD_DIR not found, skipping local NWN copy"
@@ -197,8 +222,8 @@ if [[ -f homers_lotr_v3.mod ]]; then
     fi
     echo
     # Copy 3: timestamped archive in project root
-    ARCHIVE_DEST="$PROJECT/homers_lotr_v3_$(date +%Y%m%d_%H%M%S).mod"
-    cp "homers_lotr_v3.mod" "$ARCHIVE_DEST"
+    ARCHIVE_DEST="$PROJECT/${MODBASE}_$(date +%Y%m%d_%H%M%S).mod"
+    cp "$MODFILE" "$ARCHIVE_DEST"
     echo "[archive] → $ARCHIVE_DEST"
     echo
     # NOTE: nwsync is intentionally NOT refreshed here. Use the dedicated
@@ -210,12 +235,12 @@ if [[ -f homers_lotr_v3.mod ]]; then
     echo "      shortcut so connecting EE clients pull the new snapshot."
     status=0
   else
-    echo "[STALE] homers_lotr_v3.mod exists but was not updated this run."
+    echo "[STALE] $MODFILE exists but was not updated this run."
     echo "        nasher exit: $nasher_status — check output above."
     status=1
   fi
 else
-  echo "[FAILED] no homers_lotr_v3.mod produced (nasher exit $nasher_status)"
+  echo "[FAILED] no $MODFILE produced (nasher exit $nasher_status)"
   status=1
 fi
 echo
