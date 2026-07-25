@@ -24,7 +24,8 @@
 #   MODBASE             MODFILE without the .mod extension
 #   NWN_MOD_DIR         $NWN_HOME_DIR/modules
 #   NWN_MOD_DEST        installed module path — MUST match NWN_MODULE exactly
-#   ONEDRIVE_MOD_DIR    OneDrive copy dir      (override: $REPACK_ONEDRIVE_DIR)
+#   ONEDRIVE_ROOT       OneDrive share root    (override: $REPACK_ONEDRIVE_DIR)
+#   ONEDRIVE_MOD_DIR    season subdir under it — $ONEDRIVE_ROOT/Season<N>
 #   ONEDRIVE_MOD_DEST   OneDrive copy path
 #   plus everything server.env exports (NWN_MODULE, NWN_HOME_DIR, SEASON_*, …)
 
@@ -56,7 +57,16 @@ repack_resolve_project() {
   NWN_MOD_DIR="$NWN_HOME_DIR/modules"
   NWN_MOD_DEST="$NWN_MOD_DIR/$NWN_MODULE.mod"
 
-  ONEDRIVE_MOD_DIR=${REPACK_ONEDRIVE_DIR:-$HOME/OneDrive/Games/NWNHomersLOTR}
+  # Each season gets its own subfolder under the shared OneDrive root. Builds go
+  # out to the Windows toolset from here and come back deliberately renamed as
+  # point-in-time backups, so the unpack side can't key on a filename — but with
+  # the folder season-scoped, "newest mtime in this dir" is unambiguous.
+  ONEDRIVE_ROOT=${REPACK_ONEDRIVE_DIR:-$HOME/OneDrive/Games/NWNHomersLOTR}
+  if [[ -n ${SEASON_NUM:-} ]]; then
+    ONEDRIVE_MOD_DIR="$ONEDRIVE_ROOT/Season$SEASON_NUM"
+  else
+    ONEDRIVE_MOD_DIR="$ONEDRIVE_ROOT"   # non-seasoned project: legacy flat layout
+  fi
   ONEDRIVE_MOD_DEST="$ONEDRIVE_MOD_DIR/$MODFILE"
 }
 

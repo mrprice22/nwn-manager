@@ -182,12 +182,15 @@ if [[ -f $MODFILE ]]; then
     dlg_sum=$(grep -E "^check-dlg-integrity: scanned " "$tmpout" | tail -1)
     [[ -n $dlg_sum ]] && echo "${C_GREEN}✓ ${dlg_sum}${C_RESET}"
     echo
-    # Copy 1: OneDrive modules dir (primary — used by the Unpack pipeline)
-    if [[ -d $ONEDRIVE_MOD_DIR ]]; then
+    # Copy 1: OneDrive season dir (primary — used by the Unpack pipeline).
+    # Created on demand: a brand-new season's subfolder won't exist yet, so only
+    # a missing/unmounted OneDrive *root* is worth warning about.
+    if [[ -d $ONEDRIVE_ROOT ]]; then
+      mkdir -p "$ONEDRIVE_MOD_DIR"
       cp "$MODFILE" "$ONEDRIVE_MOD_DEST"
       echo "[install] → $ONEDRIVE_MOD_DEST"
     else
-      echo "[install] WARNING: $ONEDRIVE_MOD_DIR not found, skipping OneDrive copy"
+      echo "[install] WARNING: $ONEDRIVE_ROOT not found, skipping OneDrive copy"
     fi
     echo
     # Copy 2: local NWN modules dir (production deploy — skipped with --no-prod).
