@@ -14127,16 +14127,16 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         "</dl>\n"
         "<h2>Play-hours per player</h2>\n"
         f'<div style="overflow-x:auto;">{chart_time}</div>\n'
-        "<h2>Daily play-hours</h2>\n"
+        "<h2>Play-hours per period</h2>\n"
         f'<div style="overflow-x:auto;">{chart_daily_hours}</div>\n'
         + (
-            f'<div style="overflow-x:auto;">{chart_weekly_hours}</div>\n'
+            f'<p style="overflow-x:auto;">{chart_weekly_hours}</p>\n'
             if chart_weekly_hours else ""
         )
         + "<h2>Concurrent players</h2>\n"
         f'<div style="overflow-x:auto;">{chart_concurrent}</div>\n'
         + (
-            f'<div style="overflow-x:auto;">{chart_weekly_conc}</div>\n'
+            f'<p style="overflow-x:auto;">{chart_weekly_conc}</p>\n'
             if chart_weekly_conc else ""
         )
         +
