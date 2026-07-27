@@ -775,16 +775,14 @@ cmd_serve() {
         if [[ $auto_publish -eq 1 ]]; then
           local ts
           ts=$(date '+%Y-%m-%d %H:%M:%S')
-          local changed_files=(docs/activity.html)
-          [[ -n $db_dir ]] && changed_files+=(docs/manual/ServerFirsts.html)
-          local any_changed=0
-          for f in "${changed_files[@]}"; do
-            [[ -n "$(git -C "$root" status --porcelain -- "$f" 2>/dev/null)" ]] && any_changed=1
-          done
-          if [[ $any_changed -eq 0 ]]; then
-            echo "[$PROG] serve: no changes to wiki pages; skipping commit"
-          elif git -C "$root" add -- "${changed_files[@]}" \
-            && git -C "$root" commit -m "Auto Wiki Activity Refresh: $ts" \
+          # Only ever publish the generated wiki. The pathspec is applied to
+          # BOTH the add and the commit so that unrelated work in the tree —
+          # including anything another process has already staged in the index
+          # — can never be swept into an automated commit.
+          if [[ -z "$(git -C "$root" status --porcelain -- docs 2>/dev/null)" ]]; then
+            echo "[$PROG] serve: no changes under docs/; skipping commit"
+          elif git -C "$root" add -A -- docs \
+            && git -C "$root" commit -m "Auto Wiki Activity Refresh: $ts" -- docs \
             && git -C "$root" push; then
             echo "[$PROG] serve: committed and pushed activity update ($ts)"
           else
