@@ -797,7 +797,7 @@ treated specially:
 |------|--------|
 | `theme.css` | Loaded as a second stylesheet after the built-in `style.css`. Use it to override CSS custom properties or add new rules. |
 | `favicon.png` / `favicon.ico` / `favicon.svg` | Set as the site favicon via a `<link rel="icon">` tag on every page. |
-| `header.png` / `header.jpg` / `header.webp` / etc. | Replaces the plain "Module Wiki" brand text in the site header with a clickable banner image that takes the visitor back to the index. Add more images as `header_02.png`, `header_03.png`, etc. (any filename starting with `header`); the site will randomly cycle through all of them on each page load. |
+| `header.png` / `header.jpg` / `header.webp` / etc. | Replaces the plain "Module Wiki" brand text in the site header with a clickable banner image that takes the visitor back to the index. Add more images as `header_02.png`, `header_03.png`, etc. (any filename starting with `header`); the site will randomly cycle through all of them on each page load. Each image's intrinsic size is read at generation time and emitted as `width`/`height` on the tag, so the header reserves its space and the nav bar doesn't jump once the banner loads — banners of similar aspect ratio work best, since the pick is random per page load. |
 
 Any other files in `wiki-theme/` are copied to `assets/` as-is (useful
 for custom fonts or images referenced from `theme.css`).
@@ -824,11 +824,19 @@ quickest way to restyle the site without touching the generator:
 
 One non-colour custom property is also exposed:
 
-- `--nav-grace` (default `0.75s`) — how long a nav dropdown/submenu stays
-  open and clickable after the mouse leaves before it fades. This grace makes
+- `--nav-grace` (default `0.3s`) — how long a nav dropdown/submenu stays
+  open and clickable after the mouse leaves before it closes. This grace makes
   it easier to travel from a menu to one of its submenus without it snapping
-  shut. Override it in `theme.css` (e.g. `:root { --nav-grace: 0.4s; }`) to
+  shut. Override it in `theme.css` (e.g. `:root { --nav-grace: 0.6s; }`) to
   make menus close faster or slower.
+
+  The nav is driven by `site.js`, which reads `--nav-grace` at runtime, so the
+  override applies either way. Two behaviours come from that script: hovering a
+  different top-level menu instantly collapses whichever menu was still open on
+  its grace period (rather than leaving both visible), and no menu can expand
+  until the header banner has finished loading, so menus never get shoved around
+  by the header settling. With JavaScript disabled the menus fall back to a
+  CSS-only `:hover` version of the same grace period.
 
 The SVG area map embeds its own `<style>` block (so it stays usable as
 a standalone download). To override map colours in a theme stylesheet,

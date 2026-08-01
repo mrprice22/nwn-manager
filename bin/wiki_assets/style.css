@@ -13,8 +13,9 @@
   --link: #5a3210;
   --link-hover: #a05a1c;
   /* Grace period a nav dropdown/submenu stays open after the mouse leaves,
-     before it fades — gives room to travel to a submenu. Tune freely. */
-  --nav-grace: 0.75s;
+     before it closes — gives room to travel to a submenu. Read by site.js for
+     the JS-driven nav, and used as a transition delay in the no-JS fallback. */
+  --nav-grace: 0.3s;
 }
 
 * { box-sizing: border-box; }
@@ -51,6 +52,12 @@ header.site-header .brand img.site-header-img {
   width: auto;
   vertical-align: middle;
   display: inline-block;
+}
+/* Multi-banner themes emit a src-less <img> that an inline script fills in, plus
+   a <noscript> copy. Without JS the src-less one would render as a broken image
+   next to the fallback, so hide it. */
+html:not(.js-nav) header.site-header .brand img.site-header-img[data-header-images] {
+  display: none;
 }
 header.site h1 {
   margin: 0;
@@ -489,6 +496,24 @@ p.note strong, p.note em { color: var(--fg); }
   outline-offset: 2px;
 }
 
+/* Nav open/closed state.
+   With JS (an inline script in <head> adds html.js-nav) .nav-open drives it all:
+   site.js owns the --nav-grace delay so it can cancel a sibling's grace period
+   the moment another top-level menu is entered. Without JS the :hover rules
+   below take over, with the delay expressed as a CSS transition-delay.
+   html.nav-pending blocks every menu until the header banner has loaded, so
+   nothing can expand while the header is still resizing the page. */
+html.nav-pending .nav-dropdown-menu,
+html.nav-pending .nav-submenu-menu {
+  display: none;
+}
+html.js-nav .nav-dropdown-menu,
+html.js-nav .nav-submenu-menu {
+  /* Close instantly — JS has already waited out the grace period. */
+  transition: opacity 0.12s ease,
+              visibility 0s linear 0.12s;
+}
+
 /* Documents nav dropdown */
 .nav-dropdown {
   display: inline-block;
@@ -517,7 +542,8 @@ p.note strong, p.note em { color: var(--fg); }
   transition: opacity 0.12s ease var(--nav-grace),
               visibility 0s linear var(--nav-grace);
 }
-.nav-dropdown:hover .nav-dropdown-menu {
+html:not(.js-nav) .nav-dropdown:hover > .nav-dropdown-menu,
+.nav-dropdown.nav-open > .nav-dropdown-menu {
   visibility: visible;
   opacity: 1;
   transition-delay: 0s;  /* appear instantly on hover; delay applies to close only */
@@ -565,7 +591,8 @@ p.note strong, p.note em { color: var(--fg); }
   transition: opacity 0.12s ease var(--nav-grace),
               visibility 0s linear var(--nav-grace);
 }
-.nav-submenu:hover .nav-submenu-menu {
+html:not(.js-nav) .nav-submenu:hover > .nav-submenu-menu,
+.nav-submenu.nav-open > .nav-submenu-menu {
   visibility: visible;
   opacity: 1;
   transition-delay: 0s;

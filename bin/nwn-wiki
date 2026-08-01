@@ -76,6 +76,7 @@ _CREATURE_PIC_GROUPS: list[dict] = []         # [{"name","matches","images","cr"
 # Per-module theme assets loaded from <project-root>/wiki-theme/ by load_wiki_theme().
 _THEME_FAVICON: str = ""           # filename in assets/, e.g. "favicon.png"
 _THEME_HEADER_IMGS: list[str] = [] # filenames in assets/, e.g. ["header.png", "header_02.png"]
+_THEME_HEADER_DIMS: list[tuple[int, int] | None] = []  # intrinsic (w, h) per header image
 _THEME_EXTRA_CSS: str = ""         # filename in assets/, e.g. "theme.css"
 
 # Lookup warning registry: message → sorted list of referencing items/creatures.
@@ -5432,25 +5433,63 @@ def _md_title(text: str, stem: str) -> str:
     return stem.replace("-", " ").replace("_", " ").title()
 
 
+def _brand_html(root_rel: str) -> str:
+    """Return the site-header brand: a banner image when the theme supplies one,
+    otherwise plain text.
+
+    The banner is emitted with width/height attributes (read from the file by
+    _img_pixel_size) so the browser reserves the right box before the image
+    downloads — without them the whole nav bar shifts once the header decodes.
+    When a theme ships several banners one is picked at random by a tiny inline
+    script that runs the moment the <img> is parsed, so only the chosen image is
+    ever fetched and the reserved box matches it.
+    """
+    home = f'{E(root_rel)}/index.html'
+    if not _THEME_HEADER_IMGS:
+        return f'<a class="brand" href="{home}">Module Wiki</a>'
+
+    srcs = [f"{root_rel}/assets/{n}" for n in _THEME_HEADER_IMGS]
+    dims = _THEME_HEADER_DIMS or [None] * len(srcs)
+
+    def size_attrs(i: int) -> str:
+        d = dims[i] if i < len(dims) else None
+        return f' width="{d[0]}" height="{d[1]}"' if d else ""
+
+    if len(srcs) == 1:
+        return (f'<a class="brand" href="{home}">'
+                f'<img class="site-header-img" src="{E(srcs[0])}"{size_attrs(0)}'
+                f' alt="Home"></a>')
+
+    entries = [{"src": s, "w": d[0], "h": d[1]} if d else {"src": s}
+               for s, d in zip(srcs, dims)]
+    imgs_attr = E(json.dumps(entries, separators=(",", ":")))
+    picker = ('(function(){var i=document.currentScript.previousElementSibling,'
+              'a=JSON.parse(i.dataset.headerImages),'
+              'p=a[Math.floor(Math.random()*a.length)];'
+              'if(p.w){i.width=p.w;i.height=p.h;}i.src=p.src;})();')
+    # No src on the <img>: the picker assigns it synchronously, so the browser
+    # never starts a fetch for a banner it is about to discard.
+    return (f'<a class="brand" href="{home}">'
+            f'<img class="site-header-img"{size_attrs(0)}'
+            f' data-header-images="{imgs_attr}" alt="Home">'
+            f'<script>{picker}</script>'
+            f'<noscript><img class="site-header-img" src="{E(srcs[0])}"'
+            f'{size_attrs(0)} alt="Home"></noscript></a>')
+
+
 def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") -> str:
     """Wrap body in the standard wiki page shell."""
     extra_css = (f'\n  <link rel="stylesheet" href="{E(root_rel)}/assets/{E(_THEME_EXTRA_CSS)}">'
                  if _THEME_EXTRA_CSS else "")
     favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(_THEME_FAVICON)}">'
                if _THEME_FAVICON else "")
-    if _THEME_HEADER_IMGS:
-        imgs_attr = json.dumps([f"{root_rel}/assets/{n}" for n in _THEME_HEADER_IMGS]).replace('"', "&quot;")
-        first = E(f"{root_rel}/assets/{_THEME_HEADER_IMGS[0]}")
-        brand = (f'<a class="brand" href="{E(root_rel)}/index.html">'
-                 f'<img class="site-header-img" src="{first}"'
-                 f' data-header-images="{imgs_attr}" alt="Home"></a>')
-    else:
-        brand = f'<a class="brand" href="{E(root_rel)}/index.html">Module Wiki</a>'
+    brand = _brand_html(root_rel)
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <title>{E(nwn_text(title))}</title>
+  <script>document.documentElement.classList.add('js-nav','nav-pending');</script>
   <link rel="stylesheet" href="{E(root_rel)}/assets/style.css">{extra_css}{favicon}
   <script src="{E(root_rel)}/assets/site.js" defer></script>
 </head>
@@ -5503,9 +5542,73 @@ def write(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _img_pixel_size(path: Path) -> tuple[int, int] | None:
+    """Intrinsic (width, height) of a PNG/GIF/JPEG/WebP, or None if unreadable.
+
+    Stdlib-only header parse — Pillow is not a dependency of this script. Used to
+    emit width/height on the header banner so the browser reserves its box before
+    the bytes arrive; None (SVG, odd encodings) just means no attributes.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+                w, h = struct.unpack(">II", head[16:24])
+                return int(w), int(h)
+            if head[:6] in (b"GIF87a", b"GIF89a"):
+                w, h = struct.unpack("<HH", head[6:10])
+                return int(w), int(h)
+            if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+                chunk = head[12:16]
+                if chunk == b"VP8X":
+                    # 24-bit little-endian canvas size minus one, at offset 24.
+                    d = head[24:30]
+                    return (d[0] | d[1] << 8 | d[2] << 16) + 1, (d[3] | d[4] << 8 | d[5] << 16) + 1
+                if chunk == b"VP8 ":
+                    d = head[26:30]     # after the 3-byte start code + 0x9d012a
+                    return (d[0] | d[1] << 8) & 0x3FFF, (d[2] | d[3] << 8) & 0x3FFF
+                if chunk == b"VP8L":
+                    b = head[21:25]
+                    n = b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24
+                    return (n & 0x3FFF) + 1, ((n >> 14) & 0x3FFF) + 1
+                return None
+            if head[:2] == b"\xff\xd8":
+                # Walk the marker chain to the start-of-frame, which carries the size.
+                fh.seek(2)
+                while True:
+                    b = fh.read(1)
+                    if not b:
+                        return None
+                    if b != b"\xff":
+                        continue
+                    marker = fh.read(1)
+                    while marker == b"\xff":     # fill bytes
+                        marker = fh.read(1)
+                    if not marker:
+                        return None
+                    m = marker[0]
+                    if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+                        continue                # standalone markers, no payload
+                    seg = fh.read(2)
+                    if len(seg) < 2:
+                        return None
+                    length = struct.unpack(">H", seg)[0]
+                    if m in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                             0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                        body = fh.read(5)
+                        if len(body) < 5:
+                            return None
+                        h, w = struct.unpack(">HH", body[1:5])
+                        return int(w), int(h)
+                    fh.seek(length - 2, 1)
+    except (OSError, struct.error, IndexError):
+        return None
+    return None
+
+
 def load_wiki_theme(project_root: Path, out: Path) -> None:
     """Copy files from <project_root>/wiki-theme/ into output assets and set theme globals."""
-    global _THEME_FAVICON, _THEME_HEADER_IMGS, _THEME_EXTRA_CSS
+    global _THEME_FAVICON, _THEME_HEADER_IMGS, _THEME_HEADER_DIMS, _THEME_EXTRA_CSS
     theme_dir = project_root / "wiki-theme"
     if not theme_dir.is_dir():
         return
@@ -5524,6 +5627,7 @@ def load_wiki_theme(project_root: Path, out: Path) -> None:
             loaded.append(f"favicon={f.name}")
         elif stem.startswith("header") and ext in img_exts:
             _THEME_HEADER_IMGS.append(f.name)
+            _THEME_HEADER_DIMS.append(_img_pixel_size(f))
             loaded.append(f"header={f.name}")
         elif f.name == "theme.css":
             _THEME_EXTRA_CSS = f.name
