@@ -745,6 +745,47 @@ def race_name(row: int | None) -> str:
     return f"Race #{r}"
 
 
+# Immunities the engine grants from a creature's racial type. These are *not*
+# stored anywhere in the .utc — NWN applies them by creature type at runtime, so
+# a crit-immune undead has no "Immunity: Critical Hits" item property to find.
+# Labels deliberately reuse the iprp_immunity vocabulary (see
+# wiki_data/itemprops.json) so racial and equipment immunities merge into one
+# namespace on the creature pages and in the creature search index.
+# Keyed by racialtypes.2da row.
+RACE_IMMUNITIES: dict[int, tuple[str, ...]] = {
+    10: (  # Construct
+        "Critical Hits", "Sneak Attack", "Mind-Affecting Spells", "Paralysis",
+        "Poison", "Disease", "Death Magic", "Level/Ability Drain", "Fear",
+    ),
+    16: (  # Elemental
+        "Critical Hits", "Sneak Attack", "Paralysis", "Poison", "Disease",
+    ),
+    24: (  # Undead
+        "Critical Hits", "Sneak Attack", "Mind-Affecting Spells", "Paralysis",
+        "Poison", "Disease", "Death Magic", "Level/Ability Drain", "Fear",
+    ),
+    25: (  # Vermin — mindless, but *not* crit immune
+        "Mind-Affecting Spells",
+    ),
+    29: (  # Ooze
+        "Critical Hits", "Sneak Attack", "Mind-Affecting Spells", "Paralysis",
+        "Poison", "Fear",
+    ),
+}
+
+
+def creature_race_immunities(race_raw: Any) -> list[str]:
+    """Immunity labels a creature gets purely from its racial type (see
+    RACE_IMMUNITIES). Returns [] for races with no engine-granted immunities."""
+    if race_raw is None:
+        return []
+    try:
+        rid = int(race_raw)
+    except (TypeError, ValueError):
+        return []
+    return list(RACE_IMMUNITIES.get(rid, ()))
+
+
 def appearance_name(row: int | None) -> str:
     if row is None:
         return ""
@@ -5506,6 +5547,7 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
           <a href="{E(root_rel)}/creatures/by-area/index.html">By Area</a>
           <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
           <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
+          <a href="{E(root_rel)}/creatures/search.html">Search</a>
           {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if _BOSS_REGISTRY else ''}
           <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>
         </div>
@@ -7207,6 +7249,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
         '<div><a href="by-area/index.html">By Area</a></div>',
         '<div><a href="by-cr/index.html">By Challenge Rating</a></div>',
         '<div><a href="by-race/index.html">By Race</a></div>',
+        '<div><a href="search.html">Search</a></div>',
         '<div class="toc-group-heading">Sections</div>',
     ]
     if rows_present:
@@ -7826,6 +7869,19 @@ def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
 
     spell_immunities = sorted({_pf["cost"] for _pf, _ in cprop_by_pid.get(53, [])
                                if _pf["cost"]})
+
+    # Miscellaneous immunities (crit, sneak attack, mind-affecting, …) come from
+    # two independent sources: equipped gear (property 37) and the creature's
+    # racial type (engine rule, nothing in the .utc). Merge them into one map so
+    # callers can filter on the effective immunity and still see where it came from.
+    race_immunities = creature_race_immunities(_race_id)
+    misc_immunities: dict[str, str] = {}
+    for _lbl in race_immunities:
+        misc_immunities[_lbl] = "race"
+    for _pf, _ in cprop_by_pid.get(37, []):
+        _lbl = _pf["subtype"] or "?"
+        misc_immunities[_lbl] = "race+gear" if _lbl in misc_immunities else "gear"
+
     regen = sum(cv for _, cv in cprop_by_pid.get(51, []))
     vampiric = sum(cv for _, cv in cprop_by_pid.get(67, []))
 
@@ -7855,6 +7911,7 @@ def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
         "hp_display": hp_display, "hp": hp_value,
         "cprop_by_pid": cprop_by_pid, "cprop_dodge_ac": cprop_dodge_ac,
         "dr": dr, "resistances": resistances, "immunities": immunities,
+        "race_immunities": race_immunities, "misc_immunities": misc_immunities,
         "spell_immunities": spell_immunities, "regen": regen, "vampiric": vampiric,
         "dmg_script": dmg_script, "hard_required_tags": hard_required_tags,
         "mitigates_damage": mitigates_damage, "retaliation": retaliation,
@@ -8078,6 +8135,8 @@ def _creature_detail_sections(
     _monk_bab = D["monk_bab"]
     cprop_by_pid = D["cprop_by_pid"]
     cprop_dodge_ac = D["cprop_dodge_ac"]
+    race_immunities = D["race_immunities"]
+    misc_immunities = D["misc_immunities"]
     ac_total = D["ac"]
     ac_breakdown = D["ac_breakdown"]
     ac_extra = D["ac_extra"]
@@ -8166,10 +8225,12 @@ def _creature_detail_sections(
             f'<span class="muted">(<code>OnDamaged</code>: <code>{E(dmg_script)}</code>)</span></p>'
         )
 
-    # ----- Combined equipment combat properties display ----------------------
+    # ----- Combined abilities / combat properties display --------------------
     # (cprop_by_pid and cprop_dodge_ac are built earlier, before ac_total.)
+    # Racial immunities have no gear behind them, so this section renders even
+    # for a creature carrying nothing.
     cprop_rows: list[str] = []
-    if cprop_by_pid:
+    if cprop_by_pid or misc_immunities:
         # Dodge AC from non-armor/non-shield accessories (already in main AC above).
         if cprop_dodge_ac:
             _dodge_sum = sum(cprop_dodge_ac)
@@ -8240,9 +8301,12 @@ def _creature_detail_sections(
             _imm_parts = [f"{_sub} ({_cstr})" for _sub, (_, _cstr) in sorted(_imm_max.items())]
             cprop_rows.append(f"<tr><th>Damage Immunity</th><td>{E(', '.join(_imm_parts))}</td></tr>")
 
-        # Immunity: Miscellaneous (ID 37) — list unique
-        if 37 in cprop_by_pid:
-            _misc = sorted({_pf["subtype"] or "?" for _pf, _ in cprop_by_pid[37]})
+        # Immunity: Miscellaneous — gear (ID 37) merged with racial-type
+        # immunities, tagged so the two sources stay distinguishable.
+        if misc_immunities:
+            _SRC_TAG = {"race": " (racial)", "race+gear": " (racial, gear)", "gear": ""}
+            _misc = [f"{_lbl}{_SRC_TAG[_src]}"
+                     for _lbl, _src in sorted(misc_immunities.items())]
             cprop_rows.append(f"<tr><th>Misc Immunity</th><td>{E(', '.join(_misc))}</td></tr>")
 
         # Immunity: Specific Spell (ID 53) — list every spell the creature is
@@ -8307,12 +8371,13 @@ def _creature_detail_sections(
 
     if cprop_rows:
         sections.append(
-            "<h3>Equipment combat properties (combined)</h3>"
+            "<h3>Abilities &amp; combat properties</h3>"
             '<table class="data"><tbody>' + "\n".join(cprop_rows) + "</tbody></table>"
             '<p class="muted">Dodge AC and save bonuses are factored into the main '
             'combat stats above. Dodge AC stacks (cap +20); haste adds +4 more (separate). '
             'All other same-type bonuses do not stack — only the highest is shown. '
-            'Regeneration stacks without limit.</p>'
+            'Regeneration stacks without limit. Immunities marked <em>(racial)</em> are '
+            'granted by the creature\'s racial type by the engine, not by its equipment.</p>'
         )
 
     # ----- Weapons / attack schedule ----------------------------------------
@@ -8831,6 +8896,7 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
         '<div><a href="../index.html">All Creatures</a></div>',
         '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
         '<div><a href="../by-race/index.html">By Race</a></div>',
+        '<div><a href="../search.html">Search</a></div>',
         '<div class="toc-group-heading">Areas</div>',
     ]
     for area_rr in sorted(visible_areas, key=lambda r: db.area_name(r).lower()):
@@ -8974,6 +9040,7 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
         '<div><a href="../index.html">All Creatures</a></div>',
         '<div><a href="../by-area/index.html">By Area</a></div>',
         '<div><a href="../by-race/index.html">By Race</a></div>',
+        '<div><a href="../search.html">Search</a></div>',
         '<div class="toc-group-heading">Challenge Rating</div>',
     ]
     for start, end, creatures in merged:
@@ -9086,6 +9153,7 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
         '<div><a href="../index.html">All Creatures</a></div>',
         '<div><a href="../by-area/index.html">By Area</a></div>',
         '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
+        '<div><a href="../search.html">Search</a></div>',
         '<div class="toc-group-heading">Races</div>',
     ]
     for rid in sorted_races:
@@ -9166,6 +9234,385 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
           page("Creatures by Race",
                '<div class="items-layout">' + body + "</div>",
                root_rel="../.."))
+
+
+_CREATURE_SEARCH_JS = r"""(function(){
+var N=4,data=[],form=document.getElementById('cf'),results=document.getElementById('cr_out');
+var modeSels=[],propSels=[],subSels=[],minVals=[];
+for(var i=1;i<=N;i++){
+  modeSels.push(document.getElementById('cm'+i));
+  propSels.push(document.getElementById('cp'+i));
+  subSels.push(document.getElementById('cs'+i));
+  minVals.push(document.getElementById('cv'+i));
+}
+function $(id){return document.getElementById(id);}
+function num(id){var v=parseFloat($(id).value);return isNaN(v)?null:v;}
+
+fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
+  data=d; populateFilters();
+  results.innerHTML='<p class="muted">'+data.length+' creatures indexed. Set filters above and click Search.</p>';
+});
+
+function fillSel(sel,vals){
+  vals.forEach(function(v){sel.appendChild(new Option(v,v));});
+}
+
+function populateFilters(){
+  var props={},subs={},races={},classes={},areas={},factions={};
+  data.forEach(function(cr){
+    if(cr.race)races[cr.race]=1;
+    if(cr.faction)factions[cr.faction]=1;
+    (cr.classes||[]).forEach(function(c){classes[c.n]=1;});
+    (cr.areas||[]).forEach(function(a){areas[a]=1;});
+    (cr.props||[]).forEach(function(p){
+      props[p.p]=1;
+      if(p.s){if(!subs[p.p])subs[p.p]={};subs[p.p][p.s]=1;}
+    });
+  });
+  window._csubs=subs;
+  fillSel($('frace'),Object.keys(races).sort());
+  fillSel($('fclass'),Object.keys(classes).sort());
+  fillSel($('farea'),Object.keys(areas).sort());
+  fillSel($('ffac'),Object.keys(factions).sort());
+  var propOpts=Object.keys(props).sort();
+  propSels.forEach(function(sel){fillSel(sel,propOpts);});
+}
+
+propSels.forEach(function(sel,idx){
+  sel.addEventListener('change',function(){
+    var chosen=sel.value,sub=(window._csubs||{})[chosen]||{};
+    subSels[idx].innerHTML='<option value="">— any —</option>';
+    Object.keys(sub).sort().forEach(function(s){subSels[idx].appendChild(new Option(s,s));});
+    subSels[idx].disabled=!chosen||!Object.keys(sub).length;
+  });
+});
+
+function propMatches(cr,c){
+  return (cr.props||[]).filter(function(p){
+    if(c.prop&&p.p!==c.prop)return false;
+    if(c.sub&&p.s!==c.sub)return false;
+    if(c.minv>0&&(p.v||0)<c.minv)return false;
+    return true;
+  });
+}
+
+form.addEventListener('submit',function(e){
+  e.preventDefault();
+  var q=($('fq').value||'').trim().toLowerCase();
+  var race=$('frace').value,cls=$('fclass').value,area=$('farea').value,fac=$('ffac').value;
+  var clvl=parseInt($('fclvl').value,10)||0;
+  var crMin=num('fcrmin'),crMax=num('fcrmax');
+  var hpMin=num('fhpmin'),hpMax=num('fhpmax');
+  var acMin=num('facmin'),babMin=num('fbabmin'),srMin=num('fsrmin');
+  var saveMin=num('fsavemin');
+  var inMod=$('fim').checked;
+  var bossEl=$('fboss'),bossOnly=bossEl&&bossEl.checked;
+  var sortBy=$('fo').value,asc=$('fd').value==='asc';
+
+  var conds=[];
+  for(var i=0;i<N;i++){
+    var prop=propSels[i].value,sub=subSels[i].value;
+    var minv=parseInt(minVals[i].value,10)||0;
+    if(prop||sub||minv>0)conds.push({prop:prop,sub:sub,minv:minv,neg:modeSels[i].value==='lacks'});
+  }
+
+  var out=[];
+  data.forEach(function(cr){
+    if(q&&cr.name.toLowerCase().indexOf(q)<0)return;
+    if(race&&cr.race!==race)return;
+    if(fac&&cr.faction!==fac)return;
+    if(area&&(cr.areas||[]).indexOf(area)<0)return;
+    if(inMod&&!cr.count)return;
+    if(bossOnly&&!cr.boss)return;
+    if(cls){
+      var hit=(cr.classes||[]).some(function(c){return c.n===cls&&c.l>=clvl;});
+      if(!hit)return;
+    }else if(clvl>0){
+      if(!(cr.classes||[]).some(function(c){return c.l>=clvl;}))return;
+    }
+    if(crMin!==null&&(cr.cr===null||cr.cr<crMin))return;
+    if(crMax!==null&&(cr.cr===null||cr.cr>crMax))return;
+    if(hpMin!==null&&(cr.hp===null||cr.hp<hpMin))return;
+    if(hpMax!==null&&(cr.hp===null||cr.hp>hpMax))return;
+    if(acMin!==null&&(cr.ac||0)<acMin)return;
+    if(babMin!==null&&(cr.bab||0)<babMin)return;
+    if(srMin!==null&&(cr.sr||0)<srMin)return;
+    if(saveMin!==null&&Math.min(cr.fort||0,cr.ref||0,cr.will||0)<saveMin)return;
+
+    var matched=[];
+    var ok=conds.every(function(c){
+      var mp=propMatches(cr,c);
+      if(c.neg)return mp.length===0;
+      if(!mp.length)return false;
+      matched.push(mp[0]);
+      return true;
+    });
+    if(!ok)return;
+    out.push({c:cr,matched:matched});
+  });
+
+  out.sort(function(a,b){
+    var v;
+    if(sortBy==='name')v=a.c.name.localeCompare(b.c.name);
+    else if(sortBy==='value')v=(a.matched[0]?(a.matched[0].v||0):0)-(b.matched[0]?(b.matched[0].v||0):0);
+    else v=(a.c[sortBy]===null?-Infinity:(a.c[sortBy]||0))-(b.c[sortBy]===null?-Infinity:(b.c[sortBy]||0));
+    if(v===0)v=a.c.name.localeCompare(b.c.name);
+    return asc?v:-v;
+  });
+  render(out,conds.length>0);
+});
+
+function crBucket(cr){
+  if(cr===null)return 'CR unset';
+  var lo=Math.floor(cr/5)*5;
+  return 'CR '+lo+'–'+(lo+4);
+}
+
+function tally(rows,keyFn){
+  var m={};
+  rows.forEach(function(r){var k=keyFn(r.c);m[k]=(m[k]||0)+1;});
+  return Object.keys(m).sort(function(a,b){return m[b]-m[a]||a.localeCompare(b);})
+    .map(function(k){return '<li>'+esc(k)+' <strong>'+m[k]+'</strong></li>';}).join('');
+}
+
+function render(rows,showProps){
+  var total=data.length;
+  var head='<p><strong>'+rows.length+'</strong> of '+total+' creature'+(total!==1?'s':'')
+    +' match'+(rows.length===1?'es':'')
+    +' <span class="muted">('+(total-rows.length)+' excluded)</span></p>';
+  if(!rows.length){results.innerHTML=head+'<p class="muted">No creatures match.</p>';return;}
+  head+='<details class="search-breakdown"><summary>Breakdown of the '+rows.length+' matches</summary>'
+    +'<div class="breakdown-cols">'
+    +'<div><h4>By race</h4><ul>'+tally(rows,function(c){return c.race||'(unset)';})+'</ul></div>'
+    +'<div><h4>By challenge rating</h4><ul>'+tally(rows,function(c){return crBucket(c.cr);})+'</ul></div>'
+    +'</div></details>';
+
+  var cols='<th>Name</th><th>Count</th><th>Race</th><th>Class</th>'
+    +'<th>CR</th><th>HP</th><th>AC</th>'
+    +(showProps?'<th>Matched</th>':'');
+  var html=head+'<table class="data"><thead><tr>'+cols+'</tr></thead><tbody>';
+  rows.forEach(function(r){
+    var c=r.c;
+    var cls=(c.classes||[]).map(function(x){return esc(x.n)+' '+x.l;}).join('/');
+    var props=r.matched.map(function(p){
+      var label=p.a
+        ?'<a href="../items/properties/index.html#'+esc(p.a)+'">'+esc(p.p)+'</a>'
+        :esc(p.p);
+      var det='';
+      if(p.s&&p.c)det=': '+esc(p.s)+' — '+esc(p.c);
+      else if(p.s)det=': '+esc(p.s);
+      else if(p.c)det=' — '+esc(p.c);
+      var tag=p.src==='race'?' <span class="muted">(racial)</span>':'';
+      return '<span>'+label+det+tag+'</span>';
+    }).join('<br>');
+    var boss=c.boss?' <span class="badge-boss">boss</span>':'';
+    html+='<tr><td><a href="'+esc(c.url)+'">'+esc(c.name)+'</a>'+boss+'</td>'
+      +'<td>'+(c.count?c.count:'—')+'</td>'
+      +'<td>'+esc(c.race||'')+'</td>'
+      +'<td>'+cls+'</td>'
+      +'<td>'+(c.cr===null?'—':c.cr)+'</td>'
+      +'<td>'+(c.hp===null?'—':c.hp.toLocaleString())+'</td>'
+      +'<td>'+(c.ac||'—')+'</td>'
+      +(showProps?'<td>'+props+'</td>':'')
+      +'</tr>';
+  });
+  results.innerHTML=html+'</tbody></table>';
+}
+
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+})();"""
+
+
+def render_creatures_search(db: Db, out: Path) -> None:
+    """creatures/search.html — client-side search over every unique creature.
+
+    Mirrors the item search (render_items_search): a JSON index plus inline JS.
+    Each creature's searchable "abilities" are its equipped-item properties
+    (already resolved by extract_creature_defenses, so the combat rules stay in
+    one place) merged with the immunities its racial type grants. Conditions can
+    be negated, which is what makes "everything that is *not* crit immune"
+    answerable.
+    """
+    global _current_context
+    boss_rrs = {b["resref"] for b in _BOSS_REGISTRY}
+    index: list[dict] = []
+
+    for can_rr in sorted(db.canonical_creatures,
+                         key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        entry = db.canonical_creatures[can_rr]
+        c = entry["c"]
+        bp_rr = entry["bp_rr"]
+        bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+        _current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
+
+        def _f(key, default=None, _c=c, _bp=bp):
+            v = fld(_c, key)
+            if v is None and _bp is not None:
+                v = fld(_bp, key)
+            return default if v is None else v
+
+        D = extract_creature_defenses(db, c, bp)
+
+        classes = (list_items(c.get("ClassList"))
+                   or (list_items(bp.get("ClassList")) if bp else []))
+        cls_list = []
+        for cl in classes:
+            cid = fld(cl, "Class")
+            try:
+                lvl = int(fld(cl, "ClassLevel", 0) or 0)
+            except (TypeError, ValueError):
+                lvl = 0
+            cls_list.append({"n": class_name(cid), "l": lvl})
+
+        # Searchable properties: one row per distinct (property, subtype, cost),
+        # keeping the highest value when several items grant the same thing.
+        props: dict[tuple, dict] = {}
+
+        def _add(p: str, s: str, cost: str, val: int, src: str, anchor: str = "",
+                 _props=props):
+            key = (p, s, cost, src)
+            prev = _props.get(key)
+            if prev is None or val > prev["v"]:
+                row = {"p": p, "s": s, "c": cost, "v": val, "src": src}
+                if anchor:
+                    row["a"] = anchor
+                _props[key] = row
+
+        for _pid, _entries in D["cprop_by_pid"].items():
+            for _pf, _cv in _entries:
+                pname = _pf["property"]
+                if not pname:
+                    continue
+                subtype, cost = _pf["subtype"], _pf["cost"]
+                # Same quirk the item index handles: the spell name lands in the
+                # cost field, which makes the subtype dropdown useless without it.
+                if pname == "Immunity: Specific Spell" and not subtype and cost:
+                    subtype, cost = cost, ""
+                _add(pname, subtype, cost, _prop_value_num(_pf["cost"]) if _pf["cost"] else _cv,
+                     "gear", "pn-" + _prop_slug(pname, ""))
+
+        for _lbl in D["race_immunities"]:
+            _add("Immunity: Miscellaneous", _lbl, "", 0, "race")
+
+        locs = db.canonical_locations.get(can_rr, [])
+        _hp = D["hp"]
+        _cr = _creature_cr_value(db, can_rr)
+
+        index.append({
+            "rr": can_rr,
+            "name": nwn_text(db.canonical_creature_name(can_rr)),
+            "url": f"{can_rr}.html",
+            "race": race_name(_f("Race")),
+            "classes": cls_list,
+            "cr": None if _cr < 0 else _cr,
+            "hp": _hp,
+            "ac": D["ac"],
+            "bab": D["bab"],
+            "fort": D["fort"], "ref": D["ref"], "will": D["will"],
+            "sr": D["sr"],
+            "faction": db.faction_name(_f("FactionID", "")),
+            "count": sum(l["count"] for l in locs),
+            "areas": sorted({db.area_name(l["area"]) for l in locs if l.get("area")}),
+            "boss": can_rr in boss_rrs,
+            "props": sorted(props.values(), key=lambda r: (r["p"], r["s"], r["c"])),
+        })
+
+    _current_context = ""
+    write(out / "creatures" / "search-index.json",
+          json.dumps(index, ensure_ascii=False, separators=(",", ":")))
+
+    def _cond_row(n: int) -> str:
+        return (
+            f'<div class="prop-row">'
+            f'<select id="cm{n}" class="mode-sel">'
+            f'<option value="has">has</option><option value="lacks">lacks</option>'
+            f'</select>'
+            f'<select id="cp{n}" class="prop-sel"><option value="">— any —</option></select>'
+            f'<select id="cs{n}" class="subtype-sel" disabled>'
+            f'<option value="">— any —</option></select>'
+            f'<input id="cv{n}" type="number" min="0" placeholder="min value">'
+            f'</div>'
+        )
+
+    cond_rows = "".join(_cond_row(n) for n in range(1, 5))
+    boss_box = (
+        '<label class="checkbox-label"><input type="checkbox" id="fboss"> Bosses only</label>'
+        if _BOSS_REGISTRY else ""
+    )
+
+    body = (
+        "<h1>Search Creatures</h1>"
+        "<p>All conditions must be satisfied simultaneously. Leave fields blank to skip. "
+        "Set a row to <em>lacks</em> to find creatures <em>without</em> an ability — "
+        "the result header reports how many of the total matched, so a "
+        "<em>has</em>/<em>lacks</em> pair always sums to the full roster.</p>"
+        '<form id="cf" class="item-search-form creature-search-form">'
+        '<div class="search-row">'
+        '<label for="fq">Name</label>'
+        '<input id="fq" type="search" placeholder="substring">'
+        '<label for="frace">Race</label>'
+        '<select id="frace"><option value="">— all —</option></select>'
+        '<label for="fclass">Class</label>'
+        '<select id="fclass"><option value="">— any —</option></select>'
+        '<input id="fclvl" type="number" min="0" placeholder="min level">'
+        '</div>'
+        '<div class="search-row">'
+        '<label for="farea">Area</label>'
+        '<select id="farea"><option value="">— all —</option></select>'
+        '<label for="ffac">Faction</label>'
+        '<select id="ffac"><option value="">— all —</option></select>'
+        '<label class="checkbox-label" title="Only creatures actually placed in the module '
+        '(spawned by an encounter, placed in an area, or created by a script)">'
+        '<input type="checkbox" id="fim"> Placed in module only</label>'
+        f'{boss_box}'
+        '</div>'
+        '<div class="search-row stat-row">'
+        '<label for="fcrmin">CR</label>'
+        '<input id="fcrmin" type="number" step="0.5" placeholder="min">'
+        '<input id="fcrmax" type="number" step="0.5" placeholder="max">'
+        '<label for="fhpmin">HP</label>'
+        '<input id="fhpmin" type="number" placeholder="min">'
+        '<input id="fhpmax" type="number" placeholder="max">'
+        '<label for="facmin">AC</label>'
+        '<input id="facmin" type="number" placeholder="min">'
+        '<label for="fbabmin">BAB</label>'
+        '<input id="fbabmin" type="number" placeholder="min">'
+        '<label for="fsrmin">SR</label>'
+        '<input id="fsrmin" type="number" placeholder="min">'
+        '<label for="fsavemin" title="Every saving throw must be at least this high">Saves</label>'
+        '<input id="fsavemin" type="number" placeholder="min">'
+        '</div>'
+        f'<div class="prop-rows">{cond_rows}</div>'
+        '<div class="search-row">'
+        '<label for="fo">Sort by</label>'
+        '<select id="fo">'
+        '<option value="cr">Challenge Rating</option>'
+        '<option value="name">Name</option>'
+        '<option value="hp">HP</option>'
+        '<option value="ac">AC</option>'
+        '<option value="bab">BAB</option>'
+        '<option value="sr">Spell Resistance</option>'
+        '<option value="count">Count in module</option>'
+        '<option value="value">Matched Property Value</option>'
+        '</select>'
+        '<select id="fd">'
+        '<option value="desc">Descending</option>'
+        '<option value="asc">Ascending</option>'
+        '</select>'
+        '<button type="submit">Search</button>'
+        '</div>'
+        '</form>'
+        '<div id="cr_out"><p class="muted">Loading creature index…</p></div>'
+        '<p class="muted">Abilities come from a creature\'s equipped items plus the '
+        'immunities its racial type grants (marked <em>racial</em>) — see any creature\'s '
+        '<em>Abilities &amp; combat properties</em> table for the full picture.</p>'
+        f"<script>{_CREATURE_SEARCH_JS}</script>"
+    )
+    write(out / "creatures" / "search.html",
+          page("Search Creatures", body, root_rel=".."))
 
 
 def _fmt_cost(raw) -> str:
@@ -16658,6 +17105,8 @@ def main() -> int:
     render_creatures_by_area(db, out)
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
     render_creatures_by_race(db, out)
+    render_creatures_search(db, out)
+    _current_context = ""
     for can_rr in db.canonical_creatures:
         _current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
         render_creature_page(db, can_rr, out)

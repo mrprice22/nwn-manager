@@ -757,6 +757,53 @@ section[id] { scroll-margin-top: 4em; }
 }
 .search-row button:hover { opacity: 0.85; }
 
+/* Creature search — has/lacks condition rows, compact stat ranges, tallies */
+.creature-search-form .prop-row .mode-sel {
+  flex: 0 0 auto;
+  width: 6.5em;
+  font-weight: 600;
+}
+.creature-search-form .stat-row label { min-width: 0; }
+.creature-search-form .stat-row input[type="number"] {
+  width: 5.5em;
+  min-width: 0;
+}
+.creature-search-form input[type="search"] {
+  font: inherit;
+  font-size: 0.9em;
+  padding: 0.3em 0.5em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  min-width: 10em;
+}
+.badge-boss {
+  background: #f3dcc4;
+  color: #7a4a12;
+  border-radius: 3px;
+  font-size: 0.75em;
+  padding: 0.1em 0.4em;
+  margin-left: 0.4em;
+  vertical-align: middle;
+}
+.search-breakdown { margin: 0.5em 0 1em; }
+.search-breakdown summary { cursor: pointer; color: var(--muted); font-size: 0.9em; }
+.breakdown-cols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1em 2.5em;
+  margin-top: 0.5em;
+}
+.breakdown-cols h4 { margin: 0 0 0.3em; font-size: 0.9em; }
+.breakdown-cols ul {
+  margin: 0;
+  padding-left: 1.2em;
+  font-size: 0.9em;
+  columns: 2;
+  column-gap: 2em;
+}
+
 /* Custom token annotations in dialog text */
 .custom-token {
   background: #f0f4ff;
