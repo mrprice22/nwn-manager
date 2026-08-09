@@ -888,8 +888,37 @@ items:
 - id: db-index
   phase: 1
   title: Split Db.index into db/index.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: daf4eef
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (137s), lotr2008 IDENTICAL (84s), lotr2009 IDENTICAL (110s)"
+  impl_notes: >
+    db/index.py 479 lines (43 scaffolding + the 436-line body, nesting untouched);
+    cli.py 13,963 -> 13,515.  Followed the db-core convention exactly:
+    `class Db(DbIndexMixin, DbCore)`, mixin prepended, DbCore last.  A diff of the
+    moved body against HEAD's cli.py range is empty — verbatim.  DRAGGED ALONG:
+    _store_instance_slug, because db/ may not import cli — but it is NOT index-only
+    (5 other cli.py call sites), so cli.py imports it back out of db/index.py; the
+    back-import is noted in that module's docstring.  Four cli.py imports died with
+    the code that used them and were dropped: STOCK_ITEM_BASE, STOCK_ITEM_COST,
+    STOCK_ITEM_PROPS, _creature_key.  dir(Db) identical to HEAD; MRO
+    Db -> DbIndexMixin -> DbCore -> object.  index() touches no module state, so no
+    state.X rewrites were needed.
+  found:
+    - "_store_instance_slug is a store URL-slug builder parked in db/index.py purely
+       because db/ may not import cli, and 5 of its 6 call sites are renderers.  When
+       render-stores lands it should move there (or to a small slug/link leaf) and
+       db/index.py should import it rather than own it."
+    - "_backfill_stock_items() is a zero-argument closure defined inside index() and
+       called on the very next line; it closes over nothing that needs a closure."
+    - "The canonical-creature orphan branch (__orphan_{area}_{idx:03d}) reimplements
+       _intern_creature's registry bookkeeping inline instead of calling it — a
+       divergence risk if the interning rules ever change."
+    - "db/__init__.py's planned-module list names `index` while the class naming
+       convention is Db<Concern>Mixin; DbIndexMixin matches, so nothing needs
+       'fixing' there."
+
   after: [db-core]
   ranges: "2887-3485 (index is 436 lines, nesting depth 6)"
 
