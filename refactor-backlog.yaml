@@ -1097,8 +1097,37 @@ items:
 - id: render-map
   phase: 1
   title: Extract the area map SVG into render/map.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: e1a0836
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (134s), lotr2008 IDENTICAL (84s), lotr2009 IDENTICAL (106s)"
+  impl_notes: >
+    New render/ subpackage (docstring-only __init__.py, same shape as htmlgen/ and
+    sim/); render/map.py 400 lines, 368 of them verbatim; cli.py 11,863 -> 11,481.
+    The 37-line inline pan/zoom/download IIFE moved byte-verbatim and is still
+    inline — dedup-map-js owns relocating it.  _MAP_HINT_HTML had to travel (map.py
+    may not import cli) even though render_index still appends it, so cli.py imports
+    it back with the two renderers, the _store_instance_slug pattern.  map.py imports
+    math, Path, chrome.page/write and escape.E/nwn_first_color/nwn_text; Db
+    annotations left bare per the links.py/chrome.py precedent.  STATE AUDIT: zero —
+    the moved code touches no state symbol at all, everything arrives through the db,
+    positions, sizes and base_url arguments (page()/write() read state internally,
+    inside chrome.py, unchanged).  Line multiset: 4 added lines, all import-block
+    entries; all 368 removed non-blank lines present verbatim in map.py.
+  found:
+    - "render_map_svg's embedded_css hardcodes a light-theme palette kept in sync
+       with wiki_assets/style.css BY HAND — the same copy-drift problem as the JS,
+       and a natural companion to dedup-map-js."
+    - "render_map_svg builds the toolbar HTML in the same return expression as the
+       SVG, so the /map page and the index each emit a duplicate id='area-map-wrap'
+       / id='area-map-svg'.  Harmless across separate pages, but it makes the ids
+       load-bearing and blocks ever putting two maps on one page."
+    - "render_index is the only other consumer of _MAP_HINT_HTML; when render-index
+       extracts it, the import-back can be dropped."
+    - "zoom = 4.0 (oversampling in render_map_svg) and var zoom=0.8 (the IIFE
+       default) are two halves of one scale decision in different places and units."
+
   after: [db-names]
   ranges: "6150-6527 (render_map_page, render_map_svg 358 lines)"
   notes: >
