@@ -435,8 +435,32 @@ items:
 - id: htmlgen-markdown
   phase: 1
   title: Extract md_to_html into htmlgen/markdown.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: ea6ccf8
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (136s), lotr2008 IDENTICAL (83s), lotr2009 IDENTICAL (105s)"
+  impl_notes: >
+    markdown.py 138 lines; cli.py 16,560 -> 16,435.  Nothing stayed behind:
+    md_to_html owns no module-level regexes or constants (every pattern is an
+    inline re.match/re.sub literal), so the new module is a stdlib-only leaf
+    importing just `re`.  The redundant function-local `import html as _html` was
+    moved verbatim rather than tidied.  Line multiset: one line added (the import),
+    126 removed and all present verbatim in markdown.py.
+  found:
+    - "md_to_html's inline() italic rule \\*([^*]+)\\*|_([^_]+)_ matches underscores
+       inside words, so a bare identifier like some_var_name in manual prose renders
+       as some<em>var</em>name.  Backticked identifiers are safe (code spans are
+       converted first)."
+    - "Fenced code blocks escape with _html.escape(raw) (quote=True, so \" becomes
+       &quot;) while inline() uses quote=False — arbitrary inconsistency between the
+       code and prose paths."
+    - "md_to_html has no <table> support; GFM tables in docs.manual sources fall
+       through to the paragraph branch and emit pipes literally.  Check the corpus
+       before anyone 'improves' the converter."
+    - "The paragraph-break test is r.startswith('#') rather than the ^(#{1,3})\\s+
+       heading regex, so a line like '#1 priority' silently ends a paragraph."
+
   after: [htmlgen-escape-links]
   ranges: "5506-5631"
 
