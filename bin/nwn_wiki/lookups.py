@@ -527,3 +527,12 @@ def tileset_name(resref: str) -> str:
     if not resref:
         return ""
     return TILESETS.get(resref.lower(), resref)
+
+
+# Friendly labels for NWN DAMAGE_TYPE_* constants used in retaliation summaries.
+_DAMAGE_TYPE_LABELS = {
+    "BLUDGEONING": "Bludgeoning", "PIERCING": "Piercing", "SLASHING": "Slashing",
+    "MAGICAL": "Magical", "ACID": "Acid", "COLD": "Cold", "DIVINE": "Divine",
+    "ELECTRICAL": "Electrical", "FIRE": "Fire", "NEGATIVE": "Negative",
+    "POSITIVE": "Positive", "SONIC": "Sonic",
+}

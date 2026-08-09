@@ -118,6 +118,7 @@ from nwn_wiki.items import (
     SLOT_LEFT,
     SLOT_NAMES,
     SLOT_RIGHT,
+    _ABIL_NAME_KEY,
     _ARMOR_BASEITEMS,
     _CEP_WEAPON_BASEITEMS,
     _CREATURE_ITEM_BASEITEMS,
@@ -129,6 +130,8 @@ from nwn_wiki.items import (
     _item_category,
     _item_category_label,
     baseitem_slots,
+    extract_item_defense,
+    extract_item_offense,
     is_ranged_weapon,
     item_ac_bonus,
     item_attack_bonus,
@@ -137,6 +140,7 @@ from nwn_wiki.items import (
     item_gp_value,
     slot_label,
     weapon_crit_string,
+    weapon_damage_props,
     weapon_damage_string,
     weapon_enhancement,
 )
@@ -161,6 +165,7 @@ from nwn_wiki.lookups import (
     WEAPONS,
     _CAST_SPELL_PROP_ID,
     _COMBINED_PROP_PAGES,
+    _DAMAGE_TYPE_LABELS,
     _iprp_name_spell_info,
     _scroll_cast_spell_info,
     _spell_level_classes,
@@ -430,210 +435,6 @@ def creature_max_hp(c: dict | None, bp: dict | None = None) -> int | None:
     except (TypeError, ValueError):
         return None
     return base + epic_toughness_hp(creature_feat_ids(c, bp))
-
-# Physical damage type(s) a base weapon deals, keyed by baseitems.2da WeaponType.
-# weapons.json carries no physical-damage-type column, so this map is the only
-# source. Elemental/divine damage instead comes from item properties.
-_PHYSICAL_DAMAGE_TYPES = ("Bludgeoning", "Piercing", "Slashing")
-_WEAPONTYPE_TO_PHYS: dict[int, frozenset[str]] = {
-    1: frozenset({"Piercing"}),
-    2: frozenset({"Bludgeoning"}),
-    3: frozenset({"Slashing"}),
-    4: frozenset({"Slashing", "Piercing"}),
-    5: frozenset({"Bludgeoning", "Piercing"}),
-}
-
-
-def _weapon_extra_damage_types(item: dict | None) -> set[str]:
-    """Elemental / divine / etc. damage types a weapon adds via item properties
-    (Damage Bonus #6-style subtypes and On Hit). Physical Damage Bonus adds to
-    existing physical damage and carries no new type, so it is excluded here.
-    Returns canonical _DAMAGE_TYPE_LABELS names."""
-    if not item:
-        return set()
-    _names = set(_DAMAGE_TYPE_LABELS.values())
-    out: set[str] = set()
-    for p in list_items(item.get("PropertiesList")):
-        pname_id = fld(p, "PropertyName")
-        if pname_id is None:
-            continue
-        pdef = IPROP_DEFS.get(int(pname_id), {})
-        pname = (pdef.get("name") or "").lower()
-        if "damage bonus" not in pname:
-            continue
-        sub_id = fld(p, "Subtype")
-        if sub_id in (None, 0, 7):  # 0/7 = Physical (no new damage type)
-            continue
-        sub = itemprop_format(p)["subtype"]
-        if sub in _names:
-            out.add(sub)
-    return out
-
-
-def weapon_damage_props(item: dict | None) -> tuple[float, dict[str, float]]:
-    """Damage a weapon's item properties add, split into (flat_physical, by_type).
-
-    Mirrors _weapon_extra_damage_types' rules — Damage Bonus (#6-style) props
-    with subtype 0/7 are Physical and fold into the flat number, everything else
-    is its own damage type — but returns averaged *amounts* (via avg_roll, so
-    '1d6' is 3.5) instead of just the type names. On Hit properties are excluded:
-    they fire on a chance and often apply an effect rather than damage.
-    """
-    if not item:
-        return 0.0, {}
-    _names = set(_DAMAGE_TYPE_LABELS.values())
-    flat = 0.0
-    by_type: dict[str, float] = {}
-    for p in list_items(item.get("PropertiesList")):
-        pname_id = fld(p, "PropertyName")
-        if pname_id is None:
-            continue
-        pdef = IPROP_DEFS.get(int(pname_id), {})
-        if "damage bonus" not in (pdef.get("name") or "").lower():
-            continue
-        pf = itemprop_format(p)
-        amount = avg_roll(pf["cost"])
-        if not amount:
-            continue
-        sub_id = fld(p, "Subtype")
-        if sub_id in (None, 0, 7):          # Physical — no new damage type
-            flat += amount
-            continue
-        sub = pf["subtype"]
-        if sub in _names:
-            by_type[sub] = by_type.get(sub, 0.0) + amount
-        else:
-            flat += amount
-    return flat, by_type
-
-
-def extract_item_offense(db: "Db", item: dict, resref: str) -> dict:
-    """Offensive capability of a single item, as plain data for the
-    counter-gear matcher. Weapons report the damage types they can deal
-    (physical from the base item + elemental from properties), enhancement
-    bonus (for DR bypass) and to-hit bonus; non-weapons report is_weapon=False."""
-    _raw = fld(item, "BaseItem", None)
-    bi = -1 if _raw is None else int(_raw)
-    name = db.item_name(resref)
-    stats = WEAPONS.get(bi)
-    try:
-        _wtype = int(stats.get("WeaponType")) if stats and stats.get("WeaponType") not in (None, "", "*") else 0
-    except (TypeError, ValueError):
-        _wtype = 0
-    is_weapon = bool((stats and _wtype) or bi in _CEP_WEAPON_BASEITEMS)
-    physical = set(_WEAPONTYPE_TO_PHYS.get(_wtype, frozenset())) if is_weapon else set()
-    extra = _weapon_extra_damage_types(item) if is_weapon else set()
-    damage_dtypes = physical | extra
-    _cost = item_gp_value(item)
-    return {
-        "resref": resref,
-        "name": nwn_text(name),
-        "base_item_id": bi,
-        "base_item_name": baseitem_name(bi) if bi >= 0 else "",
-        "category": _item_category(item, nwn_text(name)),
-        "is_weapon": is_weapon,
-        "is_ranged": is_ranged_weapon(bi) if is_weapon else False,
-        "physical_dtypes": sorted(physical),
-        "extra_dtypes": sorted(extra),
-        "damage_dtypes": sorted(damage_dtypes),
-        "enhancement": weapon_enhancement(item),
-        "attack_bonus": item_attack_bonus(item),
-        "cost": _cost,
-        "tag": (fld(item, "Tag", "") or resref).lower(),
-        "accessible": _item_accessible(db, resref),
-    }
-
-
-def extract_item_defense(db: "Db", item: dict, resref: str) -> dict:
-    """Defensive capability of a single item, as plain data for the counter-gear
-    survivability matcher and the combat simulator. Reads the same item-property
-    semantics proven in extract_creature_defenses (ability #0, AC #1, immunity
-    #20, DR #22, resist #23, save #41, regen #51) so the two never drift.
-
-    Slots come from baseitems.2da EquipableSlots (BASEITEM_SLOTS), so every
-    player slot is covered and CEP/custom rows resolve too. Returns the slot
-    bitmask and label, AC granted, per-damage-type resist/immunity, save and
-    ability bonuses, regen, and GP value. `relevant=False` marks items that fill
-    no player slot or grant nothing defensive."""
-    _raw = fld(item, "BaseItem", None)
-    bi = -1 if _raw is None else int(_raw)
-    slots = baseitem_slots(bi) & PLAYER_SLOT_MASK
-    slot = slot_label(slots) if slots else ""
-
-    # AC: deflection/dodge/natural item props, plus armor/shield base AC.
-    ac_bonus, _ = item_ac_bonus(item)
-    if bi == 16:
-        ac_bonus += _torso_base_ac(item)
-    elif bi in SHIELD_BASEITEMS:
-        s_stats = WEAPONS.get(bi)
-        if s_stats:
-            try:
-                ac_bonus += int(s_stats.get("BaseAC", "0") or 0)
-            except (TypeError, ValueError):
-                pass
-
-    resist: dict[str, int] = {}
-    immune: dict[str, int] = {}
-    saves: dict[str, int] = {}
-    abilities: dict[str, int] = {}
-    dr_soak = dr_bypass = 0
-    regen = 0
-    crit_immune = False
-    for p in list_items(item.get("PropertiesList")):
-        pid_raw = fld(p, "PropertyName")
-        if pid_raw is None:
-            continue
-        pid = int(pid_raw)
-        pf = itemprop_format(p)
-        cv = _prop_value_num(pf["cost"]) if pf["cost"] else 0
-        sub = pf["subtype"] or ""
-        if pid == 37 and sub == CRIT_IMMUNITY_LABEL:   # Immunity: Miscellaneous
-            crit_immune = True
-        elif pid == 0 and sub:                     # Ability Bonus
-            key = _ABIL_NAME_KEY.get(sub)
-            if key and cv > abilities.get(key, 0):
-                abilities[key] = cv
-        elif pid == 22:                            # Damage Reduction (soak/+N)
-            if cv > dr_soak:
-                dr_soak = cv
-                dr_bypass = _prop_value_num(pf["param"]) if pf.get("param") else 0
-        elif pid == 23 and sub:                    # Damage Resistance
-            if cv > resist.get(sub, 0):
-                resist[sub] = cv
-        elif pid == 20 and sub:                    # Damage Immunity (%)
-            pct = _prop_value_num(pf["cost"]) if pf["cost"] else cv
-            if pct > immune.get(sub, 0):
-                immune[sub] = pct
-        elif pid == 41:                            # Saving Throw bonus
-            kind = sub or "Universal"
-            if cv > saves.get(kind, 0):
-                saves[kind] = cv
-        elif pid == 51:                            # Regeneration
-            regen += cv
-
-    cost = item_gp_value(item)
-
-    relevant = bool(slots and (ac_bonus or resist or immune or saves
-                               or abilities or regen or dr_soak or crit_immune))
-    return {
-        "resref": resref,
-        "name": nwn_text(db.item_name(resref)),
-        "base_item_id": bi,
-        "slots": slots,
-        "slot": slot,
-        "relevant": relevant,
-        "ac_bonus": ac_bonus,
-        "resist": resist,
-        "immune": immune,
-        "saves": saves,
-        "abilities": abilities,
-        "dr_soak": dr_soak,
-        "dr_bypass": dr_bypass,
-        "regen": regen,
-        "crit_immune": crit_immune,
-        "cost": cost,
-        "accessible": _item_accessible(db, resref),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -4874,13 +4675,6 @@ def render_creature_pictures(db: Db, out: Path) -> None:
 
 
 # --- Retaliation (OnDamaged strike-back) analysis ------------------------------
-# Friendly labels for NWN DAMAGE_TYPE_* constants used in retaliation summaries.
-_DAMAGE_TYPE_LABELS = {
-    "BLUDGEONING": "Bludgeoning", "PIERCING": "Piercing", "SLASHING": "Slashing",
-    "MAGICAL": "Magical", "ACID": "Acid", "COLD": "Cold", "DIVINE": "Divine",
-    "ELECTRICAL": "Electrical", "FIRE": "Fire", "NEGATIVE": "Negative",
-    "POSITIVE": "Positive", "SONIC": "Sonic",
-}
 _RE_STRIP_LINE_COMMENT = re.compile(r'//[^\n]*')
 _RE_STRIP_BLOCK_COMMENT = re.compile(r'/\*.*?\*/', re.S)
 _RE_RET_APPLY_EFFECT = re.compile(r'\bApplyEffect(?:ToObject|AtLocation)\s*\(')
@@ -4963,10 +4757,6 @@ def _retaliation_sentence(info: dict) -> str:
     if info.get("chance_pct"):
         return f"When struck, this creature has a ~{info['chance_pct']}% chance to {core}."
     return f"When struck, this creature will {core}."
-
-
-_ABIL_NAME_KEY = {"Strength": "Str", "Dexterity": "Dex", "Constitution": "Con",
-                  "Intelligence": "Int", "Wisdom": "Wis", "Charisma": "Cha"}
 
 
 def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
