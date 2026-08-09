@@ -34,8 +34,22 @@ items:
 - id: pkg-skeleton
   phase: 1
   title: Package skeleton, CLI shim, paths module, importer fixups
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 578a844
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (138s), lotr2008 IDENTICAL (88s), lotr2009 IDENTICAL (98s)"
+  impl_notes: >
+    git mv kept the history on cli.py.  The two SourceFileLoader importers now
+    return nwn_wiki.cli, not the nwn_wiki package — they set module attributes on
+    the result, and those writes only reach the readers if they land on the
+    defining module.  state-module retargets them again.  Their importlib.machinery
+    and importlib.util imports became unused and were dropped with the code that
+    used them.
+  found:
+    - "cli.py still ends with `if __name__ == \"__main__\"` — harmless, but the shim
+       is the only entry point now.  Tidy in cli-module."
+
   ranges: "1-108 (header/imports), 33-35 (SCRIPT_DIR/DATA_DIR/ASSETS_DIR)"
   plan: >
     Create bin/nwn_wiki/ with __init__.py and paths.py.  Move the whole monolith
