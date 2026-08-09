@@ -67,8 +67,25 @@ items:
 - id: state-module
   phase: 1
   title: Extract cross-module mutable globals into nwn_wiki/state.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 380aa6c
+  date: 2026-08-09
+  gate_result: "check --all: IDENTICAL on homers_lotr, lotr2008, lotr2009"
+  impl_notes: >
+    22 symbols moved, 157 references qualified, 12 `global` statements dropped.
+    Every `global` in the file named only moved symbols, so all of them went.
+    Names keep the leading underscore — moves only.  Verified the uncovered path
+    by hand: rendering via bin/nwn-wiki-activity against the live logs produced
+    the theme, 78 bosses, 11 manual pages and an activity page carrying its nav
+    entry, which only works if the cross-process state writes reach the readers.
+  found:
+    - "_STOCK_BASEITEM_SLOTS and the _OVERLAY_TARGETS value dicts are also mutable
+       build-time state, but they belong to the 2DA/lookup layer — handle them in
+       twoda-module / lookups-module, not here."
+    - "state.py symbols keep a leading underscore that no longer means anything now
+       that they are module attributes. Worth a rename pass once phase 1 lands."
+
   after: [pkg-skeleton]
   ranges: "44-48, 78-88 (globals); 102, 5923, 5979, 7578, 10625, 15958, 16144, 18168, 18421 (writers)"
   plan: >
