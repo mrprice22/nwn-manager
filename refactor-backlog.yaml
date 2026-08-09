@@ -548,8 +548,37 @@ items:
 - id: sim-combat
   phase: 1
   title: Extract the DPR/defence simulation into sim/combat.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 54a92ef
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (141s), lotr2008 IDENTICAL (88s), lotr2009 IDENTICAL (100s)"
+  impl_notes: >
+    New sim/ subpackage: __init__.py 10 lines (docstring only, like htmlgen's),
+    combat.py 308 lines importing nothing but math/re/typing — a true leaf.
+    cli.py 15,724 -> 15,439, gaining one import block for the only four names still
+    used outside (attack_profile, avg_roll, defense_profile, simulate).  Moved 13
+    symbols plus the "Combat simulation primitives" banner.  SCOPE REDUCED:
+    _devcrit_die, weapon_feat_id, crit_feat_effects and their constants stayed in
+    cli.py because weapon_feat_id/crit_feat_effects call _try_int, a generic helper
+    with 20 cli.py call sites — importing it back would be a hard cycle, and
+    dragging it into a simulation module would collide with phase-3 dedup-formatting.
+    Nothing in the moved set calls them (attack_profile takes devcrit_save_dc and
+    crit_bonus as plain parameters), so no call chain was severed.  New item
+    sim-crit-feats picks them up.  Line multiset: 6 lines added (the import block),
+    291 removed and all present verbatim in sim/combat.py.
+  found:
+    - "avg_roll's docstring contrasts itself with _prop_value_num, which now lives in
+       nwn_wiki.itemprops — the cross-reference is cross-module and unqualified."
+    - "crit_feat_effects quotes its has_feat annotation even though cli.py has
+       `from __future__ import annotations`, making the quoting redundant."
+    - "WEAPONS and BASEITEM_COLUMNS_SEEN look exactly like the snapshot hazard
+       state.py exists to prevent, but twoda.py only ever mutates them in place, so
+       the plain from-imports are safe.  Worth a comment at their definitions."
+    - "simulate reads pc['full_heal_rounds'] via .get(..., 0) but
+       creature['defense']/['attack'] by direct subscript — inconsistent tolerance
+       for missing keys within one function."
+
   after: [layout-module]
   ranges: "8191-8590"
   plan: >
@@ -1048,6 +1077,22 @@ items:
     _parse_cr rather than calling it.  Those sentinels sort differently.  Resolve
     it deliberately — if which one is correct isn't obvious, take the
     design-question hatch.  Do NOT silently unify them.
+
+- id: sim-crit-feats
+  phase: 3
+  title: Move the crit-feat block into sim/ once _try_int has a home
+  status: pending
+  gate: zero-diff
+  after: [dedup-formatting]
+  plan: >
+    sim-combat had to leave _devcrit_die, weapon_feat_id, crit_feat_effects and
+    their constants (_OVERWHELMING_DIE, _DEVCRIT_DIE_BY_SIZE, _DEVCRIT_DIE_LARGE,
+    _IMPROVED_CRIT_MIN_BAB, _EPIC_CRIT_MIN_STR) plus the "Critical-hit feats"
+    banner in cli.py: the last two call _try_int, which has 20 cli.py call sites,
+    so importing it back into sim/combat.py would be a cycle.  dedup-formatting
+    gives _try_int a home; afterwards move the block into sim/combat.py (or a
+    sim/crit.py).  Its other needs — lookups.WEAPONS,
+    lookups.BASEITEM_COLUMNS_SEEN, combat.ability_mod — are already cycle-free.
 
 - id: dedup-map-js
   phase: 3
