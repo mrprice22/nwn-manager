@@ -1179,8 +1179,56 @@ items:
 - id: render-creature-index
   phase: 1
   title: Extract creature index/bosses/pictures renderers into render/creatures.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 9783046
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (135s), lotr2008 IDENTICAL (83s), lotr2009 IDENTICAL (110s)"
+  impl_notes: >
+    render/creatures.py 739 lines; cli.py 11,087 -> 10,383.  Moved
+    render_creatures_index, the boss block (_BOSS_SEED_RE, _BOSS_ALIAS_RE,
+    _load_boss_registry_from_path, load_boss_registry, load_boss_registry_from_src,
+    render_bosses_index and its banner), _pic_src, _pic_figures,
+    render_creature_pictures and the three by-area/by-cr/by-race renderers.
+    SCOPE REDUCED: render_creatures_search and _CREATURE_SEARCH_JS stayed — the
+    former calls extract_creature_defenses, which render-creature-page owns, so
+    moving them here would either import cli or pre-empt the next item; that item's
+    plan now covers all three.  DRAGGED ALONG: creature_feat_ids and creature_max_hp
+    (all five moved renderers call the latter); creature_max_hp keeps 6 cli.py call
+    sites so cli.py imports it back, along with _pic_figures, load_boss_registry and
+    load_boss_registry_from_src (bin/nwn-wiki-activity reaches the last as
+    wiki.load_boss_registry_from_src).  Line multiset: 11 added lines, all imports;
+    all 715 removed lines present verbatim in the new module.
+    STATE AUDIT — _BOSS_REGISTRY and _BOSS_ALIASES are rebound and filled here (the
+    moved code is their only writer); _CREATURE_PIC_GROUPS is read and its group
+    dicts mutated in place; _BESTIARY_ACTIVE and _BESTIARY_KILLS are read.
+    _CREATURE_PICS is untouched (only render_creature_page reads it).  Write
+    visibility verified at runtime from a fake brd_db.nss: rows written through
+    cli.load_boss_registry_from_src (whose __module__ is now render.creatures) are
+    seen by the cli.py module-index reader AND by chrome.page(), which emitted the
+    Bosses nav link; clearing the registry through the moved module drops that link
+    again; and _CREATURE_PIC_GROUPS set from outside (as scan_creature_pics does) is
+    seen by the moved render_creature_pictures.
+  found:
+    - "creature_feat_ids/creature_max_hp are GFF data helpers, not renderers, and sit
+       in render/creatures.py only because their callers went there.  combat.py (next
+       to epic_toughness_hp) or a nwn_wiki/creatures.py is the better home —
+       especially as render/creature_page.py will import them from a sibling render
+       module.  This also settles render-area-page's cheap blocker."
+    - "Four renderers in the new module redefine the identical _f(key, default)
+       instance-then-blueprint closure, and the three by-X renderers each rebuild the
+       same per-creature row with only the column set varying — ~90 lines that
+       dedup-creature-row should collapse."
+    - "render_creatures_index and render_bosses_index both build kills_head and the
+       matching kills_cells inline, so header and cells can drift apart."
+    - "render_creature_pictures injects a _slug key into the shared
+       state._CREATURE_PIC_GROUPS dicts at render time — a write state.py's docs do
+       not mention (they describe the groups as name/matches/images/cr)."
+    - "_CREATURE_SEARCH_JS's esc() duplicates E()'s escaping rules across the
+       language boundary with no cross-reference."
+    - "areas.py quotes its Db annotations while creatures.py leaves them bare; the
+       render/ package is now internally inconsistent."
+
   after: [render-areas]
   ranges: "7445-7767, 10052-10803"
   plan: >
@@ -1203,7 +1251,9 @@ items:
     import cli; decide whether the sentence renderer joins it there or the analysis
     follows it here.  Then extract_creature_defenses (324),
     _creature_detail_sections (619 — second-longest function in the program) and
-    render_creature_page.
+    render_creature_page.  ALSO render_creatures_search and _CREATURE_SEARCH_JS,
+    which render-creature-index had to leave behind because the search renderer
+    calls extract_creature_defenses.
 
 - id: render-items
   phase: 1
