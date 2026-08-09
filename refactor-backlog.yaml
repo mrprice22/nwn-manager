@@ -256,8 +256,36 @@ items:
 - id: combat-module
   phase: 1
   title: Extract BAB / attack-schedule / ability-mod maths into combat.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: adbe44c
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (133s), lotr2008 IDENTICAL (85s), lotr2009 IDENTICAL (105s)"
+  impl_notes: >
+    combat.py 150 lines; cli.py 17,587 -> 17,464.  All six planned functions moved,
+    plus _UNIVERSAL_ATTACK_FEATS (the feat-id -> to-hit dict sitting between
+    attack_schedule and feat_attack_bonus) and the "Combat-stat helpers (creature
+    page)" banner that headed the block.  combat.py depends only on stdlib +
+    gff.fld + lookups.{CLASS_BAB, STOCK_FEAT_NAMES} — no Db, no state, no cycle.
+    MONK_CLASS_ID and REFERENCE_PC_CLASS stayed in cli.py: they live far below the
+    moved block among other class-id constants and are passed INTO
+    creature_class_bab/_class_bab by callers, so moving them would be scope creep.
+    Line multiset: 8 lines added (import block only), 131 removed and all present
+    verbatim in combat.py.
+  found:
+    - "cli.py still imports CLASS_BAB and STOCK_FEAT_NAMES from nwn_wiki.lookups
+       but no longer uses either — left in place to keep the line-multiset check
+       clean.  Drop them in a later cleanup pass."
+    - "attack_schedule's `ability_mod=0` parameter shadows the module-level
+       function ability_mod, now that both live in the same small module.  Harmless
+       today (it is not called inside) but a latent trap."
+    - "feat_attack_bonus's docstring claims Epic Superior Weapon Focus always
+       counts, contradicting the comment above _UNIVERSAL_ATTACK_FEATS which says
+       feat 1071 is deliberately excluded (the dict is only {584: 1, 884: 1}).  The
+       docstring is the stale one."
+    - "feat_attack_bonus rebinds _norm as a per-call lambda; a module-level def
+       would be cheaper and lint-clean."
+
   after: [itemprops-module]
   ranges: "1565-1735"
   plan: >
