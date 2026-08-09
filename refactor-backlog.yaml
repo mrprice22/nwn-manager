@@ -1012,8 +1012,39 @@ items:
 - id: db-derived
   phase: 1
   title: Split derived indexes into db/derived.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: a815c33
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (139s), lotr2008 IDENTICAL (83s), lotr2009 IDENTICAL (110s)"
+  impl_notes: >
+    db/derived.py 622 lines; cli.py 12,569 -> 11,977.  All six methods were a
+    contiguous block, so the cut was a single slice.  class Db(DbDerivedMixin,
+    DbDialogsMixin, DbScriptsMixin, DbIndexMixin, DbCore).  DRAGGED ALONG:
+    _build_dialog_quest_index calls the free functions _quest_slug and _quest_hidden,
+    so they (and _quest_hidden's private _RE_QUEST_HIDDEN) had to travel; cli.py
+    imports both back for its 4 remaining call sites.  The *_EVENT_FIELDS dicts
+    stayed in cli.py per db-dialogs — the moved methods read them through self. and
+    keep resolving via the assembled class.  dir(Db) identical to HEAD; the only
+    removed cli.py line is the old bases declaration.
+  found:
+    - "_quest_slug/_quest_hidden/_RE_QUEST_HIDDEN now live in db/derived.py but are
+       quest-directive helpers that render-quests will want; consider a shared
+       nwn_wiki/quests.py.  Side effect today: _RE_QUEST_HIDDEN is separated from
+       _RE_QUEST_GROUP/_RE_QUEST_ORDER/_RE_QUEST_GROUP_ORDER/_RE_QUEST_DIRECTIVE in
+       cli.py, whose comment block still documents @hidden."
+    - "_index_script_item_sources builds a local _ALL_CREATURE_EVENTS dict that is a
+       superset of Db.CREATURE_EVENT_FIELDS — a duplicated table that can drift."
+    - "_index_script_item_checks and _build_store_openers each independently build
+       trigger_areas/placeable_areas (and door_areas) blueprint->area maps, and they
+       DISAGREE: the former lowercases TemplateResRef, the latter does not."
+    - "_index_script_item_checks dedupes on (kind, resref, script, area, event,
+       dialog), omitting caller_resref/caller_kind, so two dialog-action entries for
+       the same dialog with different callers collapse into one.  Confirm intent."
+    - "_index_script_item_checks binds script_kind in the dialog_item_checks loop and
+       never uses it, and has a nested enumerate() whose idx is unused in the
+       trigger-instance branch."
+
   after: [db-dialogs]
   ranges: "4248-4819"
   plan: >
