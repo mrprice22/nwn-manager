@@ -45,6 +45,7 @@ from nwn_wiki.gff import (
     read_tlk,
 )
 from nwn_wiki.paths import ASSETS_DIR, DATA_DIR, SCRIPT_DIR
+from nwn_wiki.twoda import detect_cep_haks, parse_2da
 from nwn_wiki.warn import _warn_once
 
 from nwn_wiki import state
@@ -283,67 +284,6 @@ IPROP_TABLES: dict[str, dict] = ITEMPROPS.get("tables", {})
 #
 #     nwn-wiki --src unpacked --out docs --2da-dir hak_2da
 
-def parse_2da(path: Path) -> tuple[list[str], list[list[str]]]:
-    """Parse an NWN 2DA (V2.0) file. Returns (column_headers, rows).
-    Each row's first cell is the row index as text. Quoted strings (with
-    embedded spaces) are honoured. `****` cells are returned as empty
-    strings."""
-    text = path.read_text(encoding="cp1252", errors="replace")
-    lines = [ln for ln in text.splitlines()]
-    # Skip blank/header lines until we find the first whitespace-delimited
-    # row. The first non-blank line after the magic is normally the
-    # column-header row; some files include a `DEFAULT: ""` directive.
-    i = 0
-    while i < len(lines) and not lines[i].strip().startswith("2DA"):
-        i += 1
-    i += 1  # past "2DA V2.0"
-    # Optional DEFAULT line
-    while i < len(lines) and (not lines[i].strip() or
-                              lines[i].lstrip().upper().startswith("DEFAULT")):
-        i += 1
-    # Column headers
-    if i >= len(lines):
-        return [], []
-    headers = _2da_split(lines[i])
-    i += 1
-    rows: list[list[str]] = []
-    for ln in lines[i:]:
-        if not ln.strip():
-            continue
-        cells = _2da_split(ln)
-        if not cells:
-            continue
-        rows.append(cells)
-    return headers, rows
-
-
-def _2da_split(line: str) -> list[str]:
-    """Split a 2DA line on whitespace, keeping double-quoted spans together
-    and decoding `****` as the empty string."""
-    out: list[str] = []
-    i = 0
-    n = len(line)
-    while i < n:
-        while i < n and line[i] in (" ", "\t"):
-            i += 1
-        if i >= n:
-            break
-        if line[i] == '"':
-            j = i + 1
-            while j < n and line[j] != '"':
-                j += 1
-            out.append(line[i + 1:j])
-            i = j + 1
-        else:
-            j = i
-            while j < n and line[j] not in (" ", "\t"):
-                j += 1
-            tok = line[i:j]
-            out.append("" if tok == "****" else tok)
-            i = j
-    return out
-
-
 _OVERLAY_TARGETS: dict[str, dict[int, str]] = {
     "baseitems":   BASEITEMS,
     "racialtypes": RACES,
@@ -385,20 +325,6 @@ def load_json_overlay(d: Path, label: str) -> int:
         total += n
         print(f"  {label}: {name}.json → {n} rows")
     return total
-
-
-def detect_cep_haks(ifo: dict | None) -> list[str]:
-    """Return the subset of `Mod_HakList` entries that look like CEP haks.
-    Empty list when the module is vanilla. Used to decide whether to layer
-    the bundled CEP overlay onto the stock lookups."""
-    if not ifo:
-        return []
-    haks = []
-    for h in list_items(ifo.get("Mod_HakList")):
-        name = (fld(h, "Mod_Hak", "") or "").lower()
-        if name.startswith("cep"):
-            haks.append(name)
-    return haks
 
 
 def load_2da_overrides(d: Path) -> None:
