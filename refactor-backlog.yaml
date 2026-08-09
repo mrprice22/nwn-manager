@@ -213,8 +213,38 @@ items:
 - id: itemprops-module
   phase: 1
   title: Extract item-property formatting and dedup keys into itemprops.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 4535163
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (133s), lotr2008 IDENTICAL (83s), lotr2009 IDENTICAL (105s)"
+  impl_notes: >
+    itemprops.py 345 lines; cli.py 17,887 -> 17,587.  15 symbols moved, including
+    _NON_IPRP_SUBTYPES (not in the plan list, but _table_lookup is its only
+    consumer so it had to travel with it).  Three of the planned symbols stayed in
+    cli.py to avoid a cycle: _conversation_key (needs nwn_text), _variant_diff_items
+    (needs SLOT_NAMES, which items-module owns, and Db.item_name) and _where_snippet
+    (needs a Db plus E() and nwn_text) — same shape as the three lookups-module left
+    behind.  Move checked by line multiset: 16 lines added (the import block only),
+    316 removed and all present verbatim in itemprops.py.  IPROP_DEFS/IPROP_TABLES/
+    IPRP_FEATS are safe as plain from-imports because load_2da_overrides mutates
+    them in place and never rebinds.
+  found:
+    - "_variant_diff_items and _creature_key spell out the same instance-then-
+       blueprint fallback idiom via four separate closure sets (_f/_lst,
+       _fv/_fb/_lstv/_lstb); a shared _fallback_reader(c, bp) would collapse six
+       closures.  Overlaps dedup-creature-row's _bp_field."
+    - "_cost_tiers does a function-local `from collections import defaultdict as
+       _dd`, which is now the only reason itemprops.py touches collections at all."
+    - "_yn and _fmt_hp hardcode inline presentation colours (#4a8, #888) — they are
+       renderer helpers that landed in itemprops.py only because the plan listed
+       them.  Revisit when render/ is carved out."
+    - "_prop_group classifies by substring match on lowercased property names with
+       overlapping predicates, so a name containing both 'damage bonus' and 'spell'
+       resolves by clause order rather than specificity."
+    - "itemprop_format treats the 65535/0 subtype pair as inline sentinels; the same
+       magic pair appears elsewhere in cli.py and wants a named constant."
+
   after: [lookups-module]
   ranges: "1068-1563"
   plan: >
