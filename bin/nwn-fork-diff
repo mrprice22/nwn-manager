@@ -1,0 +1,2320 @@
+#!/usr/bin/env python3
+"""nwn-fork-diff — compare ancestor module forks against a baseline module.
+
+Produces a content-migration worklist: what the ancestors have that the
+baseline lost, what the baseline has but orphaned, and how shared content
+diverged.
+
+Reads each module's pre-generated ``module-index/*.json`` (names there are
+already TLK-resolved) plus its ``unpacked/*.json`` GFF (for tags and deep
+fields the indexes don't carry).  Writes ``fork_diff.json`` + ``fork_diff.md``
+into the baseline's ``module-index/``.
+
+    nwn-fork-diff \
+        --fork     /path/to/nwn_lordoftherings \
+        --fork     /path/to/nwn_homers_lotr_2009 \
+        --baseline /path/to/nwn_homers_lotr
+
+The hard part is identity: resref is *not* stable across these forks.  Roughly
+8-10% of shared resrefs were repurposed to entirely different content, and half
+the areas that look deleted were merely re-resref'd.  So every axis runs on top
+of `resolve_identity`, which matches resref -> tag -> name -> fuzzy and records
+which rule fired.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import difflib
+import hashlib
+import json
+import math
+import re
+import sys
+from pathlib import Path
+from typing import Any, Iterable
+
+DATA_DIR = Path(__file__).resolve().parent / "wiki_data"
+
+
+# ---------------------------------------------------------------------------
+# GFF helpers (mirrors bin/nwn-wiki:113 — copied rather than imported because
+# nwn-wiki has no .py extension and 17k lines of import-time side effects)
+# ---------------------------------------------------------------------------
+
+def gff(node: Any, default: Any = None) -> Any:
+    """Unwrap a {'type': ..., 'value': ...} cell to its value."""
+    if isinstance(node, dict) and "value" in node:
+        return node["value"]
+    return default if node is None else node
+
+
+def fld(struct: dict | None, name: str, default: Any = None) -> Any:
+    """Look up a named field's *value* in a GFF struct/dict."""
+    if not struct or name not in struct:
+        return default
+    return gff(struct[name], default)
+
+
+# ---------------------------------------------------------------------------
+# Item property rendering — a compact subset of nwn-wiki's itemprop_format.
+# Enough to make a property delta readable; falls back to raw numbers.
+# ---------------------------------------------------------------------------
+
+def _load_itemprops() -> tuple[dict[int, dict], dict[str, dict]]:
+    p = DATA_DIR / "itemprops.json"
+    if not p.exists():
+        return {}, {}
+    d = json.loads(p.read_text())
+    return ({int(k): v for k, v in d.get("properties", {}).items()},
+            d.get("tables", {}))
+
+
+IPROP_DEFS, IPROP_TABLES = _load_itemprops()
+
+
+def _table_lookup(table_name: str | None, idx: int | None) -> str | None:
+    """Resolve a numeric index to a label: explicit row, then '_format'."""
+    if not table_name or idx is None:
+        return None
+    tbl = IPROP_TABLES.get(table_name)
+    if not isinstance(tbl, dict):
+        return None
+    row = tbl.get(str(idx))
+    if isinstance(row, str):
+        return row
+    fmt = tbl.get("_format")
+    if isinstance(fmt, str):
+        return fmt.format(idx)
+    return None
+
+
+def itemprop_label(prop: dict) -> str:
+    """Compact single-line label for one PropertiesList entry."""
+    pid = fld(prop, "PropertyName")
+    sub = fld(prop, "Subtype")
+    cost = fld(prop, "CostValue")
+    pdef = IPROP_DEFS.get(int(pid), {}) if pid is not None else {}
+    bits = [pdef.get("name") or (f"Property #{pid}" if pid is not None else "?")]
+    st = _table_lookup(pdef.get("subtype"), sub)
+    if st:
+        bits.append(st)
+    elif sub:
+        bits.append(f"subtype {sub}")
+    cs = _table_lookup(pdef.get("cost_table"), cost)
+    if cs:
+        bits.append(cs)
+    elif cost:
+        bits.append(str(cost))
+    return " ".join(bits)
+
+
+# ---------------------------------------------------------------------------
+# Name normalization
+# ---------------------------------------------------------------------------
+
+_MARKUP = re.compile(r"<[^>]*>")
+
+
+def strip_markup(s: str | None) -> str:
+    """Drop NWN <c???>/</c> colour codes and surrounding whitespace."""
+    return _MARKUP.sub("", s or "").strip()
+
+
+def norm_name(s: str | None) -> str:
+    """Lowercase, markup-free, alphanumerics only — the name-match key."""
+    return re.sub(r"[^a-z0-9]+", "", strip_markup(s).lower())
+
+
+# ---------------------------------------------------------------------------
+# Noise classification
+# ---------------------------------------------------------------------------
+
+STOCK_PREFIXES = ("nw_", "x0_", "x1_", "x2_", "x3_", "zep_", "ld_", "cep_")
+
+_SCAFFOLD_NAME = re.compile(
+    r"^(base\s|test\s|test$|wings?[ _/]?tail)|(\bmodifier$)|(\bproperties$)",
+    re.I,
+)
+
+
+def classify_noise(kind: str, ent: dict) -> str | None:
+    """Return a noise bucket for stock/scaffolding content, else None.
+
+    These dominate the raw absent-pool and nobody wants them migrated, but we
+    classify rather than drop so the counts stay auditable.
+    """
+    resref = (ent.get("resref") or "").lower()
+    name = strip_markup(ent.get("name"))
+    if resref.startswith(STOCK_PREFIXES):
+        return "summon_blueprint" if resref.startswith("nw_s_") else "stock_blueprint"
+    if kind == "item" and (ent.get("base_item") or "").lower().startswith("creature"):
+        return "creature_item"
+    if _SCAFFOLD_NAME.search(name):
+        return "scaffolding"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Autonumbered resrefs — the toolset assigns these, so they are not identity
+# ---------------------------------------------------------------------------
+
+# 'areaNNN' is what the New Area Wizard mints; '<stem>NNN' / '<stem>_N' is what
+# palette copy-paste mints for creatures and items.  Two modules agreeing on
+# such a resref is a collision, not evidence of shared identity — and two
+# modules disagreeing on one is not evidence of lost content.  Names are the
+# authority; these get demoted wherever a finding rests on the resref alone.
+_AUTONUM_AREA = re.compile(r"^area\d+$", re.I)
+_AUTONUM_COPY = re.compile(r"^(?P<stem>.*?)(?:_?\d{2,3})$")
+
+
+def is_autonumbered(kind: str, resref: str) -> bool:
+    rr = (resref or "").lower()
+    if kind == "area":
+        return bool(_AUTONUM_AREA.match(rr))
+    m = _AUTONUM_COPY.match(rr)
+    return bool(m and len(m.group("stem")) >= 3)
+
+
+# ---------------------------------------------------------------------------
+# Module loading
+# ---------------------------------------------------------------------------
+
+# entity kind -> docs/<section>/ directory holding its published pages
+DOC_SECTION = {"area": "areas", "creature": "creatures", "item": "items",
+               "conversation": "conversations", "store": "stores"}
+
+# Every URL Module.page_url has existence-checked.  render_html refuses to emit
+# an href that is not in here, which is what makes "zero dead links" a build
+# guarantee rather than an aspiration.
+VERIFIED_URLS: set[str] = set()
+
+
+class Module:
+    """One module repo: its module-index reports plus extracted GFF fields."""
+
+    def __init__(self, root: Path, wiki_base: str, label: str | None = None) -> None:
+        self.root = root
+        self.index_dir = root / "module-index"
+        self.unpacked = root / "unpacked"
+        self.docs_dir = root / "docs"
+        if not self.index_dir.is_dir():
+            raise SystemExit(f"no module-index/ in {root} — run the wiki build there first")
+        if not self.unpacked.is_dir():
+            raise SystemExit(f"no unpacked/ in {root}")
+        self.wiki_base = wiki_base.rstrip("/") + "/"
+        self.docs_pages = self._scan_docs_pages()
+        self.title = self._index("area_index.json").get("module") or root.name
+        self.label = label or root.name
+        self.wiki_label = root.name  # replaced with a short label once linked
+        self._gff_cache: dict[str, dict[str, dict]] = {}
+        self._dialogs: dict[str, dict] | None = None
+        self.areas = self._load_areas()
+        self.creatures = self._load_creatures()
+        self.items = self._load_items()
+        # Name-level rollups.  A single blueprint being unplaced/unreachable is
+        # not evidence the *content* is gone: these modules routinely carry
+        # several blueprints of the same name (baseline has two "Gandalf the
+        # Gray", one placed and one not), and identity resolution consumes each
+        # baseline entity once, so a fork entity can land on the dead twin.
+        self.placed_names = {norm_name(c["name"]) for c in self.creatures.values()
+                             if c["placed"] and norm_name(c["name"])}
+        self.accessible_names = {norm_name(i["name"]) for i in self.items.values()
+                                 if i["accessible"] and norm_name(i["name"])}
+        self.reachable_area_names = {norm_name(a["name"]) for a in self.areas.values()
+                                     if a["inbound"] > 0 and norm_name(a["name"])}
+
+    # -- published wiki pages ---------------------------------------------
+
+    def _scan_docs_pages(self) -> dict[str, set[str]]:
+        """Page stems that actually exist under docs/<section>/.
+
+        This is the *only* source of link truth.  The `wiki_url` fields in
+        module-index are not usable — a wiki build without --base-url writes
+        absolute local paths into every one of them — and they are also emitted
+        for pages the build then skips (hidden areas), so trusting them yields
+        404s.  Scanning the built tree instead handles the `__vN` variant stems
+        and the hidden-area gaps for free.
+        """
+        out: dict[str, set[str]] = {}
+        for section in ("areas", "creatures", "items", "conversations", "stores"):
+            d = self.docs_dir / section
+            out[section] = ({p.stem.lower() for p in d.glob("*.html")}
+                            if d.is_dir() else set())
+        return out
+
+    def page_url(self, kind: str, resref: str) -> str:
+        """Public URL for an entity's wiki page, or '' if this module has none."""
+        section = DOC_SECTION.get(kind)
+        if not section or not resref:
+            return ""
+        if resref.lower() not in self.docs_pages.get(section, ()):
+            return ""
+        url = f"{self.wiki_base}{section}/{resref.lower()}.html"
+        VERIFIED_URLS.add(url)
+        return url
+
+    # -- raw report access ------------------------------------------------
+
+    def _index(self, name: str) -> dict:
+        p = self.index_dir / name
+        if not p.exists():
+            return {}
+        return json.loads(p.read_text())
+
+    # -- GFF extraction ---------------------------------------------------
+
+    def _gff(self, ext: str, extract) -> dict[str, dict]:
+        """Read every unpacked/*.<ext>.json once, keeping only what we need."""
+        if ext in self._gff_cache:
+            return self._gff_cache[ext]
+        out: dict[str, dict] = {}
+        for p in sorted(self.unpacked.glob(f"*.{ext}.json")):
+            resref = p.name[: -len(f".{ext}.json")].lower()
+            try:
+                d = json.loads(p.read_text())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            out[resref] = extract(d)
+        self._gff_cache[ext] = out
+        return out
+
+    @staticmethod
+    def _extract_utc(d: dict) -> dict:
+        classes = sorted(
+            (fld(c, "Class"), fld(c, "ClassLevel"))
+            for c in (fld(d, "ClassList") or [])
+        )
+        return {
+            "tag": fld(d, "Tag", ""),
+            "natural_ac": fld(d, "NaturalAC"),
+            "classes": classes,
+            "feat_count": len(fld(d, "FeatList") or []),
+            "conversation": fld(d, "Conversation", ""),
+            "equip": sorted(
+                str(fld(e, "EquippedRes", "")).lower()
+                for e in (fld(d, "Equip_ItemList") or [])
+            ),
+            "inventory": sorted(
+                str(fld(e, "InventoryRes", "")).lower()
+                for e in (fld(d, "ItemList") or [])
+            ),
+            "scripts": {k: fld(d, k, "") for k in d if k.startswith("Script")},
+        }
+
+    @staticmethod
+    def _extract_uti(d: dict) -> dict:
+        props = []
+        for p in fld(d, "PropertiesList") or []:
+            props.append((
+                fld(p, "PropertyName"), fld(p, "Subtype"),
+                fld(p, "CostTable"), fld(p, "CostValue"), fld(p, "Param1Value"),
+                itemprop_label(p),
+            ))
+        return {
+            "tag": fld(d, "Tag", ""),
+            "cost": fld(d, "Cost"),
+            "add_cost": fld(d, "AddCost"),
+            "charges": fld(d, "Charges"),
+            "stack": fld(d, "StackSize"),
+            "plot": fld(d, "Plot"),
+            "cursed": fld(d, "Cursed"),
+            "props": props,
+        }
+
+    @staticmethod
+    def _extract_are(d: dict) -> dict:
+        return {
+            "tag": fld(d, "Tag", ""),
+            "tileset": fld(d, "Tileset", ""),
+            "width": fld(d, "Width"),
+            "height": fld(d, "Height"),
+            "scripts": {k: fld(d, k, "") for k in
+                        ("OnEnter", "OnExit", "OnHeartbeat", "OnUserDefined")},
+        }
+
+    # -- normalized entity tables ----------------------------------------
+
+    def _load_areas(self) -> dict[str, dict]:
+        graph = self._index("area_graph.json").get("areas", {})
+        inbound: dict[str, int] = {}
+        for src, node in graph.items():
+            for t in node.get("transitions", []):
+                if t.get("to"):
+                    inbound[t["to"]] = inbound.get(t["to"], 0) + 1
+        gffs = self._gff("are", self._extract_are)
+        out = {}
+        for a in self._index("area_index.json").get("areas", []):
+            rr = a["resref"].lower()
+            g = gffs.get(rr, {})
+            node = graph.get(rr, {})
+            out[rr] = {
+                "kind": "area", "resref": rr, "name": a.get("name", ""),
+                "tag": g.get("tag", ""),
+                "creature_count": a.get("creature_count", 0),
+                "encounter_count": a.get("encounter_count", 0),
+                "store_count": a.get("store_count", 0),
+                "container_count": a.get("container_count", 0),
+                "hidden": a.get("hidden", False),
+                "outbound": len(node.get("transitions", [])),
+                "inbound": inbound.get(rr, 0),
+                "transitions": sorted({t.get("to", "") for t in node.get("transitions", [])}),
+                "tileset": g.get("tileset", ""),
+                "width": g.get("width"), "height": g.get("height"),
+                "scripts": g.get("scripts", {}),
+            }
+        return out
+
+    def _load_creatures(self) -> dict[str, dict]:
+        unspawned = {c["canonical_resref"].lower()
+                     for c in self._index("unspawned_creatures.json").get("creatures", [])}
+        gffs = self._gff("utc", self._extract_utc)
+        out = {}
+        for c in self._index("creature_index.json").get("creatures", []):
+            rr = (c.get("canonical_resref") or c.get("resref") or "").lower()
+            if not rr:
+                continue
+            g = gffs.get(rr) or gffs.get((c.get("resref") or "").lower(), {})
+            locs = c.get("locations", [])
+            out[rr] = {
+                "kind": "creature", "resref": rr, "name": c.get("name", ""),
+                "tag": g.get("tag", ""),
+                "cr": _num(c.get("cr")), "hp": c.get("hp"),
+                "race": c.get("race", ""), "faction": c.get("faction_name", ""),
+                "appearance": c.get("appearance_name", ""),
+                "locations": locs,
+                "placements": sum(l.get("count", 1) for l in locs),
+                "placed": rr not in unspawned,
+                "classes": g.get("classes", []),
+                "natural_ac": g.get("natural_ac"),
+                "feat_count": g.get("feat_count"),
+                "conversation": g.get("conversation", ""),
+                "scripts": g.get("scripts", {}),
+                "equip": g.get("equip", []),
+                "inventory": g.get("inventory", []),
+            }
+        return out
+
+    def _load_items(self) -> dict[str, dict]:
+        inacc = {i["resref"].lower(): i
+                 for i in self._index("inaccessible_items.json").get("items", [])}
+        gffs = self._gff("uti", self._extract_uti)
+        out = {}
+        for i in self._index("item_index.json").get("items", []):
+            rr = i["resref"].lower()
+            g = gffs.get(rr, {})
+            out[rr] = {
+                "kind": "item", "resref": rr, "name": i.get("name", ""),
+                "tag": g.get("tag", ""),
+                "base_item": i.get("base_item", ""),
+                "cost_gp": i.get("cost_gp", 0),
+                "accessible": bool(i.get("accessible")),
+                "sources": i.get("sources", []),
+                "inaccessible_reason": (inacc.get(rr) or {}).get("reason", ""),
+                "props": g.get("props", []),
+                "cost": g.get("cost"), "add_cost": g.get("add_cost"),
+                "plot": g.get("plot"), "cursed": g.get("cursed"),
+            }
+        return out
+
+    # -- scripts & dialogs ------------------------------------------------
+
+    def script_hashes(self) -> dict[str, tuple[str, int]]:
+        """resref -> (hash of comment-stripped normalized source, line count)."""
+        out = {}
+        for p in sorted(self.unpacked.glob("*.nss")):
+            text = p.read_text(encoding="utf-8", errors="replace")
+            body = re.sub(r"//[^\n]*|/\*.*?\*/", "", text, flags=re.S)
+            body = re.sub(r"\s+", " ", body).strip()
+            out[p.stem.lower()] = (hashlib.sha1(body.encode()).hexdigest(),
+                                   text.count("\n") + 1)
+        return out
+
+    def script_source(self, resref: str) -> str:
+        p = self.unpacked / f"{resref}.nss"
+        return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+
+    @staticmethod
+    def _locstring(node: dict | None) -> str:
+        """First localized string out of a CExoLocString cell."""
+        v = gff(node) if node is not None else None
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict):
+            for k in sorted(v):
+                if isinstance(v[k], str) and v[k].strip():
+                    return v[k]
+        return ""
+
+    def dialogs(self) -> dict[str, dict]:
+        """resref -> node counts, an ordered transcript, and its hash.
+
+        The old version kept only three integers, so a conversation whose text
+        was rewritten wholesale but kept its shape was invisible, and a
+        conversation that merely moved to a new resref looked dropped.  The
+        transcript fixes both and is what the report diffs.
+        """
+        if self._dialogs is not None:
+            return self._dialogs
+        out: dict[str, dict] = {}
+        for p in sorted(self.unpacked.glob("*.dlg.json")):
+            try:
+                d = json.loads(p.read_text())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            nodes: list[dict] = []
+            scripts: set[str] = set()
+            for role, key in (("NPC", "EntryList"), ("PC", "ReplyList")):
+                for i, n in enumerate(fld(d, key) or []):
+                    text = self._locstring(n.get("Text"))
+                    act, cond = fld(n, "Script", ""), fld(n, "Active", "")
+                    quest = fld(n, "Quest", "")
+                    scripts.update(s for s in (act, cond) if s)
+                    nodes.append({
+                        "role": role, "index": i, "text": strip_markup(text),
+                        "speaker": fld(n, "Speaker", ""),
+                        "script": act, "active": cond, "quest": quest,
+                    })
+            transcript = [f"{n['role']} {n['index']}: {n['text']}" for n in nodes]
+            out[p.name[: -len(".dlg.json")].lower()] = {
+                "entries": len(fld(d, "EntryList") or []),
+                "replies": len(fld(d, "ReplyList") or []),
+                "starts": len(fld(d, "StartingList") or []),
+                "nodes": nodes,
+                "scripts": sorted(scripts),
+                "transcript": transcript,
+                "text_hash": hashlib.sha1(
+                    "\n".join(n["text"] for n in nodes).encode()).hexdigest(),
+            }
+        self._dialogs = out
+        return out
+
+    def dialog_owners(self) -> dict[str, list[dict]]:
+        """conversation resref -> the creatures that use it, and where they stand."""
+        out: dict[str, list[dict]] = {}
+        for rr, c in self.creatures.items():
+            conv = (c.get("conversation") or "").lower()
+            if not conv:
+                continue
+            out.setdefault(conv, []).append({
+                "resref": rr, "name": strip_markup(c["name"]),
+                "areas": sorted({l.get("area_name", "") for l in c["locations"] if l.get("area_name")}),
+                "placed": c["placed"],
+            })
+        for v in out.values():
+            v.sort(key=lambda c: c["name"])
+        return out
+
+    # -- cross-module wiki links -----------------------------------------
+
+    def table_for(self, kind: str) -> dict[str, dict]:
+        if kind == "conversation":
+            return self.dialogs()
+        return {"area": self.areas, "creature": self.creatures,
+                "item": self.items}[kind]
+
+    def by_norm_name(self, kind: str) -> dict[str, list[str]]:
+        """normalized name -> resrefs, for cross-module lookup by name."""
+        cache = getattr(self, "_name_cache", None)
+        if cache is None:
+            cache = self._name_cache = {}
+        if kind not in cache:
+            idx: dict[str, list[str]] = {}
+            for rr, e in self.table_for(kind).items():
+                n = norm_name(e.get("name"))
+                if n:
+                    idx.setdefault(n, []).append(rr)
+            for v in idx.values():
+                v.sort()
+            cache[kind] = idx
+        return cache[kind]
+
+
+def short_wiki_label(mod: Module, is_baseline: bool) -> str:
+    """A compact name for a module's wiki, taken from its published host."""
+    if is_baseline:
+        return "live"
+    m = re.match(r"https?://([^./]+)\.", mod.wiki_base)
+    if m:
+        return "2008" if m.group(1) == "lotr" else m.group(1)
+    return mod.root.name
+
+
+def wiki_links(pairs: list[tuple[Module, str, str]], kind: str) -> list[dict]:
+    """Build a chip per module: {label, url, present, resref}.
+
+    Fork and baseline resrefs differ for renamed content, so each module is
+    looked up with *its own* resref rather than a shared one.  Modules where
+    the entity has no page still get a chip, with ``present: False`` — the
+    *absence* of a link is the finding ("this does not exist over there"), so
+    it has to be rendered rather than silently omitted.
+    """
+    out, seen = [], set()
+    for mod, resref, label in pairs:
+        if label in seen:
+            continue
+        seen.add(label)
+        url = mod.page_url(kind, resref) if resref else ""
+        out.append({"label": label, "url": url, "present": bool(url),
+                    "resref": (resref or "").lower()})
+    return out
+
+
+# (baseline, [(label, fork_module), ...]) — set once by main(), so every finding
+# can be given a chip for *every* module rather than only the ones it came from.
+ALL_MODULES: list[tuple[str, Module]] = []
+
+
+def entity_chips(kind: str, resrefs: dict[str, str], name: str = "") -> list[dict]:
+    """One chip per known module, resolving by resref then by name.
+
+    ``resrefs`` maps a module's wiki label to the resref that module uses for
+    this entity, where it is known.  Where it is not, we fall back to a
+    name lookup in that module, so a chip only comes out absent when the entity
+    genuinely has no page there.
+    """
+    pairs = []
+    for label, mod in ALL_MODULES:
+        rr = (resrefs.get(label) or "").lower()
+        if not rr and name:
+            cands = mod.by_norm_name(kind).get(norm_name(name)) or []
+            rr = cands[0] if cands else ""
+        pairs.append((mod, rr, label))
+    return wiki_links(pairs, kind)
+
+
+def merge_links(rec: dict, extra: list[dict]) -> None:
+    """Add chips for modules not already represented, upgrading absent→present."""
+    by_label = {l["label"]: l for l in rec.setdefault("wiki_links", [])}
+    for l in extra:
+        cur = by_label.get(l["label"])
+        if cur is None:
+            rec["wiki_links"].append(l)
+            by_label[l["label"]] = l
+        elif l["present"] and not cur["present"]:
+            cur.update(l)
+
+
+def _num(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Component 1 — identity resolution
+# ---------------------------------------------------------------------------
+
+# ratio >= CUTOFF implies max_len <= min_len * (2/CUTOFF - 1); used to skip
+# hopeless candidates before paying for SequenceMatcher.
+FUZZY_CUTOFF = 0.82
+_LEN_BOUND = 2.0 / FUZZY_CUTOFF - 1.0
+
+
+def resolve_identity(fork: dict[str, dict], base: dict[str, dict],
+                     *, fuzzy: bool = True) -> dict[str, dict]:
+    """Match every fork entity to at most one baseline entity.
+
+    Tries resref, then tag, then normalized name, then fuzzy name.  Each
+    baseline entity is consumed once.  Returns {fork_resref: {match_kind,
+    base_resref}} with match_kind 'none' when nothing matched.
+    """
+    matches: dict[str, dict] = {}
+    consumed: set[str] = set()
+
+    # 1. resref
+    for rr in fork:
+        if rr in base:
+            matches[rr] = {"match_kind": "resref", "base_resref": rr}
+            consumed.add(rr)
+
+    remaining = [rr for rr in fork if rr not in matches]
+
+    # 2. tag — only when the tag identifies exactly one entity on *both*
+    #    sides.  Area tags in particular are heavily duplicated ('Area001' is
+    #    shared by six areas), so an ambiguous tag is worse than no tag.
+    base_by_tag: dict[str, list[str]] = {}
+    for rr, e in base.items():
+        if e.get("tag"):
+            base_by_tag.setdefault(e["tag"].lower(), []).append(rr)
+    fork_tag_counts: dict[str, int] = {}
+    for rr in remaining:
+        t = (fork[rr].get("tag") or "").lower()
+        if t:
+            fork_tag_counts[t] = fork_tag_counts.get(t, 0) + 1
+    for rr in remaining:
+        t = (fork[rr].get("tag") or "").lower()
+        if not t or fork_tag_counts.get(t, 0) != 1:
+            continue
+        cands = base_by_tag.get(t, [])
+        if len(cands) == 1 and cands[0] not in consumed:
+            matches[rr] = {"match_kind": "tag", "base_resref": cands[0]}
+            consumed.add(cands[0])
+
+    remaining = [rr for rr in fork if rr not in matches]
+
+    # 3. exact normalized name
+    base_by_name: dict[str, list[str]] = {}
+    for rr, e in base.items():
+        base_by_name.setdefault(norm_name(e.get("name")), []).append(rr)
+    for rr in sorted(remaining):
+        n = norm_name(fork[rr].get("name"))
+        if not n:
+            continue
+        for cand in sorted(base_by_name.get(n, [])):
+            if cand not in consumed:
+                matches[rr] = {"match_kind": "name", "base_resref": cand}
+                consumed.add(cand)
+                break
+
+    remaining = [rr for rr in fork if rr not in matches]
+
+    # 4. fuzzy name over what's left
+    if fuzzy:
+        pool = [(norm_name(base[rr].get("name")), rr)
+                for rr in base if rr not in consumed and norm_name(base[rr].get("name"))]
+        by_len: dict[int, list[tuple[str, str]]] = {}
+        for n, rr in pool:
+            by_len.setdefault(len(n), []).append((n, rr))
+        for rr in sorted(remaining):
+            n = norm_name(fork[rr].get("name"))
+            if not n:
+                continue
+            lo, hi = math.ceil(len(n) / _LEN_BOUND), math.floor(len(n) * _LEN_BOUND)
+            best, best_rr = 0.0, None
+            for ln in range(lo, hi + 1):
+                for cn, crr in by_len.get(ln, []):
+                    if crr in consumed:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, n, cn).ratio()
+                    if ratio > best:
+                        best, best_rr = ratio, crr
+            if best_rr and best >= FUZZY_CUTOFF:
+                matches[rr] = {"match_kind": "fuzzy", "base_resref": best_rr,
+                               "similarity": round(best, 3)}
+                consumed.add(best_rr)
+
+    for rr in fork:
+        matches.setdefault(rr, {"match_kind": "none", "base_resref": None})
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# Component 2 — lost content to reclaim
+# ---------------------------------------------------------------------------
+
+def reclaim_score(kind: str, e: dict) -> float:
+    """Rough 'how much content comes back if we reclaim this' weight."""
+    if kind == "area":
+        return (e["creature_count"] * 3 + e["encounter_count"] * 2
+                + e["store_count"] * 5 + e["container_count"] * 2 + e["inbound"])
+    if kind == "creature":
+        return (e["placements"] * 4 + min(e["cr"], 100) / 10
+                + (3 if e.get("conversation") else 0))
+    # item
+    return ((10 if e["accessible"] else 0)
+            + min(e.get("cost_gp") or 0, 5_000_000) / 500_000)
+
+
+def lost_content(forks: list[tuple[str, Module]], base: Module,
+                 resolved: dict, include_stock: bool) -> dict:
+    """Fork entities that resolved to nothing in the baseline."""
+    out: dict[str, list] = {"areas": [], "creatures": [], "items": []}
+    noise: dict[str, int] = {}
+    seen: dict[str, set] = {"areas": set(), "creatures": set(), "items": set()}
+
+    for label, mod in forks:
+        for kind, plural, table in (("area", "areas", mod.areas),
+                                    ("creature", "creatures", mod.creatures),
+                                    ("item", "items", mod.items)):
+            for rr, e in table.items():
+                if resolved[label][plural][rr]["match_kind"] != "none":
+                    continue
+                bucket = classify_noise(kind, e)
+                if bucket and not include_stock:
+                    noise[bucket] = noise.get(bucket, 0) + 1
+                    continue
+                key = (rr, norm_name(e["name"]))
+                if key in seen[plural]:
+                    # already reported from an earlier fork; note the extra source
+                    for rec in out[plural]:
+                        if (rec["resref"], norm_name(rec["name"])) == key:
+                            rec["forks"].append(label)
+                            rec["fork_resrefs"][label] = rr
+                            merge_links(rec, entity_chips(
+                                kind, {label: rr}, rec["name"]))
+                            break
+                    continue
+                seen[plural].add(key)
+                rec = {
+                    "resref": rr, "name": strip_markup(e["name"]), "tag": e["tag"],
+                    "forks": [label], "fork_resrefs": {label: rr},
+                    "score": round(reclaim_score(kind, e), 2),
+                    "wiki_links": entity_chips(kind, {label: rr},
+                                               strip_markup(e["name"])),
+                }
+                if bucket:
+                    rec["noise_bucket"] = bucket
+                if kind == "area":
+                    rec.update({
+                        "creature_count": e["creature_count"],
+                        "encounter_count": e["encounter_count"],
+                        "store_count": e["store_count"],
+                        "container_count": e["container_count"],
+                        "inbound": e["inbound"], "outbound": e["outbound"],
+                        "tileset": e["tileset"],
+                        "scripts": sorted({s for s in e["scripts"].values() if s}),
+                        "contains": _area_manifest(mod, rr, label),
+                    })
+                elif kind == "creature":
+                    rec.update({
+                        "cr": e["cr"], "hp": e["hp"], "race": e["race"],
+                        "faction": e["faction"], "placed": e["placed"],
+                        "placements": e["placements"],
+                        "areas": sorted({l.get("area_name", "") for l in e["locations"]}),
+                        "conversation": e["conversation"],
+                        "scripts": sorted({s for s in e["scripts"].values() if s}),
+                    })
+                else:
+                    rec.update({
+                        "base_item": e["base_item"], "cost_gp": e["cost_gp"],
+                        "accessible_in_fork": e["accessible"],
+                        "sources": e["sources"],
+                        "properties": [p[5] for p in e["props"]],
+                    })
+                out[plural].append(rec)
+
+    for plural in out:
+        out[plural].sort(key=lambda r: (-r["score"], r["name"]))
+    return {"noise_filtered": noise, **out}
+
+
+def _area_manifest(mod: Module, area_rr: str, label: str) -> dict:
+    """What a lost area contained, so reclaiming it pulls its content along."""
+    creatures = []
+    for rr, c in mod.creatures.items():
+        for loc in c["locations"]:
+            if (loc.get("area_resref") or "").lower() == area_rr:
+                creatures.append({
+                    "resref": rr, "name": strip_markup(c["name"]),
+                    "cr": c["cr"], "count": loc.get("count", 1),
+                    "wiki_links": entity_chips("creature", {label: rr},
+                                               strip_markup(c["name"])),
+                })
+                break
+    creatures.sort(key=lambda c: -c["cr"])
+    return {"creatures": creatures}
+
+
+# ---------------------------------------------------------------------------
+# Component 3 — accessibility regressions
+# ---------------------------------------------------------------------------
+
+def _siblings(base: Module, kind: str, name: str, flag: str) -> list[dict]:
+    """Every baseline blueprint sharing this name, with its own status.
+
+    Answers the question a bare finding leaves open: "there are four Weathertop
+    King blueprints — which one do I place?"
+    """
+    out = []
+    for rr in base.by_norm_name(kind).get(norm_name(name), []):
+        e = base.table_for(kind)[rr]
+        out.append({
+            "resref": rr, "ok": bool(e.get(flag)),
+            "wiki_links": entity_chips(kind, {base.wiki_label: rr}, name),
+        })
+    return sorted(out, key=lambda s: (not s["ok"], s["resref"]))
+
+
+def accessibility(forks: list[tuple[str, Module]], base: Module,
+                  resolved: dict) -> dict:
+    improved: list[dict] = []
+    # keyed by baseline resref so a finding present in several forks is one row
+    reg_by_rr: dict[str, dict] = {}
+    orph_by_rr: dict[str, dict] = {}
+    spawn_by_rr: dict[str, dict] = {}
+    # Findings the name-level rollup demoted: the *content* is still live in the
+    # baseline, just under a different blueprint of the same name.  Kept and
+    # reported separately rather than dropped, so the reader can see why an
+    # entry they expected is not in the real list.
+    dup_reg: dict[str, dict] = {}
+    dup_spawn: dict[str, dict] = {}
+    dup_orph: dict[str, dict] = {}
+
+    def _record(store: dict, key: str, seed: dict, label: str, fork_rr: str,
+                match_kind: str) -> dict:
+        rec = store.setdefault(key, seed)
+        rec["forks"].append(label)
+        rec["fork_resrefs"][label] = fork_rr
+        rec["match_kinds"].append(match_kind)
+        merge_links(rec, entity_chips(seed["kind"], {label: fork_rr}, rec["name"]))
+        return rec
+
+    for label, mod in forks:
+        # items reachable in the fork, unreachable now
+        for rr, e in mod.items.items():
+            m = resolved[label]["items"][rr]
+            if m["match_kind"] == "none":
+                continue
+            b = base.items[m["base_resref"]]
+            name = strip_markup(b["name"])
+            if e["accessible"] and not b["accessible"]:
+                live = norm_name(name) in base.accessible_names
+                seed = {
+                    "kind": "item",
+                    "resref": b["resref"], "name": name,
+                    "forks": [], "fork_resrefs": {}, "match_kinds": [],
+                    "base_item": b["base_item"], "cost_gp": b["cost_gp"],
+                    "reason_now": b["inaccessible_reason"],
+                    "sources_in_fork": [],
+                    "siblings": _siblings(base, "item", name, "accessible"),
+                    "wiki_links": entity_chips(
+                        "item", {base.wiki_label: b["resref"]}, name),
+                }
+                rec = _record(dup_reg if live else reg_by_rr, b["resref"], seed,
+                              label, rr, m["match_kind"])
+                for s in e["sources"]:
+                    if s not in rec["sources_in_fork"]:
+                        rec["sources_in_fork"].append(s)
+            elif not e["accessible"] and b["accessible"]:
+                improved.append({"resref": b["resref"], "fork": label})
+
+        # areas that had inbound transitions in the fork and have none now
+        for rr, e in mod.areas.items():
+            m = resolved[label]["areas"][rr]
+            if m["match_kind"] == "none":
+                continue
+            b = base.areas[m["base_resref"]]
+            name = strip_markup(b["name"])
+            if e["inbound"] > 0 and b["inbound"] == 0:
+                live = norm_name(name) in base.reachable_area_names
+                seed = {
+                    "kind": "area",
+                    "resref": b["resref"], "name": name,
+                    "forks": [], "fork_resrefs": {}, "match_kinds": [],
+                    "inbound_in_fork": 0,
+                    "creature_count": b["creature_count"],
+                    "hidden": b.get("hidden", False),
+                    "siblings": _siblings(base, "area", name, "inbound"),
+                    "wiki_links": entity_chips(
+                        "area", {base.wiki_label: b["resref"]}, name),
+                }
+                rec = _record(dup_orph if live else orph_by_rr, b["resref"], seed,
+                              label, rr, m["match_kind"])
+                rec["inbound_in_fork"] = max(rec["inbound_in_fork"], e["inbound"])
+
+        # creatures placed in the fork, blueprint-only now
+        for rr, e in mod.creatures.items():
+            m = resolved[label]["creatures"][rr]
+            if m["match_kind"] == "none":
+                continue
+            b = base.creatures[m["base_resref"]]
+            name = strip_markup(b["name"])
+            if e["placed"] and not b["placed"]:
+                # The matched baseline blueprint is unplaced — but identity
+                # resolution consumes each baseline entity once, so it may have
+                # landed on the dead twin of a name that *is* placed elsewhere
+                # (baseline carries two "Gandalf the Gray", one of each).  Only
+                # a name with no placed blueprint at all is a real regression.
+                live = norm_name(name) in base.placed_names
+                seed = {
+                    "kind": "creature",
+                    "resref": b["resref"], "name": name,
+                    "forks": [], "fork_resrefs": {}, "match_kinds": [],
+                    "cr": b["cr"], "areas_in_fork": [],
+                    "siblings": _siblings(base, "creature", name, "placed"),
+                    "wiki_links": entity_chips(
+                        "creature", {base.wiki_label: b["resref"]}, name),
+                }
+                rec = _record(dup_spawn if live else spawn_by_rr, b["resref"], seed,
+                              label, rr, m["match_kind"])
+                for a in sorted({l.get("area_name", "") for l in e["locations"]}):
+                    if a and a not in rec["areas_in_fork"]:
+                        rec["areas_in_fork"].append(a)
+
+    regressed = sorted(reg_by_rr.values(), key=lambda r: -(r["cost_gp"] or 0))
+    lost_spawns = sorted(spawn_by_rr.values(), key=lambda r: -r["cr"])
+    orphaned_areas = sorted(orph_by_rr.values(), key=lambda r: -r["creature_count"])
+    by_fork: dict[str, int] = {}
+    for r in regressed:
+        for f in r["forks"]:
+            by_fork[f] = by_fork.get(f, 0) + 1
+
+    return {
+        "items_regressed": regressed,
+        "items_regressed_by_fork": by_fork,
+        "items_improved_count": len(improved),
+        "areas_orphaned": orphaned_areas,
+        "creatures_no_longer_spawned": lost_spawns,
+        "items_regressed_dup": sorted(dup_reg.values(),
+                                      key=lambda r: -(r["cost_gp"] or 0)),
+        "creatures_spawned_elsewhere": sorted(dup_spawn.values(),
+                                              key=lambda r: -r["cr"]),
+        "areas_orphaned_dup": sorted(dup_orph.values(),
+                                     key=lambda r: -r["creature_count"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Component 4 — diverged shared content
+# ---------------------------------------------------------------------------
+
+def _delta(a: dict, b: dict, fields: Iterable[str]) -> dict:
+    out = {}
+    for f in fields:
+        if a.get(f) != b.get(f):
+            out[f] = {"fork": a.get(f), "baseline": b.get(f)}
+    return out
+
+
+def divergence(forks: list[tuple[str, Module]], base: Module,
+               resolved: dict, include_stock: bool) -> dict:
+    rebalanced: list[dict] = []
+    # keyed by (kind, resref, fork name) so the same repurposing seen in two
+    # forks is one row listing both, not two near-identical rows
+    repurp_by_key: dict[tuple, dict] = {}
+
+    for label, mod in forks:
+        for plural, table, btable, fields in (
+            ("creatures", mod.creatures, base.creatures,
+             ("cr", "hp", "race", "faction", "appearance", "natural_ac",
+              "classes", "feat_count", "conversation")),
+            ("items", mod.items, base.items,
+             ("base_item", "cost_gp", "add_cost", "plot", "cursed")),
+            ("areas", mod.areas, base.areas,
+             ("tileset", "width", "height")),
+        ):
+            kind = plural[:-1]
+            for rr, e in table.items():
+                m = resolved[label][plural][rr]
+                if m["match_kind"] == "none":
+                    continue
+                if not include_stock and classify_noise(kind, e):
+                    continue
+                b = btable[m["base_resref"]]
+                same_name = norm_name(e["name"]) == norm_name(b["name"])
+
+                if m["match_kind"] == "resref" and not same_name:
+                    key = (kind, rr, norm_name(e["name"]))
+                    rec = repurp_by_key.setdefault(key, {
+                        "kind": kind, "resref": rr, "forks": [],
+                        "fork_name": strip_markup(e["name"]),
+                        "baseline_name": strip_markup(b["name"]),
+                        "fork_tag": e["tag"], "baseline_tag": b["tag"],
+                        # A shared 'areaNNN' / '<stem>NNN' resref is the toolset
+                        # numbering two unrelated things the same, not a slot
+                        # anybody deliberately reused.
+                        "autonumbered": is_autonumbered(kind, rr),
+                        "wiki_links": entity_chips(
+                            kind, {base.wiki_label: b["resref"], label: rr}),
+                    })
+                    rec["forks"].append(label)
+                    merge_links(rec, entity_chips(kind, {label: rr}))
+                    continue
+
+                d = _delta(e, b, fields)
+                if plural == "items":
+                    fp = {p[:5] for p in e["props"]}
+                    bp = {p[:5] for p in b["props"]}
+                    if fp != bp:
+                        flab = {p[:5]: p[5] for p in e["props"]}
+                        blab = {p[:5]: p[5] for p in b["props"]}
+                        d["properties"] = {
+                            "removed": sorted(flab[k] for k in fp - bp),
+                            "added": sorted(blab[k] for k in bp - fp),
+                        }
+                elif plural == "areas":
+                    ft, bt = set(e["transitions"]), set(b["transitions"])
+                    if ft != bt:
+                        d["transitions"] = {"removed": sorted(ft - bt),
+                                            "added": sorted(bt - ft)}
+                if not d:
+                    continue
+                rec = {
+                    "kind": kind, "fork": label, "fork_resref": rr,
+                    "resref": b["resref"], "match_kind": m["match_kind"],
+                    "name": strip_markup(b["name"]), "changes": d,
+                    "wiki_links": entity_chips(
+                        kind, {base.wiki_label: b["resref"], label: rr},
+                        strip_markup(b["name"])),
+                }
+                if not same_name:
+                    rec["fork_name"] = strip_markup(e["name"])
+                rebalanced.append(rec)
+
+    repurposed = sorted(repurp_by_key.values(), key=lambda r: (r["kind"], r["resref"]))
+    rebalanced.sort(key=lambda r: (r["kind"], -len(r["changes"]), r["name"]))
+    by_kind: dict[str, list[dict]] = {}
+    for r in rebalanced:
+        by_kind.setdefault(r["kind"], []).append(r)
+    return {
+        "repurposed": [r for r in repurposed if not r["autonumbered"]],
+        "repurposed_autonumbered": [r for r in repurposed if r["autonumbered"]],
+        "rebalanced": rebalanced,
+        "rebalanced_by_kind": by_kind,
+        "by_name": name_divergence(forks, base, include_stock),
+    }
+
+
+def name_divergence(forks: list[tuple[str, Module]], base: Module,
+                    include_stock: bool) -> dict:
+    """The same comparison keyed on *names* rather than resrefs.
+
+    resrefs are the wrong axis for "what changed": the toolset autonumbers area
+    and copy-paste resrefs, so two modules can hold the same content under
+    different resrefs and different content under the same one.  Keyed on name,
+    the three interesting buckets fall out cleanly per kind: content that
+    survived under a new resref, content only the fork has, and content only the
+    baseline has — and the resref pair is then reported as *supporting detail*
+    ("was X, is now Y") rather than as the thing being matched on.
+    """
+    out: dict[str, dict] = {}
+    for kind in ("area", "creature", "item"):
+        btable = base.table_for(kind)
+        bnames = base.by_norm_name(kind)
+        renamed: list[dict] = []
+        only_fork: dict[str, dict] = {}
+        seen_names: set[str] = set()
+
+        for label, mod in forks:
+            for rr, e in mod.table_for(kind).items():
+                if not include_stock and classify_noise(kind, e):
+                    continue
+                n = norm_name(e["name"])
+                if not n:
+                    continue
+                cands = bnames.get(n) or []
+                if not cands:
+                    rec = only_fork.setdefault(n, {
+                        "kind": kind, "name": strip_markup(e["name"]),
+                        "forks": [], "fork_resrefs": {},
+                        "wiki_links": entity_chips(kind, {label: rr},
+                                                   strip_markup(e["name"])),
+                    })
+                    rec["forks"].append(label)
+                    rec["fork_resrefs"][label] = rr
+                    merge_links(rec, entity_chips(kind, {label: rr}))
+                elif rr not in btable:
+                    # same name, different resref — survived, re-resref'd
+                    renamed.append({
+                        "kind": kind, "name": strip_markup(e["name"]),
+                        "fork": label, "fork_resref": rr,
+                        "baseline_resrefs": cands,
+                        "autonumbered": (is_autonumbered(kind, rr)
+                                         or all(is_autonumbered(kind, c) for c in cands)),
+                        "wiki_links": entity_chips(
+                            kind, {base.wiki_label: cands[0], label: rr},
+                            strip_markup(e["name"])),
+                    })
+                seen_names.add(n)
+
+        only_base = []
+        for n, rrs in sorted(bnames.items()):
+            if n in seen_names:
+                continue
+            e = btable[rrs[0]]
+            if not include_stock and classify_noise(kind, e):
+                continue
+            only_base.append({
+                "kind": kind, "name": strip_markup(e["name"]),
+                "baseline_resrefs": rrs,
+                "wiki_links": entity_chips(kind, {base.wiki_label: rrs[0]},
+                                           strip_markup(e["name"])),
+            })
+
+        out[kind] = {
+            "renamed": sorted(renamed, key=lambda r: r["name"].lower()),
+            "only_in_fork": sorted(only_fork.values(), key=lambda r: r["name"].lower()),
+            "only_in_baseline": sorted(only_base, key=lambda r: r["name"].lower()),
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Component 5 — script & dialog divergence
+# ---------------------------------------------------------------------------
+
+def script_divergence(forks: list[tuple[str, Module]], base: Module,
+                      lost: dict, max_diff_lines: int) -> dict:
+    base_scripts = base.script_hashes()
+
+    # scripts referenced by content we lost — reclaiming the content needs these
+    wanted: dict[str, list[str]] = {}
+    for plural in ("areas", "creatures"):
+        for rec in lost.get(plural, []):
+            for s in rec.get("scripts", []):
+                wanted.setdefault(s.lower(), []).append(f"{plural[:-1]} {rec['name']}")
+            conv = rec.get("conversation")
+            if conv:
+                wanted.setdefault(conv.lower(), []).append(f"{plural[:-1]} {rec['name']}")
+
+    per_fork = {}
+    dropped_all: dict[str, dict] = {}
+    modified_all: dict[str, dict] = {}
+
+    for label, mod in forks:
+        fs = mod.script_hashes()
+        common = set(fs) & set(base_scripts)
+        dropped = sorted(set(fs) - set(base_scripts))
+        modified = sorted(k for k in common if fs[k][0] != base_scripts[k][0])
+        per_fork[label] = {
+            "dropped": len(dropped), "modified": len(modified),
+            "identical": len(common) - len(modified),
+            "added_in_baseline": len(set(base_scripts) - set(fs)),
+        }
+        for k in dropped:
+            rec = dropped_all.setdefault(k, {
+                "resref": k, "forks": [], "lines": fs[k][1],
+                "needed_by": wanted.get(k, []),
+            })
+            rec["forks"].append(label)
+        for k in modified:
+            rec = modified_all.setdefault(k, {
+                "resref": k, "forks": [],
+                "fork_lines": fs[k][1], "baseline_lines": base_scripts[k][1],
+            })
+            rec["forks"].append(label)
+            if max_diff_lines and "diff" not in rec:
+                d = list(difflib.unified_diff(
+                    mod.script_source(k).splitlines(),
+                    base.script_source(k).splitlines(),
+                    fromfile=f"{label}/{k}.nss", tofile=f"baseline/{k}.nss",
+                    lineterm="", n=2))
+                rec["diff"] = d[:max_diff_lines]
+                rec["diff_truncated"] = len(d) > max_diff_lines
+
+    return {
+        "summary": per_fork,
+        "scripts_dropped": sorted(dropped_all.values(),
+                                  key=lambda r: (not r["needed_by"], r["resref"])),
+        "scripts_modified": sorted(modified_all.values(), key=lambda r: r["resref"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Component 6 — dialog divergence
+# ---------------------------------------------------------------------------
+
+def _owner_summary(owners: list[dict]) -> str:
+    if not owners:
+        return ""
+    return "; ".join(
+        f"{o['name']}" + (f" ({', '.join(o['areas'])})" if o["areas"] else "")
+        for o in owners)
+
+
+def dialog_divergence(forks: list[tuple[str, Module]], base: Module,
+                      max_diff_lines: int) -> dict:
+    """Conversations dropped, renamed, rewritten, or handed to a different NPC.
+
+    Conversations are the module's actual writing, so they get treated as
+    content rather than as a build artefact: the report carries who spoke each
+    one and where, the full transcript of anything dropped (so it can be
+    reclaimed straight off the page), and a real text diff of anything
+    rewritten.  Node *counts* alone — the old comparison — miss a conversation
+    whose every line was rewritten in place, and cry wolf over one that merely
+    moved to a new resref.
+    """
+    base_dlgs = base.dialogs()
+    base_owners = base.dialog_owners()
+    base_by_hash: dict[str, list[str]] = {}
+    for k, v in base_dlgs.items():
+        base_by_hash.setdefault(v["text_hash"], []).append(k)
+
+    summary: dict[str, dict] = {}
+    renamed: dict[str, dict] = {}
+    dropped: dict[str, dict] = {}
+    changed: dict[str, dict] = {}
+    owner_changed: dict[str, dict] = {}
+
+    for label, mod in forks:
+        fd = mod.dialogs()
+        fork_owners = mod.dialog_owners()
+        n_dropped = n_renamed = n_changed = 0
+
+        for k, v in sorted(fd.items()):
+            f_owners = fork_owners.get(k, [])
+            if k not in base_dlgs:
+                # Same text under a different resref is a rename, not a loss.
+                twin = [t for t in base_by_hash.get(v["text_hash"], []) if t != k]
+                if twin:
+                    n_renamed += 1
+                    rec = renamed.setdefault(k, {
+                        "resref": k, "baseline_resref": twin[0], "forks": [],
+                        "owners_in_fork": f_owners,
+                        "nodes": v["entries"] + v["replies"],
+                        "wiki_links": entity_chips(
+                            "conversation", {base.wiki_label: twin[0], label: k}),
+                    })
+                    rec["forks"].append(label)
+                    merge_links(rec, entity_chips("conversation", {label: k}))
+                    continue
+                n_dropped += 1
+                rec = dropped.setdefault(k, {
+                    "resref": k, "forks": [],
+                    "entries": v["entries"], "replies": v["replies"],
+                    "starts": v["starts"], "scripts": v["scripts"],
+                    "owners_in_fork": f_owners,
+                    "owner_summary": _owner_summary(f_owners),
+                    "transcript": v["nodes"],
+                    "wiki_links": entity_chips("conversation", {label: k}),
+                })
+                rec["forks"].append(label)
+                merge_links(rec, entity_chips("conversation", {label: k}))
+                continue
+
+            b = base_dlgs[k]
+            if v["text_hash"] != b["text_hash"] or v["scripts"] != b["scripts"]:
+                n_changed += 1
+                rec = changed.setdefault(k, {
+                    "resref": k, "forks": [],
+                    "fork_nodes": v["entries"] + v["replies"],
+                    "baseline_nodes": b["entries"] + b["replies"],
+                    "scripts_removed": sorted(set(v["scripts"]) - set(b["scripts"])),
+                    "scripts_added": sorted(set(b["scripts"]) - set(v["scripts"])),
+                    "owners_in_fork": f_owners,
+                    "owners_in_baseline": base_owners.get(k, []),
+                    "wiki_links": entity_chips(
+                        "conversation", {base.wiki_label: k, label: k}),
+                })
+                rec["forks"].append(label)
+                if "diff" not in rec:
+                    d = list(difflib.unified_diff(
+                        v["transcript"], b["transcript"],
+                        fromfile=f"{label}/{k}.dlg", tofile=f"baseline/{k}.dlg",
+                        lineterm="", n=1))
+                    rec["diff"] = d[:max_diff_lines] if max_diff_lines else d
+                    rec["diff_truncated"] = bool(max_diff_lines) and len(d) > max_diff_lines
+
+            # the conversation survived, but is anyone still speaking it?
+            f_names = {o["name"] for o in f_owners}
+            b_names = {o["name"] for o in base_owners.get(k, [])}
+            if f_names and f_names != b_names:
+                rec = owner_changed.setdefault(k, {
+                    "resref": k, "forks": [],
+                    "owners_in_fork": sorted(f_names),
+                    "owners_in_baseline": sorted(b_names),
+                    "orphaned_now": not b_names,
+                    "wiki_links": entity_chips(
+                        "conversation", {base.wiki_label: k, label: k}),
+                })
+                rec["forks"].append(label)
+
+        summary[label] = {"total": len(fd), "dropped": n_dropped,
+                          "renamed": n_renamed, "changed": n_changed,
+                          "added_in_baseline": len(set(base_dlgs) - set(fd))}
+
+    by_res = lambda r: r["resref"]  # noqa: E731
+    return {
+        "summary": summary,
+        "baseline_total": len(base_dlgs),
+        "renamed": sorted(renamed.values(), key=by_res),
+        "dropped": sorted(dropped.values(),
+                          key=lambda r: (-(r["entries"] + r["replies"]), r["resref"])),
+        "changed": sorted(changed.values(),
+                          key=lambda r: (-len(r.get("diff") or []), r["resref"])),
+        "owner_changed": sorted(owner_changed.values(),
+                                key=lambda r: (not r["orphaned_now"], r["resref"])),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared rendering helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_gp(v: Any) -> str:
+    n = v or 0
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _val(v: Any) -> str:
+    """Render a field value from a rebalance delta."""
+    if v is None or v == "":
+        return "—"
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_val(x) for x in v) or "—"
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
+def _primary_url(rec: dict) -> str:
+    """The baseline chip's URL if it has one, else the first present chip."""
+    for l in rec.get("wiki_links") or []:
+        if l["label"] == "live" and l["present"]:
+            return l["url"]
+    for l in rec.get("wiki_links") or []:
+        if l["present"]:
+            return l["url"]
+    return ""
+
+
+def _match_kinds(rec: dict) -> str:
+    return "/".join(sorted(set(rec.get("match_kinds") or []))) or "—"
+
+
+def _forks(rec: dict) -> str:
+    return ", ".join(rec.get("forks") or []) or "—"
+
+
+# ---------------------------------------------------------------------------
+# Markdown report — the machine-readable companion to the HTML page.  Keeps
+# --top truncation; the HTML deliberately does not.
+# ---------------------------------------------------------------------------
+
+def _link(name: str, url: str) -> str:
+    return f"[{name}]({url})" if url else name
+
+
+def _wikis(rec: dict) -> str:
+    """Per-module wiki links, e.g. '2008 · 2009 · ~~live~~' (~~x~~ = no page)."""
+    links = rec.get("wiki_links") or []
+    if not links:
+        return "—"
+    return " · ".join(f"[{l['label']}]({l['url']})" if l["present"]
+                      else f"~~{l['label']}~~" for l in links)
+
+
+def render_markdown(payload: dict, top: int) -> str:
+    L: list[str] = []
+    w = L.append
+    m = payload["modules"]
+    b = m["baseline"]
+    w(f"# Fork diff — {b['title']}")
+    w("")
+    w(f"_Generated {payload['generated_at']}. Ancestor forks compared against the "
+      f"current module. Identity is resolved resref → tag → name → fuzzy, because "
+      f"resrefs are not stable across these forks._")
+    w("")
+    w(f"_The full, untruncated report is the HTML page; this file is the "
+      f"companion summary (top {top} rows per table)._")
+    w("")
+
+    w("## Modules")
+    w("")
+    w("| Role | Module | Wiki | Areas | Creatures | Items |")
+    w("| --- | --- | --- | ---: | ---: | ---: |")
+    for f in m["forks"]:
+        w(f"| fork `{f['wiki_label']}` | {f['title']} | {f['wiki_base']} | {f['areas']} "
+          f"| {f['creatures']} | {f['items']} |")
+    w(f"| **baseline** | **{b['title']}** | {b['wiki_base']} | {b['areas']} "
+      f"| {b['creatures']} | {b['items']} |")
+    w("")
+
+    w("## Identity resolution")
+    w("")
+    w("| Fork | Entity | resref | tag | name | fuzzy | none |")
+    w("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+    for label, kinds in payload["match_kinds"].items():
+        for plural, counts in kinds.items():
+            w(f"| {label} | {plural} | {counts.get('resref', 0)} | {counts.get('tag', 0)} "
+              f"| {counts.get('name', 0)} | {counts.get('fuzzy', 0)} | {counts.get('none', 0)} |")
+    w("")
+
+    def _rows(title: str, rows: list[dict], cols: list[str],
+              cell) -> None:
+        w(f"### {title} ({len(rows)})")
+        w("")
+        if not rows:
+            w("_None._")
+            w("")
+            return
+        w("| " + " | ".join(cols) + " |")
+        w("| " + " | ".join("---" for _ in cols) + " |")
+        for r in rows[:top]:
+            w("| " + " | ".join(cell(r)) + " |")
+        if len(rows) > top:
+            w("")
+            w(f"_… {len(rows) - top} more; see the HTML report for the full list._")
+        w("")
+
+    lost = payload["lost_content"]
+    w("## Lost content to reclaim")
+    w("")
+    nf = lost.get("noise_filtered") or {}
+    if nf:
+        w("Filtered as stock blueprints or toolset scaffolding (re-run with "
+          "`--include-stock` to see them): "
+          + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in sorted(nf.items())) + ".")
+        w("")
+    _rows("Areas", lost["areas"], ["Area", "resref", "Wiki", "Creatures", "Stores"],
+          lambda a: [_link(a["name"], _primary_url(a)), f"`{a['resref']}`", _wikis(a),
+                     str(a["creature_count"]), str(a["store_count"])])
+    _rows("Creatures", lost["creatures"], ["Creature", "resref", "Wiki", "CR", "Race"],
+          lambda c: [_link(c["name"], _primary_url(c)), f"`{c['resref']}`", _wikis(c),
+                     f"{c['cr']:g}", c["race"]])
+    _rows("Items", lost["items"], ["Item", "resref", "Wiki", "Base", "Cost"],
+          lambda i: [_link(i["name"], _primary_url(i)), f"`{i['resref']}`", _wikis(i),
+                     i["base_item"], _fmt_gp(i["cost_gp"])])
+
+    acc = payload["accessibility"]
+    w("## Accessibility regressions")
+    w("")
+    _rows("Items reachable in a fork, unreachable now", acc["items_regressed"],
+          ["Item", "resref", "Wiki", "match", "Cost", "Why unreachable now"],
+          lambda i: [_link(i["name"], _primary_url(i)), f"`{i['resref']}`", _wikis(i),
+                     _match_kinds(i), _fmt_gp(i["cost_gp"]), i["reason_now"] or "—"])
+    _rows("Areas that lost their inbound transitions", acc["areas_orphaned"],
+          ["Area", "resref", "Wiki", "match", "Creatures", "Inbound in fork"],
+          lambda a: [_link(a["name"], _primary_url(a)), f"`{a['resref']}`", _wikis(a),
+                     _match_kinds(a), str(a["creature_count"]), str(a["inbound_in_fork"])])
+    _rows("Creatures placed in a fork, blueprint-only now",
+          acc["creatures_no_longer_spawned"],
+          ["Creature", "resref", "Wiki", "match", "CR", "Was in"],
+          lambda c: [_link(c["name"], _primary_url(c)), f"`{c['resref']}`", _wikis(c),
+                     _match_kinds(c), f"{c['cr']:g}", ", ".join(c["areas_in_fork"]) or "—"])
+    _rows("Same content lives under another blueprint (not a regression)",
+          acc["creatures_spawned_elsewhere"] + acc["items_regressed_dup"],
+          ["Name", "matched resref", "Placed/reachable under"],
+          lambda r: [r["name"], f"`{r['resref']}`",
+                     ", ".join(f"`{s['resref']}`" for s in r["siblings"] if s["ok"]) or "—"])
+
+    div = payload["divergence"]
+    w("## Diverged shared content")
+    w("")
+    for kind in ("area", "creature", "item"):
+        nd = div["by_name"][kind]
+        w(f"### {kind.title()}s by name")
+        w("")
+        for key, title in (("renamed", "Renamed / re-resref'd"),
+                           ("only_in_fork", "Only in a fork"),
+                           ("only_in_baseline", "Only in the baseline")):
+            w(f"- **{title}:** {len(nd[key])}")
+        w("")
+    _rows("Repurposed resrefs", div["repurposed"],
+          ["Kind", "resref", "Was", "Is now", "Wiki"],
+          lambda r: [r["kind"], f"`{r['resref']}`", r["fork_name"],
+                     _link(r["baseline_name"], _primary_url(r)), _wikis(r)])
+    for kind, rows in sorted(div["rebalanced_by_kind"].items()):
+        _rows(f"Rebalanced — {kind}s", rows,
+              ["Name", "resref", "Wiki", "match", "Changed fields"],
+              lambda r: [_link(r["name"], _primary_url(r)), f"`{r['resref']}`",
+                         _wikis(r), r["match_kind"], ", ".join(r["changes"])])
+
+    dlg = payload["dialogs"]
+    w("## Dialog divergence")
+    w("")
+    w("| Fork | Conversations | Dropped | Renamed | Changed | Added since |")
+    w("| --- | ---: | ---: | ---: | ---: | ---: |")
+    for label, s in dlg["summary"].items():
+        w(f"| {label} | {s['total']} | {s['dropped']} | {s['renamed']} | {s['changed']} "
+          f"| {s['added_in_baseline']} |")
+    w("")
+    _rows("Dropped conversations", dlg["dropped"],
+          ["resref", "Spoken by", "Nodes", "Wiki"],
+          lambda r: [f"`{r['resref']}`", r["owner_summary"] or "_no NPC references it_",
+                     str(r["entries"] + r["replies"]), _wikis(r)])
+    _rows("Changed conversations", dlg["changed"],
+          ["resref", "Fork nodes", "Baseline nodes", "Diff lines", "Wiki"],
+          lambda r: [f"`{r['resref']}`", str(r["fork_nodes"]), str(r["baseline_nodes"]),
+                     str(len(r.get("diff") or [])), _wikis(r)])
+    _rows("Renamed conversations", dlg["renamed"],
+          ["Fork resref", "Baseline resref", "Nodes", "Wiki"],
+          lambda r: [f"`{r['resref']}`", f"`{r['baseline_resref']}`",
+                     str(r["nodes"]), _wikis(r)])
+    _rows("Conversations whose speaker changed", dlg["owner_changed"],
+          ["resref", "Spoken by in fork", "Spoken by now"],
+          lambda r: [f"`{r['resref']}`", ", ".join(r["owners_in_fork"]) or "—",
+                     ", ".join(r["owners_in_baseline"]) or "_nobody_"])
+
+    sc = payload.get("scripts")
+    w("## Script divergence")
+    w("")
+    if not sc:
+        w("_Skipped (`--no-scripts`)._")
+        w("")
+    else:
+        w("| Fork | Dropped | Modified | Identical | Added since |")
+        w("| --- | ---: | ---: | ---: | ---: |")
+        for label, s in sc["summary"].items():
+            w(f"| {label} | {s['dropped']} | {s['modified']} | {s['identical']} "
+              f"| {s['added_in_baseline']} |")
+        w("")
+        needed = [r for r in sc["scripts_dropped"] if r["needed_by"]]
+        _rows("Dropped scripts required by lost content", needed,
+              ["Script", "Forks", "Lines", "Referenced by"],
+              lambda r: [f"`{r['resref']}.nss`", ", ".join(r["forks"]), str(r["lines"]),
+                         ", ".join(sorted(set(r["needed_by"]))[:4])])
+        others = [r for r in sc["scripts_dropped"] if not r["needed_by"]]
+        w(f"### Other dropped scripts ({len(others)})")
+        w("")
+        w(", ".join(f"`{r['resref']}`" for r in others) or "_None._")
+        w("")
+        w(f"### Modified scripts ({len(sc['scripts_modified'])})")
+        w("")
+        w(", ".join(f"`{r['resref']}`" for r in sc["scripts_modified"]) or "_None._")
+        w("")
+
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# HTML report — the published page.  Complete: no row is truncated away, and
+# every href has been existence-checked against that module's built docs/ tree.
+# ---------------------------------------------------------------------------
+
+def esc(s: Any) -> str:
+    return (str(s if s is not None else "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def href(url: str, text: str) -> str:
+    """Emit a link, refusing any URL that was not existence-checked."""
+    if url not in VERIFIED_URLS:
+        raise SystemExit(f"[fork-diff] refusing to emit unverified link: {url}")
+    return f'<a href="{esc(url)}">{esc(text)}</a>'
+
+
+def linked(rec: dict, text: str) -> str:
+    url = _primary_url(rec)
+    return href(url, text) if url else esc(text)
+
+
+def chips(rec: dict) -> str:
+    """Per-module presence chips: a link where the entity has a page, a muted
+    chip where it does not.  The muted chip is the point — it says *this module
+    does not have this entity*, which a missing link cannot say."""
+    links = rec.get("wiki_links") or []
+    if not links:
+        return '<span class="fd-chip fd-chip-off">—</span>'
+    out = []
+    for l in sorted(links, key=lambda l: l["label"]):
+        if l["present"]:
+            out.append(f'<a class="fd-chip" href="{esc(l["url"])}" '
+                       f'title="{esc(l["resref"])}">{esc(l["label"])}</a>')
+        else:
+            out.append(f'<span class="fd-chip fd-chip-off" '
+                       f'title="not in this module">{esc(l["label"])}</span>')
+    return "".join(out)
+
+
+def code(s: Any) -> str:
+    return f"<code>{esc(s)}</code>" if s else "—"
+
+
+class Page:
+    """Accumulates HTML plus the table of contents it needs."""
+
+    OPEN_LIMIT = 50  # rows below which a block starts expanded
+
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.toc: list[tuple[int, str, str]] = []
+        self._n = 0
+
+    def w(self, s: str) -> None:
+        self.parts.append(s)
+
+    def h2(self, title: str, sub: str = "") -> str:
+        anchor = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        self.toc.append((2, anchor, title))
+        self.w(f'<div class="tier-header" id="{anchor}"><h2>{esc(title)}</h2>'
+               + (f'<p class="tier-sub">{sub}</p>' if sub else "") + "</div>")
+        return anchor
+
+    def h3(self, title: str, sub: str = "") -> str:
+        anchor = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        self.toc.append((3, anchor, title))
+        self.w(f'<h3 id="{anchor}">{esc(title)}</h3>')
+        if sub:
+            self.w(f'<p class="muted">{sub}</p>')
+        return anchor
+
+    def note(self, html: str, cls: str = "tip-box") -> None:
+        self.w(f'<div class="{cls}"><p>{html}</p></div>')
+
+    def block(self, title: str, count: int, body: str, *, sub: str = "",
+              open_: bool | None = None) -> None:
+        """A collapsible subsection carrying its own row count."""
+        if open_ is None:
+            open_ = 0 < count <= self.OPEN_LIMIT
+        if not count:
+            self.w(f'<details class="fd-block"><summary>{esc(title)} '
+                   f'<span class="fd-count">0</span></summary>'
+                   f'<p class="muted">None.</p></details>')
+            return
+        self.w(f'<details class="fd-block"{" open" if open_ else ""}>'
+               f'<summary>{esc(title)} <span class="fd-count">{count}</span></summary>'
+               + (f'<p class="muted">{sub}</p>' if sub else "") + body + "</details>")
+
+    def table(self, headers: list[str], rows: list[list[str]], *,
+              nums: set[int] = frozenset(), filterable: bool = True) -> str:
+        """A scrollable table, optionally with a live text filter above it."""
+        if not rows:
+            return '<p class="muted">None.</p>'
+        self._n += 1
+        tid = f"fdt{self._n}"
+        head = "".join(f'<th{" class=num" if i in nums else ""}>{esc(h)}</th>'
+                       for i, h in enumerate(headers))
+        body = []
+        for r in rows:
+            cells = "".join(f'<td{" class=num" if i in nums else ""}>{c}</td>'
+                            for i, c in enumerate(r))
+            body.append(f"<tr>{cells}</tr>")
+        filt = (f'<input class="fd-filter" type="search" data-target="{tid}" '
+                f'placeholder="Filter {len(rows)} rows…" aria-label="Filter table">'
+                if filterable and len(rows) > 12 else "")
+        return (f'{filt}<div class="fd-scroll"><table id="{tid}"><thead><tr>{head}'
+                f'</tr></thead><tbody>{"".join(body)}</tbody></table></div>')
+
+    def render_toc(self) -> str:
+        out = ['<nav class="toc" aria-label="Page contents"><h2>Contents</h2><ol>']
+        for level, anchor, title in self.toc:
+            cls = ' class="toc-sub"' if level > 2 else ""
+            out.append(f'<li{cls}><a href="#{anchor}">{esc(title)}</a></li>')
+        out.append("</ol></nav>")
+        return "".join(out)
+
+
+FD_STYLE = """
+    .mw-layout { display: flex; gap: 2.5em; align-items: flex-start; }
+    .mw-toc-pane { flex: 0 0 240px; position: sticky; top: 1.5em;
+                   max-height: calc(100vh - 3em); overflow-y: auto; }
+    .mw-content { flex: 1; min-width: 0; }
+    @media (max-width: 700px) {
+      .mw-layout { flex-direction: column; }
+      .mw-toc-pane { position: static; max-height: none; flex: none; width: 100%; }
+    }
+    .toc { background: var(--card); border: 1px solid var(--border);
+           border-radius: 4px; padding: 1em 1.2em; }
+    .toc h2 { font-size: 1em; margin: 0 0 0.5em; border: none; padding: 0;
+              color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
+    .toc ol { margin: 0; padding-left: 1.3em; font-size: 0.92em; }
+    .toc li { margin: 0.2em 0; }
+    .toc li.toc-sub { list-style: none; margin-left: -0.8em; font-size: 0.95em;
+                      color: var(--muted); }
+    .tier-header { background: rgba(107,58,28,0.08); border-left: 4px solid var(--accent);
+                   padding: 0.5em 1em; margin: 2.2em 0 0.8em; border-radius: 0 4px 4px 0; }
+    .tier-header h2 { margin: 0; border: none; padding: 0; }
+    .tier-header .tier-sub { font-size: 0.88em; color: var(--muted); margin: 0.3em 0 0; }
+    .tip-box { background: rgba(30,30,60,0.07); border-left: 4px solid var(--accent-soft);
+               border-radius: 0 4px 4px 0; padding: 0.7em 1.1em; margin: 0.8em 0 1em;
+               font-size: 0.93em; }
+    .tip-box p { margin: 0.3em 0; }
+    .warning-box { background: rgba(200,60,60,0.08); border-left: 4px solid #c03030;
+                   border-radius: 0 4px 4px 0; padding: 0.7em 1.1em; margin: 0.8em 0 1em;
+                   font-size: 0.93em; }
+    .warning-box p { margin: 0.3em 0; }
+
+    /* --- fork-diff specifics --- */
+    .fd-block { border: 1px solid var(--border); border-radius: 4px;
+                background: var(--card); margin: 0.6em 0; padding: 0 0.9em; }
+    .fd-block > summary { cursor: pointer; padding: 0.6em 0; font-weight: 600; }
+    .fd-block > summary:hover { color: var(--link-hover); }
+    .fd-count { display: inline-block; background: rgba(107,58,28,0.10);
+                color: var(--accent); border-radius: 10px; padding: 0 0.55em;
+                font-size: 0.82em; font-weight: 600; margin-left: 0.3em; }
+    .fd-scroll { overflow-x: auto; margin-bottom: 0.9em; }
+    .fd-scroll table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+    .fd-scroll th, .fd-scroll td { border-bottom: 1px solid var(--border);
+                                   padding: 0.35em 0.6em; text-align: left;
+                                   vertical-align: top; }
+    .fd-scroll th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+    .fd-scroll td.num, .fd-scroll th.num { text-align: right; white-space: nowrap; }
+    .fd-scroll tr:hover td { background: rgba(107,58,28,0.04); }
+    .fd-filter { width: 100%; max-width: 26em; margin: 0.5em 0 0.6em;
+                 padding: 0.35em 0.6em; border: 1px solid var(--border);
+                 border-radius: 3px; background: var(--bg); color: var(--fg); }
+    .fd-chip { display: inline-block; font-size: 0.78em; line-height: 1.5;
+               padding: 0 0.5em; margin: 0 0.22em 0.15em 0; border-radius: 9px;
+               border: 1px solid var(--accent-soft); white-space: nowrap; }
+    a.fd-chip { background: rgba(200,165,119,0.18); }
+    .fd-chip-off { color: var(--muted); border-style: dashed; opacity: 0.6;
+                   text-decoration: line-through; }
+    .fd-diff { background: rgba(30,30,60,0.05); border: 1px solid var(--border);
+               border-radius: 3px; padding: 0.5em 0.7em; overflow-x: auto;
+               font-size: 0.82em; line-height: 1.35; max-height: 26em; }
+    .fd-diff .del { color: #a03030; }
+    .fd-diff .add { color: #2e7030; }
+    .fd-diff .hunk { color: var(--muted); }
+    .fd-lines { margin: 0.2em 0 0.4em 1.1em; padding: 0; font-size: 0.9em; }
+    .fd-lines li { margin: 0.05em 0; }
+    .fd-sub { margin: 1.4em 0 0.4em; font-size: 1.02em; color: var(--accent); }
+    .fd-transcript { font-size: 0.86em; margin: 0.3em 0 0.8em; }
+    .fd-transcript dt { color: var(--muted); font-size: 0.9em; margin-top: 0.4em; }
+    .fd-transcript dd { margin: 0 0 0 1em; }
+"""
+
+FD_SCRIPT = """
+document.querySelectorAll('.fd-filter').forEach(function (box) {
+  box.addEventListener('input', function () {
+    var q = box.value.toLowerCase();
+    var rows = document.getElementById(box.dataset.target)
+                       .tBodies[0].rows;
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].style.display =
+        (!q || rows[i].textContent.toLowerCase().indexOf(q) !== -1) ? '' : 'none';
+    }
+  });
+});
+"""
+
+
+def _changes_html(changes: dict) -> str:
+    """Full change list for one rebalanced entity — no field or length cap."""
+    out = []
+    for f, v in sorted(changes.items()):
+        if isinstance(v, dict) and "fork" in v:
+            out.append(f"<li><b>{esc(f)}</b>: {esc(_val(v['fork']))} → "
+                       f"{esc(_val(v['baseline']))}</li>")
+        elif isinstance(v, dict):
+            bits = []
+            for lbl, key in (("removed since", "removed"), ("added since", "added")):
+                vals = v.get(key) or []
+                if vals:
+                    bits.append(f'<li>{lbl}: ' + ", ".join(
+                        f"<code>{esc(x)}</code>" for x in vals) + "</li>")
+            out.append(f"<li><b>{esc(f)}</b><ul class=\"fd-lines\">"
+                       + "".join(bits) + "</ul></li>")
+    return f'<ul class="fd-lines">{"".join(out)}</ul>'
+
+
+def _diff_html(diff: list[str], truncated: bool) -> str:
+    if not diff:
+        return ""
+    rows = []
+    for line in diff:
+        cls = ("hunk" if line.startswith("@@") else
+               "del" if line.startswith("-") else
+               "add" if line.startswith("+") else "")
+        rows.append(f'<span class="{cls}">{esc(line)}</span>' if cls else esc(line))
+    tail = ('\n<span class="hunk">… diff truncated (--max-diff-lines)</span>'
+            if truncated else "")
+    return f'<pre class="fd-diff">{chr(10).join(rows)}{tail}</pre>'
+
+
+def _transcript_html(nodes: list[dict]) -> str:
+    out = ['<dl class="fd-transcript">']
+    for n in nodes:
+        meta = []
+        if n.get("script"):
+            meta.append(f'action <code>{esc(n["script"])}</code>')
+        if n.get("active"):
+            meta.append(f'shown if <code>{esc(n["active"])}</code>')
+        tag = f'{n["role"]} {n["index"]}'
+        out.append(f"<dt>{esc(tag)}"
+                   + (f' <span class="muted">({", ".join(meta)})</span>' if meta else "")
+                   + "</dt>")
+        out.append(f"<dd>{esc(n['text']) or '<i>(no text)</i>'}</dd>")
+    out.append("</dl>")
+    return "".join(out)
+
+
+def render_html(payload: dict) -> str:
+    p = Page()
+    m = payload["modules"]
+    b = m["baseline"]
+    mods = m["forks"] + [b]
+
+    p.w(f"<h1>Fork diff — {esc(b['title'])}</h1>")
+    p.w(f'<p class="muted">Generated {esc(payload["generated_at"])} by '
+        f"<code>nwn-fork-diff</code>. Regenerate rather than edit — this page is "
+        f"overwritten wholesale on the next run.</p>")
+    p.w("<p>The two ancestor forks of this module, compared against what is live now: "
+        "what they have that we lost, what we still have but orphaned, and how the "
+        "content we share drifted apart. Identity is resolved "
+        "<b>resref → tag → name → fuzzy</b>, because resrefs are not stable across "
+        "these forks.</p>")
+
+    p.w(p.table(
+        ["Role", "Module", "Wiki", "Areas", "Creatures", "Items"],
+        [[("fork" if mod is not b else "<b>baseline</b>"),
+          esc(mod["title"]),
+          f'<code>{esc(mod["wiki_label"])}</code> — {esc(mod["wiki_base"])}',
+          str(mod["areas"]), str(mod["creatures"]), str(mod["items"])]
+         for mod in mods],
+        nums={3, 4, 5}, filterable=False))
+
+    p.note(
+        "<b>Reading the wiki chips.</b> Every row carries one chip per module: "
+        + " ".join(f'<code>{esc(mod["wiki_label"])}</code>' for mod in mods)
+        + ". A <b>solid chip is a link</b> to that entity's page in that module's "
+        "wiki; a <b>struck-through chip means the entity does not exist there</b> — "
+        "which is usually the finding. Chips are resolved per module by that module's "
+        "own resref (hover a chip to see it), because renamed content carries a "
+        "different resref in each. Every link on this page was checked against the "
+        "built wiki before being emitted, so none of them 404.")
+
+    # -- identity resolution --------------------------------------------
+    p.h2("Identity resolution",
+         "Which rule matched each fork entity to a baseline one.")
+    p.w(p.table(
+        ["Fork", "Entity", "resref", "tag", "name", "fuzzy", "none"],
+        [[esc(label), plural, str(c.get("resref", 0)), str(c.get("tag", 0)),
+          str(c.get("name", 0)), str(c.get("fuzzy", 0)), str(c.get("none", 0))]
+         for label, kinds in payload["match_kinds"].items()
+         for plural, c in kinds.items()],
+        nums={2, 3, 4, 5, 6}, filterable=False))
+    p.note("<code>tag</code> / <code>name</code> / <code>fuzzy</code> matches are "
+           "content that survived under a <b>different resref</b> — renamed or "
+           "rebuilt, not lost. Only <code>none</code> is a migration candidate.")
+
+    # -- lost content ----------------------------------------------------
+    lost = payload["lost_content"]
+    p.h2("Lost content to reclaim",
+         "Fork content that resolved to nothing in the baseline, ranked by how much "
+         "comes back with it.")
+    nf = lost.get("noise_filtered") or {}
+    if nf:
+        p.note("Filtered as stock blueprints or toolset scaffolding (re-run with "
+               "<code>--include-stock</code> to see them): "
+               + ", ".join(f"{v} {k.replace('_', ' ')}"
+                           for k, v in sorted(nf.items())) + ".")
+
+    rows = []
+    for a in lost["areas"]:
+        contained = a.get("contains", {}).get("creatures") or []
+        manifest = ", ".join(
+            f'{linked(c, c["name"])} <span class="muted">(CR {c["cr"]:g}'
+            + (f' ×{c["count"]}' if c["count"] > 1 else "") + ")</span>"
+            for c in contained) or '<span class="muted">—</span>'
+        rows.append([linked(a, a["name"]), code(a["resref"]), chips(a),
+                     esc(_forks(a)), str(a["creature_count"]),
+                     str(a["encounter_count"]), str(a["store_count"]),
+                     f'{a["inbound"]}→/→{a["outbound"]}', manifest])
+    p.block("Areas", len(lost["areas"]), p.table(
+        ["Area", "resref", "Wiki", "In fork(s)", "Creatures", "Encounters",
+         "Stores", "Links", "Carries"], rows, nums={4, 5, 6}),
+        sub="Every creature each lost area carried is listed, so reclaiming an area "
+            "shows what comes with it.")
+
+    p.block("Creatures", len(lost["creatures"]), p.table(
+        ["Creature", "resref", "Wiki", "In fork(s)", "CR", "HP", "Race", "Faction",
+         "Placed in"],
+        [[linked(c, c["name"]), code(c["resref"]), chips(c), esc(_forks(c)),
+          f'{c["cr"]:g}', esc(c["hp"]), esc(c["race"]), esc(c["faction"]),
+          esc(", ".join(a for a in c["areas"] if a)) or "<i>blueprint only</i>"]
+         for c in lost["creatures"]], nums={4, 5}))
+
+    p.block("Items", len(lost["items"]), p.table(
+        ["Item", "resref", "Wiki", "In fork(s)", "Base item", "Cost",
+         "Reachable in fork", "Obtained from"],
+        [[linked(i, i["name"]), code(i["resref"]), chips(i), esc(_forks(i)),
+          esc(i["base_item"]), _fmt_gp(i["cost_gp"]),
+          "yes" if i["accessible_in_fork"] else "no",
+          esc("; ".join(i.get("sources") or [])) or "—"]
+         for i in lost["items"]], nums={5}))
+
+    # -- accessibility ---------------------------------------------------
+    acc = payload["accessibility"]
+    p.h2("Accessibility regressions",
+         "Content the baseline still has, but players can no longer reach.")
+
+    reg = acc["items_regressed"]
+    per = ", ".join(f"{k}: {v}" for k, v in sorted(acc["items_regressed_by_fork"].items()))
+    p.block("Items reachable in a fork, unreachable now", len(reg), p.table(
+        ["Item", "resref", "Wiki", "In fork(s)", "match", "Cost",
+         "Why unreachable now", "Was obtained from"],
+        [[linked(i, i["name"]), code(i["resref"]), chips(i), esc(_forks(i)),
+          esc(_match_kinds(i)), _fmt_gp(i["cost_gp"]),
+          esc(i["reason_now"]) or "—",
+          esc("; ".join(i["sources_in_fork"])) or "—"]
+         for i in reg], nums={5}),
+        sub=f"Per fork: {esc(per)}. Counter-check: {acc['items_improved_count']} "
+            f"item(s) moved the other way (unreachable in a fork, reachable now).")
+
+    orph = acc["areas_orphaned"]
+    p.block("Areas that lost their inbound transitions", len(orph), p.table(
+        ["Area", "resref", "Wiki", "In fork(s)", "match", "Creatures",
+         "Inbound in fork", "Hidden"],
+        [[linked(a, a["name"]), code(a["resref"]), chips(a), esc(_forks(a)),
+          esc(_match_kinds(a)), str(a["creature_count"]), str(a["inbound_in_fork"]),
+          "yes" if a.get("hidden") else ""]
+         for a in orph], nums={5, 6}),
+        sub="Counts door, trigger and conversation transitions only — an area still "
+            "reached by a script teleport will show up here anyway.")
+
+    spawn = acc["creatures_no_longer_spawned"]
+    p.block("Creatures placed in a fork, blueprint-only now", len(spawn), p.table(
+        ["Creature", "resref", "Wiki", "In fork(s)", "match", "CR",
+         "Was placed in", "Baseline blueprints of this name"],
+        [[linked(c, c["name"]), code(c["resref"]), chips(c), esc(_forks(c)),
+          esc(_match_kinds(c)), f'{c["cr"]:g}',
+          esc(", ".join(c["areas_in_fork"])) or "—",
+          ", ".join(f'<code>{esc(s["resref"])}</code>' for s in c["siblings"]) or "—"]
+         for c in spawn], nums={5}),
+        sub="No blueprint of this name is placed anywhere in the baseline, so the "
+            "creature really is absent from the live world. The last column lists "
+            "every baseline blueprint sharing the name — pick one to place.")
+
+    dup = (acc["creatures_spawned_elsewhere"] + acc["items_regressed_dup"]
+           + acc["areas_orphaned_dup"])
+    p.block("Same content is live under a different blueprint (not a regression)",
+            len(dup), p.table(
+        ["Kind", "Name", "Matched blueprint", "Live under", "Wiki"],
+        [[r["kind"], linked(r, r["name"]), code(r["resref"]),
+          ", ".join(f'<code>{esc(s["resref"])}</code>'
+                    for s in r["siblings"] if s["ok"]) or "—",
+          chips(r)] for r in dup]),
+        sub="These matched an unplaced/unreachable baseline blueprint, but another "
+            "blueprint of the <b>same name</b> is placed or reachable — identity "
+            "resolution consumes each baseline entity once, so it can land on the "
+            "dead twin of a name that is perfectly alive. Listed so you can see why "
+            "an entry you expected above is not there.", open_=False)
+
+    # -- content by name -------------------------------------------------
+    div = payload["divergence"]
+    p.h2("Content by name",
+         "The same comparison keyed on names instead of resrefs.")
+    p.note("resrefs are the wrong axis for &ldquo;what changed&rdquo;. "
+           "<code>areaNNN</code> comes from the toolset's New Area Wizard and "
+           "<code>&lt;stem&gt;NNN</code> from palette copy-paste, so two modules can "
+           "hold the same content under different resrefs and different content under "
+           "the same one. Keyed on name, the resref pair becomes supporting detail "
+           "(&ldquo;was <i>X</i>, is now <i>Y</i>&rdquo;) instead of the thing being "
+           "matched on.")
+    for kind in ("area", "creature", "item"):
+        nd = div["by_name"][kind]
+        p.h3(f"{kind.title()}s by name")
+        p.block(f"Renamed / re-resref'd {kind}s", len(nd["renamed"]), p.table(
+            ["Name", "In fork", "Fork resref", "Baseline resref(s)", "Wiki",
+             "Autonumbered"],
+            [[linked(r, r["name"]), esc(r["fork"]), code(r["fork_resref"]),
+              ", ".join(f'<code>{esc(x)}</code>' for x in r["baseline_resrefs"]),
+              chips(r), "yes" if r["autonumbered"] else ""]
+             for r in nd["renamed"]]),
+            sub="Same name on both sides, different resref — the content survived, "
+                "the slot moved.")
+        p.block(f"{kind.title()}s only a fork has (by name)", len(nd["only_in_fork"]),
+                p.table(["Name", "In fork(s)", "Fork resref(s)", "Wiki"],
+                        [[linked(r, r["name"]), esc(_forks(r)),
+                          ", ".join(f'<code>{esc(v)}</code>'
+                                    for v in r["fork_resrefs"].values()),
+                          chips(r)] for r in nd["only_in_fork"]]))
+        p.block(f"{kind.title()}s only the baseline has (by name)",
+                len(nd["only_in_baseline"]),
+                p.table(["Name", "Baseline resref(s)", "Wiki"],
+                        [[linked(r, r["name"]),
+                          ", ".join(f'<code>{esc(x)}</code>'
+                                    for x in r["baseline_resrefs"]),
+                          chips(r)] for r in nd["only_in_baseline"]]),
+                sub="Added since the fork.")
+
+    # -- diverged shared content -----------------------------------------
+    p.h2("Diverged shared content",
+         "Entities both sides have, holding different content or different numbers.")
+
+    rep = div["repurposed"]
+    p.block("Repurposed resrefs", len(rep), p.table(
+        ["Kind", "resref", "Was (in fork)", "Is now (baseline)", "In fork(s)", "Wiki"],
+        [[r["kind"], code(r["resref"]), esc(r["fork_name"]),
+          linked(r, r["baseline_name"]), esc(_forks(r)), chips(r)]
+         for r in rep]),
+        sub="Same resref, entirely different content — the blueprint slot was reused. "
+            "Worth auditing against <code>item_tag_conflicts.json</code> / "
+            "<code>creature_tag_conflicts.json</code>.")
+
+    auto = div["repurposed_autonumbered"]
+    p.block("Autonumbered resref collisions (not evidence of anything)", len(auto),
+            p.table(["Kind", "resref", "Was (in fork)", "Is now (baseline)", "Wiki"],
+                    [[r["kind"], code(r["resref"]), esc(r["fork_name"]),
+                      linked(r, r["baseline_name"]), chips(r)] for r in auto]),
+            sub="The toolset assigns these resrefs, so two modules landing on the same "
+                "one means nothing was deliberately repurposed. Separated out so they "
+                "do not drown the list above.", open_=False)
+
+    p.h3("Rebalanced")
+    p.w('<p class="muted">Matched on both sides, same content, different numbers. '
+        'Split by entity type; every changed field is listed in full.</p>')
+    for kind in ("creature", "item", "area"):
+        rows = div["rebalanced_by_kind"].get(kind, [])
+        p.block(f"Rebalanced {kind}s", len(rows), p.table(
+            ["Name", "resref", "Wiki", "In fork", "match", "Changes"],
+            [[linked(r, r["name"])
+              + (f'<br><span class="muted">was {esc(r["fork_name"])}</span>'
+                 if r.get("fork_name") else ""),
+              code(r["resref"]), chips(r), esc(r["fork"]), esc(r["match_kind"]),
+              _changes_html(r["changes"])]
+             for r in rows]), open_=False)
+
+    # -- dialogs ---------------------------------------------------------
+    dlg = payload["dialogs"]
+    p.h2("Dialog divergence",
+         "The module's writing: who said what, what stopped being said, and what "
+         "got rewritten.")
+    p.w(p.table(
+        ["Fork", "Conversations", "Dropped", "Renamed", "Changed", "Added since"],
+        [[esc(label), str(s["total"]), str(s["dropped"]), str(s["renamed"]),
+          str(s["changed"]), str(s["added_in_baseline"])]
+         for label, s in dlg["summary"].items()]
+        + [["<b>baseline</b>", str(dlg["baseline_total"]), "", "", "", ""]],
+        nums={1, 2, 3, 4, 5}, filterable=False))
+    p.note("Conversations are compared on their <b>text</b>, not their node counts: a "
+           "conversation rewritten line-by-line without changing shape used to be "
+           "invisible, and one that merely moved to a new resref used to look dropped. "
+           "Renames are resolved first, so the dropped list below is real loss.")
+
+    ren = dlg["renamed"]
+    p.block("Renamed conversations", len(ren), p.table(
+        ["Fork resref", "Baseline resref", "In fork(s)", "Nodes", "Spoken by in fork",
+         "Wiki"],
+        [[code(r["resref"]), code(r["baseline_resref"]), esc(_forks(r)),
+          str(r["nodes"]),
+          esc(_owner_summary(r["owners_in_fork"])) or "—", chips(r)]
+         for r in ren], nums={3}),
+        sub="Identical text under a different resref — not lost, just moved.")
+
+    drop = dlg["dropped"]
+    body = []
+    for r in drop:
+        owners = esc(r["owner_summary"]) or "<i>no NPC in the fork referenced it</i>"
+        scripts = (", ".join(f"<code>{esc(s)}</code>" for s in r["scripts"])
+                   or '<span class="muted">none</span>')
+        body.append(
+            f'<details class="fd-block"><summary><code>{esc(r["resref"])}</code> '
+            f'<span class="fd-count">{r["entries"] + r["replies"]} nodes</span> '
+            f'<span class="muted">— {owners}</span></summary>'
+            f'<p class="muted">In {esc(_forks(r))}. '
+            f'{r["entries"]} NPC / {r["replies"]} PC nodes, {r["starts"]} entry '
+            f'point(s). Scripts: {scripts}. {chips(r)}</p>'
+            + _transcript_html(r["transcript"]) + "</details>")
+    p.block("Dropped conversations", len(drop), "".join(body),
+            sub="Gone from the baseline entirely. Each expands to its full transcript "
+                "— including the scripts each node fired — so the writing can be "
+                "reclaimed straight off this page.", open_=False)
+
+    chg = dlg["changed"]
+    body = []
+    for r in chg:
+        bits = []
+        if r["scripts_removed"]:
+            bits.append("scripts dropped: " + ", ".join(
+                f"<code>{esc(s)}</code>" for s in r["scripts_removed"]))
+        if r["scripts_added"]:
+            bits.append("scripts added: " + ", ".join(
+                f"<code>{esc(s)}</code>" for s in r["scripts_added"]))
+        meta = (f'<p class="muted">In {esc(_forks(r))}. '
+                f'{r["fork_nodes"]} nodes in the fork → {r["baseline_nodes"]} now. '
+                + ("; ".join(bits) + ". " if bits else "")
+                + f'Spoken by: {esc(_owner_summary(r["owners_in_baseline"])) or "nobody"}'
+                  f'. {chips(r)}</p>')
+        body.append(
+            f'<details class="fd-block"><summary><code>{esc(r["resref"])}</code> '
+            f'<span class="fd-count">{len(r.get("diff") or [])} diff lines</span>'
+            f'</summary>{meta}'
+            + _diff_html(r.get("diff") or [], r.get("diff_truncated", False))
+            + "</details>")
+    p.block("Rewritten conversations", len(chg), "".join(body),
+            sub="Text or attached scripts changed. The diff runs fork → baseline, so "
+                "<span class=\"fd-diff\" style=\"padding:0 .3em\">"
+                "<span class=\"del\">-</span></span> is a line the fork had and "
+                "<span class=\"fd-diff\" style=\"padding:0 .3em\">"
+                "<span class=\"add\">+</span></span> is what replaced it.",
+            open_=False)
+
+    own = dlg["owner_changed"]
+    p.block("Conversations whose speaker changed", len(own), p.table(
+        ["resref", "In fork(s)", "Spoken by in the fork", "Spoken by now", "Wiki"],
+        [[code(r["resref"]), esc(_forks(r)),
+          esc(", ".join(r["owners_in_fork"])) or "—",
+          esc(", ".join(r["owners_in_baseline"]))
+          or "<b>nobody — orphaned</b>", chips(r)]
+         for r in own]),
+        sub="The conversation still exists, but a different NPC speaks it — or none "
+            "does, which means players can no longer hear it.")
+
+    # -- scripts (deliberately not detailed here) ------------------------
+    sc = payload.get("scripts")
+    p.h2("Script divergence", "Recorded, not listed — see the JSON.")
+    if not sc:
+        p.w('<p class="muted">Skipped (<code>--no-scripts</code>).</p>')
+    else:
+        tot_drop = len(sc["scripts_dropped"])
+        tot_mod = len(sc["scripts_modified"])
+        needed = sum(1 for r in sc["scripts_dropped"] if r["needed_by"])
+        p.w(f"<p>The forks carry <b>{tot_drop}</b> <code>.nss</code> scripts the "
+            f"baseline does not ({needed} of them referenced by content in the lost "
+            f"list above), and <b>{tot_mod}</b> scripts exist on both sides with "
+            f"different source. Script-level detail — including the unified diff of "
+            f"every modified script — is deliberately kept out of this page and "
+            f"lives in <code>module-index/fork_diff.json</code> and "
+            f"<code>fork_diff.md</code>, which are regenerated by the same run.</p>")
+
+    body = "".join(p.parts)
+    # Everything outside <body> is dropped by the wiki generator, which builds
+    # its own <head> (and re-escapes the <title>, so keep it free of & and ').
+    # The <style> therefore has to live *inside* <main>, as ManualPageTemplate
+    # does it — in <head> it would silently vanish from the published page.
+    return (
+        '<!doctype html>\n<html lang="en">\n<head>\n  <meta charset="utf-8">\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'  <title>Fork diff: 2008 and 2009 vs. {esc(b["title"])}</title>\n'
+        '  <link rel="stylesheet" href="../../assets/style.css">\n'
+        "</head>\n<body>\n  <main>\n"
+        f"  <style>{FD_STYLE}  </style>\n"
+        '  <div class="mw-layout">\n    <aside class="mw-toc-pane">'
+        + p.render_toc()
+        + '</aside>\n    <div class="mw-content">\n'
+        + body
+        + "\n    </div><!-- .mw-content -->\n  </div><!-- .mw-layout -->\n"
+        f"  <script>{FD_SCRIPT}  </script>\n  </main>\n</body>\n</html>\n")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _die(msg: str) -> "int":
+    raise SystemExit(f"[fork-diff] {msg}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="nwn-fork-diff",
+        description="Compare ancestor module forks against a baseline module.")
+    ap.add_argument("--fork", action="append", required=True, metavar="REPO",
+                    help="ancestor module repo root (repeatable)")
+    ap.add_argument("--baseline", required=True, metavar="REPO",
+                    help="current module repo root")
+    ap.add_argument("--wiki-url", action="append", required=True, metavar="REPO=URL",
+                    help="published wiki base URL for a repo, by path or basename "
+                         "(required once per --baseline/--fork; repeatable)")
+    ap.add_argument("--out", metavar="DIR",
+                    help="output directory for fork_diff.json/.md "
+                         "(default: BASELINE/module-index)")
+    ap.add_argument("--html", metavar="FILE",
+                    help="HTML report path "
+                         "(default: BASELINE/docs.manual/Draft/ForkDiff.html)")
+    ap.add_argument("--no-scripts", action="store_true",
+                    help="skip the .nss/.dlg comparison (the slowest pass)")
+    ap.add_argument("--no-fuzzy", action="store_true",
+                    help="skip fuzzy name matching in identity resolution")
+    ap.add_argument("--include-stock", action="store_true",
+                    help="do not filter stock/CEP blueprints and scaffolding")
+    ap.add_argument("--top", type=int, default=40, metavar="N",
+                    help="rows per table in the Markdown report (default: 40)")
+    ap.add_argument("--max-diff-lines", type=int, default=80, metavar="N",
+                    help="unified-diff lines kept per modified script (0 = none)")
+    args = ap.parse_args(argv)
+
+    # Wiki base URLs are explicit and mandatory.  They used to be read out of
+    # each module-index's `wiki_url` fields, which is how the published report
+    # ended up full of dead links: a wiki build without --base-url writes local
+    # filesystem paths into every one of them, and nothing downstream noticed.
+    urls: dict[str, str] = {}
+    for spec in args.wiki_url:
+        repo, sep, url = spec.partition("=")
+        if not sep or not url.strip():
+            return _die(f"--wiki-url needs REPO=URL, got {spec!r}")
+        urls[repo.strip().rstrip("/")] = url.strip()
+
+    def _wiki_base_for(root: Path) -> str:
+        for key in (str(root), root.name):
+            if key in urls:
+                return urls[key]
+        return _die(f"no --wiki-url given for {root} — pass "
+                    f"--wiki-url {root.name}=https://…/")
+
+    base = Module(Path(args.baseline).resolve(),
+                  _wiki_base_for(Path(args.baseline).resolve()))
+    forks: list[tuple[str, Module]] = []
+    for f in args.fork:
+        root = Path(f).resolve()
+        mod = Module(root, _wiki_base_for(root))
+        forks.append((root.name, mod))
+    base.wiki_label = short_wiki_label(base, True)
+    for _, mod in forks:
+        mod.wiki_label = short_wiki_label(mod, False)
+    # Findings are keyed by wiki label from here on, so every module can be
+    # given a presence chip on every row.
+    forks = [(mod.wiki_label, mod) for _, mod in forks]
+    ALL_MODULES[:] = [(base.wiki_label, base)] + list(forks)
+    labels = [l for l, _ in ALL_MODULES]
+    if len(set(labels)) != len(labels):
+        return _die(f"wiki labels are not unique: {labels} — the hosts in "
+                    f"--wiki-url must differ in their first label")
+
+    print(f"[fork-diff] baseline: {base.title} ({base.root})", file=sys.stderr)
+    for label, mod in forks:
+        print(f"[fork-diff] fork:     {mod.title} ({label})", file=sys.stderr)
+
+    # Component 1
+    resolved: dict[str, dict] = {}
+    match_kinds: dict[str, dict] = {}
+    for label, mod in forks:
+        resolved[label] = {
+            "areas": resolve_identity(mod.areas, base.areas, fuzzy=not args.no_fuzzy),
+            "creatures": resolve_identity(mod.creatures, base.creatures, fuzzy=not args.no_fuzzy),
+            "items": resolve_identity(mod.items, base.items, fuzzy=not args.no_fuzzy),
+        }
+        match_kinds[label] = {}
+        for plural, table in resolved[label].items():
+            counts: dict[str, int] = {}
+            for m in table.values():
+                counts[m["match_kind"]] = counts.get(m["match_kind"], 0) + 1
+            match_kinds[label][plural] = counts
+        print(f"[fork-diff] {label}: matched "
+              + ", ".join(f"{p}={match_kinds[label][p]}" for p in ("areas", "creatures", "items")),
+              file=sys.stderr)
+
+    lost = lost_content(forks, base, resolved, args.include_stock)
+    acc = accessibility(forks, base, resolved)
+    div = divergence(forks, base, resolved, args.include_stock)
+    scripts = None if args.no_scripts else script_divergence(
+        forks, base, lost, args.max_diff_lines)
+    dialogs = dialog_divergence(forks, base, args.max_diff_lines)
+
+    def _mod_row(mod: Module) -> dict:
+        return {"label": mod.root.name, "title": mod.title,
+                "wiki_label": mod.wiki_label, "wiki_base": mod.wiki_base,
+                "root": str(mod.root), "areas": len(mod.areas),
+                "creatures": len(mod.creatures), "items": len(mod.items)}
+
+    payload = {
+        "generated_at": _dt.datetime.now().replace(microsecond=0).isoformat(),
+        "modules": {
+            "baseline": _mod_row(base),
+            "forks": [_mod_row(m) for _, m in forks],
+        },
+        "match_kinds": match_kinds,
+        "lost_content": lost,
+        "accessibility": acc,
+        "divergence": div,
+        "dialogs": dialogs,
+    }
+    if scripts is not None:
+        payload["scripts"] = scripts
+
+    out_dir = Path(args.out).resolve() if args.out else base.index_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "fork_diff.json").write_text(
+        json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "fork_diff.md").write_text(
+        render_markdown(payload, args.top), encoding="utf-8")
+
+    html_path = (Path(args.html).resolve() if args.html
+                 else base.root / "docs.manual" / "Draft" / "ForkDiff.html")
+    html = render_html(payload)  # raises on any unverified href
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.write_text(html, encoding="utf-8")
+
+    n_href = html.count(' href="http')
+    print(f"[fork-diff] lost: {len(lost['areas'])} area(s), {len(lost['creatures'])} creature(s), "
+          f"{len(lost['items'])} item(s)", file=sys.stderr)
+    print(f"[fork-diff] accessibility regressions: {len(acc['items_regressed'])} item(s), "
+          f"{len(acc['areas_orphaned'])} area(s), "
+          f"{len(acc['creatures_no_longer_spawned'])} creature(s) "
+          f"({len(acc['creatures_spawned_elsewhere'])} demoted: live under another "
+          f"blueprint)", file=sys.stderr)
+    print(f"[fork-diff] diverged: {len(div['repurposed'])} repurposed "
+          f"(+{len(div['repurposed_autonumbered'])} autonumbered), "
+          f"{len(div['rebalanced'])} rebalanced", file=sys.stderr)
+    print(f"[fork-diff] dialogs: {len(dialogs['dropped'])} dropped, "
+          f"{len(dialogs['renamed'])} renamed, {len(dialogs['changed'])} rewritten, "
+          f"{len(dialogs['owner_changed'])} reassigned", file=sys.stderr)
+    print(f"[fork-diff] links: {n_href} emitted, {len(VERIFIED_URLS)} distinct URLs, "
+          f"all existence-checked against the built docs/ trees", file=sys.stderr)
+    print(f"[fork-diff] wrote {out_dir / 'fork_diff.json'}, {out_dir / 'fork_diff.md'} "
+          f"and {html_path}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
