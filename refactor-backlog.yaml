@@ -777,8 +777,55 @@ items:
 - id: bestiary-module
   phase: 1
   title: Extract bestiary/server-firsts DB reads into bestiary.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 522c156
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (139s), lotr2008 IDENTICAL (85s), lotr2009 IDENTICAL (112s) — but this code is NOT exercised by the gate; see the by-hand run below"
+  impl_notes: >
+    bestiary.py 246 lines; cli.py 14,643 -> 14,427.  Moved seed_bestiary_catalogue,
+    load_bestiary_stats, backfill_server_first_player_names and _utc_to_local as one
+    contiguous verbatim block.  SCOPE REDUCED: _render_server_first_body stayed in
+    cli.py — it calls _tz_label_from_env, which render-activity explicitly owns and
+    which bin/nwn-wiki-activity reaches as wiki._tz_label_from_env; moving it here
+    would wrong-home it, and importing cli from a submodule is forbidden.  Pick it
+    up after render-activity lands.  No constants moved: the _BESTIARY_*/
+    _SERVER_FIRSTS globals and BST_SF_CR already live in state.py.  cli.py keeps
+    re-exporting the four names so bin/nwn-wiki-activity's wiki.load_bestiary_stats
+    / wiki.backfill_server_first_player_names still resolve.  Line multiset: 6 added
+    lines (the import block), all 222 removed lines present verbatim in bestiary.py.
+    State audit — all access via `from nwn_wiki import state` + state.X, zero
+    from-imports: _BESTIARY_ACTIVE written; _BESTIARY_KILLS, _BESTIARY_TOP and
+    _SERVER_FIRSTS each REBOUND to a fresh {} / [] and then filled, which is exactly
+    the case the module-object rule exists for.
+    BECAUSE THE GATE IS BLIND HERE, verified by hand: built a sqlite bestiary DB in
+    the scratchpad with the queried schema (catalogue, kills, resref_alias, and a
+    server_first table deliberately lacking first_player_name so the ALTER TABLE
+    migration and OperationalError fallback both ran), then drove everything through
+    the cli.* bindings.  backfill_server_first_player_names back-filled 1 record;
+    load_bestiary_stats reported 2 creatures + 1 server-first and cli.state showed
+    the resref_alias fold applied, per-player rows sorted by total desc and cdkey
+    resolved to names; cli.state._BESTIARY_KILLS is bestiary.state._BESTIARY_KILLS
+    (post-rebind objects visible across the split); _utc_to_local converted correctly
+    under TZ=America/Chicago; _render_server_first_body — still in cli.py — rendered
+    the full table from the state the moved loader wrote, proving the seam works in
+    both directions; seed_bestiary_catalogue seeded the accessible row and pruned the
+    orphan.
+  found:
+    - "seed_bestiary_catalogue's `db: \"Db\"` annotation is now a dangling forward
+       reference to a class in cli.py.  Harmless under PEP 563 but it would break
+       typing.get_type_hints; wants a TYPE_CHECKING import once Db has a home."
+    - "_render_server_first_body is stranded bestiary code in the monolith purely
+       because of _tz_label_from_env — a sequencing wart between this item and
+       render-activity."
+    - "All three DB entry points do `import sqlite3` inside the function body; now
+       that they share a module, one module-level import would do."
+    - "backfill_server_first_player_names reports con.total_changes, the connection's
+       CUMULATIVE change count, not the count for its executemany.  Correct only
+       because the connection is fresh."
+    - "load_bestiary_stats leaves con unclosed on both early returns and on any
+       exception before con.close() — no try/finally, unlike seed_bestiary_catalogue."
+
   after: [sim-pc-gear]
   ranges: "15875-16141"
   plan: >
@@ -988,6 +1035,9 @@ items:
     The log collectors and cache (_collect_log_files .. _save_activity_cache),
     parse_nwserver_logs, the SVG chart builders (svg_vbar_chart, svg_hbar_chart),
     _tz_label_from_env, render_activity_page.
+    ALSO take _render_server_first_body, which bestiary-module had to leave in
+    cli.py because it calls _tz_label_from_env; once that lands here, decide whether
+    it belongs in this module or follows the rest of the bestiary code.
   notes: >
     NOT covered by the gate — needs --log-dir, which the golden build omits.
     After this item, run bin/nwn-wiki-activity --check-online by hand against a
