@@ -63,6 +63,18 @@ WEAPON_COLS = [
     "WeaponType", "WeaponSize", "RangedWeapon", "MinRange", "MaxRange",
     "NumDice", "DieToRoll", "CritThreat", "CritHitMult", "WeaponWield",
     "AmmunitionType", "BaseAC", "ArmorCheckPen", "AC_Enchant",
+    # Hex bitmask over nwn-wiki's SLOT_* constants — the authoritative
+    # "what can wear this" answer, used by the counter-gear slot model.
+    "EquipableSlots",
+    # Per-base-item feat ids. The engine looks a weapon's Focus / Specialization
+    # / Improved Critical / Overwhelming / Devastating Critical feat up here, so
+    # a blank column means the feat cannot be taken for that weapon at all — the
+    # counter-gear simulation reads these to decide which feats a wielder has.
+    # Keep in step with _WEAPON_2DA_COLS in bin/nwn-wiki.
+    "WeaponFocusFeat", "EpicWeaponFocusFeat",
+    "WeaponSpecializationFeat", "EpicWeaponSpecializationFeat",
+    "WeaponImprovedCriticalFeat", "EpicWeaponOverwhelmingCriticalFeat",
+    "EpicWeaponDevastatingCriticalFeat",
 ]
 
 

@@ -26,6 +26,8 @@ CLI:
 nwn_manager/
   bin/nwn-manager        the wrapper CLI
   bin/nwn-wiki           the wiki generator (Python 3, stdlib only)
+  bin/nwn-fork-diff      cross-module comparison of ancestor forks against a
+                         baseline module (see "Compare module forks")
   bin/wiki_data/         bundled 2DA → name lookups (classes, baseitems,
                          item properties, …)
   bin/wiki_assets/       bundled wiki stylesheet
@@ -456,7 +458,7 @@ the bottom.
 
 #### Combat-stat configuration
 
-Two derived combat numbers depend on server/module rules rather than the
+Some derived combat numbers depend on server/module rules rather than the
 blueprint alone, so they're exposed as dials (defaults match stock NWN). Set
 them to match your server:
 
@@ -464,15 +466,135 @@ them to match your server:
 | --- | --- | --- |
 | `--max-character-level N` | `40` | Server level cap. A creature's total class levels are clamped to `N` (consumed in `ClassList` order) when deriving **base attack bonus**, so an over-HD boss doesn't accrue unbounded BAB. With `N=40`, a Fighter60/WeaponMaster10/ArcaneArcher60 is treated as Fighter40 → BAB 20. `0` disables the cap. |
 | `--max-ability-bonus N` | `12` | Cap on the ability-score bonus a single equipped item may grant when folded into a creature's effective Str/Dex/… (which drive AC, saves, and attack). NWN's default is `+12`; some modules raise it (e.g. `+24`). |
+| `--max-player-level N` | follows `--max-character-level` | Level cap a **player** can actually reach, used only for the counter-gear report's reference PC. Deliberately separate from `--max-character-level`: a server running NWNX MaxLevel can let players past 40 (`NWN_MAXLEVEL=60`) while creature BAB still wants clamping at the engine's own 40 — raising the latter would move published creature attack figures. |
 
 ```sh
-# Homer's LotR server: level cap 40, item ability bonus cap +24
-nwn-manager wiki -- --max-character-level 40 --max-ability-bonus 24
+# Homer's LotR server: creature BAB clamp 40, item ability bonus cap +24,
+# players capped at 60 by NWNX MaxLevel
+nwn-manager wiki -- --max-character-level 40 --max-ability-bonus 24 --max-player-level 60
 # or directly:
-nwn-wiki --src unpacked --out docs --max-character-level 40 --max-ability-bonus 24
+nwn-wiki --src unpacked --out docs --max-character-level 40 --max-ability-bonus 24 --max-player-level 60
 ```
 
-(The `refresh-homers-lotr-wiki` runner already passes this module's values.)
+(The `refresh-homers-lotr-wiki` runner already passes this module's values, and
+reads `--max-player-level` from `server.env`'s `NWN_MAXLEVEL`.)
+
+#### Counter-gear analysis (`--counter-gear`)
+
+`module-index/counter_gear.{json,md}` answers "what does a player need to kill
+this?" for every creature in the module. It simulates each one against a
+synthetic reference PC, using only items players can actually obtain (sold in a
+store, in a container, dropped or pickpocketed off a creature, or granted by a
+script). For each creature it reports rounds-to-kill and rounds-to-die, the
+**cheapest kit that actually wins**, and the strongest kit the module offers,
+plus a Challenge-Rating progression ladder and a table of the highest-GP
+attainable item in every equipment slot.
+
+The reference PC is a single-class fighter at level `min(CR,
+--max-player-level)` with:
+
+- every level-up point and all ten tiers of Great Strength in its attacking
+  stat — Great **Dexterity** instead behind a finesse or ranged weapon, since
+  those attack off Dex (damage stays Strength either way, as in the engine).
+  Epic feats are gated by level, so the tiers accumulate from level 21 and are
+  all affordable by 48;
+- Weapon Focus / Specialization and their epic tiers in whatever weapon the
+  solver equips, so weapons stay comparable with one another;
+- ability bonuses from gear that **stack across items**, with the total per
+  ability clamped by `--max-ability-bonus` (see above). Two +12 items reach a
+  +24 cap where one cannot, so raising that dial only pays off once the module
+  has enough +ability gear to stack;
+- a free full heal on a 150-second cooldown (25 rounds). Surviving one cooldown
+  therefore counts as surviving indefinitely, which is why some creatures are
+  "outlasts heal" rather than "never dies";
+- Epic Toughness out of its leftover class bonus feats, via the same
+  `epic_toughness_hp()` used for creature HP. The feat budget models two pools —
+  Fighter bonus feats (weapon chain, critical feats, Epic Prowess, then Epic
+  Toughness) and general feats (Great Strength, then Great Constitution) — since
+  a class bonus feat may only be spent from that class's own list.
+
+**Critical hits.** Threat range and multiplier come from each weapon's own
+`baseitems.2da` row, and a critical requires a threatening roll that *also hits*
+followed by a confirmation roll against the same AC. Every attack keeps the
+natural-20 / natural-1 floor and ceiling of 5%. On top of that:
+
+- **Improved Critical** doubles the threat range (20 → 19-20, 19-20 → 17-20).
+- **Overwhelming Critical** adds `(multiplier - 1)d6` on a confirmed critical.
+- **Devastating Critical** — see below.
+- **Immunity to critical hits** (item property 37, subtype 8) suppresses all
+  three outright, for creatures and for the PC.
+
+Which feats exist for a given weapon is read from that weapon's own
+`baseitems.2da` feat columns, so a base item that names no Weapon Focus feat
+correctly grants none. The PC is assumed specced into whatever it holds, subject
+to the real prerequisites (Improved Critical needs BAB 8; the epic critical chain
+needs Strength 25, which is why a Dexterity/finesse build gets neither).
+Creatures get only the critical feats their blueprint actually carries.
+
+**Legendary feats are deliberately not simulated** while they remain in
+development.
+
+#### Devastating Critical
+
+The engine only rolls a devastating critical for a weapon whose `baseitems.2da`
+row names a feat in `EpicWeaponDevastatingCriticalFeat`. That makes the rule in
+force **detectable rather than configurable**:
+
+| 2DA state | Behaviour |
+| --- | --- |
+| column populated | stock: a confirmed critical forces a Fortitude save (DC 10 + ½ level + Str mod) or death, folded into the sim as a per-round kill chance in both directions |
+| column blank | the engine never rolls it — the module disabled it at source |
+| column absent from our data | assumed stock; pass `--2da-dir` to detect it properly |
+
+A module that replaces it with damage supplies only the replacement:
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--devcrit-bonus-dice N` | `0` | On an ordinary critical, an attacker specced into the weapon adds `N` dice of physical damage, sized by `WeaponSize` (1–2 → d6, 3 → d8, 4+ → d10). |
+
+`refresh-homers-lotr-wiki` passes `3`, matching `DEVCRIT_DICE` in that module's
+`unpacked/devcrit_inc.nss`, where `bin/gen-devcrit-map.py` blanks the column.
+
+Wins that take more than 100 rounds are marked ⏳ attrition with a wall-clock
+estimate — technically winnable, but usually because the kit only just
+out-paces the creature's regeneration.
+
+The simulation is expensive (~1 minute for 1000 creatures against ~600 candidate
+items), and its inputs rarely change, so it does **not** run on a normal wiki
+refresh:
+
+```sh
+# Rebuild the analysis
+nwn-manager wiki -- --counter-gear
+```
+
+Note `--2da-dir` matters here beyond naming things: `nwn-wiki` merges that
+`baseitems.2da`'s weapon columns into its own tables, which is what gives
+CEP/custom base items (rows past the stock 112) real damage dice, crit stats and
+feat mappings. Without it those weapons contribute no weapon dice at all.
+
+Every other run instead hashes the analysis' inputs — item stats, costs and
+accessibility, creature stats, the `--2da-dir` files, and the combat dials — and
+compares that fingerprint against the one stored in `counter_gear.json`. When
+they differ, the module-index summary prints:
+
+```
+[nwn-wiki] module-index: counter_gear.json is STALE — items, creatures, 2DAs or
+combat dials changed since it was built. Re-run with --counter-gear.
+```
+
+This is module-agnostic (it derives entirely from the unpacked tree), so it
+works as a build gate in any project. The two `counter_gear.*` files are the one
+exception to the `module-index/` wipe at the start of each run — otherwise the
+on-demand report would be deleted by every refresh.
+
+Model limitations, all stated in the report header: no spells, potions or
+summons are simulated, so "unwinnable" means *unwinnable on gear alone*; rounds
+are expected values rather than rolled; armour maximum-Dex limits are not
+modelled; and special-ability save DCs are estimates, because innate spell level
+is not in the blueprint data. A save DC the best gear cannot beat is reported as
+a review note rather than a loss — the data cannot distinguish a save-or-die
+from a save-for-half.
 
 #### Quests: grouping and ordering
 
@@ -785,6 +907,84 @@ files add what the raw files don't have: resolved string names, built
 cross-references, and pre-aggregated views that let an LLM or script answer
 questions like "where is this item found?" or "which NPCs share this
 appearance?" without re-parsing the full GFF tree.
+
+### Compare module forks
+
+`bin/nwn-fork-diff` compares one or more **ancestor** module repos against a
+**baseline** (current) module. It answers "what did we lose, what did we
+orphan, and how did shared content drift" — a content-migration worklist. It
+writes three files:
+
+| Output | Where | Contents |
+|--------|-------|----------|
+| `ForkDiff.html` | `BASELINE/docs.manual/Draft/` (override with `--html`) | The published report. **Complete** — no table is truncated, and every link was existence-checked before being emitted. |
+| `fork_diff.json` | `BASELINE/module-index/` (override with `--out`) | Everything, machine-readable, including the `.nss` detail the HTML omits. |
+| `fork_diff.md` | `BASELINE/module-index/` | Companion summary, truncated to `--top` rows per table. |
+
+```sh
+nwn-fork-diff \
+  --baseline ../nwn_homers_lotr    --wiki-url nwn_homers_lotr=https://season2.homerslotr.com/ \
+  --fork     ../nwn_lordoftherings --wiki-url nwn_lordoftherings=https://lotr.homerslotr.com/ \
+  --fork     ../nwn_homers_lotr_2009 --wiki-url nwn_homers_lotr_2009=https://2009.homerslotr.com/
+```
+
+Every repo passed in must already have a generated `module-index/` (run the
+wiki there first), its `unpacked/` tree, and its built `docs/` tree. Names are
+read from `module-index/` because they are TLK-resolved; tags and deep fields
+(`PropertiesList`, `ClassList`, `NaturalAC`, script slots) come from the raw
+GFF in `unpacked/`.
+
+**`--wiki-url` is required, once per repo** (matched by full path or by
+basename). It is deliberately explicit: the tool used to take link URLs from
+each `module-index`'s `wiki_url` fields, but a wiki build run without
+`--base-url` writes local filesystem paths into every one of them, which is how
+the first published report ended up full of dead links. URLs are now built from
+the flag and then **existence-checked against that repo's `docs/<section>/`
+tree**, so a link is only ever emitted for a page that exists — hidden areas
+included. Where an entity has no page in a module, the report shows a
+struck-through chip instead of a link, which is what tells you the entity is
+absent *from that module*.
+
+**Identity is resolved, not assumed.** Resrefs are not stable across forks of
+the same module — a slot can be reused for entirely different content, and
+content that survived can carry a new resref. Each fork entity is matched to at
+most one baseline entity by, in order, `resref` → `tag` → normalized `name` →
+fuzzy name, and the report records which rule fired. Only `none` is a real
+migration candidate; `tag`/`name`/`fuzzy` mean the content survived under a
+different resref, and a `resref` match with a different name is a **repurposed**
+slot.
+
+Report sections:
+
+| Section | Contents |
+|---------|----------|
+| Identity resolution | Match-kind counts per fork and entity type, so the matcher's behaviour is visible and tunable. |
+| Lost content to reclaim | Areas, creatures and items present in a fork and absent from the baseline, ranked by a reclaim-value score. Each lost area lists the creatures it contained. |
+| Accessibility regressions | Items obtainable in a fork but unreachable now (with the current `inaccessible_items` reason), areas that lost all inbound transitions, and creatures placed in a fork but blueprint-only now — plus a separate, demoted list of findings where the content is in fact still live under a **different blueprint of the same name**. |
+| Content by name | The same comparison keyed on names instead of resrefs: renamed / re-resref'd, only-in-a-fork, and only-in-the-baseline, per entity type. |
+| Diverged shared content | `repurposed` (same resref, different content, with autonumbered collisions separated out) and `rebalanced` (field-level deltas: CR, HP, cost, item properties, transitions, …), split by entity type. |
+| Dialog divergence | Conversations dropped (with their full transcript and speaking NPC), renamed (same text, new resref), rewritten (unified text diff + attached-script changes), and reassigned to a different speaker. |
+| Script divergence | Counts only in the HTML; the dropped/modified lists and the unified diff of every modified `.nss` live in `fork_diff.json` / `fork_diff.md`. |
+
+**Two rules the report is built on**, both learned from wrong findings in the
+first published run:
+
+- **Names outrank resrefs.** `areaNNN` comes from the toolset's New Area
+  Wizard and `<stem>NNN` from palette copy-paste, so a shared resref can be a
+  collision and a differing resref can be the same content. Findings that rest
+  on an autonumbered resref alone are demoted into their own collapsed block.
+- **Placement and reachability are checked per *name*, not per blueprint.**
+  These modules carry several blueprints of the same name (the baseline has two
+  "Gandalf the Gray", one placed and one not), and identity resolution consumes
+  each baseline entity once — so it can land on the dead twin of a name that is
+  perfectly alive. Only a name with no placed/reachable blueprint at all counts
+  as a regression.
+
+Useful flags: `--include-stock` keeps stock BioWare/CEP blueprints and toolset
+scaffolding (filtered by default, but always counted); `--no-scripts` skips the
+slowest pass; `--no-fuzzy` restricts matching to resref/tag/exact name;
+`--top N` sets rows per Markdown table (the JSON and the HTML are always
+complete); `--max-diff-lines` caps each unified diff.
 
 #### Custom theme (wiki-theme/)
 

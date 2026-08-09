@@ -26,6 +26,21 @@ cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; 
 # server.env (sourced above); fall back to the standard NWN user dir.
 DB_DIR="${NWN_HOME_DIR:-$HOME/.local/share/Neverwinter Nights}/database"
 
+# --max-character-level stays at the engine's 40: it clamps *creature* class
+# levels when deriving BAB, and the published creature attack figures are tuned
+# against it. --max-player-level is the separate dial for how high a *player*
+# can actually go, which NWNX MaxLevel raises to NWN_MAXLEVEL (60) — it only
+# feeds the counter-gear report's reference PC.
+#
+# --devcrit-bonus-dice 3 matches DEVCRIT_DICE in unpacked/devcrit_inc.nss. Only
+# the replacement damage needs stating: that the engine's save-or-die
+# Devastating Critical is disabled at all is DETECTED from hak_2da/baseitems.2da,
+# whose EpicWeaponDevastatingCriticalFeat column bin/gen-devcrit-map.py blanks.
+# Legendary feats are deliberately not simulated while they are in development.
+#
+# The counter-gear simulation is NOT run here: it is opt-in via --counter-gear
+# (this run only fingerprints its inputs and warns if the report went stale).
+# To rebuild it, re-run this command with --counter-gear appended.
 nwn-manager wiki \
   --base-url https://homerslotr.com/ \
   --exclude-conv-option "[Admin Options]" \
@@ -35,6 +50,8 @@ nwn-manager wiki \
   --2da-dir "$PROJECT/hak_2da" \
   --max-character-level 40 \
   --max-ability-bonus 24 \
+  --max-player-level "${NWN_MAXLEVEL:-40}" \
+  --devcrit-bonus-dice 3 \
   --path-from thewelloferu
 status=$?
 

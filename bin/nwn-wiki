@@ -14,6 +14,7 @@ Pure stdlib. No third-party deps.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import math
@@ -29,7 +30,7 @@ import urllib.parse
 from collections import Counter, defaultdict, deque
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR / "wiki_data"
@@ -318,6 +319,32 @@ def _load_weapons() -> dict[int, dict[str, str]]:
 
 WEAPONS = _load_weapons()
 
+# baseitems.2da columns merged into WEAPONS from a --2da-dir override. Keep in
+# step with WEAPON_COLS in bin/wiki_data/_build_stock.py, which writes the same
+# set into the bundled weapons.json.
+#
+# The five feat columns name the per-base-item feat a wielder would take (the
+# engine looks the feat up here rather than by weapon name), so a base item with
+# a blank column has no such feat to take — which is exactly how this module
+# disables Devastating Critical: bin/gen-devcrit-map.py blanks
+# EpicWeaponDevastatingCriticalFeat for every row.
+_WEAPON_2DA_COLS = (
+    "WeaponType", "WeaponSize", "RangedWeapon", "MinRange", "MaxRange",
+    "NumDice", "DieToRoll", "CritThreat", "CritHitMult", "WeaponWield",
+    "AmmunitionType", "BaseAC", "ArmorCheckPen", "AC_Enchant",
+    "WeaponFocusFeat", "EpicWeaponFocusFeat",
+    "WeaponSpecializationFeat", "EpicWeaponSpecializationFeat",
+    "WeaponImprovedCriticalFeat", "EpicWeaponOverwhelmingCriticalFeat",
+    "EpicWeaponDevastatingCriticalFeat",
+)
+
+# Which of the above a real baseitems.2da actually supplied. Only non-blank
+# cells reach WEAPONS, so this is the only way to tell "the column is there and
+# deliberately empty" (a module that disabled a mechanic) from "we never had
+# that column" (the bundled weapons.json predates it) — a distinction the
+# devastating-critical detection depends on.
+BASEITEM_COLUMNS_SEEN: set[str] = set()
+
 
 def _load_class_bab() -> dict[int, list[int]]:
     """Load class_bab.json → {class_id: [bab_at_lvl1, bab_at_lvl2, ...]}.
@@ -602,6 +629,63 @@ def load_2da_overrides(d: Path) -> None:
                 target[ridx] = label
                 n_loaded += 1
         print(f"  override: {fname} → {n_loaded} rows")
+
+    # Equippable slots and weapon stats from a baseitems.2da override.
+    #
+    # EquipableSlots is a hex bitmask over the SLOT_* constants, so it is the
+    # authoritative slot map for CEP/custom base items as well as stock ones.
+    #
+    # The weapon columns matter just as much: the bundled weapons.json only
+    # covers stock rows 0-112, so without this merge every CEP/custom weapon has
+    # no damage dice, no crit stats and no weapon type at all — it would deal
+    # flat bonuses only in the combat simulation. Merging here also brings in the
+    # per-base-item feat columns (Weapon Focus, Improved Critical, Overwhelming /
+    # Devastating Critical), which is how the simulator knows which feats a
+    # wielder of that weapon could even take.
+    bp = d / "baseitems.2da"
+    if bp.is_file():
+        try:
+            headers, rows = parse_2da(bp)
+            hl = [h.lower() for h in headers]
+            slot_idx = hl.index("equipableslots") + 1 if "equipableslots" in hl else None
+            wcol_idx = {c: hl.index(c.lower()) + 1 for c in _WEAPON_2DA_COLS
+                        if c.lower() in hl}
+            if slot_idx is None:
+                print(f"  warn: {bp} has no 'EquipableSlots' column; "
+                      "keeping the stock slot map", file=sys.stderr)
+            n_slots = n_weap = 0
+            for row in rows:
+                if not row:
+                    continue
+                try:
+                    ridx = int(row[0])
+                except ValueError:
+                    continue
+
+                def _cell(idx: int) -> str:
+                    v = row[idx] if idx < len(row) else ""
+                    return "" if v in ("", "****") else v
+
+                if slot_idx is not None and _cell(slot_idx):
+                    cell = _cell(slot_idx)
+                    try:
+                        BASEITEM_SLOTS[ridx] = (int(cell, 16) if cell.lower().startswith("0x")
+                                                else int(cell))
+                        n_slots += 1
+                    except ValueError:
+                        pass
+
+                BASEITEM_COLUMNS_SEEN.update(wcol_idx)
+                stats = {c: _cell(i) for c, i in wcol_idx.items() if _cell(i)}
+                if stats:
+                    # Merge rather than replace: keep any bundled stock value
+                    # whose column this 2DA happens not to carry.
+                    WEAPONS.setdefault(ridx, {}).update(stats)
+                    n_weap += 1
+            print(f"  override: baseitems.2da → {n_slots} slot rows, "
+                  f"{n_weap} weapon-stat rows")
+        except Exception as e:
+            print(f"  warn: could not parse {bp} weapon columns: {e}", file=sys.stderr)
 
     # Racial ability-score adjustments from a racialtypes.2da override (so
     # module-custom races get correct +/- ability mods). Mirrors the stock
@@ -1643,6 +1727,105 @@ WEAPON_SLOTS = {SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B}
 ARMOR_SLOTS = {SLOT_CHEST, SLOT_LEFT}  # left can hold a shield
 SHIELD_BASEITEMS = {14, 56, 57}  # Small / Large / Tower shields (stock 2da rows)
 
+# Immunity to critical hits is item property 37 (Immunity: Miscellaneous) with
+# subtype 8, which itemprop_format renders through iprp_immunity as this label.
+# Matching the label rather than the raw subtype id keeps this working when a
+# HAK renumbers the table. See nwn_homers_lotr/CLAUDE-devcrit-immunity-audit.md.
+CRIT_IMMUNITY_LABEL = "Critical Hits"
+
+# ---------------------------------------------------------------------------
+# Base item → equippable slots (baseitems.2da "EquipableSlots").
+#
+# The 2DA column is a hex bitmask over exactly the SLOT_* constants above, so it
+# is the authoritative answer to "what can wear this?" — no hand-maintained base
+# item lists needed, and CEP/custom rows come along for free via --2da-dir.
+# BASEITEM_SLOTS starts as the stock table and load_2da_overrides() merges any
+# module baseitems.2da over it (same pattern as BASEITEMS itself).
+# ---------------------------------------------------------------------------
+
+_STOCK_BASEITEM_SLOTS: dict[int, int] = {}
+for _rows, _mask in (
+    ((17,),                                       SLOT_HEAD),
+    ((16,),                                       SLOT_CHEST),
+    ((26,),                                       SLOT_BOOTS),
+    ((36, 78),                                    SLOT_ARMS),
+    ((31, 59, 63),                                SLOT_RIGHT),
+    ((14, 15, 56, 57),                            SLOT_LEFT),
+    ((6, 7, 8, 11, 30, 61),                       SLOT_RIGHT | SLOT_LEFT),
+    ((80,),                                       SLOT_CLOAK),
+    ((52,),                                       SLOT_LRING | SLOT_RRING),
+    ((19,),                                       SLOT_NECK),
+    ((21,),                                       SLOT_BELT),
+    ((20,),                                       SLOT_ARROWS),
+    ((27,),                                       SLOT_BULLETS),
+    ((25,),                                       SLOT_BOLTS),
+    ((69, 70, 71, 72),                            SLOT_CWEAP_R | SLOT_CWEAP_L | SLOT_CWEAP_B),
+    ((10, 12, 13, 18, 32, 33, 35, 45, 50, 55, 111),
+                                                  SLOT_RIGHT | SLOT_CWEAP_R | SLOT_CWEAP_L | SLOT_CWEAP_B),
+    ((0, 1, 2, 3, 4, 5, 9, 22, 28, 37, 38, 40, 41, 42, 47,
+      48, 51, 53, 58, 60, 92, 93, 94, 95, 108),
+                                                  SLOT_RIGHT | SLOT_LEFT | SLOT_CWEAP_R | SLOT_CWEAP_L | SLOT_CWEAP_B),
+    ((73,),                                       SLOT_CHIDE),
+):
+    for _r in _rows:
+        _STOCK_BASEITEM_SLOTS[_r] = _mask
+del _rows, _mask, _r
+
+BASEITEM_SLOTS: dict[int, int] = dict(_STOCK_BASEITEM_SLOTS)
+
+# The slots a player character actually equips, in report order. Creature-only
+# slots (claw/bite/hide) and the three ammo slots are excluded; ammo is folded
+# into one pseudo-slot by PLAYER_SLOT_ORDER's "Ammo" entry below.
+_AMMO_SLOTS = SLOT_ARROWS | SLOT_BULLETS | SLOT_BOLTS
+PLAYER_SLOT_MASK = (SLOT_HEAD | SLOT_CHEST | SLOT_BOOTS | SLOT_ARMS | SLOT_RIGHT
+                    | SLOT_LEFT | SLOT_CLOAK | SLOT_LRING | SLOT_RRING
+                    | SLOT_NECK | SLOT_BELT | _AMMO_SLOTS)
+
+# (report key, label, mask, how many can be worn at once). Rings collapse to one
+# bucket wearable twice; the three ammo types collapse to one "Ammo" bucket.
+PLAYER_SLOTS: list[tuple[str, str, int, int]] = [
+    ("head",   "Head",              SLOT_HEAD,                 1),
+    ("chest",  "Chest",             SLOT_CHEST,                1),
+    ("boots",  "Boots",             SLOT_BOOTS,                1),
+    ("arms",   "Arms",              SLOT_ARMS,                 1),
+    ("right",  "Right hand",        SLOT_RIGHT,                1),
+    ("left",   "Left hand",         SLOT_LEFT,                 1),
+    ("cloak",  "Cloak",             SLOT_CLOAK,                1),
+    ("neck",   "Neck",              SLOT_NECK,                 1),
+    ("belt",   "Belt",              SLOT_BELT,                 1),
+    ("ring",   "Ring",              SLOT_LRING | SLOT_RRING,   2),
+    ("ammo",   "Ammo",              _AMMO_SLOTS,               1),
+]
+
+
+def baseitem_slots(bi: int | None) -> int:
+    """Equippable-slot bitmask for a base item row, 0 when unknown/unequippable."""
+    if bi is None or bi < 0:
+        return 0
+    return BASEITEM_SLOTS.get(int(bi), 0)
+
+
+def item_equip_slots(item: dict | None) -> int:
+    """Equippable-slot bitmask for an item blueprint."""
+    if not item:
+        return 0
+    raw = fld(item, "BaseItem", None)
+    if raw is None:
+        return 0
+    try:
+        return baseitem_slots(int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def slot_label(mask: int) -> str:
+    """Human label for a slot bitmask — a single SLOT_* name where the mask is
+    one known slot, otherwise the names joined with '/'."""
+    if mask in SLOT_NAMES:
+        return SLOT_NAMES[mask]
+    parts = [SLOT_NAMES[b] for b in sorted(SLOT_NAMES) if mask & b]
+    return "/".join(parts) if parts else f"0x{mask:X}"
+
 # Stock 2da row ids used in combat-stat derivation.
 TUMBLE_SKILL_ID = 21       # skills.2da row; Tumble grants +1 dodge AC per 5 ranks
 ARMOR_SKIN_FEAT = 490      # feat.2da FEAT_EPIC_ARMOR_SKIN → +2 natural AC
@@ -1737,7 +1920,11 @@ _MISC_TYPE_MAP: dict[int, str] = {
 # Miscellaneous-subtype base items that get name-based sub-categorization.
 _MISC_LIKE_BASEITEMS: frozenset[int] = frozenset({24, 29, 34, 79, 83, 84, 85, 86, 307, 311})
 
-# CEP weapon base item IDs not present in weapons.json (stock IDs only cover 0–112).
+# CEP weapon base item IDs not present in weapons.json (stock IDs only cover
+# 0–112). Now only a fallback: with --2da-dir, load_2da_overrides merges the
+# module's own baseitems.2da weapon columns into WEAPONS, so these rows get a
+# real WeaponType (and dice, and crit stats) and are recognised on their own.
+# This list still carries runs with no 2DA override.
 _CEP_WEAPON_BASEITEMS: frozenset[int] = frozenset({
     300, 301, 302, 303, 304, 305, 308, 309, 310,
     312, 313, 316, 317, 318, 319, 320, 321, 322, 323, 324,
@@ -2037,6 +2224,68 @@ def _weapon_extra_damage_types(item: dict | None) -> set[str]:
     return out
 
 
+def _try_int(v: Any, default: int = 0) -> int:
+    """int(v) with a fallback — for 2DA cells and GFF fields that may be blank,
+    '****' or missing."""
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def weapon_damage_props(item: dict | None) -> tuple[float, dict[str, float]]:
+    """Damage a weapon's item properties add, split into (flat_physical, by_type).
+
+    Mirrors _weapon_extra_damage_types' rules — Damage Bonus (#6-style) props
+    with subtype 0/7 are Physical and fold into the flat number, everything else
+    is its own damage type — but returns averaged *amounts* (via avg_roll, so
+    '1d6' is 3.5) instead of just the type names. On Hit properties are excluded:
+    they fire on a chance and often apply an effect rather than damage.
+    """
+    if not item:
+        return 0.0, {}
+    _names = set(_DAMAGE_TYPE_LABELS.values())
+    flat = 0.0
+    by_type: dict[str, float] = {}
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pdef = IPROP_DEFS.get(int(pname_id), {})
+        if "damage bonus" not in (pdef.get("name") or "").lower():
+            continue
+        pf = itemprop_format(p)
+        amount = avg_roll(pf["cost"])
+        if not amount:
+            continue
+        sub_id = fld(p, "Subtype")
+        if sub_id in (None, 0, 7):          # Physical — no new damage type
+            flat += amount
+            continue
+        sub = pf["subtype"]
+        if sub in _names:
+            by_type[sub] = by_type.get(sub, 0.0) + amount
+        else:
+            flat += amount
+    return flat, by_type
+
+
+def item_gp_value(item: dict | None) -> int:
+    """Gold-piece value the engine reports for an item: the toolset-computed
+    `Cost` plus the builder-set `AddCost`. This is what GetGoldPieceValue()
+    returns; reading `Cost` alone under-values every item a builder priced by
+    hand (288 of this module's blueprints carry a non-zero AddCost)."""
+    if not item:
+        return 0
+    total = 0
+    for key in ("Cost", "AddCost"):
+        try:
+            total += int(fld(item, key, 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 def _item_accessible(db: "Db", rr: str) -> bool:
     """True when players can obtain this item: sold in a store, found in a
     container, dropped/pickpocketed off a creature, or granted by a script.
@@ -2067,10 +2316,7 @@ def extract_item_offense(db: "Db", item: dict, resref: str) -> dict:
     physical = set(_WEAPONTYPE_TO_PHYS.get(_wtype, frozenset())) if is_weapon else set()
     extra = _weapon_extra_damage_types(item) if is_weapon else set()
     damage_dtypes = physical | extra
-    try:
-        _cost = int(fld(item, "Cost", 0) or 0)
-    except (TypeError, ValueError):
-        _cost = 0
+    _cost = item_gp_value(item)
     return {
         "resref": resref,
         "name": nwn_text(name),
@@ -2090,28 +2336,21 @@ def extract_item_offense(db: "Db", item: dict, resref: str) -> dict:
     }
 
 
-# Base item → the human-readable equip slot it occupies, for grouping defensive
-# counter-gear recommendations. Mirrors _ACCESSORY_BASEITEM_MAP plus armor /
-# helmet / shield rows. Items whose base item isn't here are not defensive slots.
-_DEFENSE_BASEITEM_SLOT: dict[int, str] = {
-    16: "Chest (armor)", 17: "Head", 14: "Left hand (shield)",
-    56: "Left hand (shield)", 57: "Left hand (shield)",
-    19: "Neck", 21: "Belt", 26: "Boots", 36: "Arms (gauntlets)",
-    78: "Arms (bracers)", 52: "Ring", 80: "Cloak",
-}
-
-
 def extract_item_defense(db: "Db", item: dict, resref: str) -> dict:
-    """Defensive capability of a single non-weapon item, as plain data for the
-    counter-gear survivability matcher. Reads the same item-property semantics
-    proven in extract_creature_defenses (AC #1, immunity #20, DR #22, resist #23,
-    save #41, regen #51) so the two never drift. Returns slots it can fill, AC it
-    grants, per-damage-type resist/immunity, save bonuses, regen, and cost.
-    Items that grant none of these (or aren't a defensive base item) return
-    `relevant=False`."""
+    """Defensive capability of a single item, as plain data for the counter-gear
+    survivability matcher and the combat simulator. Reads the same item-property
+    semantics proven in extract_creature_defenses (ability #0, AC #1, immunity
+    #20, DR #22, resist #23, save #41, regen #51) so the two never drift.
+
+    Slots come from baseitems.2da EquipableSlots (BASEITEM_SLOTS), so every
+    player slot is covered and CEP/custom rows resolve too. Returns the slot
+    bitmask and label, AC granted, per-damage-type resist/immunity, save and
+    ability bonuses, regen, and GP value. `relevant=False` marks items that fill
+    no player slot or grant nothing defensive."""
     _raw = fld(item, "BaseItem", None)
     bi = -1 if _raw is None else int(_raw)
-    slot = _DEFENSE_BASEITEM_SLOT.get(bi)
+    slots = baseitem_slots(bi) & PLAYER_SLOT_MASK
+    slot = slot_label(slots) if slots else ""
 
     # AC: deflection/dodge/natural item props, plus armor/shield base AC.
     ac_bonus, _ = item_ac_bonus(item)
@@ -2128,7 +2367,10 @@ def extract_item_defense(db: "Db", item: dict, resref: str) -> dict:
     resist: dict[str, int] = {}
     immune: dict[str, int] = {}
     saves: dict[str, int] = {}
+    abilities: dict[str, int] = {}
+    dr_soak = dr_bypass = 0
     regen = 0
+    crit_immune = False
     for p in list_items(item.get("PropertiesList")):
         pid_raw = fld(p, "PropertyName")
         if pid_raw is None:
@@ -2137,7 +2379,17 @@ def extract_item_defense(db: "Db", item: dict, resref: str) -> dict:
         pf = itemprop_format(p)
         cv = _prop_value_num(pf["cost"]) if pf["cost"] else 0
         sub = pf["subtype"] or ""
-        if pid == 23 and sub:                      # Damage Resistance
+        if pid == 37 and sub == CRIT_IMMUNITY_LABEL:   # Immunity: Miscellaneous
+            crit_immune = True
+        elif pid == 0 and sub:                     # Ability Bonus
+            key = _ABIL_NAME_KEY.get(sub)
+            if key and cv > abilities.get(key, 0):
+                abilities[key] = cv
+        elif pid == 22:                            # Damage Reduction (soak/+N)
+            if cv > dr_soak:
+                dr_soak = cv
+                dr_bypass = _prop_value_num(pf["param"]) if pf.get("param") else 0
+        elif pid == 23 and sub:                    # Damage Resistance
             if cv > resist.get(sub, 0):
                 resist[sub] = cv
         elif pid == 20 and sub:                    # Damage Immunity (%)
@@ -2151,23 +2403,26 @@ def extract_item_defense(db: "Db", item: dict, resref: str) -> dict:
         elif pid == 51:                            # Regeneration
             regen += cv
 
-    try:
-        cost = int(fld(item, "Cost", 0) or 0)
-    except (TypeError, ValueError):
-        cost = 0
+    cost = item_gp_value(item)
 
-    relevant = bool(slot and (ac_bonus or resist or immune or saves or regen))
+    relevant = bool(slots and (ac_bonus or resist or immune or saves
+                               or abilities or regen or dr_soak or crit_immune))
     return {
         "resref": resref,
         "name": nwn_text(db.item_name(resref)),
         "base_item_id": bi,
-        "slot": slot or "",
+        "slots": slots,
+        "slot": slot,
         "relevant": relevant,
         "ac_bonus": ac_bonus,
         "resist": resist,
         "immune": immune,
         "saves": saves,
+        "abilities": abilities,
+        "dr_soak": dr_soak,
+        "dr_bypass": dr_bypass,
         "regen": regen,
+        "crit_immune": crit_immune,
         "cost": cost,
         "accessible": _item_accessible(db, resref),
     }
@@ -2326,8 +2581,23 @@ class Db:
         #     0 disables the cap. See README "Combat-stat configuration".
         #   max_ability_bonus: cap on the ability-score bonus an item may grant
         #     (NWN default +12; some modules raise it, e.g. +24).
+        #   max_player_level: the level cap a *player* can actually reach, used
+        #     only to cap the counter-gear report's reference PC. Deliberately
+        #     separate from max_character_level: a server can raise the player
+        #     cap (NWN_MAXLEVEL=60 here, via NWNX MaxLevel) while creature BAB
+        #     still wants clamping at the engine's own 40 — changing the latter
+        #     would move published creature attack figures.
         self.max_character_level: int = 40
         self.max_ability_bonus: int = 12
+        self.max_player_level: int = 40
+        # Set from main(): the resolved --2da-dir (part of the counter-gear
+        # staleness fingerprint) and whether --counter-gear asked for a re-run.
+        self.twoda_dir: "Path | None" = None
+        self.run_counter_gear: bool = False
+        # Replacement dice a module grants on an ordinary critical when it has
+        # disabled the engine's save-or-die Devastating Critical (detected from
+        # baseitems.2da, not configured). 0 = stock behaviour.
+        self.devcrit_bonus_dice: int = 0
         # Areas whose Comments field contains "WIKI_HIDDEN" (case-insensitive).
         # These areas, their stores, and their creature placements are omitted
         # from all wiki output (map, index pages, cross-references).
@@ -7151,7 +7421,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
                 iname = irr or "(unknown)"
             stack = fld(it, "StackSize", 1)
             base = baseitem_label(fld(it, "BaseItem"))
-            cost = fld(it, "Cost", "")
+            cost = item_gp_value(it) or fld(it, "Cost", "")
             cell = (link(f"../items/{irr}.html", iname)
                     if irr in db.items else nwn_html(iname))
             rows.append(
@@ -7918,6 +8188,876 @@ def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Combat simulation primitives.
+#
+# One damage model, used for both sides of a fight: the creature swinging at the
+# reference PC and the reference PC swinging back. Everything here is expected
+# value (no dice are rolled) — the question the report answers is "does this kit
+# win", not "what happened in one particular fight".
+# ---------------------------------------------------------------------------
+
+_DICE_RE = re.compile(r"^\s*(\d+)\s*d\s*(\d+)\s*$", re.I)
+
+
+def avg_roll(cost_str: str) -> float:
+    """Average value of an iprp cost label. '1d6' → 3.5, '2d10' → 11.0, '5' → 5.0.
+
+    Note this is NOT _prop_value_num, which pulls the first integer out of the
+    string and would read '1d6' as 1 — fine for '+N' tables, wrong for damage.
+    """
+    if not cost_str:
+        return 0.0
+    m = _DICE_RE.match(cost_str)
+    if m:
+        n, d = int(m.group(1)), int(m.group(2))
+        return n * (d + 1) / 2.0
+    m = re.search(r"\d+", cost_str)
+    return float(m.group()) if m else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Critical-hit feats.
+#
+# The engine resolves these per base item: baseitems.2da names the exact feat id
+# for this weapon's Weapon Focus, Improved Critical, Overwhelming Critical and
+# Devastating Critical. A blank column means the feat does not exist for that
+# weapon and cannot be taken — which is precisely how nwn_homers_lotr disables
+# Devastating Critical server-wide (bin/gen-devcrit-map.py blanks the column, so
+# the engine's own check can never succeed and no save is ever rolled).
+#
+# Reading the columns rather than hardcoding a rule keeps this module-agnostic:
+# a stock module keeps its save-or-die, this one does not, and neither has to be
+# told which it is.
+# ---------------------------------------------------------------------------
+
+# Overwhelming Critical adds damage scaling with the weapon's crit multiplier:
+# +1d6 for a x2 weapon, +2d6 for x3, +3d6 for x4 — i.e. (mult - 1) six-sided
+# dice. Isolated here so it can be corrected in one place if a module's own
+# rules differ.
+_OVERWHELMING_DIE = 6
+
+# Devastating Critical's replacement damage, when a module has disabled the
+# engine's save-or-die and re-implemented it as bonus dice (--devcrit-bonus-dice).
+# Die size follows baseitems.2da WeaponSize, matching this module's
+# unpacked/devcrit_inc.nss: 1-2 small, 3 medium, 4+ large.
+_DEVCRIT_DIE_BY_SIZE = {1: 6, 2: 6, 3: 8}
+_DEVCRIT_DIE_LARGE = 10
+
+# Feat prerequisites the simulation actually enforces. Improved Critical needs
+# BAB +8; the epic critical chain needs Strength 25, which is what stops a
+# Dexterity/finesse build from taking it.
+_IMPROVED_CRIT_MIN_BAB = 8
+_EPIC_CRIT_MIN_STR = 25
+
+
+def _devcrit_die(weapon_size: int) -> int:
+    """Die size for a replacement devastating-critical bonus die."""
+    return _DEVCRIT_DIE_BY_SIZE.get(weapon_size, _DEVCRIT_DIE_LARGE)
+
+
+def weapon_feat_id(bi: int, column: str) -> int:
+    """Feat id this base item names in `column`, or 0 when it names none.
+
+    Zero is the answer that matters: it means the engine has no feat to check,
+    so nobody wielding this weapon can have it.
+    """
+    return _try_int((WEAPONS.get(bi) or {}).get(column), 0)
+
+
+def crit_feat_effects(bi: int, *, bab: int, str_score: int,
+                      has_feat: "Callable[[int], bool] | None" = None,
+                      devcrit_bonus_dice: int = 0) -> dict:
+    """Resolve the critical-hit feats for one weapon in one wielder's hands.
+
+    `has_feat(feat_id) -> bool` decides whether the wielder actually has a given
+    feat; pass None for the reference PC, which is assumed specced into whatever
+    it holds (subject to the real prerequisites below). Creatures pass a lookup
+    over their own FeatList so they only get what they were built with.
+
+    Returns {threat_mult, crit_bonus, devcrit_save_dc, feats} where `feats` names
+    what was granted, for the report.
+    """
+    stats = WEAPONS.get(bi) or {}
+    size = _try_int(stats.get("WeaponSize"), 0)
+    crit_mult = _try_int(stats.get("CritHitMult"), 2) or 2
+
+    def _granted(column: str, *, prereq: bool) -> bool:
+        feat_id = weapon_feat_id(bi, column)
+        if not feat_id or not prereq:
+            return False
+        return has_feat(feat_id) if has_feat is not None else True
+
+    names: list[str] = []
+    threat_mult = 1
+    crit_bonus = 0.0
+    devcrit_dc = 0
+
+    if _granted("WeaponImprovedCriticalFeat", prereq=bab >= _IMPROVED_CRIT_MIN_BAB):
+        threat_mult = 2          # NWN doubles the range: 20 -> 19-20, 19-20 -> 17-20
+        names.append("Improved Critical")
+
+    epic_ok = str_score >= _EPIC_CRIT_MIN_STR and threat_mult > 1
+    overwhelming = _granted("EpicWeaponOverwhelmingCriticalFeat", prereq=epic_ok)
+    if overwhelming:
+        crit_bonus += max(1, crit_mult - 1) * (_OVERWHELMING_DIE + 1) / 2.0
+        names.append("Overwhelming Critical")
+
+    # Devastating Critical requires Overwhelming. Which of its two forms applies
+    # is decided by the 2DA, not by configuration: a named feat means the engine
+    # still rolls its save-or-die, a blank column means the module disabled it
+    # and any replacement damage comes from --devcrit-bonus-dice.
+    if overwhelming:
+        _col = "EpicWeaponDevastatingCriticalFeat"
+        # A blank column means the module disabled the mechanic; a column we
+        # never loaded means we have no evidence, so assume the engine default.
+        if weapon_feat_id(bi, _col) or _col not in BASEITEM_COLUMNS_SEEN:
+            # Stock: Fort save or die. DC 10 + half character level + Str mod;
+            # the caller supplies the level via `bab` for creatures whose level
+            # we do not track separately.
+            devcrit_dc = 10 + bab // 2 + ability_mod(str_score)
+            names.append("Devastating Critical (save-or-die)")
+        elif devcrit_bonus_dice > 0:
+            die = _devcrit_die(size)
+            crit_bonus += devcrit_bonus_dice * (die + 1) / 2.0
+            names.append(f"Devastating Critical ({devcrit_bonus_dice}d{die})")
+
+    return {"threat_mult": threat_mult, "crit_bonus": crit_bonus,
+            "devcrit_save_dc": devcrit_dc, "feats": names}
+
+
+def hit_chance(ab: int, ac: int) -> float:
+    """Probability a single attack lands. A natural 1 always misses and a
+    natural 20 always hits, so the result is clamped to [0.05, 0.95]."""
+    return min(0.95, max(0.05, (21 - (ac - ab)) / 20.0))
+
+
+def attack_profile(schedule: list[int], *, num_dice: int, die: int,
+                   flat: float, crit_threat: int, crit_mult: int,
+                   phys_types: Iterable[str], elem: dict[str, float],
+                   enhancement: int, crit_bonus: float = 0.0,
+                   devcrit_save_dc: int = 0) -> dict:
+    """Everything the simulator needs about one weapon in one wielder's hands.
+
+    schedule     iterative to-hit bonuses (from attack_schedule)
+    num_dice/die base weapon damage dice
+    flat         flat physical damage added (Str mod, Damage Bonus props, feats)
+    crit_threat  threat range width in natural-roll numbers (2 ⇒ 19-20)
+    crit_mult    critical multiplier
+    phys_types   physical damage types the weapon can deal; the engine uses the
+                 attacker-favourable one, so the simulator mitigates with the
+                 *least* resisted of them
+    elem         extra non-physical damage, average per hit, keyed by type
+    enhancement  weapon enhancement, for damage-reduction bypass
+    crit_bonus   average extra *physical* damage on a confirmed critical only,
+                 from Overwhelming Critical and (where the module replaces the
+                 engine's save-or-die) Devastating Critical. Not multiplied by
+                 the crit multiplier — these are flat extra dice.
+    devcrit_save_dc  when non-zero, a confirmed critical forces a Fortitude save
+                 at this DC or the target dies outright — the stock Devastating
+                 Critical. Zero when the base item has no devastating-critical
+                 feat, which is how a module disables the mechanic wholesale.
+    """
+    return {
+        "schedule": list(schedule),
+        "num_dice": max(0, num_dice), "die": max(0, die),
+        "flat": flat,
+        "crit_threat": max(1, crit_threat), "crit_mult": max(1, crit_mult),
+        "phys_types": sorted(set(phys_types)),
+        "elem": dict(elem),
+        "enhancement": enhancement,
+        "crit_bonus": max(0.0, crit_bonus),
+        "devcrit_save_dc": max(0, devcrit_save_dc),
+    }
+
+
+def defense_profile(*, ac: int, hp: int, dr_soak: int = 0, dr_bypass: int = 0,
+                    resist: dict[str, int] | None = None,
+                    immune: dict[str, int] | None = None,
+                    regen: int = 0, fort: int = 0, ref: int = 0,
+                    will: int = 0, crit_immune: bool = False) -> dict:
+    """The receiving end of a fight: what has to be chewed through.
+
+    `crit_immune` suppresses critical hits outright — no multiplier, no
+    Overwhelming Critical damage, no Devastating Critical — which is the whole
+    point of the property.
+    """
+    return {
+        "ac": ac, "hp": max(1, hp),
+        "dr_soak": dr_soak, "dr_bypass": dr_bypass,
+        "resist": dict(resist or {}), "immune": dict(immune or {}),
+        "regen": regen, "fort": fort, "ref": ref, "will": will,
+        "crit_immune": crit_immune,
+    }
+
+
+def _mitigate(amount: float, dtype: str, dfn: dict, *, physical: bool,
+              enhancement: int) -> float:
+    """Apply one defender's mitigation to `amount` damage of type `dtype`.
+
+    Order matches the engine: percentage immunity first, then flat damage
+    resistance, then (physical only, and only when the attacker's enhancement
+    is below the bypass) damage reduction. Never goes below zero.
+    """
+    if amount <= 0:
+        return 0.0
+    pct = dfn["immune"].get(dtype, 0)
+    if pct >= 100:
+        return 0.0
+    if pct:
+        amount *= (1 - pct / 100.0)
+    amount -= dfn["resist"].get(dtype, 0)
+    if physical and dfn["dr_soak"] and enhancement < dfn["dr_bypass"]:
+        amount -= dfn["dr_soak"]
+    return max(0.0, amount)
+
+
+def _hit_damage(att: dict, dfn: dict, *, crit: bool) -> float:
+    """Post-mitigation damage from one landed hit.
+
+    Critical hits multiply the *physical* portion only — NWN does not multiply
+    item-property elemental damage. Mitigation is applied per hit rather than to
+    the round's expectation, because flat resistance and DR soak each attack
+    separately (applying them to an average would understate a many-small-hits
+    defence).
+    """
+    phys = att["num_dice"] * (att["die"] + 1) / 2.0 + att["flat"]
+    phys = max(0.0, phys)
+    if crit:
+        # The multiplier applies to the weapon's own damage; the crit-feat dice
+        # are added afterwards, not multiplied.
+        phys = phys * att["crit_mult"] + att["crit_bonus"]
+    total = 0.0
+    if phys > 0:
+        types = att["phys_types"] or ["Bludgeoning"]
+        # The wielder gets the attacker-favourable physical type.
+        total += max(
+            _mitigate(phys, t, dfn, physical=True, enhancement=att["enhancement"])
+            for t in types
+        )
+    for t, amt in att["elem"].items():
+        total += _mitigate(amt, t, dfn, physical=False, enhancement=att["enhancement"])
+    return total
+
+
+def dpr(att: dict, dfn: dict) -> float:
+    """Expected damage per round for one weapon against one defender."""
+    if not att["schedule"]:
+        return 0.0
+    p_norm_hit = _hit_damage(att, dfn, crit=False)
+    if dfn["crit_immune"]:
+        return sum(hit_chance(ab, dfn["ac"]) for ab in att["schedule"]) * p_norm_hit
+    p_crit_hit = _hit_damage(att, dfn, crit=True)
+    threat_p = min(1.0, att["crit_threat"] / 20.0)
+    total = 0.0
+    for ab in att["schedule"]:
+        p_hit = hit_chance(ab, dfn["ac"])
+        # A crit needs a threatening roll that hits, then a confirmation roll
+        # against the same AC.
+        p_crit = min(p_hit, threat_p) * p_hit
+        total += p_crit * p_crit_hit + (p_hit - p_crit) * p_norm_hit
+    return total
+
+
+def crit_chance_per_round(att: dict, dfn: dict) -> float:
+    """Probability that at least one attack this round lands a confirmed crit.
+
+    Needed on its own by the stock Devastating Critical rule, which is a
+    save-or-die triggered per critical rather than a lump of damage. Zero
+    against a crit-immune defender.
+    """
+    if not att["schedule"] or dfn["crit_immune"]:
+        return 0.0
+    threat_p = min(1.0, att["crit_threat"] / 20.0)
+    p_none = 1.0
+    for ab in att["schedule"]:
+        p_hit = hit_chance(ab, dfn["ac"])
+        p_none *= 1.0 - min(p_hit, threat_p) * p_hit
+    return 1.0 - p_none
+
+
+def _rounds_to_drop(att: dict, dfn: dict) -> tuple[float, float]:
+    """Rounds to take a defender from full HP to zero, and the net damage per
+    round behind that figure.
+
+    Returns (rounds, raw_dpr). `rounds` is math.inf when the damage never
+    outpaces regeneration. The raw (pre-regeneration) DPR is returned alongside
+    because the kit solver needs a value that keeps moving even while the fight
+    is unwinnable: if it only saw "infinity" it would see every candidate item
+    as equally useless and equip nothing at all.
+    """
+    raw = dpr(att, dfn)
+    net = raw - dfn["regen"]
+    if net <= 0.01:
+        return math.inf, raw
+    return dfn["hp"] / net, raw
+
+
+def _devcrit_rounds(rounds: float, att: dict, dfn: dict) -> float:
+    """Shorten `rounds` by the stock Devastating Critical save-or-die.
+
+    Each confirmed critical forces a Fortitude save; failing it ends the fight
+    immediately, so the expected number of rounds to a kill is 1 / (chance of a
+    crit landing x chance of the save failing). Returns whichever is sooner:
+    grinding the target's hit points down, or rolling the kill.
+    """
+    dc = att["devcrit_save_dc"]
+    if not dc:
+        return rounds
+    p = crit_chance_per_round(att, dfn) * save_fail_chance(dc, dfn["fort"])
+    if p <= 0.0:
+        return rounds
+    return min(rounds, 1.0 / p)
+
+
+def save_fail_chance(dc: int, save_bonus: int) -> float:
+    """Probability of failing a saving throw. A natural 1 always fails and a
+    natural 20 always succeeds, so this is clamped to [0.05, 0.95]."""
+    return min(0.95, max(0.05, (dc - save_bonus) / 20.0))
+
+
+def simulate(pc: dict, creature: dict) -> dict:
+    """Run one fight: the PC's best weapon against the creature, and the
+    creature's best weapon back.
+
+    `pc` is a reference_pc() result; `creature` is a dict with "attack" (an
+    attack_profile), "defense" (a defense_profile) and "save_threats".
+
+    `wins` means the PC drops the creature before the creature drops the PC.
+    Saving throws deliberately do NOT gate that: the data cannot tell a
+    save-or-die apart from a save-for-half, so failing one is reported as a risk
+    (`save_fail`) and folded into `score` rather than counted as a loss.
+
+    `score` is the scalar the kit solver maximises, and it must be strictly
+    monotonic in "how much better did that item make things" even when the
+    fight is hopeless. A score that flattened to zero for every losing kit
+    would leave the solver unable to tell a legendary sword from a stick, so
+    the outgoing damage is kept in the score directly.
+    """
+    to_kill, raw_out = _rounds_to_drop(pc["attack"], creature["defense"])
+    unhealed_to_die, _raw_in = _rounds_to_drop(creature["attack"], pc["defense"])
+
+    # Stock Devastating Critical is not damage — it is a Fortitude save or die
+    # on every confirmed critical. Expressed as a per-round kill probability, it
+    # caps how long the fight can last regardless of hit points. Both directions,
+    # because the rule is symmetric.
+    to_kill = _devcrit_rounds(to_kill, pc["attack"], creature["defense"])
+    unhealed_to_die = _devcrit_rounds(unhealed_to_die, creature["attack"], pc["defense"])
+
+    # The PC has a free full heal off a fixed cooldown. Outlasting one cooldown
+    # therefore means outlasting the fight: the heal lands before the damage
+    # does, and then the clock restarts. Below that threshold the heal never
+    # arrives in time and changes nothing. The pre-heal figure is still what
+    # gets reported, since "survives 40 rounds per heal" is the useful number.
+    heal_rounds = pc.get("full_heal_rounds", 0)
+    outlasts = bool(heal_rounds) and unhealed_to_die >= heal_rounds
+    to_die = math.inf if outlasts else unhealed_to_die
+
+    # The creature gets at most one special ability per round; assume it leads
+    # with its highest-DC one against the PC's weakest relevant save.
+    fail = 0.0
+    for threat in creature.get("save_threats", ())[:1]:
+        worst = min(pc["defense"]["fort"], pc["defense"]["ref"], pc["defense"]["will"])
+        fail = save_fail_chance(int(threat.get("dc_est", 0) or 0), worst)
+
+    survive = 999.0 if math.isinf(to_die) else to_die
+    if math.isinf(to_kill):
+        # Hopeless so far, but still rank kits by raw progress: outgoing damage
+        # first (even below the regeneration threshold), then survivability.
+        margin = 0.0
+        score = raw_out / (creature["defense"]["hp"] + 1.0) + survive / 1e6
+    elif math.isinf(to_die):
+        # The creature cannot hurt this PC at all, so however long the kill
+        # takes the fight is never in doubt — a flat maximum, not survive/to_kill,
+        # which would otherwise rank a harmless-but-tanky creature as the
+        # hardest fight in its band.
+        margin = 999.0
+        score = margin + 1.0
+    else:
+        margin = survive / to_kill
+        score = margin + 1.0
+    return {
+        "rounds_to_kill": None if math.isinf(to_kill) else round(to_kill, 1),
+        "rounds_to_die": (None if math.isinf(unhealed_to_die)
+                          else round(unhealed_to_die, 1)),
+        "outlasts_heal_cooldown": outlasts,
+        "no_damage": raw_out <= 0.01,
+        "save_fail": round(fail, 3),
+        "margin": round(margin, 3),
+        "wins": margin >= 1.0,
+        "score": score / (1.0 + fail),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The reference PC.
+#
+# The counter-gear report is build-agnostic in the sense that it models no
+# *particular* character, but a fight needs two sides, so it models a canonical
+# one: a single-class fighter at the level the tier implies, with all ability
+# points in Strength and assumed specced into whatever weapon is being tested
+# (so weapons stay comparable with each other).
+#
+# Two NWN facts keep this simple and are load-bearing:
+#   * There is no epic attack bonus and no epic save bonus. BAB and base saves
+#     stop advancing at class level 20 — which is why a level-60 character's
+#     power comes almost entirely from gear, and why this report is worth
+#     running at all.
+#   * bin/serve sets always-roll-max-hitpoints-on-levelup, so HP is the maximum
+#     roll per level rather than an average.
+# ---------------------------------------------------------------------------
+
+REFERENCE_PC_CLASS = 4      # classes.2da row 4 = Fighter (d10, full BAB)
+_PC_HIT_DIE = 10
+_PRE_EPIC_CAP = 20          # class level past which BAB and saves stop growing
+
+# ---- feat budget ----------------------------------------------------------
+#
+# A pure single-class build draws on TWO pools, and they are not interchangeable:
+# a class bonus feat may only be spent from that class's own list. Great
+# Constitution is not on the Fighter list, so it cannot be bought with one; Epic
+# Toughness is, and is where spare Fighter feats go.
+#
+#   Pool A, Fighter bonus feats — level 1, then every even level, continuing
+#       every 2 levels into epic. Spent on the weapon chain (Focus,
+#       Specialization, Improved Critical, then the epic critical feats), Epic
+#       Prowess, and finally Epic Toughness.
+#   Pool B, general feats — level 1, then every 3 levels. Spent on Great
+#       Strength (Great Dexterity behind a finesse or ranged weapon), then Great
+#       Constitution.
+#
+# Legendary feats are deliberately NOT modelled: they are still in development
+# in nwn_homers_lotr, so simulating them would report power no character has.
+# Do not add them here until that lands.
+_GREAT_ABILITY_TIERS = 10       # Great <Ability> I..X
+_EPIC_TOUGHNESS_TIERS = 10      # Epic Toughness I..X, +20 HP each
+_FIRST_EPIC_LEVEL = 21
+
+# Fighter weapon/combat feats bought out of pool A before anything else. The
+# epic critical feats are counted here too, but only claim a slot when the
+# weapon and the build actually qualify for them (see crit_feat_effects).
+_FIGHTER_CORE_FEATS = 4         # Weapon Focus, Specialization + their epic tiers
+_EPIC_PROWESS_FEATS = 1
+
+# The reference PC is assumed to have a free full heal off a 150-second
+# cooldown, which is 25 six-second rounds. Surviving one cooldown therefore
+# means surviving indefinitely.
+_FULL_HEAL_ROUNDS = 150 // 6
+
+
+def _general_feat_slots(level: int) -> int:
+    """General feats: one at level 1, then one every 3 levels."""
+    return 1 + level // 3
+
+
+def _fighter_bonus_slots(level: int) -> int:
+    """Fighter bonus feats: level 1 and every even level, continuing every 2
+    levels past 20."""
+    return 1 + level // 2
+
+
+def _great_ability_tiers(level: int, *, spent: int = 0) -> int:
+    """Tiers of Great <Ability> pool B can afford at `level`.
+
+    Only epic levels can buy them, so the pre-epic general feats are set aside
+    as already spent on the ordinary prerequisites (Weapon Finesse, Toughness
+    and friends) rather than counted here.
+    """
+    if level < _FIRST_EPIC_LEVEL:
+        return 0
+    epic_general = _general_feat_slots(level) - _general_feat_slots(_FIRST_EPIC_LEVEL - 1)
+    return max(0, min(_GREAT_ABILITY_TIERS, epic_general - spent))
+
+
+def _epic_toughness_tiers(level: int, *, spent: int) -> int:
+    """Epic Toughness tiers left over in pool A once the weapon chain, the epic
+    critical feats and Epic Prowess have been paid for."""
+    if level < _FIRST_EPIC_LEVEL:
+        return 0
+    epic_bonus = _fighter_bonus_slots(level) - _fighter_bonus_slots(_FIRST_EPIC_LEVEL - 1)
+    return max(0, min(_EPIC_TOUGHNESS_TIERS, epic_bonus - spent))
+
+
+def _kit_pieces(kit: dict) -> list[dict]:
+    """Flatten a kit (slot key → piece or list of pieces) to a piece list."""
+    out: list[dict] = []
+    for v in kit.values():
+        if not v:
+            continue
+        out.extend(v if isinstance(v, list) else [v])
+    return out
+
+
+def reference_pc(level: int, kit: dict, db: "Db") -> dict:
+    """Build the reference PC at `level` wearing `kit`.
+
+    Returns {"level", "attack", "defense", "cost", "weapon", ...} where "attack"
+    is an attack_profile and "defense" a defense_profile, ready for simulate().
+
+    Known simplifications, all in the conservative direction: armour maximum-Dex
+    limits are not modelled (baseitems.2da's Dex cap is not in our caches), AC
+    bonuses from different sources are summed rather than resolved by AC type,
+    and no spells, potions or class abilities are used.
+    """
+    pieces = _kit_pieces(kit)
+    lvl = max(1, int(level))
+    pre_epic = min(lvl, _PRE_EPIC_CAP)
+    bab = _class_bab(REFERENCE_PC_CLASS, pre_epic)
+
+    # ----- weapon -----------------------------------------------------------
+    # Resolved before ability scores, because a finesse weapon changes which
+    # ability the whole build pumps.
+    weapon = kit.get("right")
+    if isinstance(weapon, list):
+        weapon = weapon[0] if weapon else None
+    have_weapon = bool(weapon is not None and weapon["off"] and weapon["off"]["is_weapon"])
+    off = weapon["off"] if have_weapon else None
+    bi = off["base_item_id"] if have_weapon else -1
+    stats = (WEAPONS.get(bi) or {}) if have_weapon else {}
+    ranged = bool(off["is_ranged"]) if have_weapon else False
+    two_handed = have_weapon and _try_int(stats.get("WeaponSize"), 0) >= 4 and not ranged
+    # Weapon Finesse on a light weapon puts Dexterity on the attack roll, so a
+    # character wielding one builds Dex instead of Strength. Damage still comes
+    # from Strength either way — NWN's finesse affects to-hit only.
+    finesse = have_weapon and not ranged and bi in FINESSE_BASEITEMS
+    primary = "Dex" if (finesse or ranged) else "Str"
+
+    # ----- feats: two pools, spent in priority order -------------------------
+    # Pool A (Fighter bonus feats) buys the weapon chain first. The epic
+    # critical feats each claim a slot only when the weapon names them and the
+    # build qualifies, which is resolved below once Strength is known — so
+    # provisionally reserve them and correct after.
+    great_tiers = _great_ability_tiers(lvl)
+
+    # ----- ability scores ---------------------------------------------------
+    # Base array, with every level-up point and every tier of Great <Ability>
+    # from pool B spent on the attacking stat.
+    scores = {"Str": 14, "Dex": 14, "Con": 16, "Wis": 12}
+    scores[primary] = 18 + lvl // 4 + great_tiers
+
+    # Ability bonuses from *different* items stack; the module's
+    # --max-ability-bonus dial caps the resulting total per ability (NWN's
+    # default is +12, this module raises it to +24). So two +12 belts-and-rings
+    # reach the cap where one cannot — which is why this sums and then clamps
+    # rather than taking the largest single item.
+    item_abil: dict[str, int] = defaultdict(int)
+    for p in pieces:
+        for ab, val in p["def"]["abilities"].items():
+            item_abil[ab] += val
+    cap = db.max_ability_bonus
+    for ab, val in item_abil.items():
+        scores[ab] = scores.get(ab, 10) + (min(val, cap) if cap and cap > 0 else val)
+
+    str_mod = ability_mod(scores["Str"])
+    dex_mod = ability_mod(scores["Dex"])
+    con_mod = ability_mod(scores["Con"])
+    wis_mod = ability_mod(scores["Wis"])
+
+    # Weapon Focus / Specialization only exist for a base item that names them,
+    # so a weapon with a blank column correctly grants nothing here rather than
+    # a blanket bonus. The PC is assumed specced into whatever it holds.
+    def _has(column: str, min_level: int = 1) -> bool:
+        return lvl >= min_level and bool(weapon_feat_id(bi, column))
+
+    feat_hit = (1 if _has("WeaponFocusFeat") else 0) \
+        + (2 if _has("EpicWeaponFocusFeat", _FIRST_EPIC_LEVEL) else 0) \
+        + (1 if lvl >= _FIRST_EPIC_LEVEL else 0)          # Epic Prowess
+    feat_dmg = (2 if _has("WeaponSpecializationFeat", 4) else 0) \
+        + (4 if _has("EpicWeaponSpecializationFeat", _FIRST_EPIC_LEVEL) else 0)
+
+    crit = crit_feat_effects(bi, bab=bab, str_score=scores["Str"],
+                             devcrit_bonus_dice=db.devcrit_bonus_dice)
+
+    if have_weapon:
+        # Two-handed melee gets 1.5x Strength to damage; ranged gets none.
+        str_dmg = 0 if ranged else int(str_mod * (1.5 if two_handed else 1.0))
+        prop_flat, elem = weapon_damage_props(weapon["item"])
+        # Finesse uses the better of the two, matching the engine.
+        melee_ab = max(str_mod, dex_mod) if finesse else str_mod
+        atk_mod = (dex_mod if ranged else melee_ab) + off["attack_bonus"] + feat_hit
+        attack = attack_profile(
+            attack_schedule(bab, ability_mod=atk_mod),
+            num_dice=_try_int(stats.get("NumDice"), 0),
+            die=_try_int(stats.get("DieToRoll"), 0),
+            flat=str_dmg + feat_dmg + prop_flat,
+            crit_threat=(_try_int(stats.get("CritThreat"), 1) or 1) * crit["threat_mult"],
+            crit_mult=_try_int(stats.get("CritHitMult"), 2) or 2,
+            phys_types=off["physical_dtypes"] or ["Bludgeoning"],
+            elem=elem,
+            enhancement=off["enhancement"],
+            crit_bonus=crit["crit_bonus"],
+            devcrit_save_dc=crit["devcrit_save_dc"],
+        )
+    else:
+        attack = attack_profile(
+            attack_schedule(bab, ability_mod=str_mod + feat_hit),
+            num_dice=1, die=3, flat=str_mod + feat_dmg,
+            crit_threat=1, crit_mult=2,
+            phys_types=["Bludgeoning"], elem={}, enhancement=0)
+
+    # Pool A's leftovers go to Epic Toughness. The epic critical feats only cost
+    # a slot when they were actually granted.
+    epic_crit_spent = sum(1 for f in crit["feats"] if f != "Improved Critical")
+    toughness = _epic_toughness_tiers(
+        lvl, spent=_FIGHTER_CORE_FEATS + _EPIC_PROWESS_FEATS + epic_crit_spent)
+
+    # ----- defences ---------------------------------------------------------
+    ac = 10 + dex_mod
+    resist: dict[str, int] = {}
+    immune: dict[str, int] = {}
+    save_bonus = {"Fortitude": 0, "Reflex": 0, "Will": 0, "Universal": 0}
+    regen = 0
+    dr_soak = dr_bypass = 0
+    cost = 0
+    crit_immune = False
+    for p in pieces:
+        d = p["def"]
+        ac += d["ac_bonus"]
+        cost += p["cost"]
+        regen += d["regen"]
+        crit_immune = crit_immune or d["crit_immune"]
+        if d["dr_soak"] > dr_soak:
+            dr_soak, dr_bypass = d["dr_soak"], d["dr_bypass"]
+        for t, v in d["resist"].items():
+            resist[t] = max(resist.get(t, 0), v)      # same-type resist: max
+        for t, v in d["immune"].items():
+            immune[t] = max(immune.get(t, 0), v)
+        for k, v in d["saves"].items():
+            if k in save_bonus:
+                save_bonus[k] = max(save_bonus[k], v)
+
+    univ = save_bonus["Universal"]
+    # Epic Toughness adds a flat block on top of the per-level HP, exactly as it
+    # does for creatures — reusing that helper so the two sides cannot drift.
+    toughness_hp = epic_toughness_hp(
+        range(EPIC_TOUGHNESS_BASE, EPIC_TOUGHNESS_BASE + toughness))
+    defense = defense_profile(
+        ac=ac,
+        hp=lvl * (_PC_HIT_DIE + con_mod) + toughness_hp,
+        dr_soak=dr_soak, dr_bypass=dr_bypass,
+        resist=resist, immune=immune, regen=regen,
+        crit_immune=crit_immune,
+        # Fighter: good Fortitude (2 + L/2), poor Reflex and Will (L/3).
+        fort=2 + pre_epic // 2 + con_mod + save_bonus["Fortitude"] + univ,
+        ref=pre_epic // 3 + dex_mod + save_bonus["Reflex"] + univ,
+        will=pre_epic // 3 + wis_mod + save_bonus["Will"] + univ,
+    )
+    return {
+        "level": lvl, "bab": bab, "attack": attack, "defense": defense,
+        "cost": cost, "two_handed": two_handed, "finesse": finesse,
+        "full_heal_rounds": _FULL_HEAL_ROUNDS,
+        "crit_feats": crit["feats"], "epic_toughness": toughness,
+        "great_ability": (primary, great_tiers),
+        "weapon": weapon, "kit": kit, "scores": scores,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gear pool + kit solver.
+# ---------------------------------------------------------------------------
+
+def build_gear_pool(db: "Db") -> dict[str, list[dict]]:
+    """Bucket every player-attainable item by the slots it can fill.
+
+    A piece carries its blueprint plus the pre-computed offense/defense
+    extracts, so the solver never re-parses item properties. Items appear under
+    every slot they fit (a longsword under both hands). Right hand takes weapons
+    only; left hand takes weapons and shields.
+    """
+    pool: dict[str, list[dict]] = {key: [] for key, _, _, _ in PLAYER_SLOTS}
+    for rr in sorted(db.items):
+        if not _item_accessible(db, rr):
+            continue
+        item = db.items[rr]
+        slots = item_equip_slots(item) & PLAYER_SLOT_MASK
+        if not slots:
+            continue
+        off = extract_item_offense(db, item, rr)
+        if off["name"].startswith("[TLK#") or off["name"] == rr:
+            continue                              # broken/unnamed blueprint
+        d = extract_item_defense(db, item, rr)
+        piece = {
+            "resref": rr, "name": off["name"], "cost": off["cost"],
+            "slots": slots, "item": item, "off": off, "def": d,
+            "is_weapon": off["is_weapon"],
+        }
+        is_shield = off["base_item_id"] in SHIELD_BASEITEMS
+        for key, _label, mask, _n in PLAYER_SLOTS:
+            if not (slots & mask):
+                continue
+            if key == "right":
+                keep = off["is_weapon"]
+            elif key == "left":
+                keep = off["is_weapon"] or is_shield
+            else:
+                keep = d["relevant"]
+            if keep:
+                pool[key].append(piece)
+    return pool
+
+
+def _prune_pool(pool: dict[str, list[dict]], per_axis: int = 6) -> dict[str, list[dict]]:
+    """Cut each slot down to the items that could plausibly be the best pick.
+
+    An exhaustive search over thousands of items is pointless: for any given
+    axis (AC, a save, resistance to one damage type, raw damage, price) only the
+    leaders can ever win. Keep the top `per_axis` on every axis and union them —
+    a few dozen candidates per slot instead of hundreds, with no realistic
+    chance of dropping the item the solver would have chosen.
+    """
+    out: dict[str, list[dict]] = {}
+    for key, pieces in pool.items():
+        axes: list[Callable[[dict], float]] = [
+            lambda p: p["def"]["ac_bonus"],
+            lambda p: p["def"]["regen"],
+            lambda p: p["def"]["dr_soak"],
+            lambda p: -p["cost"],                       # cheapest
+            lambda p: max(p["def"]["abilities"].values(), default=0),
+            lambda p: p["def"]["abilities"].get("Str", 0),
+            lambda p: p["def"]["abilities"].get("Con", 0),
+            lambda p: p["def"]["abilities"].get("Dex", 0),
+        ]
+        axes += [(lambda p, _k=k: p["def"]["saves"].get(_k, 0))
+                 for k in ("Fortitude", "Reflex", "Will", "Universal")]
+        dtypes = {t for p in pieces for t in
+                  set(p["def"]["resist"]) | set(p["def"]["immune"])}
+        axes += [(lambda p, _t=t: max(p["def"]["immune"].get(_t, 0),
+                                      p["def"]["resist"].get(_t, 0))) for t in sorted(dtypes)]
+        if key in ("right", "left"):
+            axes += [
+                lambda p: p["off"]["enhancement"],
+                lambda p: p["off"]["attack_bonus"],
+                lambda p: _weapon_raw_damage(p),
+                lambda p: len(p["off"]["damage_dtypes"]),
+            ]
+        keep: dict[str, dict] = {}
+        for axis in axes:
+            for p in sorted(pieces, key=axis, reverse=True)[:per_axis]:
+                keep[p["resref"]] = p
+        # Plus a price ladder: evenly spaced samples across the slot's whole
+        # cost range. Without it every candidate is either top-end or bargain-
+        # bin, and the "cheapest kit that still wins" pass has nothing to step
+        # down to — it would report a 2M gp sword as the minimum for a CR 3 orc
+        # simply because no mid-priced weapon survived pruning.
+        by_cost = sorted(pieces, key=lambda p: (p["cost"], p["resref"]))
+        rungs = min(len(by_cost), per_axis * 3)
+        for i in range(rungs):
+            p = by_cost[i * (len(by_cost) - 1) // max(1, rungs - 1)]
+            keep[p["resref"]] = p
+        out[key] = sorted(keep.values(), key=lambda p: p["resref"])
+    return out
+
+
+def _weapon_raw_damage(piece: dict) -> float:
+    """Average un-mitigated damage of a weapon piece — a pruning heuristic."""
+    stats = WEAPONS.get(piece["off"]["base_item_id"]) or {}
+    n, d = _try_int(stats.get("NumDice"), 0), _try_int(stats.get("DieToRoll"), 0)
+    flat, elem = weapon_damage_props(piece["item"])
+    return n * (d + 1) / 2.0 + flat + sum(elem.values())
+
+
+def _kit_conflicts(kit: dict, key: str, piece: dict) -> bool:
+    """True when installing `piece` in `key` is illegal for the current kit.
+
+    The only rule that matters here: a two-handed weapon leaves no hand for a
+    shield or off-hand weapon.
+    """
+    def _two_handed(p: dict | None) -> bool:
+        if not p or not p["is_weapon"] or p["off"]["is_ranged"]:
+            return False
+        return _try_int((WEAPONS.get(p["off"]["base_item_id"]) or {}).get("WeaponSize"), 0) >= 4
+
+    if key == "left":
+        return _two_handed(kit.get("right"))
+    if key == "right" and _two_handed(piece):
+        return bool(kit.get("left"))
+    return False
+
+
+def best_in_slot_kit(level: int, creature: dict, pool: dict[str, list[dict]],
+                     db: "Db") -> tuple[dict, dict]:
+    """The strongest kit the reference PC can field against `creature`.
+
+    Returns (kit, sim). One pass over the slots in a fixed order, taking the
+    candidate that most improves simulate()'s score given what is already
+    equipped — greedy, but the slots barely interact so it lands on the same
+    answer a full search would, at a fraction of the cost. Cost is ignored: this
+    is the ceiling, not the shopping list (see minimum_viable_kit).
+    """
+    kit: dict[str, dict | None] = {}
+
+    def _sim(k: dict) -> dict:
+        return simulate(reference_pc(level, k, db), creature)
+
+    for key, _label, _mask, count in PLAYER_SLOTS:
+        for _ in range(count):
+            best_piece, best_score = None, _sim(kit)["score"]
+            already = {p["resref"] for p in _kit_pieces(kit)}
+            for piece in pool.get(key, ()):
+                if piece["resref"] in already or _kit_conflicts(kit, key, piece):
+                    continue
+                trial = dict(kit)
+                existing = trial.get(key)
+                trial[key] = ((existing if isinstance(existing, list) else [existing])
+                              + [piece]) if existing and count > 1 else piece
+                score = _sim(trial)["score"]
+                if score > best_score + 1e-9:
+                    best_piece, best_score = piece, score
+            if best_piece is None:
+                break
+            existing = kit.get(key)
+            kit[key] = ((existing if isinstance(existing, list) else [existing])
+                        + [best_piece]) if existing and count > 1 else best_piece
+
+    return kit, _sim(kit)
+
+
+def minimum_viable_kit(level: int, creature: dict, pool: dict[str, list[dict]],
+                       db: "Db", start_kit: dict) -> tuple[dict, dict]:
+    """Strip `start_kit` (a best_in_slot_kit result) down to the cheapest gear
+    that still beats `creature`.
+
+    Every slot is first tested empty — if the fight is still won, the slot was
+    never needed — and otherwise re-filled with the cheapest candidate that
+    keeps the win. This is what separates "the minimum kit that actually beats
+    this creature" from the old report's "cheapest item that isn't literally
+    useless", which is how every tier ended up recommending a 2 gp club.
+
+    Returns the input kit unchanged when it does not win in the first place.
+    """
+    kit = dict(start_kit)
+
+    def _sim(k: dict) -> dict:
+        return simulate(reference_pc(level, k, db), creature)
+
+    sim = _sim(kit)
+    if not sim["wins"]:
+        return kit, sim
+
+    for key, _label, _mask, _count in PLAYER_SLOTS:
+        if not kit.get(key):
+            continue
+        held = kit[key]
+        trial = dict(kit)
+        trial[key] = None
+        if _sim(trial)["wins"]:
+            kit[key] = None                       # the slot was never needed
+            continue
+        # Needed, but maybe a cheaper item does the job.
+        current_cost = sum(p["cost"] for p in (held if isinstance(held, list) else [held]))
+        for piece in sorted(pool.get(key, ()), key=lambda p: (p["cost"], p["resref"])):
+            if piece["cost"] >= current_cost:
+                break
+            if _kit_conflicts(trial, key, piece):
+                continue
+            cand = dict(kit)
+            cand[key] = piece
+            if _sim(cand)["wins"]:
+                kit[key] = piece
+                break
+    return kit, _sim(kit)
+
+
 def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> dict:
     """Compute a creature's *offensive* threat (what the player must survive), as
     plain data for the counter-gear survivability matcher. Reuses the ability
@@ -7930,6 +9070,11 @@ def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> d
       save_threats       special abilities the player must save against, with an
                          *estimated* DC (innate spell level is not in our caches,
                          so it is derived from caster level — labelled an estimate)
+      attack_profiles    one attack_profile() per wielded weapon (see that
+                         function) — the full iterative schedule plus damage
+                         dice/crit/elemental data the combat simulator needs.
+                         `attack_bonus` is still just the best schedule[0], so
+                         the published creature-page figure is unaffected.
     """
     equip_by_slot: dict[int, dict] = D["equip_by_slot"]
     str_mod, dex_mod = D["str_mod"], D["dex_mod"]
@@ -7948,6 +9093,36 @@ def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> d
     best_atk: int | None = None
     dtypes: set[str] = set()
     have_weapon = False
+    profiles: list[dict] = []
+
+    # Creatures get only the critical feats they were actually built with — no
+    # "assume specced" here, unlike the reference PC.
+    _feat_set = set(feat_ids)
+    _str_score = D.get("ability_scores", {}).get("Str") or 10
+
+    def _profile(sched: list[int], bi: int, item: dict | None, off: dict,
+                 str_bonus: int) -> dict:
+        """Build the simulator's attack_profile for one wielded weapon."""
+        stats = WEAPONS.get(bi) or {}
+        prop_flat, elem = weapon_damage_props(item)
+        crit = crit_feat_effects(
+            bi, bab=bab, str_score=_str_score,
+            has_feat=lambda fid: fid in _feat_set,
+            devcrit_bonus_dice=db.devcrit_bonus_dice)
+        return attack_profile(
+            sched,
+            num_dice=_try_int(stats.get("NumDice"), 0),
+            die=_try_int(stats.get("DieToRoll"), 0),
+            flat=str_bonus + prop_flat,
+            crit_threat=(_try_int(stats.get("CritThreat"), 1) or 1) * crit["threat_mult"],
+            crit_mult=_try_int(stats.get("CritHitMult"), 2) or 2,
+            phys_types=off["physical_dtypes"],
+            elem=elem,
+            enhancement=off["enhancement"],
+            crit_bonus=crit["crit_bonus"],
+            devcrit_save_dc=crit["devcrit_save_dc"],
+        )
+
     for slot in (SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B):
         e = equip_by_slot.get(slot)
         if not e:
@@ -7975,6 +9150,11 @@ def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> d
         sched = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_bab=_monk_atk_bab)
         if sched and (best_atk is None or sched[0] > best_atk):
             best_atk = sched[0]
+        if sched:
+            # Ranged weapons add no Str to damage unless Mighty; melee adds the
+            # same ability the attack used (finesse switches to Dex for to-hit
+            # only — damage stays Str in NWN).
+            profiles.append(_profile(sched, bi, item, off, 0 if ranged else str_mod))
 
     if not have_weapon:
         dtypes = {"Bludgeoning"}  # unarmed
@@ -7986,6 +9166,11 @@ def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> d
                 monk_unarmed_bab=(monk_bab if monk_levels >= 1 else 0))
             if sched:
                 best_atk = sched[0]
+                # Unarmed: 1d3 bludgeoning + Str, no crit multiplier beyond x2.
+                profiles.append(attack_profile(
+                    sched, num_dice=1, die=3, flat=str_mod,
+                    crit_threat=1, crit_mult=2,
+                    phys_types=["Bludgeoning"], elem={}, enhancement=0))
 
     attack_bonus = best_atk if best_atk is not None else 0
 
@@ -8026,6 +9211,7 @@ def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> d
         "ac_target": attack_bonus + 10,
         "damage_types_dealt": sorted(dtypes),
         "save_threats": save_threats,
+        "attack_profiles": profiles,
     }
 
 
@@ -9684,10 +10870,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
         return
 
     def _item_cost_key(entry: tuple[str, dict]) -> int:
-        try:
-            return int(fld(entry[1], "Cost", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+        return item_gp_value(entry[1])
 
     buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
     for rr, i in inaccessible:
@@ -9815,10 +10998,7 @@ def render_items_index(db: Db, out: Path) -> None:
     total = sum(len(v) for v in buckets.values()) + len(broken)
 
     def _item_cost_key(entry: tuple[str, dict]) -> int:
-        try:
-            return int(fld(entry[1], "Cost", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+        return item_gp_value(entry[1])
 
     # Split weapon keys into player weapons and creature-only weapons.
     all_weapon_keys = sorted(
@@ -11235,10 +12415,7 @@ def render_items_search(db: "Db", out: Path) -> None:
         _current_context = f"item:{resref} ({name})"
         _bi_raw = fld(i, "BaseItem", None)
         bi = -1 if _bi_raw is None else int(_bi_raw)
-        try:
-            cost_val = int(fld(i, "Cost", 0) or 0)
-        except (TypeError, ValueError):
-            cost_val = 0
+        cost_val = item_gp_value(i)
         props = []
         for p in list_items(i.get("PropertiesList")):
             f = itemprop_format(p)
@@ -11555,10 +12732,7 @@ def _store_inventory_html(db: "Db", pages: list, item_prefix: str = "../items/")
         buckets[cat_key].append((irr, enriched))
 
     def _cost_key(entry: tuple[str, dict]) -> int:
-        try:
-            return int(fld(entry[1], "Cost", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+        return item_gp_value(entry[1])
 
     for items in buckets.values():
         items.sort(key=_cost_key, reverse=True)
@@ -11696,10 +12870,7 @@ def _store_item_gp_stats(db: "Db", pages: list) -> tuple[int, str, str, float]:
     count = 0
     for p in pages:
         for it in list_items(p.get("ItemList")):
-            try:
-                cost = int(fld(it, "Cost", 0) or 0)
-            except (TypeError, ValueError):
-                cost = 0
+            cost = item_gp_value(it)
             if cost <= 0:
                 continue
             count += 1
@@ -15157,10 +16328,7 @@ def generate_tag_conflict_report(
             name = nwn_text(db.item_name(rr))
             bi = fld(item, "BaseItem")
             base_name = baseitem_name(bi) if bi is not None else ""
-            try:
-                cost = int(fld(item, "Cost", 0) or 0)
-            except (TypeError, ValueError):
-                cost = 0
+            cost = item_gp_value(item)
             props = sorted(sigs[rr])
             variants.append({
                 "resref": rr,
@@ -15421,29 +16589,319 @@ def _module_index_url_helpers(
     return _cu, _iu, _au, _su
 
 
+
+# Challenge-Rating buckets for the progression ladder. [lo, hi) half-open; the
+# last bucket's hi is open-ended. The bands past the player level cap exist to
+# separate "hard" from "not intended to be soloed at cap" — every creature in
+# them faces the same level-capped reference PC, which is the point.
+_CR_TIERS: list[tuple[float, float, str]] = [
+    (0, 5, "CR 0–5"),
+    (5, 10, "CR 5–10"),
+    (10, 20, "CR 10–20"),
+    (20, 40, "CR 20–40"),
+    (40, 80, "CR 40–80"),
+    (80, 200, "CR 80–200"),
+    (200, float("inf"), "CR 200+"),
+]
+
+# Bumped by hand whenever the simulation, the reference PC or the kit solver
+# changes in a way that would move the numbers. Part of the staleness
+# fingerprint, so an algorithm change makes existing reports report themselves
+# as out of date without anyone having to remember to delete them.
+_COUNTER_GEAR_ALGO_VERSION = 4
+
+# Past this many rounds a "win" is really a war of attrition (100 rounds is ten
+# minutes of unbroken melee), so the report labels it instead of just ticking it.
+_ATTRITION_ROUNDS = 100
+
+
+def _parse_cr(cr_raw: object) -> float:
+    """Numeric Challenge Rating, or 0.0 when unparseable."""
+    try:
+        return float(cr_raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fmt_gp(cost: int) -> str:
+    """Compact gold display: 1234 → '1.2k gp', 1500000 → '1.5M gp'."""
+    if cost >= 1_000_000_000:
+        return f"{cost / 1_000_000_000:.1f}B gp"
+    if cost >= 1_000_000:
+        return f"{cost / 1_000_000:.1f}M gp"
+    if cost >= 1_000:
+        return f"{cost / 1_000:.1f}k gp"
+    return f"{cost} gp"
+
+
+def devcrit_mode(db: "Db") -> dict:
+    """Which Devastating Critical rule is in force, detected from the 2DAs.
+
+    The engine only rolls a devastating critical for a weapon whose baseitems.2da
+    row names a feat in EpicWeaponDevastatingCriticalFeat. A module that blanks
+    that column across the board (as nwn_homers_lotr does, via
+    bin/gen-devcrit-map.py) has disabled the save-or-die at source, for players
+    and NPCs alike — so no configuration is needed to notice, and any module that
+    left it alone keeps stock behaviour automatically.
+    """
+    col = "EpicWeaponDevastatingCriticalFeat"
+    armed = sum(1 for bi in WEAPONS if weapon_feat_id(bi, col))
+    if armed:
+        return {"mode": "stock", "weapons_armed": armed, "bonus_dice": 0,
+                "label": f"save-or-die (stock; {armed} base items armed)"}
+    if col not in BASEITEM_COLUMNS_SEEN:
+        # No baseitems.2da carried the column, so we never saw the evidence
+        # either way. Assume the engine default rather than silently reporting
+        # a mechanic as disabled — run with --2da-dir to detect it properly.
+        return {"mode": "unknown", "weapons_armed": 0, "bonus_dice": 0,
+                "label": ("assumed stock save-or-die — no baseitems.2da was "
+                          "available to check; pass --2da-dir to detect it")}
+    if db.devcrit_bonus_dice > 0:
+        return {"mode": "bonus-dice", "weapons_armed": 0,
+                "bonus_dice": db.devcrit_bonus_dice,
+                "label": ("disabled at source; replaced by "
+                          f"+{db.devcrit_bonus_dice} damage dice on a critical")}
+    return {"mode": "disabled", "weapons_armed": 0, "bonus_dice": 0,
+            "label": "disabled at source, with no replacement configured"}
+
+
+def _pc_level_for_cr(cr: float, db: "Db") -> int:
+    """Reference-PC level for a creature of this Challenge Rating: CR, clamped
+    to the server's player cap. Everything above the cap gets a capped PC — so a
+    boss the cap cannot beat is reported as unwinnable rather than quietly
+    matched against a character who could never exist."""
+    return max(1, min(int(round(cr)) or 1, db.max_player_level or 40))
+
+
+# ---------------------------------------------------------------------------
+# Staleness fingerprint.
+#
+# The simulation is far too slow to run on every wiki refresh, but a stale
+# report is worse than no report. Both problems go away with a cheap hash of
+# everything the analysis actually reads: if it matches, the report on disk is
+# still correct; if it does not, a normal run says so and you re-run with
+# --counter-gear. Module-agnostic — nothing here knows about any one module.
+# ---------------------------------------------------------------------------
+
+def _counter_gear_fingerprint(db: "Db") -> str:
+    """Hash of every input the counter-gear analysis depends on."""
+    h = hashlib.sha256()
+    h.update(f"algo={_COUNTER_GEAR_ALGO_VERSION}\n".encode())
+    h.update(f"dials={db.max_character_level},{db.max_ability_bonus},"
+             f"{db.max_player_level},{db.devcrit_bonus_dice}\n".encode())
+
+    # 2DA overrides change base item stats, slots and property tables.
+    if db.twoda_dir and Path(db.twoda_dir).is_dir():
+        for p in sorted(Path(db.twoda_dir).glob("*.2da")):
+            st = p.stat()
+            h.update(f"2da:{p.name}:{st.st_size}:{int(st.st_mtime)}\n".encode())
+
+    # Items: what they are, what they cost, what they do, and whether a player
+    # can get one (an item becoming reachable changes every kit).
+    h.update(b"--items--\n")
+    for rr in sorted(db.items):
+        it = db.items[rr]
+        h.update(f"{rr}|{fld(it, 'BaseItem', '')}|{item_gp_value(it)}|"
+                 f"{int(_item_accessible(db, rr))}|".encode())
+        for p in list_items(it.get("PropertiesList")):
+            h.update(f"{fld(p, 'PropertyName', '')},{fld(p, 'Subtype', '')},"
+                     f"{fld(p, 'CostValue', '')},{fld(p, 'Param1Value', '')};".encode())
+        h.update(b"\n")
+
+    # Creatures: the canonical set and the fields the sim reads off them.
+    h.update(b"--creatures--\n")
+    for rr in sorted(db.canonical_creatures):
+        entry = db.canonical_creatures[rr]
+        c = entry["c"]
+        h.update(f"{rr}|{fld(c, 'ChallengeRating', '')}|{fld(c, 'MaxHitPoints', '')}|"
+                 f"{fld(c, 'NaturalAC', '')}|{fld(c, 'ScriptDamaged', '')}|".encode())
+        for key in ("Equip_ItemList", "ClassList", "FeatList", "SpecAbilityList",
+                    "PropertiesList"):
+            for e in list_items(c.get(key)):
+                h.update(repr(sorted(
+                    (k, v) for k, v in e.items() if isinstance(v, (int, str))
+                )).encode())
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def check_counter_gear_freshness(db: "Db", module_index_dir: Path) -> bool:
+    """Compare the on-disk counter_gear.json against the current inputs.
+
+    Returns True when the report is present and current. Called on every wiki
+    run; pushes a warning onto the module-index summary when the report is
+    missing or stale so the staleness surfaces without paying for the sim.
+    """
+    path = module_index_dir / "counter_gear.json"
+    if not path.is_file():
+        _module_index_summary.append(("warn",
+            "[nwn-wiki] module-index: counter_gear.json absent — "
+            "run with --counter-gear to build it"))
+        return False
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8")).get("input_fingerprint")
+    except (OSError, ValueError):
+        stored = None
+    if stored and stored == _counter_gear_fingerprint(db):
+        _module_index_summary.append(("info",
+            "[nwn-wiki] module-index: counter_gear.json current (inputs unchanged)"))
+        return True
+    _module_index_summary.append(("warn",
+        "[nwn-wiki] module-index: counter_gear.json is STALE — items, creatures, "
+        "2DAs or combat dials changed since it was built. Re-run with "
+        "--counter-gear."))
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Report data + rendering
+# ---------------------------------------------------------------------------
+
+def _top_value_by_slot(db: "Db", _iu, limit: int = 5) -> list[dict]:
+    """The most valuable player-attainable items in each equipment slot.
+
+    A blunt but effective best-in-slot proxy: builders price power, so sorting
+    a slot by gold piece value surfaces its strongest items without simulating
+    anything. Attainability is the same rule the items index uses. Items that
+    fit several slots appear under each of them.
+    """
+    buckets: dict[str, list[dict]] = {key: [] for key, _, _, _ in PLAYER_SLOTS}
+    for rr in sorted(db.items):
+        if not _item_accessible(db, rr):
+            continue
+        item = db.items[rr]
+        slots = item_equip_slots(item) & PLAYER_SLOT_MASK
+        if not slots:
+            continue
+        name = nwn_text(db.item_name(rr))
+        if name.startswith("[TLK#") or name == rr:
+            continue                              # broken/unnamed blueprint
+        entry = {
+            "resref": rr, "name": name,
+            "gp_value": item_gp_value(item),
+            "base_item": baseitem_name(_try_int(fld(item, "BaseItem", -1), -1)),
+            "wiki_url": _iu(rr),
+        }
+        for key, _label, mask, _n in PLAYER_SLOTS:
+            if slots & mask:
+                buckets[key].append(entry)
+
+    out: list[dict] = []
+    for key, label, _mask, wearable in PLAYER_SLOTS:
+        items = sorted(buckets[key],
+                       key=lambda e: (-e["gp_value"], e["name"].lower()))[:limit]
+        if items:
+            out.append({"slot": key, "label": label,
+                        "wearable": wearable, "items": items})
+    return out
+
+
+def _kit_entries(kit: dict, _iu) -> list[dict]:
+    """Serialise a solved kit to slot-ordered JSON entries."""
+    entries: list[dict] = []
+    for key, label, _mask, _n in PLAYER_SLOTS:
+        held = kit.get(key)
+        if not held:
+            continue
+        for piece in (held if isinstance(held, list) else [held]):
+            entries.append({
+                "slot": key, "label": label,
+                "resref": piece["resref"], "name": piece["name"],
+                "gp_value": piece["cost"], "wiki_url": _iu(piece["resref"]),
+            })
+    return entries
+
+
+def _fmt_rounds(sim: dict) -> str:
+    """One-line verdict for a simulated fight."""
+    kill = sim["rounds_to_kill"]
+    die = sim["rounds_to_die"]
+    kill_s = f"{kill} rds" if kill is not None else "never"
+    if sim.get("outlasts_heal_cooldown"):
+        # Survives longer than the heal cooldown, so the heal keeps it standing.
+        die_s = f"outlasts heal ({die} rds/heal)" if die is not None else "never"
+    else:
+        die_s = f"dies in {die} rds" if die is not None else "never dies"
+    verdict = "✅" if sim["wins"] else "❌"
+    out = f"kills in {kill_s}, {die_s} {verdict}"
+    # A win measured in thousands of rounds is a win on paper only — that is
+    # hours of real time, and it usually means the kit only just out-paces the
+    # creature's regeneration. Say so rather than let ✅ imply "go fight this".
+    if kill is not None and kill > _ATTRITION_ROUNDS:
+        out += f" ⏳ attrition ({kill * 6 / 60:.0f} min)"
+    if sim["save_fail"] > 0:
+        out += f" (save-fail {sim['save_fail'] * 100:.0f}%/rd)"
+    return out
+
+
+def _kit_lines(entries: list[dict]) -> list[str]:
+    """Markdown table rows for a kit, or a single 'nothing needed' line."""
+    if not entries:
+        return ["  - _(nothing — the fight is won bare-handed)_"]
+    return [f"  - {e['label']}: {e['name']} (`{e['resref']}`, {_fmt_gp(e['gp_value'])})"
+            for e in entries]
+
+
 def _counter_gear_markdown(data: dict) -> str:
     """Render the counter_gear.json payload as a human-readable report."""
     L: list[str] = []
     L.append(f"# Counter-gear analysis — {data['module']}")
     L.append("")
-    L.append(f"_Generated {data['generated_at']}. Build-agnostic: objective creature "
-             "requirements vs. obtainable items only (no player build/level modelled). "
-             "Recommends the **cheapest sufficient** gear (offense + survival), not "
-             "best-in-slot — a leveling guide. Save DCs are estimates (innate spell "
-             "level isn't in the data)._")
+    L.append(f"_Generated {data['generated_at']}. Every creature is fought by a "
+             f"synthetic reference PC — a single-class fighter at level "
+             f"min(CR, {data['max_player_level']}), every level-up point and all "
+             "ten tiers of Great Strength (Great Dexterity behind a finesse or "
+             "ranged weapon) in its attacking stat, specced into whatever weapon "
+             "it is holding, with a free full heal every 150s — using only items "
+             "players can actually obtain. Ability bonuses stack across items up "
+             f"to this module's +{data['max_ability_bonus']} cap. Rounds are "
+             "expected values, not rolls. No spells, potions or summons are "
+             "modelled, so **\"unwinnable\" means unwinnable on gear alone**, and "
+             "save DCs are estimates (innate spell level isn't in the data)._")
+    L.append("")
+    L.append(f"_Critical hits: threat range and multiplier come from each "
+             "weapon's own `baseitems.2da` row, and a critical needs a "
+             "threatening roll that hits followed by a confirmation roll. The PC "
+             "takes Improved Critical (doubling the threat range) and, where the "
+             "weapon allows it and Strength reaches 25, Overwhelming and "
+             "Devastating Critical; creatures get only the critical feats their "
+             "blueprint actually carries. Devastating Critical in this module: "
+             f"**{data['devastating_critical']['label']}**. Creatures immune to "
+             "critical hits take none of it. Legendary feats are not simulated._")
     L.append("")
     creatures = data["creatures"]
+    won = [c for c in creatures if c["sim"]["wins"]]
     L.append("## Summary")
     L.append("")
     L.append(f"- Creatures analysed: **{len(creatures)}**")
-    L.append(f"- Unbeatable (no obtainable counter): **{len(data['unbeatable'])}**")
+    L.append(f"- Beatable with obtainable gear: **{len(won)}**")
+    L.append(f"- Unwinnable at the level cap: **{len(data['unbeatable'])}**")
     L.append(f"- Needs manual review: **{len(data['manual_review'])}**")
     L.append(f"- Damage types dealt by obtainable weapons: "
              f"{', '.join(data['damage_types']) or '(none found)'}")
     L.append("")
 
+    # ---- best in slot by GP ------------------------------------------------
+    L.append("## Best in slot (by GP value)")
+    L.append("")
+    L.append("_The most valuable items a player can actually get hold of, per "
+             "equipment slot. Gold is a proxy for power, not a measure of it — "
+             "use the per-creature kits below for what actually wins fights._")
+    L.append("")
+    for grp in data.get("top_value_by_slot", []):
+        heading = grp["label"]
+        if grp["wearable"] > 1:
+            heading += f" (×{grp['wearable']} wearable)"
+        L.append(f"### {heading}")
+        L.append("")
+        L.append("| # | Item | ResRef | GP Value |")
+        L.append("|--:|------|--------|---------:|")
+        for i, e in enumerate(grp["items"], 1):
+            L.append(f"| {i} | {e['name']} | `{e['resref']}` | {e['gp_value']:,} |")
+        L.append("")
+
     if data["unbeatable"]:
-        L.append("## ⛔ Unbeatable creatures")
+        L.append("## ⛔ Unwinnable at the level cap")
         L.append("")
         for u in data["unbeatable"]:
             L.append(f"- **{u['name']}** (`{u['canonical_resref']}`) — "
@@ -15461,48 +16919,49 @@ def _counter_gear_markdown(data: dict) -> str:
     # ---- progression ladder ------------------------------------------------
     L.append("## Progression ladder (by Challenge Rating)")
     L.append("")
-    L.append("_Each tier's kit is the cheapest gear that handles that band of "
-             "creatures — clear it to afford/loot the next tier's kit._")
+    L.append("_Each tier's kit is the minimum kit of the band's most gear-hungry "
+             "winnable fight — the band's worst equipment requirement, not an "
+             "average. The hardest fight is listed separately: it is usually a "
+             "different creature, one that needs skill rather than shopping._")
     L.append("")
     for t in data.get("progression_tiers", []):
         prof = t["defeat_profile"]
-        kit = t["recommended_kit"]
         lo, hi = prof["ac_target_range"]
-        L.append(f"### {t['label']} — {t['creature_count']} creatures")
+        L.append(f"### {t['label']} — {t['creature_count']} creatures "
+                 f"(reference PC level {t['pc_level']})")
         bits = []
-        typ = prof["min_enhancement_to_bypass_dr"]
-        mx = prof.get("max_enhancement_to_bypass_dr", 0)
-        if typ:
-            note = f"weapon ≥ +{typ} (DR)"
-            if mx > typ:
-                note += f"; outliers need +{mx}"
-            bits.append(note)
-        elif mx:
-            bits.append(f"weapon: no DR for most; outliers need +{mx}")
+        if prof["min_enhancement_to_bypass_dr"]:
+            bits.append(f"weapon ≥ +{prof['min_enhancement_to_bypass_dr']} (DR)")
         bits.append(f"AC target {lo}–{hi}")
         if prof["resist_priority"]:
             bits.append("resist " + "/".join(prof["resist_priority"]))
         if prof["has_special_attacks"]:
             bits.append("save gear (special attacks)")
         L.append(f"- Profile: {' · '.join(bits)}")
-        w = kit["weapon"]
-        if w:
-            L.append(f"- Weapon: {w['name']} (+{w['enhancement']}, {_fmt_gp(w['cost'])})")
-        for r in kit["resist"]:
-            L.append(f"- {r['slot']}: {r['name']} ({r['reason']}, {_fmt_gp(r['cost'])})")
-        if kit["ac"]:
-            L.append(f"- {kit['ac']['slot']}: {kit['ac']['name']} "
-                     f"({kit['ac']['reason']}, {_fmt_gp(kit['ac']['cost'])})")
-        for s in kit.get("save", []):
-            L.append(f"- {s['slot']}: {s['name']} ({s['reason']}, {_fmt_gp(s['cost'])})")
+        if t.get("hardest"):
+            L.append(f"- Hardest fight: **{t['hardest']['name']}** "
+                     f"(CR {t['hardest']['cr']}) in the module's best gear — "
+                     f"{_fmt_rounds(t['hardest']['sim'])}")
+        if t.get("benchmark"):
+            L.append(f"- Most gear-hungry fight: **{t['benchmark']['name']}** "
+                     f"(CR {t['benchmark']['cr']}) — {_fmt_rounds(t['benchmark']['sim'])}; "
+                     "its minimum kit is the tier kit below")
+        L.append(f"- Kit ({_fmt_gp(t['kit_cost'])} total):")
+        L.extend(_kit_lines(t["recommended_kit"]))
+        if t["unwinnable"]:
+            L.append(f"- ⛔ Unwinnable in this band: "
+                     + ", ".join(u["name"] for u in t["unwinnable"][:10])
+                     + (f" (+{len(t['unwinnable']) - 10} more)"
+                        if len(t["unwinnable"]) > 10 else ""))
         L.append("")
 
     L.append("## Per-creature counter-gear")
     L.append("")
     for c in creatures:
+        sim = c["sim"]
         flag = ""
         if c["unbeatable"]:
-            flag = " ⛔ UNBEATABLE"
+            flag = " ⛔ UNWINNABLE"
         elif c["needs_manual_review"]:
             flag = " ⚠️ review"
         L.append(f"### {c['name']} (CR {c['cr']}){flag}")
@@ -15513,15 +16972,19 @@ def _counter_gear_markdown(data: dict) -> str:
         L.append(f"- HP {c['hp'] if c['hp'] is not None else '?'} · AC {d['ac']} · "
                  f"Fort {d['fort']:+d}/Ref {d['ref']:+d}/Will {d['will']:+d}"
                  f" · SR {d['sr']} · DR {dr_txt or '—'}")
-        sv = c.get("survival", {})
-        off_bits = [f"attacks +{sv.get('attack_bonus', 0)}"]
+        sv = c["survival"]
+        off_bits = [f"attacks +{sv['attack_bonus']}"]
         if sv.get("damage_types_dealt"):
             off_bits.append("deals " + "/".join(sv["damage_types_dealt"]))
         if sv.get("save_threats"):
             st = sv["save_threats"][0]
-            off_bits.append(f"special DC ~{st['dc_est']} est. (+{len(sv['save_threats'])} abilities)")
+            off_bits.append(
+                f"special DC ~{st['dc_est']} est. ({len(sv['save_threats'])} abilities)")
         L.append(f"- Offense: {' · '.join(off_bits)}")
         req = c["defeat_requirements"]
+        if d.get("crit_immune"):
+            L.append("- **Immune to critical hits** — no multiplier, no "
+                     "Overwhelming or Devastating Critical damage")
         if req["immune_types"]:
             L.append(f"- Immune to: {', '.join(req['immune_types'])}")
         if req["mandatory_weapon_tags"]:
@@ -15532,61 +16995,15 @@ def _counter_gear_markdown(data: dict) -> str:
             L.append(f"- ⛔ {u}")
         for n in c["review_notes"]:
             L.append(f"- ⚠️ {n}")
-        # Offensive weapon (cheapest sufficient) + aspirational reach.
-        weps = c["recommended_gear"].get("Right hand", [])
-        if weps:
-            picks = ", ".join(f"{i['name']} (+{i['enhancement']}, {_fmt_gp(i['cost'])})"
-                              for i in weps)
-            L.append(f"- Weapon (cheapest sufficient): {picks}")
-        rw = c.get("reach_weapon")
-        if rw:
-            L.append(f"- Weapon (reach upgrade): {rw['name']} (+{rw['enhancement']}, {_fmt_gp(rw['cost'])})")
-        # Survival gear.
-        if sv.get("resist"):
-            res = "; ".join(f"{r['name']} [{r['slot']}] ({r['reason']}, {_fmt_gp(r['cost'])})"
-                            for r in sv["resist"])
-            L.append(f"- Survive (resist): {res}")
-        if sv.get("ac"):
-            ac = "; ".join(f"{r['name']} [{r['slot']}] ({r['reason']}, {_fmt_gp(r['cost'])})"
-                           for r in sv["ac"])
-            L.append(f"- Survive (AC → {sv.get('ac_target')}): {ac}")
-        elif sv.get("ac_note"):
-            L.append(f"- Survive (AC): {sv['ac_note']}")
-        if sv.get("saves"):
-            sav = "; ".join(f"{r['name']} [{r['slot']}] ({r['reason']}, {_fmt_gp(r['cost'])})"
-                            for r in sv["saves"])
-            L.append(f"- Survive (saves): {sav}")
+        L.append(f"- Simulated (L{c['pc_level']} PC, best gear): {_fmt_rounds(c['best_sim'])}")
+        if c["minimum_kit"] is not None:
+            L.append(f"- Minimum kit that wins ({_fmt_gp(c['minimum_kit_cost'])}) — "
+                     f"{_fmt_rounds(sim)}:")
+            L.extend(_kit_lines(c["minimum_kit"]))
+        L.append("- Best obtainable kit:")
+        L.extend(_kit_lines(c["best_kit"]))
         L.append("")
     return "\n".join(L)
-
-
-# Challenge-Rating buckets for the progression ladder. (lo, hi] half-open; the
-# last bucket's hi is open-ended.
-_CR_TIERS: list[tuple[float, float, str]] = [
-    (0, 5, "CR 0–5"),
-    (5, 10, "CR 5–10"),
-    (10, 20, "CR 10–20"),
-    (20, 40, "CR 20–40"),
-    (40, 80, "CR 40–80"),
-    (80, float("inf"), "CR 80+"),
-]
-
-
-def _parse_cr(cr_raw: object) -> float:
-    """Numeric Challenge Rating, or 0.0 when unparseable."""
-    try:
-        return float(cr_raw)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _fmt_gp(cost: int) -> str:
-    """Compact gold display: 1234 → '1.2k gp', 1500000 → '1.5M gp'."""
-    if cost >= 1_000_000:
-        return f"{cost / 1_000_000:.1f}M gp"
-    if cost >= 1_000:
-        return f"{cost / 1_000:.1f}k gp"
-    return f"{cost} gp"
 
 
 def generate_counter_gear_index(
@@ -15597,57 +17014,29 @@ def generate_counter_gear_index(
     _cu,
     _iu,
 ) -> None:
-    """Link each creature to the obtainable items needed to defeat it.
+    """Simulate every canonical creature against a level-appropriate reference PC
+    and report the gear needed to beat it.
 
-    Build-agnostic, objective requirements only. For every canonical creature we
-    derive (a) its damage-relevant defences and the *cheapest obtainable weapon*
-    that can hurt it — a leveling guide, not a best-in-slot list — and (b) its
-    offensive threat (damage types dealt, attack bonus, special-ability saves)
-    plus the cheapest defensive gear that mitigates each, since defeating a
-    creature also means surviving it. Creatures are bucketed by Challenge Rating
-    into a progression ladder. Writes counter_gear.json + counter_gear.md."""
-    # ---- obtainable offensive items ---------------------------------------
-    accessible_weapons: list[dict] = []
-    for rr, item in db.items.items():
-        if not _item_accessible(db, rr):
-            continue
-        off = extract_item_offense(db, item, rr)
-        if off["is_weapon"] and off["damage_dtypes"]:
-            accessible_weapons.append(off)
+    For each creature this derives its objective defences and offensive threat
+    (via extract_creature_defenses / extract_creature_offense, shared with the
+    creature pages so the combat maths never forks), then solves for two kits
+    out of the player-attainable item pool: the strongest one available, and the
+    cheapest one that still wins. Creatures are bucketed by Challenge Rating into
+    a progression ladder, and the report opens with the highest-GP attainable
+    item in every slot. Writes counter_gear.json + counter_gear.md.
+    """
+    t0 = time.time()
+    pool = _prune_pool(build_gear_pool(db))
+    print("[nwn-wiki] counter-gear: gear pool "
+          + ", ".join(f"{k}={len(v)}" for k, v in pool.items() if v))
+
+    # Damage types any obtainable weapon can deal — used to spot creatures that
+    # nothing in the module can hurt.
     module_weapon_dtypes: set[str] = set()
-    for off in accessible_weapons:
-        module_weapon_dtypes.update(off["damage_dtypes"])
-
-    # ---- obtainable defensive items (for survivability) -------------------
-    accessible_defense: list[dict] = []
-    for rr, item in db.items.items():
-        if not _item_accessible(db, rr):
-            continue
-        d = extract_item_defense(db, item, rr)
-        if d["relevant"]:
-            accessible_defense.append(d)
-    # Survival indexes, cheapest-first (the leveling-guide philosophy: the
-    # cheapest gear that helps, partial mitigation is fine — players have heals).
-    # Ties break toward the stronger item so equal-cost picks favour more bonus.
-    defense_by_resist: dict[str, list[dict]] = defaultdict(list)
-    for d in accessible_defense:
-        for dt in set(d["resist"]) | set(d["immune"]):
-            defense_by_resist[dt].append(d)
-    for dt in defense_by_resist:
-        defense_by_resist[dt].sort(
-            key=lambda d, _dt=dt: (d["cost"], -d["immune"].get(_dt, 0), -d["resist"].get(_dt, 0)))
-    defense_ac = sorted((d for d in accessible_defense if d["ac_bonus"] > 0),
-                        key=lambda d: (d["cost"], -d["ac_bonus"]))
-    defense_save: dict[str, list[dict]] = defaultdict(list)
-    for d in accessible_defense:
-        for kind in d["saves"]:
-            defense_save[kind].append(d)
-    for kind in defense_save:
-        defense_save[kind].sort(key=lambda d, _k=kind: (d["cost"], -d["saves"].get(_k, 0)))
-
-    def _def_entry(d: dict, reason: str) -> dict:
-        return {"resref": d["resref"], "name": d["name"], "wiki_url": _iu(d["resref"]),
-                "slot": d["slot"], "cost": d["cost"], "reason": reason}
+    for pieces in pool.values():
+        for p in pieces:
+            if p["is_weapon"]:
+                module_weapon_dtypes.update(p["off"]["damage_dtypes"])
 
     def _tag_has_obtainable(tag: str) -> bool:
         return any(_item_accessible(db, irr)
@@ -15657,10 +17046,15 @@ def generate_counter_gear_index(
     unbeatable_out: list[dict] = []
     review_out: list[dict] = []
 
-    for can_rr in sorted(db.canonical_creatures,
-                         key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
-        if can_rr.startswith("__orphan_"):
-            continue
+    ordered = [r for r in sorted(
+        db.canonical_creatures,
+        key=lambda r: nwn_text(db.canonical_creature_name(r)).lower())
+        if not r.startswith("__orphan_")]
+
+    for n, can_rr in enumerate(ordered, 1):
+        if n % 100 == 0:
+            print(f"[nwn-wiki] counter-gear: {n}/{len(ordered)} creatures "
+                  f"({time.time() - t0:.0f}s)")
         entry = db.canonical_creatures[can_rr]
         c = entry["c"]
         bp_rr = entry["bp_rr"]
@@ -15671,120 +17065,82 @@ def generate_counter_gear_index(
         O = extract_creature_offense(db, c, bp, D)
 
         immune_types = sorted(t for t, pct in D["immunities"].items() if pct >= 100)
-        damageable = module_weapon_dtypes - set(immune_types)
         dr = D["dr"]
         min_enh = _prop_value_num(dr["bypass"]) if dr and dr.get("bypass") else 0
         mandatory_tags = sorted({t.lower() for t in D["hard_required_tags"]})
 
-        # ---- offensive gear: cheapest *sufficient* weapon -----------------
-        # Sufficient = deals a non-immune damage type and satisfies any weapon-tag
-        # gate. Clearing DR is preferred (DR is soak, not immunity — a weapon that
-        # doesn't clear it still does reduced damage), as is a real priced melee
-        # weapon over a 0-gp stock filler. We list the cheapest few (the leveling
-        # pick) plus one aspirational "reach" upgrade — never a best-in-slot dump.
-        sufficient: list[dict] = []
-        for off in accessible_weapons:
-            deals = sorted(set(off["damage_dtypes"]) & damageable)
-            if not deals:
-                continue
-            satisfies_tag = (not mandatory_tags) or (off["tag"] in mandatory_tags)
-            if mandatory_tags and not satisfies_tag:
-                continue
-            clears_dr = (min_enh == 0) or (off["enhancement"] >= min_enh)
-            reasons = []
-            if satisfies_tag and mandatory_tags:
-                reasons.append(f"matches required weapon tag '{off['tag']}'")
-            reasons.append("deals " + "/".join(deals))
-            if min_enh:
-                reasons.append(f"+{off['enhancement']} {'clears' if clears_dr else 'does NOT clear'} DR +{min_enh}")
-            sufficient.append({
-                "resref": off["resref"], "name": off["name"],
-                "wiki_url": _iu(off["resref"]), "enhancement": off["enhancement"],
-                "damage_types": deals, "tag": off["tag"],
-                "satisfies_tag": bool(satisfies_tag and mandatory_tags),
-                "clears_dr": clears_dr, "is_ranged": off["is_ranged"],
-                "cost": off["cost"], "reason": "; ".join(reasons),
-            })
-        # Free (0-gp) stock weapons sink below real priced gear; melee before
-        # ranged; DR-clearers before non-clearers; then cheapest.
-        def _wkey(r: dict) -> tuple:
-            return (not r["clears_dr"], r["is_ranged"],
-                    r["cost"] if r["cost"] > 0 else float("inf"), -r["enhancement"])
-        sufficient.sort(key=_wkey)
-        weapon_recs = sufficient[:3]
-        reach = None
-        if sufficient:
-            best = max(sufficient, key=lambda r: (r["clears_dr"], r["enhancement"], -r["cost"]))
-            if best["resref"] not in {r["resref"] for r in weapon_recs}:
-                reach = best
-        recommended: dict[str, list[dict]] = {}
-        if weapon_recs:
-            recommended["Right hand"] = weapon_recs
-        if D["ac"] >= 40 and weapon_recs:
-            weapon_recs[0]["reason"] += (
-                f"; high AC {D['ac']} — more enhancement helps to-hit")
-
-        # ---- survivability: defensive gear vs this creature ---------------
-        resist_recs: list[dict] = []
-        for dt in O["damage_types_dealt"]:
-            cands = defense_by_resist.get(dt)
-            if not cands:
-                continue
-            d = cands[0]
-            amt = (f"immune {d['immune'][dt]}%" if dt in d["immune"]
-                   else f"resist {d['resist'][dt]}/-")
-            resist_recs.append(_def_entry(d, f"{amt} vs {dt}"))
-        ac_recs: list[dict] = []
-        ac_note = ""
-        if O["attack_bonus"] >= 10:
-            seen_slots: set[str] = set()
-            for d in defense_ac:
-                if d["slot"] in seen_slots:
-                    continue
-                seen_slots.add(d["slot"])
-                ac_recs.append(_def_entry(d, f"+{d['ac_bonus']} AC"))
-                if len(ac_recs) >= 4:
-                    break
-        else:
-            ac_note = f"low attack (+{O['attack_bonus']}) — little AC needed"
-        save_recs: list[dict] = []
-        if O["save_threats"]:
-            # Innate save type is unknown, so cover all three with the best
-            # obtainable item for each (Universal items would count too if any
-            # existed in this module — none do).
-            for kind in ("Fortitude", "Reflex", "Will", "Universal"):
-                lst = defense_save.get(kind)
-                if lst:
-                    d = lst[0]
-                    save_recs.append(_def_entry(d, f"+{d['saves'].get(kind, 0)} {kind}"))
-        survival = {
-            "attack_bonus": O["attack_bonus"],
-            "ac_target": O["ac_target"],
-            "damage_types_dealt": O["damage_types_dealt"],
+        # ---- the creature as a simulation opponent -------------------------
+        # Its best weapon is the one that hits hardest; with none, the profile
+        # list is empty and it can only be worn down by the PC.
+        profiles = O["attack_profiles"]
+        creature_att = (max(profiles, key=lambda p: p["schedule"][0] if p["schedule"] else -99)
+                        if profiles else
+                        attack_profile([], num_dice=0, die=0, flat=0, crit_threat=1,
+                                       crit_mult=2, phys_types=[], elem={}, enhancement=0))
+        crit_immune = CRIT_IMMUNITY_LABEL in D["misc_immunities"]
+        creature_sim = {
+            "attack": creature_att,
+            "defense": defense_profile(
+                ac=D["ac"], hp=D["hp"] or 1,
+                dr_soak=_prop_value_num(dr["soak"]) if dr and dr.get("soak") else 0,
+                dr_bypass=min_enh,
+                resist=D["resistances"], immune=D["immunities"],
+                regen=D["regen"], fort=D["fort"], ref=D["ref"], will=D["will"],
+                crit_immune=crit_immune),
             "save_threats": O["save_threats"],
-            "resist": resist_recs,
-            "ac": ac_recs,
-            "ac_note": ac_note,
-            "saves": save_recs,
         }
 
-        # ---- unbeatable / review detection --------------------------------
+        cr = _parse_cr(cr_raw)
+        pc_level = _pc_level_for_cr(cr, db)
+        best_kit, best_sim = best_in_slot_kit(pc_level, creature_sim, pool, db)
+        min_kit, min_sim = minimum_viable_kit(pc_level, creature_sim, pool, db, best_kit)
+
+        best_entries = _kit_entries(best_kit, _iu)
+        min_entries = _kit_entries(min_kit, _iu) if best_sim["wins"] else None
+
+        # ---- unwinnable / review detection ---------------------------------
         unbeatable_reasons: list[str] = []
         if mandatory_tags and not any(_tag_has_obtainable(t) for t in mandatory_tags):
             unbeatable_reasons.append(
                 "requires a weapon tagged "
                 + " or ".join(f"'{t}'" for t in mandatory_tags)
                 + " but no obtainable item has that tag")
-        if module_weapon_dtypes and not damageable:
+        if module_weapon_dtypes and not (module_weapon_dtypes - set(immune_types)):
             unbeatable_reasons.append(
                 "immune to every damage type any obtainable weapon deals ("
                 + ", ".join(sorted(module_weapon_dtypes)) + ")")
+        if not best_sim["wins"]:
+            if best_sim["no_damage"]:
+                unbeatable_reasons.append(
+                    f"takes no damage from a level-{pc_level} PC in the best "
+                    "obtainable gear — its immunities, resistances and damage "
+                    "reduction absorb every attack")
+            elif best_sim["rounds_to_kill"] is None:
+                unbeatable_reasons.append(
+                    f"regenerates faster than a level-{pc_level} PC in the best "
+                    "obtainable gear can deal damage")
+            else:
+                unbeatable_reasons.append(
+                    f"kills a level-{pc_level} PC in the best obtainable gear "
+                    f"({best_sim['rounds_to_die']} rounds) before it can be killed "
+                    f"({best_sim['rounds_to_kill']} rounds)")
+        if best_sim["save_fail"] > 0.5:
+            review_notes_save = (
+                f"special-attack save DC ~{O['save_threats'][0]['dc_est']} beats even "
+                f"the best obtainable save gear ({best_sim['save_fail'] * 100:.0f}% "
+                "failure per round) — survivable only if those abilities are not "
+                "save-or-die, which the blueprint data cannot tell us")
+        else:
+            review_notes_save = ""
 
         review_notes: list[str] = []
-        if not unbeatable_reasons and D["mitigates_damage"]:
+        if review_notes_save:
+            review_notes.append(review_notes_save)
+        if D["mitigates_damage"]:
             review_notes.append(
                 f"OnDamaged handler '{D['dmg_script']}' self-heals or grants itself "
-                "damage immunity — verify available DPS exceeds the mitigation")
+                "damage immunity — the simulation cannot see that, so verify the "
+                "result by hand")
 
         rec = {
             "canonical_resref": can_rr,
@@ -15793,23 +17149,35 @@ def generate_counter_gear_index(
             "wiki_url": _cu(can_rr),
             "cr": str(cr_raw),
             "hp": D["hp"],
+            "pc_level": pc_level,
             "defenses": {
                 "ac": D["ac"], "fort": D["fort"], "ref": D["ref"], "will": D["will"],
                 "sr": D["sr"], "dr": dr,
                 "resistances": D["resistances"], "immunities": D["immunities"],
                 "spell_immunities": D["spell_immunities"],
                 "regen": D["regen"], "vampiric": D["vampiric"],
+                "crit_immune": crit_immune,
             },
             "defeat_requirements": {
-                "damageable_types": sorted(damageable),
+                "damageable_types": sorted(module_weapon_dtypes - set(immune_types)),
                 "immune_types": immune_types,
                 "min_enhancement_to_bypass_dr": min_enh,
                 "mandatory_weapon_tags": mandatory_tags,
                 "hard_gate": bool(mandatory_tags),
             },
-            "recommended_gear": recommended,
-            "reach_weapon": reach,
-            "survival": survival,
+            "survival": {
+                "attack_bonus": O["attack_bonus"],
+                "ac_target": O["ac_target"],
+                "damage_types_dealt": O["damage_types_dealt"],
+                "save_threats": O["save_threats"],
+            },
+            "sim": min_sim if min_entries is not None else best_sim,
+            "best_sim": best_sim,
+            "best_kit": best_entries,
+            "best_kit_cost": sum(e["gp_value"] for e in best_entries),
+            "minimum_kit": min_entries,
+            "minimum_kit_cost": (sum(e["gp_value"] for e in min_entries)
+                                 if min_entries else 0),
             "unbeatable": bool(unbeatable_reasons),
             "unbeatable_reasons": unbeatable_reasons,
             "needs_manual_review": bool(review_notes),
@@ -15823,31 +17191,16 @@ def generate_counter_gear_index(
             review_out.append({"canonical_resref": can_rr, "name": name,
                                "notes": review_notes})
 
-    # ---- progression ladder: bucket creatures by Challenge Rating ---------
-    def _kit_weapon(min_e: int) -> dict | None:
-        """Cheapest real (priced) weapon clearing DR +min_e; falling back to the
-        cheapest clearing weapon of any cost, then to the highest-enhancement
-        weapon available (best effort when nothing reaches min_e)."""
-        clearing = [w for w in accessible_weapons if w["enhancement"] >= min_e]
-        priced = [w for w in clearing if w["cost"] > 0]
-        if priced:
-            return min(priced, key=lambda w: w["cost"])
-        if clearing:
-            return min(clearing, key=lambda w: w["cost"])
-        return max(accessible_weapons, key=lambda w: w["enhancement"], default=None)
-
+    # ---- progression ladder ------------------------------------------------
+    # A tier's kit has to beat the *hardest* creature in the band, not a typical
+    # one — a kit that clears the average and dies to the boss is not a kit.
     progression_tiers: list[dict] = []
+    by_resref = {r["canonical_resref"]: r for r in creatures_out}
     for lo, hi, label in _CR_TIERS:
-        members = [r for r in creatures_out if not r["unbeatable"]
-                   and lo <= _parse_cr(r["cr"]) < hi]
+        members = [r for r in creatures_out if lo <= _parse_cr(r["cr"]) < hi]
         if not members:
             continue
-        # Use a typical (75th-percentile) DR requirement for the kit so a single
-        # heavy-DR outlier doesn't push a top-tier weapon onto the whole band;
-        # the max is surfaced separately as the "tough outliers" threshold.
-        enhs = sorted(r["defeat_requirements"]["min_enhancement_to_bypass_dr"] for r in members)
-        typical_enh = enhs[int(0.75 * (len(enhs) - 1))] if enhs else 0
-        max_enh = enhs[-1] if enhs else 0
+        winnable = [r for r in members if not r["unbeatable"]]
         ac_targets = [r["survival"]["ac_target"] for r in members]
         resist_counter: dict[str, int] = defaultdict(int)
         for r in members:
@@ -15855,52 +17208,66 @@ def generate_counter_gear_index(
                 resist_counter[dt] += 1
         top_resist = [dt for dt, _ in sorted(
             resist_counter.items(), key=lambda kv: (-kv[1], kv[0]))[:3]]
-        has_saves = any(r["survival"]["save_threats"] for r in members)
 
-        kit_weapon = _kit_weapon(typical_enh)
-        kit_resist = []
-        for dt in top_resist:
-            cands = defense_by_resist.get(dt)
-            if cands:
-                d = cands[0]
-                amt = (f"immune {d['immune'][dt]}%" if dt in d["immune"]
-                       else f"resist {d['resist'][dt]}/-")
-                kit_resist.append(_def_entry(d, f"{amt} vs {dt}"))
-        kit_ac = _def_entry(defense_ac[0], f"+{defense_ac[0]['ac_bonus']} AC") if defense_ac else None
-        kit_save = []
-        if has_saves:
-            for kind in ("Fortitude", "Reflex", "Will", "Universal"):
-                lst = defense_save.get(kind)
-                if lst:
-                    d = lst[0]
-                    kit_save.append(_def_entry(d, f"+{d['saves'].get(kind, 0)} {kind}"))
-
+        # Two different questions, two different answers — conflating them is
+        # what made the draft report useless.
+        #
+        # "Most demanding" is the fight in the band that needs the most gear, so
+        # its minimum kit is the one to publish for the tier: buy that and you
+        # have covered the band's worst equipment requirement.
+        #
+        # "Hardest" is the closest-run fight in the module's best gear. It is a
+        # separate creature more often than not, and it cannot be found from the
+        # minimum kits: those are shrunk until they only just win, so every
+        # creature's margin there sits at ~1.0 by construction.
+        benchmark = hardest = None
+        kit_entries: list[dict] = []
+        if winnable:
+            demanding = max(winnable, key=lambda r: (r["minimum_kit_cost"],
+                                                     r["canonical_resref"]))
+            kit_entries = demanding["minimum_kit"] or []
+            benchmark = {
+                "canonical_resref": demanding["canonical_resref"],
+                "name": demanding["name"], "cr": demanding["cr"],
+                "sim": demanding["sim"],
+            }
+            tightest = min(winnable, key=lambda r: (r["best_sim"]["margin"],
+                                                    -(r["best_sim"]["rounds_to_kill"] or 0)))
+            hardest = {
+                "canonical_resref": tightest["canonical_resref"],
+                "name": tightest["name"], "cr": tightest["cr"],
+                "sim": tightest["best_sim"],
+            }
         progression_tiers.append({
             "label": label,
             "creature_count": len(members),
+            "pc_level": _pc_level_for_cr(max(_parse_cr(r["cr"]) for r in members), db),
             "defeat_profile": {
-                "min_enhancement_to_bypass_dr": typical_enh,
-                "max_enhancement_to_bypass_dr": max_enh,
+                "min_enhancement_to_bypass_dr": max(
+                    (r["defeat_requirements"]["min_enhancement_to_bypass_dr"]
+                     for r in members), default=0),
                 "ac_target_range": [min(ac_targets), max(ac_targets)],
                 "resist_priority": top_resist,
-                "has_special_attacks": has_saves,
+                "has_special_attacks": any(r["survival"]["save_threats"] for r in members),
             },
-            "recommended_kit": {
-                "weapon": ({"resref": kit_weapon["resref"], "name": kit_weapon["name"],
-                            "wiki_url": _iu(kit_weapon["resref"]),
-                            "enhancement": kit_weapon["enhancement"],
-                            "cost": kit_weapon["cost"]} if kit_weapon else None),
-                "resist": kit_resist,
-                "ac": kit_ac,
-                "save": kit_save,
-            },
+            "benchmark": benchmark,
+            "hardest": hardest,
+            "recommended_kit": kit_entries,
+            "kit_cost": sum(e["gp_value"] for e in kit_entries),
+            "unwinnable": [{"canonical_resref": r["canonical_resref"], "name": r["name"]}
+                           for r in members if r["unbeatable"]],
         })
 
     payload = {
         "generated_at": now,
         "module": module_title,
-        "build_agnostic": True,
+        "input_fingerprint": _counter_gear_fingerprint(db),
+        "algo_version": _COUNTER_GEAR_ALGO_VERSION,
+        "max_player_level": db.max_player_level,
+        "max_ability_bonus": db.max_ability_bonus,
+        "devastating_critical": devcrit_mode(db),
         "damage_types": sorted(module_weapon_dtypes),
+        "top_value_by_slot": _top_value_by_slot(db, _iu),
         "creatures": creatures_out,
         "unbeatable": unbeatable_out,
         "manual_review": review_out,
@@ -15912,8 +17279,10 @@ def generate_counter_gear_index(
     sev = "warn" if unbeatable_out else "info"
     _module_index_summary.append((sev,
         f"[nwn-wiki] module-index: counter_gear.json "
-        f"({len(creatures_out)} creatures, {len(unbeatable_out)} unbeatable, "
-        f"{len(review_out)} review)"))
+        f"({len(creatures_out)} creatures, {len(unbeatable_out)} unwinnable, "
+        f"{len(review_out)} review, {time.time() - t0:.0f}s)"))
+
+
 
 
 def generate_module_index(
@@ -15955,12 +17324,6 @@ def generate_module_index(
             return int(raw)
         except (TypeError, ValueError):
             return None
-
-    def _try_int(v: Any, default: int = 0) -> int:
-        try:
-            return int(v or 0)
-        except (TypeError, ValueError):
-            return default
 
     # ------------------------------------------------------------------ area_graph.json
     area_graph_data: dict[str, Any] = {}
@@ -16241,7 +17604,14 @@ def generate_module_index(
     _module_index_summary.append(("info", f"[nwn-wiki] module-index: creature_index.json ({len(creature_index)} canonical creatures)"))
 
     # ------------------------------------------------------------------ counter_gear.json
-    generate_counter_gear_index(db, module_index_dir, module_title, now, _cu, _iu)
+    # Opt-in: the simulation runs every creature against the whole attainable
+    # item pool, which is far too slow for a routine wiki refresh. A normal run
+    # only fingerprints the inputs and warns when the report on disk no longer
+    # matches them.
+    if db.run_counter_gear or not (module_index_dir / "counter_gear.json").is_file():
+        generate_counter_gear_index(db, module_index_dir, module_title, now, _cu, _iu)
+    else:
+        check_counter_gear_freshness(db, module_index_dir)
 
     # ------------------------------------------------------------------ appearance_faction_report.json
     # Group canonical creatures by (appearance_id, faction_id) so that LLMs can
@@ -16400,7 +17770,7 @@ def generate_module_index(
             continue  # broken/unnamed items; skip
         bi_raw = fld(i, "BaseItem", None)
         bi = -1 if bi_raw is None else _try_int(bi_raw, -1)
-        cost = _try_int(fld(i, "Cost", 0))
+        cost = item_gp_value(i)
         carriers = db.item_carried_by.get(rr, [])
         accessible = (
             rr in db.item_sold_at
@@ -16563,7 +17933,7 @@ def generate_module_index(
             "resref": rr,
             "name": name,
             "base_item": baseitem_name(bi) if bi >= 0 else "",
-            "cost_gp": _try_int(fld(i, "Cost", 0)),
+            "cost_gp": item_gp_value(i),
             "wiki_url": _iu(rr),
             "reason": reason,
             "carriers": carrier_list,
@@ -16769,6 +18139,30 @@ def main() -> int:
                          "applied when folding equipped-item ability bonuses into "
                          "a creature's effective scores. Default: 12 (NWN default; "
                          "some modules raise it, e.g. 24).")
+    ap.add_argument("--max-player-level", type=int, default=0, metavar="N",
+                    dest="max_player_level",
+                    help="Level cap a player character can actually reach, used "
+                         "for the counter-gear report's reference PC. Separate "
+                         "from --max-character-level (which clamps creature BAB): "
+                         "a server running NWNX MaxLevel can let players past 40 "
+                         "while creature stats still want the engine cap. "
+                         "0 (default) = follow --max-character-level.")
+    ap.add_argument("--devcrit-bonus-dice", type=int, default=0, metavar="N",
+                    dest="devcrit_bonus_dice",
+                    help="Bonus damage dice a critical hit deals when the module "
+                         "has replaced the engine's save-or-die Devastating "
+                         "Critical with flat damage. Whether the engine's version "
+                         "is still active is DETECTED from baseitems.2da's "
+                         "EpicWeaponDevastatingCriticalFeat column, not "
+                         "configured; this only supplies the replacement, whose "
+                         "die size follows WeaponSize (1-2 d6, 3 d8, 4+ d10). "
+                         "Default: 0 (stock behaviour).")
+    ap.add_argument("--counter-gear", action="store_true", dest="counter_gear",
+                    help="Run the counter-gear combat simulation and rewrite "
+                         "module-index/counter_gear.{json,md}. Off by default "
+                         "because it simulates every creature against every "
+                         "attainable item; normal runs instead compare an input "
+                         "fingerprint and warn when the existing report is stale.")
     args = ap.parse_args()
 
     global _GENERATED_AT
@@ -16843,9 +18237,11 @@ def main() -> int:
               + ", ".join(repr(t) for t in db.exclude_option_texts))
     db.max_character_level = args.max_character_level
     db.max_ability_bonus = args.max_ability_bonus
+    db.max_player_level = args.max_player_level or args.max_character_level or 40
     print(f"[nwn-wiki] combat dials: max-character-level="
           f"{db.max_character_level or 'uncapped'}, "
-          f"max-ability-bonus=+{db.max_ability_bonus}")
+          f"max-ability-bonus=+{db.max_ability_bonus}, "
+          f"max-player-level={db.max_player_level}")
     db.load()
     db.index()
     db.index_dialogs()
@@ -16895,6 +18291,9 @@ def main() -> int:
             if candidate.is_dir():
                 twoda_dir = candidate
                 break
+    db.twoda_dir = twoda_dir
+    db.run_counter_gear = bool(args.counter_gear)
+    db.devcrit_bonus_dice = max(0, args.devcrit_bonus_dice)
     if twoda_dir is not None:
         if twoda_dir.is_dir():
             print(f"[nwn-wiki] applying 2DA overrides from {twoda_dir}")
@@ -16954,8 +18353,14 @@ def main() -> int:
 
     module_index_dir = src.parent / "module-index"
     # Wipe stale content so removed resources don't linger across refreshes.
+    # The counter-gear report is exempt: it is rebuilt only on demand
+    # (--counter-gear), so deleting it here would destroy the previous run's
+    # analysis and silently force the slow rebuild on every refresh.
+    _KEEP = {"counter_gear.json", "counter_gear.md"}
     if module_index_dir.is_dir():
         for _child in module_index_dir.iterdir():
+            if _child.name in _KEEP:
+                continue
             if _child.is_dir():
                 shutil.rmtree(_child)
             else:
