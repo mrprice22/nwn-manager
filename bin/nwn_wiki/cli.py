@@ -1,0 +1,18616 @@
+#!/usr/bin/env python3
+"""nwn-wiki — generate a static HTML wiki from an unpacked NWN1 module.
+
+Usage:
+  nwn-wiki --src <unpacked-dir> --out <wiki-dir> [--module-name NAME] [--seed N]
+
+Reads the unpacked GFF-as-JSON tree, builds derived indexes (waypoint→area
+map, transitions, per-area NPCs/loot/encounters/stores), and writes a static
+multi-page wiki including a force-directed SVG map of all areas.
+
+Pure stdlib. No third-party deps.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import math
+import os
+import random
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+import urllib.parse
+from collections import Counter, defaultdict, deque
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from nwn_wiki.paths import ASSETS_DIR, DATA_DIR, SCRIPT_DIR
+
+# Populated by render_manual_pages(); used by page() to build the Documents dropdown.
+# Each entry is one of:
+#   {"kind": "file", "title": str, "stem": str}
+#   {"kind": "dir",  "title": str, "dirname": str,
+#    "items": [{"title": str, "stem": str}, ...]}
+_MANUAL_MENUS: dict[str, list[dict]] = {}  # menu name -> ordered manual-page entries
+_MANUAL_MENU_ORDER: dict[str, int] = {}  # custom menu name -> first @menu-order seen
+_HAS_ACTIVITY_PAGE: bool = False
+_HAS_SERVER_FIRSTS: bool = False  # set in render_manual_pages(); drives Activity nav
+_GENERATED_AT: str = ""  # set in main(); included in every page footer
+
+# Bestiary kill-tracking stats, read from the live NWNX:EE campaign DB
+# (<db-dir>/bestiarydb.sqlite3) when the module uses the bestiary system. The
+# filename must match the module's campaign DB name (BST_DB="bestiarydb" in
+# bst_db.nss) — that is the file the in-game scripts read and write.
+BST_SF_CR = 60  # Server-First Challenge Rating threshold (mirror bst_db.nss)
+_BESTIARY_ACTIVE: bool = False
+_BESTIARY_KILLS: dict[str, dict] = {}  # canonical resref -> {"total","solo","party"}
+# canonical resref -> per-character kill rows, sorted by total desc:
+#   [{"uuid","name","solo","party","total","last"}]  ("uuid" is internal only —
+#   never rendered into HTML; pages show char_name.)
+_BESTIARY_TOP: dict[str, list[dict]] = {}
+_SERVER_FIRSTS: list[dict] = []        # [{"resref","cr","name","cname","at"}]
+
+# Boss respawn tracker ("Roll of the Fallen") registry, parsed from the module's
+# brd_db.nss BRD_SeedBoss(...) seed rows by load_boss_registry(). Single source
+# of truth shared with the in-game Well of Eru board — the wiki Bosses page is
+# generated from the same rows the game seeds into respawndb on module load, so
+# the two can never drift. Empty for modules without the tracker (no nav link).
+_BOSS_REGISTRY: list[dict] = []   # [{"resref","name","tag","area","area_name","cr"}]
+_BOSS_ALIASES: dict[str, str] = {}  # variant blueprint resref -> canonical resref
+
+# Creature artwork loaded from <project-root>/creature-pics/ by scan_creature_pics().
+# Filenames are matched to creature display names; a trailing "_NN" sets order.
+CREATURE_PIC_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+_CREATURE_PICS: dict[str, list[str]] = {}     # canonical resref -> [image filename, ...]
+_CREATURE_PIC_GROUPS: list[dict] = []         # [{"name","matches","images","cr"}], sorted
+
+# Per-module theme assets loaded from <project-root>/wiki-theme/ by load_wiki_theme().
+_THEME_FAVICON: str = ""           # filename in assets/, e.g. "favicon.png"
+_THEME_HEADER_IMGS: list[str] = [] # filenames in assets/, e.g. ["header.png", "header_02.png"]
+_THEME_HEADER_DIMS: list[tuple[int, int] | None] = []  # intrinsic (w, h) per header image
+_THEME_EXTRA_CSS: str = ""         # filename in assets/, e.g. "theme.css"
+
+# Lookup warning registry: message → sorted list of referencing items/creatures.
+# Populated by _warn_once(); avoids flooding stderr on large modules.
+_warned: dict[str, list[str]] = {}
+# Set by rendering functions before processing each entity so warnings can
+# record which item/creature triggered them.
+_current_context: str = ""
+
+# Module-index summary collector: (severity, message) tuples accumulated during
+# generation and printed as a grouped, colour-coded block at the end of the run.
+# severity ∈ {"info", "warn", "issue"}
+_module_index_summary: list[tuple[str, str]] = []
+
+_C_INFO  = "\033[36m"    # cyan — informational
+_C_WARN  = "\033[33m"    # yellow — warnings
+_C_ISSUE = "\033[1;31m"  # bold red — major issues
+_C_RESET = "\033[0m"
+
+
+def _warn_once(msg: str) -> None:
+    global _warned, _current_context
+    already = msg in _warned
+    if not already:
+        _warned[msg] = []
+    if _current_context and _current_context not in _warned[msg]:
+        _warned[msg].append(_current_context)
+
+
+# ---------------------------------------------------------------------------
+# GFF helpers
+# ---------------------------------------------------------------------------
+
+def gff(node: Any, default: Any = None) -> Any:
+    """Unwrap a {'type': ..., 'value': ...} cell to its value."""
+    if isinstance(node, dict) and "value" in node:
+        return node["value"]
+    return default if node is None else node
+
+
+def fld(struct: dict | None, name: str, default: Any = None) -> Any:
+    """Look up a named field's *value* in a GFF struct/dict."""
+    if not struct or name not in struct:
+        return default
+    return gff(struct[name], default)
+
+
+# TLK lookup tables, populated from --dialog-tlk / --custom-tlk if given.
+# StrRefs >= CUSTOM_TLK_BASE are custom-TLK rows (id - CUSTOM_TLK_BASE);
+# anything below resolves against the base game's dialog.tlk.
+CUSTOM_TLK_BASE = 0x01000000  # 16777216
+BASE_TLK: dict[int, str] = {}
+CUSTOM_TLK: dict[int, str] = {}
+
+
+def read_tlk(path: Path) -> dict[int, str]:
+    """Parse an NWN TLK V3.0 file into {strref: text}.
+    Empty entries (no TextPresent flag) are omitted."""
+    data = path.read_bytes()
+    if len(data) < 20 or data[:4] != b"TLK " or data[4:8] != b"V3.0":
+        raise ValueError(f"not a TLK V3.0 file: {path}")
+    _lang_id, count, str_off = struct.unpack_from("<III", data, 8)
+    out: dict[int, str] = {}
+    base = 20
+    for i in range(count):
+        off = base + i * 40
+        flags = struct.unpack_from("<I", data, off)[0]
+        if not (flags & 0x1):  # TextPresent
+            continue
+        soff, ssize = struct.unpack_from("<II", data, off + 28)
+        start = str_off + soff
+        out[i] = data[start:start + ssize].decode("cp1252", errors="replace")
+    return out
+
+
+def _load_stock_item_names() -> tuple[dict[str, str], dict[str, int], dict[str, int], dict[str, list]]:
+    p = DATA_DIR / "stock_item_names.json"
+    if not p.exists():
+        return {}, {}, {}, {}
+    raw = json.loads(p.read_text())
+    names: dict[str, str] = {}
+    base_items: dict[str, int] = {}
+    costs: dict[str, int] = {}
+    props: dict[str, list] = {}
+    for k, v in raw.items():
+        if k.startswith("_") or not isinstance(v, dict):
+            continue
+        if "name" in v:
+            names[k] = v["name"]
+        if "base_item" in v:
+            base_items[k] = int(v["base_item"])
+        if "cost" in v and v["cost"]:
+            costs[k] = int(v["cost"])
+        if "properties" in v and isinstance(v["properties"], list):
+            props[k] = v["properties"]
+    return names, base_items, costs, props
+
+
+STOCK_ITEM_NAMES: dict[str, str]
+STOCK_ITEM_BASE: dict[str, int]
+STOCK_ITEM_COST: dict[str, int]
+STOCK_ITEM_PROPS: dict[str, list]
+STOCK_ITEM_NAMES, STOCK_ITEM_BASE, STOCK_ITEM_COST, STOCK_ITEM_PROPS = _load_stock_item_names()
+
+
+def _load_stock_creature_names() -> dict[str, str]:
+    """Display names for stock NWN/CEP creatures referenced only by encounter
+    pools (no module .utc). Flat resref -> name map; "_"-prefixed keys are
+    metadata. Unlisted resrefs fall back to the resref itself."""
+    p = DATA_DIR / "stock_creature_names.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    return {k: v for k, v in raw.items()
+            if not k.startswith("_") and isinstance(v, str)}
+
+
+STOCK_CREATURE_NAMES: dict[str, str] = _load_stock_creature_names()
+
+
+def loc(node: Any, lang: int = 0) -> str:
+    """Resolve a cexolocstring. Falls back to TLK tables for ID-only refs;
+    if the StrRef can't be resolved, yields a `[TLK#N]` placeholder."""
+    val = gff(node)
+    if not isinstance(val, dict) or not val:
+        return ""
+    key = str(lang)
+    if key in val and isinstance(val[key], str):
+        return val[key]
+    if "id" in val:
+        sid = val["id"]
+        if isinstance(sid, int) and sid >= 0:
+            if sid >= CUSTOM_TLK_BASE:
+                t = CUSTOM_TLK.get(sid - CUSTOM_TLK_BASE)
+                if t is not None:
+                    return t
+                if not CUSTOM_TLK:
+                    _warn_once(f"StrRef {sid} (custom TLK) unresolved: no custom TLK loaded — re-run with --custom-tlk")
+                else:
+                    _warn_once(f"StrRef {sid} (custom TLK row {sid - CUSTOM_TLK_BASE}) not found in loaded custom TLK")
+            else:
+                t = BASE_TLK.get(sid)
+                if t is not None:
+                    return t
+                if not BASE_TLK:
+                    _warn_once(f"StrRef {sid} unresolved: no dialog.tlk loaded — re-run with --dialog-tlk")
+                else:
+                    _warn_once(f"StrRef {sid} not found in loaded dialog.tlk")
+        return f"[TLK#{sid}]"
+    for v in val.values():
+        if isinstance(v, str):
+            return v
+    return ""
+
+
+def list_items(node: Any) -> list[dict]:
+    val = gff(node)
+    if isinstance(val, list):
+        return val
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Bundled 2DA-ish lookups (row → human name).
+# ---------------------------------------------------------------------------
+
+def _load_lookup(name: str) -> dict[int, str]:
+    p = DATA_DIR / f"{name}.json"
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text())
+    except Exception as e:
+        print(f"warn: could not parse {p}: {e}", file=sys.stderr)
+        return {}
+    return {int(k): str(v) for k, v in raw.items() if not k.startswith("_")}
+
+
+BASEITEMS = _load_lookup("baseitems")
+# Snapshot of the stock baseitems.2da rows, captured before load_2da_overrides()
+# extends BASEITEMS in place with the module's CEP/custom rows. Used to recognise
+# a store's "buy nothing" sentinel: builders restrict a store's WillOnlyBuy list to
+# an out-of-range base item row (one no normal player merchandise uses) so the store
+# refuses every sale. Such a row is absent from this stock set. See _store_buy_summary.
+STOCK_BASEITEMS: frozenset[int] = frozenset(BASEITEMS)
+CLASSES = _load_lookup("classes")
+RACES = _load_lookup("racialtypes")
+APPEARANCE = _load_lookup("appearance")
+PLACEABLES: dict[int, str] = {}  # populated by overlays only — stock placeables.2da
+                                  # rows are rarely interesting and we don't bundle them.
+IPRP_FEATS = _load_lookup("iprp_feats")
+FEATS = _load_lookup("feat")
+# Snapshot of the stock feat names before load_2da_overrides() relabels FEATS
+# from a module's feat.2da. Used to recognise Weapon Focus / Epic Weapon Focus
+# feats by their consistent stock names (some HAKs abbreviate the labels, e.g.
+# "WeapFocRapier", which would defeat name matching against the live FEATS).
+# Feat IDs are fixed by the engine, so matching stock names by id is reliable.
+STOCK_FEAT_NAMES = dict(FEATS)
+SKILLS = _load_lookup("skills")
+SPELLS = _load_lookup("spells")
+
+
+def _load_spell_info() -> dict[str, dict[int, dict]]:
+    """Load spell_info.json — {table_name: {row_id: {innate_level, caster_level, class_levels}}}.
+
+    Both iprp_spells and iprp_onhitspell are stored under their table names
+    to keep their independent row-ID spaces separate."""
+    p = DATA_DIR / "spell_info.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    result: dict[str, dict[int, dict]] = {}
+    for k, v in raw.items():
+        if k.startswith("_") or not isinstance(v, dict):
+            continue
+        # Top-level keys are table names ("iprp_spells", "iprp_onhitspell").
+        tbl: dict[int, dict] = {}
+        for rk, rv in v.items():
+            if isinstance(rv, dict):
+                try:
+                    tbl[int(rk)] = rv
+                except ValueError:
+                    pass
+        result[k] = tbl
+    return result
+
+
+SPELL_INFO: dict[str, dict[int, dict]] = _load_spell_info()
+
+
+def _load_weapons() -> dict[int, dict[str, str]]:
+    p = DATA_DIR / "weapons.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    return {int(k): v for k, v in raw.items()
+            if not k.startswith("_") and isinstance(v, dict)}
+
+
+WEAPONS = _load_weapons()
+
+# baseitems.2da columns merged into WEAPONS from a --2da-dir override. Keep in
+# step with WEAPON_COLS in bin/wiki_data/_build_stock.py, which writes the same
+# set into the bundled weapons.json.
+#
+# The five feat columns name the per-base-item feat a wielder would take (the
+# engine looks the feat up here rather than by weapon name), so a base item with
+# a blank column has no such feat to take — which is exactly how this module
+# disables Devastating Critical: bin/gen-devcrit-map.py blanks
+# EpicWeaponDevastatingCriticalFeat for every row.
+_WEAPON_2DA_COLS = (
+    "WeaponType", "WeaponSize", "RangedWeapon", "MinRange", "MaxRange",
+    "NumDice", "DieToRoll", "CritThreat", "CritHitMult", "WeaponWield",
+    "AmmunitionType", "BaseAC", "ArmorCheckPen", "AC_Enchant",
+    "WeaponFocusFeat", "EpicWeaponFocusFeat",
+    "WeaponSpecializationFeat", "EpicWeaponSpecializationFeat",
+    "WeaponImprovedCriticalFeat", "EpicWeaponOverwhelmingCriticalFeat",
+    "EpicWeaponDevastatingCriticalFeat",
+)
+
+# Which of the above a real baseitems.2da actually supplied. Only non-blank
+# cells reach WEAPONS, so this is the only way to tell "the column is there and
+# deliberately empty" (a module that disabled a mechanic) from "we never had
+# that column" (the bundled weapons.json predates it) — a distinction the
+# devastating-critical detection depends on.
+BASEITEM_COLUMNS_SEEN: set[str] = set()
+
+
+def _load_class_bab() -> dict[int, list[int]]:
+    """Load class_bab.json → {class_id: [bab_at_lvl1, bab_at_lvl2, ...]}.
+    Per-class base attack bonus progression from stock cls_atk_*.2da."""
+    p = DATA_DIR / "class_bab.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    return {int(k): v for k, v in raw.items()
+            if not k.startswith("_") and isinstance(v, list)}
+
+
+CLASS_BAB: dict[int, list[int]] = _load_class_bab()
+
+
+def _load_race_adjust() -> dict[int, dict[str, int]]:
+    """Load race_adjust.json → {race_id: {'Str': n, 'Dex': n, ...}}.
+    Racial ability-score adjustments the engine applies on top of the stored
+    UTC scores (e.g. Elf +2 Dex / -2 Con). A racialtypes.2da override (custom
+    races) is merged on top in load_2da_overrides()."""
+    p = DATA_DIR / "race_adjust.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    out: dict[int, dict[str, int]] = {}
+    for k, v in raw.items():
+        if k.startswith("_") or not isinstance(v, dict):
+            continue
+        try:
+            out[int(k)] = {ab: int(n) for ab, n in v.items()}
+        except (ValueError, TypeError):
+            pass
+    return out
+
+
+RACE_ABILITY_ADJ: dict[int, dict[str, int]] = _load_race_adjust()
+
+
+def _load_parts_chest() -> dict[int, int]:
+    """Load parts_chest.2da → {torso_id: base_ac}.
+    ACBONUS values may be fractional (CEP encodes model subtype in decimals);
+    we take the integer part as the game-effective base AC.
+    '****' rows (undefined model) map to 0 (treated as cloth)."""
+    p = DATA_DIR / "parts_chest.2da"
+    if not p.exists():
+        return {}
+    result: dict[int, int] = {}
+    header_done = False
+    acbonus_col: int | None = None
+    for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("2DA"):
+            continue
+        parts = line.split()
+        if not header_done:
+            # Header row has no leading row-id token; find ACBONUS position.
+            # Data rows prepend a row-id token, so data col = header_idx + 1.
+            try:
+                acbonus_col = parts.index("ACBONUS") + 1
+            except ValueError:
+                return {}
+            header_done = True
+            continue
+        if acbonus_col is None or len(parts) <= acbonus_col:
+            continue
+        try:
+            row_id = int(parts[0])
+        except ValueError:
+            continue
+        raw_val = parts[acbonus_col]
+        if raw_val == "****":
+            result[row_id] = 0
+        else:
+            try:
+                result[row_id] = int(float(raw_val))
+            except ValueError:
+                result[row_id] = 0
+    return result
+
+
+PARTS_CHEST_AC: dict[int, int] = _load_parts_chest()
+
+
+def _torso_base_ac(item: dict | None) -> int:
+    """Return the base AC for an armor item from its ArmorPart_Torso model."""
+    if item is None:
+        return 0
+    torso = fld(item, "ArmorPart_Torso")
+    if torso is None:
+        return 0
+    return PARTS_CHEST_AC.get(int(torso), 0)
+
+
+def _load_itemprops() -> dict:
+    p = DATA_DIR / "itemprops.json"
+    if not p.exists():
+        return {"properties": {}, "tables": {}}
+    return json.loads(p.read_text())
+
+
+ITEMPROPS = _load_itemprops()
+IPROP_DEFS: dict[int, dict] = {int(k): v for k, v in ITEMPROPS.get("properties", {}).items()}
+IPROP_TABLES: dict[str, dict] = ITEMPROPS.get("tables", {})
+
+
+# ---------------------------------------------------------------------------
+# 2DA override loader
+# ---------------------------------------------------------------------------
+#
+# CEP and other HAKs ship custom baseitems.2da / iprp_*.2da files that
+# override or extend the stock tables. The bundled JSON lookups can't know
+# what's in those HAKs, so we let the user point us at a directory of
+# extracted 2DAs (`--2da-dir`) and override the relevant lookups in place.
+#
+# Extracting from a HAK with the neverwinter.nim toolchain:
+#
+#     mkdir -p hak_2da
+#     nwn_erf -x -f /path/to/cepbaseitem.hak -d hak_2da
+#
+# Then point the wiki at it:
+#
+#     nwn-wiki --src unpacked --out docs --2da-dir hak_2da
+
+def parse_2da(path: Path) -> tuple[list[str], list[list[str]]]:
+    """Parse an NWN 2DA (V2.0) file. Returns (column_headers, rows).
+    Each row's first cell is the row index as text. Quoted strings (with
+    embedded spaces) are honoured. `****` cells are returned as empty
+    strings."""
+    text = path.read_text(encoding="cp1252", errors="replace")
+    lines = [ln for ln in text.splitlines()]
+    # Skip blank/header lines until we find the first whitespace-delimited
+    # row. The first non-blank line after the magic is normally the
+    # column-header row; some files include a `DEFAULT: ""` directive.
+    i = 0
+    while i < len(lines) and not lines[i].strip().startswith("2DA"):
+        i += 1
+    i += 1  # past "2DA V2.0"
+    # Optional DEFAULT line
+    while i < len(lines) and (not lines[i].strip() or
+                              lines[i].lstrip().upper().startswith("DEFAULT")):
+        i += 1
+    # Column headers
+    if i >= len(lines):
+        return [], []
+    headers = _2da_split(lines[i])
+    i += 1
+    rows: list[list[str]] = []
+    for ln in lines[i:]:
+        if not ln.strip():
+            continue
+        cells = _2da_split(ln)
+        if not cells:
+            continue
+        rows.append(cells)
+    return headers, rows
+
+
+def _2da_split(line: str) -> list[str]:
+    """Split a 2DA line on whitespace, keeping double-quoted spans together
+    and decoding `****` as the empty string."""
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        while i < n and line[i] in (" ", "\t"):
+            i += 1
+        if i >= n:
+            break
+        if line[i] == '"':
+            j = i + 1
+            while j < n and line[j] != '"':
+                j += 1
+            out.append(line[i + 1:j])
+            i = j + 1
+        else:
+            j = i
+            while j < n and line[j] not in (" ", "\t"):
+                j += 1
+            tok = line[i:j]
+            out.append("" if tok == "****" else tok)
+            i = j
+    return out
+
+
+_OVERLAY_TARGETS: dict[str, dict[int, str]] = {
+    "baseitems":   BASEITEMS,
+    "racialtypes": RACES,
+    "appearance":  APPEARANCE,
+    "placeables":  PLACEABLES,
+    "iprp_feats":  IPRP_FEATS,
+    "classes":     CLASSES,
+    "feat":        FEATS,
+    "skills":      SKILLS,
+    "spells":      SPELLS,
+}
+
+
+def load_json_overlay(d: Path, label: str) -> int:
+    """Merge pre-built `<name>.json` files in `d` onto the in-memory lookup
+    dicts. JSON layout: {"<row>": "<pretty name>", "_source": "..."}.
+    Keys starting with "_" are metadata and ignored. Returns total rows merged."""
+    total = 0
+    if not d.is_dir():
+        return 0
+    for name, target in _OVERLAY_TARGETS.items():
+        p = d / f"{name}.json"
+        if not p.is_file():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"  warn: could not parse {p}: {e}", file=sys.stderr)
+            continue
+        n = 0
+        for k, v in data.items():
+            if k.startswith("_") or not isinstance(v, str):
+                continue
+            try:
+                target[int(k)] = v
+            except ValueError:
+                continue
+            n += 1
+        total += n
+        print(f"  {label}: {name}.json → {n} rows")
+    return total
+
+
+def detect_cep_haks(ifo: dict | None) -> list[str]:
+    """Return the subset of `Mod_HakList` entries that look like CEP haks.
+    Empty list when the module is vanilla. Used to decide whether to layer
+    the bundled CEP overlay onto the stock lookups."""
+    if not ifo:
+        return []
+    haks = []
+    for h in list_items(ifo.get("Mod_HakList")):
+        name = (fld(h, "Mod_Hak", "") or "").lower()
+        if name.startswith("cep"):
+            haks.append(name)
+    return haks
+
+
+def load_2da_overrides(d: Path) -> None:
+    """Patch the in-memory lookup dicts from extracted 2DA files in `d`.
+    Updates BASEITEMS, IPRP_FEATS, RACES, CLASSES, APPEARANCE, FEATS, and
+    IPROP_TABLES in place; keys that aren't present in the override are left
+    at their stock values."""
+    files = {
+        "baseitems.2da":     ("Label", BASEITEMS),
+        "iprp_feats.2da":    ("Label", IPRP_FEATS),
+        "racialtypes.2da":   ("Label", RACES),
+        "classes.2da":       ("Label", CLASSES),
+        "appearance.2da":    ("Label", APPEARANCE),
+        "placeables.2da":    ("Label", PLACEABLES),
+        "feat.2da":          ("LABEL", FEATS),
+        "skills.2da":        ("Label", SKILLS),
+        "spells.2da":        ("Label", SPELLS),
+    }
+    for fname, (col, target) in files.items():
+        p = d / fname
+        if not p.is_file():
+            continue
+        try:
+            headers, rows = parse_2da(p)
+        except Exception as e:
+            print(f"  warn: could not parse {p}: {e}", file=sys.stderr)
+            continue
+        try:
+            col_idx = [h.lower() for h in headers].index(col.lower()) + 1
+        except ValueError:
+            print(f"  warn: {p} has no '{col}' column; skipping", file=sys.stderr)
+            continue
+        n_loaded = 0
+        for row in rows:
+            if not row:
+                continue
+            try:
+                ridx = int(row[0])
+            except ValueError:
+                continue
+            label = row[col_idx] if col_idx < len(row) else ""
+            if label:
+                target[ridx] = label
+                n_loaded += 1
+        print(f"  override: {fname} → {n_loaded} rows")
+
+    # Equippable slots and weapon stats from a baseitems.2da override.
+    #
+    # EquipableSlots is a hex bitmask over the SLOT_* constants, so it is the
+    # authoritative slot map for CEP/custom base items as well as stock ones.
+    #
+    # The weapon columns matter just as much: the bundled weapons.json only
+    # covers stock rows 0-112, so without this merge every CEP/custom weapon has
+    # no damage dice, no crit stats and no weapon type at all — it would deal
+    # flat bonuses only in the combat simulation. Merging here also brings in the
+    # per-base-item feat columns (Weapon Focus, Improved Critical, Overwhelming /
+    # Devastating Critical), which is how the simulator knows which feats a
+    # wielder of that weapon could even take.
+    bp = d / "baseitems.2da"
+    if bp.is_file():
+        try:
+            headers, rows = parse_2da(bp)
+            hl = [h.lower() for h in headers]
+            slot_idx = hl.index("equipableslots") + 1 if "equipableslots" in hl else None
+            wcol_idx = {c: hl.index(c.lower()) + 1 for c in _WEAPON_2DA_COLS
+                        if c.lower() in hl}
+            if slot_idx is None:
+                print(f"  warn: {bp} has no 'EquipableSlots' column; "
+                      "keeping the stock slot map", file=sys.stderr)
+            n_slots = n_weap = 0
+            for row in rows:
+                if not row:
+                    continue
+                try:
+                    ridx = int(row[0])
+                except ValueError:
+                    continue
+
+                def _cell(idx: int) -> str:
+                    v = row[idx] if idx < len(row) else ""
+                    return "" if v in ("", "****") else v
+
+                if slot_idx is not None and _cell(slot_idx):
+                    cell = _cell(slot_idx)
+                    try:
+                        BASEITEM_SLOTS[ridx] = (int(cell, 16) if cell.lower().startswith("0x")
+                                                else int(cell))
+                        n_slots += 1
+                    except ValueError:
+                        pass
+
+                BASEITEM_COLUMNS_SEEN.update(wcol_idx)
+                stats = {c: _cell(i) for c, i in wcol_idx.items() if _cell(i)}
+                if stats:
+                    # Merge rather than replace: keep any bundled stock value
+                    # whose column this 2DA happens not to carry.
+                    WEAPONS.setdefault(ridx, {}).update(stats)
+                    n_weap += 1
+            print(f"  override: baseitems.2da → {n_slots} slot rows, "
+                  f"{n_weap} weapon-stat rows")
+        except Exception as e:
+            print(f"  warn: could not parse {bp} weapon columns: {e}", file=sys.stderr)
+
+    # Racial ability-score adjustments from a racialtypes.2da override (so
+    # module-custom races get correct +/- ability mods). Mirrors the stock
+    # race_adjust.json; a present override row replaces the stock entry.
+    rp = d / "racialtypes.2da"
+    if rp.is_file():
+        try:
+            headers, rows = parse_2da(rp)
+            hl = [h.lower() for h in headers]
+            adj_idx = {
+                ab: (hl.index(f"{ab.lower()}adjust") + 1
+                     if f"{ab.lower()}adjust" in hl else None)
+                for ab in ("Str", "Dex", "Con", "Int", "Wis", "Cha")
+            }
+            if any(v is not None for v in adj_idx.values()):
+                for row in rows:
+                    if not row:
+                        continue
+                    try:
+                        ridx = int(row[0])
+                    except ValueError:
+                        continue
+                    vals: dict[str, int] = {}
+                    for ab, idx in adj_idx.items():
+                        if idx is None or idx >= len(row):
+                            continue
+                        cell = row[idx]
+                        if not cell or cell == "****":
+                            continue
+                        try:
+                            n = int(cell)
+                        except ValueError:
+                            continue
+                        if n:
+                            vals[ab] = n
+                    if vals or ridx in RACE_ABILITY_ADJ:
+                        RACE_ABILITY_ADJ[ridx] = vals
+        except Exception as e:
+            print(f"  warn: could not parse {rp} adjusts: {e}", file=sys.stderr)
+
+    # iprp cost/subtype tables: merge from any iprp_*.2da that matches a known
+    # IPROP_TABLES key. Custom 2das fully override stock entries for existing
+    # rows (e.g. a hak that remaps iprp_immuncost row 3 from 20% to 25%).
+    # Row 0 (always the "Random" sentinel) is skipped.
+    # Column preference: if a "Value" column exists and the Label looks like a
+    # decimal fraction (e.g. "0.25"), use Value formatted as "X%" instead —
+    # this handles CEP2-style immuncost tables whose Label is a float (0.25)
+    # rather than a human string (25%).
+    for p in sorted(d.glob("iprp_*.2da")):
+        tbl_name = p.stem
+        if tbl_name not in IPROP_TABLES or tbl_name == "iprp_feats":
+            continue  # iprp_feats is handled above via IPRP_FEATS dict
+        try:
+            headers, rows = parse_2da(p)
+        except Exception as e:
+            print(f"  warn: could not parse {p}: {e}", file=sys.stderr)
+            continue
+        hdrs_lower = [h.lower() for h in headers]
+        try:
+            col_idx = hdrs_lower.index("label") + 1
+        except ValueError:
+            continue  # no Label column — not an iprp cost table
+        val_idx: int | None = None
+        try:
+            val_idx = hdrs_lower.index("value") + 1
+        except ValueError:
+            pass
+        tbl = IPROP_TABLES[tbl_name]
+        n_updated = 0
+        for row in rows:
+            if not row:
+                continue
+            try:
+                ridx = int(row[0])
+            except ValueError:
+                continue
+            if ridx == 0:
+                continue  # sentinel row
+            label = row[col_idx] if col_idx < len(row) else ""
+            if not label:
+                continue
+            # If the label looks like a bare decimal fraction (e.g. "0.25"),
+            # prefer the Value column (e.g. "25") formatted as "25%".
+            display = label
+            if val_idx is not None and re.fullmatch(r"0?\.\d+|1\.?0*", label):
+                raw_val = row[val_idx] if val_idx < len(row) else ""
+                try:
+                    display = f"{int(float(raw_val))}%"
+                except (ValueError, TypeError):
+                    pass
+            key = str(ridx)
+            if tbl.get(key) != display:
+                tbl[key] = display
+                n_updated += 1
+        if n_updated:
+            print(f"  override: {p.name} → {n_updated} row(s) updated → {tbl_name}")
+
+
+def baseitem_name(row: int | None) -> str:
+    """Stock baseitems.2da lookup. Custom HAKs (CEP, etc.) often add rows
+    beyond stock; for those we surface the row number explicitly so the
+    reader knows the label is a guess."""
+    if row is None:
+        return ""
+    r = int(row)
+    if r in BASEITEMS:
+        return BASEITEMS[r]
+    _warn_once(f"baseitems.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"BaseItem #{r}"
+
+
+def baseitem_label(row: int | None) -> str:
+    """Human label for an item's base type, with the row number always
+    preserved (CEP/custom HAKs override many rows so the stock name is a hint
+    rather than ground truth)."""
+    if row is None:
+        return ""
+    r = int(row)
+    if r in BASEITEMS:
+        return f"{BASEITEMS[r]} <small class=\"muted\">(row {r})</small>"
+    return f"BaseItem #{r}"
+
+
+def class_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    r = int(row)
+    if r in CLASSES:
+        return CLASSES[r]
+    _warn_once(f"classes.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Class #{r}"
+
+
+def race_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    r = int(row)
+    if r in RACES:
+        return RACES[r]
+    _warn_once(f"racialtypes.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Race #{r}"
+
+
+# Immunities the engine grants from a creature's racial type. These are *not*
+# stored anywhere in the .utc — NWN applies them by creature type at runtime, so
+# a crit-immune undead has no "Immunity: Critical Hits" item property to find.
+# Labels deliberately reuse the iprp_immunity vocabulary (see
+# wiki_data/itemprops.json) so racial and equipment immunities merge into one
+# namespace on the creature pages and in the creature search index.
+# Keyed by racialtypes.2da row.
+RACE_IMMUNITIES: dict[int, tuple[str, ...]] = {
+    10: (  # Construct
+        "Critical Hits", "Sneak Attack", "Mind-Affecting Spells", "Paralysis",
+        "Poison", "Disease", "Death Magic", "Level/Ability Drain", "Fear",
+    ),
+    16: (  # Elemental
+        "Critical Hits", "Sneak Attack", "Paralysis", "Poison", "Disease",
+    ),
+    24: (  # Undead
+        "Critical Hits", "Sneak Attack", "Mind-Affecting Spells", "Paralysis",
+        "Poison", "Disease", "Death Magic", "Level/Ability Drain", "Fear",
+    ),
+    25: (  # Vermin — mindless, but *not* crit immune
+        "Mind-Affecting Spells",
+    ),
+    29: (  # Ooze
+        "Critical Hits", "Sneak Attack", "Mind-Affecting Spells", "Paralysis",
+        "Poison", "Fear",
+    ),
+}
+
+
+def creature_race_immunities(race_raw: Any) -> list[str]:
+    """Immunity labels a creature gets purely from its racial type (see
+    RACE_IMMUNITIES). Returns [] for races with no engine-granted immunities."""
+    if race_raw is None:
+        return []
+    try:
+        rid = int(race_raw)
+    except (TypeError, ValueError):
+        return []
+    return list(RACE_IMMUNITIES.get(rid, ()))
+
+
+def appearance_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    r = int(row)
+    if r in APPEARANCE:
+        return APPEARANCE[r]
+    _warn_once(f"appearance.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Appearance #{r}"
+
+
+def placeable_name(row: int | None) -> str:
+    """Human label for a placeables.2da row. Falls back to a numeric stub when
+    the row isn't bundled — placeables.2da overlays must be loaded for this to
+    return real names (CEP modules get them via the auto-detected overlay)."""
+    if row is None:
+        return ""
+    r = int(row)
+    if r in PLACEABLES:
+        return PLACEABLES[r]
+    _warn_once(f"placeables.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Placeable #{r}"
+
+
+def feat_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    r = int(row)
+    if r in FEATS:
+        return FEATS[r]
+    _warn_once(f"feat.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Feat #{r}"
+
+
+def skill_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    r = int(row)
+    if r in SKILLS:
+        return SKILLS[r]
+    _warn_once(f"skills.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Skill #{r}"
+
+
+def spell_name(row: int | None) -> str:
+    if row is None:
+        return ""
+    r = int(row)
+    if r in SPELLS:
+        return SPELLS[r]
+    _warn_once(f"spells.2da row {r} not found — add --2da-dir with an override to resolve")
+    return f"Spell #{r}"
+
+
+# PropertyName id for the Cast Spell item property.
+_CAST_SPELL_PROP_ID = 15
+# Maps property name → iprp table name for properties that carry spell data.
+_SPELL_PROP_TABLES: dict[str, str] = {
+    "Cast Spell":               "iprp_spells",
+    "On Hit Cast Spell":        "iprp_onhitspell",
+    "Immunity: Specific Spell": "iprp_spells",
+}
+
+# Properties whose subtypes are all rendered on a single combined page instead
+# of individual per-subtype files.  Key = property name, value = page slug
+# (filename without .html).
+_COMBINED_PROP_PAGES: dict[str, str] = {
+    "Cast Spell": "cast-spell",
+}
+
+
+def _iprp_spell_info(tbl_name: str, row_id: int | None) -> dict | None:
+    """Return spell info dict for a given iprp table row, or None if unavailable."""
+    if row_id is None or not SPELL_INFO:
+        return None
+    return SPELL_INFO.get(tbl_name, {}).get(row_id)
+
+
+def _spell_level_classes(info: dict | None) -> tuple[str, str]:
+    """Return (level_str, classes_str) for a spell info dict.
+
+    classes_str is 'N/A' when the spell is not castable by any PC class."""
+    if not info:
+        return ("", "")
+    lvl = info.get("innate_level")
+    classes = info.get("class_levels", {})
+    level_str = "Cantrip" if lvl == 0 else (str(lvl) if lvl is not None else "")
+    classes_str = ", ".join(classes.keys()) if classes else "N/A"
+    return (level_str, classes_str)
+
+
+def _scroll_cast_spell_info(item: dict, name: str = "") -> dict | None:
+    """Return the SPELL_INFO entry for a scroll item's Cast Spell property subtype.
+
+    Falls back to name-based lookup when PropertiesList is absent (e.g. stock
+    items that appear only as sparse store-inventory references)."""
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is not None and int(pname_id) == _CAST_SPELL_PROP_ID:
+            subtype = fld(p, "Subtype")
+            if subtype is not None:
+                return _iprp_spell_info("iprp_spells", int(subtype))
+    if name and not list_items(item.get("PropertiesList")):
+        return _iprp_name_spell_info("iprp_spells", name)
+    return None
+
+
+def _scroll_spell_sort_key(entry: tuple[str, dict], db: "Db | None" = None) -> tuple[int, str]:
+    """Sort key for scrolls: (innate_level, spell_name_lower)."""
+    rr, i = entry
+    display_name = nwn_text(db.item_name(rr)) if db else ""
+    info = _scroll_cast_spell_info(i, display_name)
+    lvl = info.get("innate_level") if info else None
+    for p in list_items(i.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is not None and int(pname_id) == _CAST_SPELL_PROP_ID:
+            subtype = fld(p, "Subtype")
+            if subtype is not None:
+                sname = _table_lookup("iprp_spells", int(subtype)) or ""
+                return (-(lvl) if lvl is not None else 999, sname.lower())
+            break
+    # Name fallback: use item display name as spell name for sort
+    if display_name and lvl is not None:
+        return (-(lvl), display_name.lower())
+    return (-(lvl) if lvl is not None else 999, display_name.lower())
+
+
+def _iprp_name_spell_info(tbl_name: str, spell_name_str: str) -> dict | None:
+    """Resolve spell info by matching a spell name in an iprp_spells-type table.
+
+    Scans IPROP_TABLES[tbl_name] for the first row whose resolved name equals
+    spell_name_str, then returns the corresponding SPELL_INFO entry."""
+    if not SPELL_INFO:
+        return None
+    tbl = SPELL_INFO.get(tbl_name, {})
+    iprp_names = IPROP_TABLES.get(tbl_name, {})
+    for k, name in iprp_names.items():
+        if k.startswith("_") or name != spell_name_str:
+            continue
+        try:
+            row_id = int(k)
+        except ValueError:
+            continue
+        info = tbl.get(row_id)
+        if info:
+            return info
+    return None
+
+
+# Stock NWN1 tileset resrefs → human-readable names. The Aurora Toolset
+# stores the resref in the area's `Tileset` field; the friendly name is
+# kept in the corresponding .set file (which we don't read here).
+TILESETS: dict[str, str] = {
+    "tcn01": "City Exterior 1",
+    "tcn02": "City Exterior 2",
+    "tdc01": "Castle Interior 1",
+    "tdc02": "Castle Interior 2",
+    "tde01": "Castle Interior, Illuminated",
+    "tdm01": "Mines and Caverns",
+    "tdr01": "Rural",
+    "tds01": "Sewers",
+    "tib01": "Beholder Caves",
+    "tic01": "City Interior",
+    "til01": "Lizardfolk Interior",
+    "tin01": "Crypt",
+    "tni01": "Mines, Lower",
+    "tno01": "Forest",
+    "ttd01": "Desert",
+    "tte01": "Forest, Drow",
+    "ttf01": "Frozen Wastes",
+    "ttp01": "Microset",
+    "ttr01": "Rural Winter",
+    "tts01": "Snow",
+    "ttu01": "Underdark",
+    "ttz01": "Mountains",
+    "twc01": "Castle Exterior, Rural",
+}
+
+
+def tileset_name(resref: str) -> str:
+    """Friendly tileset name, falling back to the raw resref for unknowns."""
+    if not resref:
+        return ""
+    return TILESETS.get(resref.lower(), resref)
+
+
+def tileset_label(resref: str) -> str:
+    """Friendly tileset name with the resref preserved as a muted suffix."""
+    if not resref:
+        return ""
+    pretty = TILESETS.get(resref.lower())
+    if pretty:
+        return f'{E(pretty)} <small class="muted">({E(resref)})</small>'
+    return E(resref)
+
+
+# ---------------------------------------------------------------------------
+# Item property formatting
+# ---------------------------------------------------------------------------
+
+# Subtype lookups whose values come from non-iprp tables we already loaded.
+# These point at top-level lookup dicts so 2DA overrides made through
+# load_2da_overrides() remain visible (closing over the dict, not the value).
+_NON_IPRP_SUBTYPES = {
+    "racialtypes": lambda i: race_name(i),
+    "classes":     lambda i: class_name(i),
+    "iprp_feats":  lambda i: IPRP_FEATS.get(int(i)) if i is not None else None,
+    "skills":      lambda i: skill_name(i),
+}
+
+
+def _table_lookup(table_name: str | None, idx: int | None) -> str | None:
+    """Resolve a per-property numeric index to a label.
+
+    Order of resolution:
+      1. Non-iprp tables (classes, races) handled directly.
+      2. Explicit row entry in the JSON (e.g. "0": "+1").
+      3. Format string fallback ("_format": "+{}") — used when a table is a
+         simple identity progression and we don't want to hand-list every row.
+
+    Empirically the engine often stores the numeric *value* directly in
+    CostValue rather than a row index (e.g. CostValue=4 ⇒ "+4"), so the
+    format-string path matters more than per-row lookups for the common
+    "+N" tables.
+    """
+    if not table_name or idx is None:
+        return None
+    if table_name in _NON_IPRP_SUBTYPES:
+        return _NON_IPRP_SUBTYPES[table_name](idx)
+    tbl = IPROP_TABLES.get(table_name)
+    if not tbl:
+        return None
+    key = str(int(idx))
+    if key in tbl:
+        return tbl[key]
+    fmt = tbl.get("_format")
+    if isinstance(fmt, str):
+        return fmt.format(int(idx))
+    return None
+
+
+def itemprop_format(prop: dict) -> dict[str, str]:
+    """Translate one PropertiesList entry to display fields.
+
+    Returns: {property, subtype, cost, param, chance}
+    Falls back to raw numbers when a lookup is missing.
+    """
+    pname_id = fld(prop, "PropertyName")
+    subtype_id = fld(prop, "Subtype")
+    cost_table_id = fld(prop, "CostTable")
+    cost_value = fld(prop, "CostValue")
+    param1 = fld(prop, "Param1")
+    param1_value = fld(prop, "Param1Value")
+    chance = fld(prop, "ChanceAppear", 100)
+
+    pdef = IPROP_DEFS.get(int(pname_id), {}) if pname_id is not None else {}
+    if pname_id is not None and not pdef:
+        _warn_once(f"item property {pname_id} not found in itemprops.json — itemprops.json may be outdated")
+    pname = pdef.get("name") or (f"Property #{pname_id}" if pname_id is not None else "")
+
+    # Subtype: per-property table (e.g. Damage Bonus → damage type name).
+    # When the lookup misses (custom HAK row or table we don't ship), surface
+    # the table name alongside the raw index so the reader can extract that
+    # 2DA and rerun with --2da-dir, instead of staring at a bare integer.
+    # Properties without a subtype table drop a subtype of 0 (the engine's
+    # "no subtype" sentinel for those props); properties that *do* have a
+    # subtype table treat 0 as a real value (e.g. Bonus Feat 0 = Alertness).
+    subtype_str = ""
+    if subtype_id is not None:
+        st_tbl = pdef.get("subtype")
+        if st_tbl:
+            sval = _table_lookup(st_tbl, subtype_id)
+            if sval is not None:
+                subtype_str = sval
+            else:
+                short = st_tbl.replace("iprp_", "")
+                subtype_str = f"{short} #{subtype_id}"
+                _warn_once(f"item property '{pname}': {st_tbl} row {subtype_id} not found — add --2da-dir with an override to resolve")
+        elif int(subtype_id) not in (0, 65535):
+            subtype_str = str(subtype_id)
+            _warn_once(f"item property '{pname}': subtype {subtype_id} has no lookup table in itemprops.json — itemprops.json may be outdated")
+
+    # Cost: indexes a per-property cost table (e.g. +1..+20).
+    # Only fall back to raw when a cost table is defined but the lookup misses
+    # (e.g. custom HAK rows); when no cost table is configured at all, the raw
+    # CostValue is an internal engine index with no user-visible meaning.
+    cost_str = ""
+    if cost_value is not None:
+        ct_tbl = pdef.get("cost_table")
+        if ct_tbl:
+            cval = _table_lookup(ct_tbl, cost_value)
+            if cval is not None:
+                cost_str = cval
+            elif ct_tbl == "iprp_chargecost":
+                # Standard table ends at row 12 (5/Day); extend the /Day pattern.
+                n = int(cost_value)
+                cost_str = f"{n - 7}/Day" if n >= 8 else f"{n} charges"
+            else:
+                cost_str = str(cost_value)
+                _warn_once(f"item property '{pname}': {ct_tbl} row {cost_value} not found — add --2da-dir with an override to resolve")
+
+    # Param1: 255 is the engine "no param" sentinel.
+    # For certain (property, subtype) combos the Param1Value further qualifies
+    # the subtype — e.g. "Slay Racial Group" becomes "Slay Racial Group: Elf".
+    # For properties with a direct param1_table (e.g. Light → iprp_lightcolor),
+    # the param column shows the resolved label (e.g. "Green") instead of "9/4".
+    param_str = ""
+    if param1 is not None and int(param1) != 255:
+        p1_for_sub = pdef.get("param1_for_subtype", {})
+        p1_tbl = p1_for_sub.get(subtype_str) if subtype_str else None
+        if p1_tbl and param1_value is not None:
+            p1_label = _table_lookup(p1_tbl, int(param1_value))
+            if p1_label:
+                subtype_str = f"{subtype_str}: {p1_label}"
+        else:
+            direct_p1_tbl = pdef.get("param1_table")
+            if direct_p1_tbl and param1_value is not None:
+                p1_label = _table_lookup(direct_p1_tbl, int(param1_value))
+                param_str = p1_label if p1_label is not None else f"{param1}/{param1_value}"
+            else:
+                param_str = f"{param1}/{param1_value if param1_value is not None else 0}"
+
+    return {
+        "property": pname,
+        "subtype": subtype_str,
+        "cost": cost_str,
+        "param": param_str,
+        "chance": "" if chance == 100 else str(chance),
+    }
+
+
+def _item_prop_key(props: list) -> tuple:
+    """Stable hashable key for a PropertiesList, used to detect property variants."""
+    parts = []
+    for p in props:
+        parts.append((
+            fld(p, "PropertyName"),
+            fld(p, "Subtype"),
+            fld(p, "CostTable"),
+            fld(p, "CostValue"),
+            fld(p, "Param1"),
+            fld(p, "Param1Value"),
+        ))
+    return tuple(sorted(parts))
+
+
+def _creature_key(c: dict, bp: dict | None = None) -> tuple:
+    """Stable fingerprint for a creature's combat identity.
+
+    Compares abilities, classes, feats, special abilities, equipment resrefs,
+    NaturalAC, and Race.  Deliberately excludes name, tag, faction,
+    conversation, scripts, and position — those are presentation/placement
+    details, not combat identity.
+
+    `c` is the primary struct (UTC blueprint or GIT placement).
+    `bp` is the blueprint to fall back to when `c` is a GIT instance,
+    mirroring the fallback pattern in _creature_detail_sections().
+    """
+    def _f(key):
+        v = fld(c, key)
+        if v is None and bp is not None:
+            v = fld(bp, key)
+        return v
+
+    def _lst(key):
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    abilities = tuple(_f(a) for a in ("Str", "Dex", "Con", "Int", "Wis", "Cha"))
+    classes   = tuple(sorted(
+        (fld(cl, "Class"), fld(cl, "ClassLevel"))
+        for cl in _lst("ClassList")
+    ))
+    feats     = tuple(sorted(
+        int(fld(f, "Feat"))
+        for f in _lst("FeatList")
+        if fld(f, "Feat") is not None
+    ))
+    spec_ab   = tuple(sorted(
+        (fld(s, "Spell"), fld(s, "SpellCasterLevel"))
+        for s in _lst("SpecAbilityList")
+    ))
+    equip     = tuple(sorted(
+        (fld(e, "__struct_id"),
+         fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or "")
+        for e in _lst("Equip_ItemList")
+    ))
+    return (abilities, classes, feats, spec_ab, equip, _f("NaturalAC"), _f("Race"))
+
+
+def _store_inv_key(store: dict) -> tuple:
+    """Stable fingerprint of a UTM blueprint's inventory and pricing.
+
+    Used to decide whether two stores with the same Tag are genuine duplicates
+    (identical key) or conflicting variants (differing key).
+    """
+    items: list[tuple] = []
+    for page in list_items(store.get("StoreList")):
+        for it in list_items(page.get("ItemList")):
+            rr = (fld(it, "TemplateResRef", "") or fld(it, "InventoryRes", "") or "").strip().lower()
+            stack = fld(it, "StackSize", 1) or 1
+            infinite = fld(it, "Infinite", 0) or 0
+            items.append((rr, stack, infinite))
+    return (
+        tuple(sorted(items)),
+        fld(store, "MarkUp", 0),
+        fld(store, "MarkDown", 0),
+        fld(store, "StoreGold", -1),
+    )
+
+
+def _conversation_key(dlg: dict) -> tuple:
+    """Stable fingerprint of a dialog tree's content.
+
+    Captures node texts, action scripts, and tree adjacency.  Deliberately
+    excludes animation, sound, delay, and comments — those are presentation
+    details, not conversation identity, matching the philosophy of _creature_key().
+    """
+    entries = list_items(dlg.get("EntryList"))
+    replies  = list_items(dlg.get("ReplyList"))
+
+    node_parts: list[tuple] = []
+    for i, e in enumerate(entries):
+        text = nwn_text(loc(e.get("Text")))
+        script = (fld(e, "Script", "") or "").strip().lower()
+        node_parts.append(("entry", i, text, script))
+    for i, r in enumerate(replies):
+        text = nwn_text(loc(r.get("Text")))
+        script = (fld(r, "Script", "") or "").strip().lower()
+        node_parts.append(("reply", i, text, script))
+
+    adj_parts: list[tuple] = []
+    for i, e in enumerate(entries):
+        reply_idxs = tuple(sorted(
+            fld(ref, "Index") for ref in list_items(e.get("RepliesList"))
+            if fld(ref, "Index") is not None
+        ))
+        adj_parts.append(("entry", i, reply_idxs))
+    for i, r in enumerate(replies):
+        entry_idxs = tuple(sorted(
+            fld(ref, "Index") for ref in list_items(r.get("EntriesList"))
+            if fld(ref, "Index") is not None
+        ))
+        adj_parts.append(("reply", i, entry_idxs))
+
+    return (tuple(node_parts), tuple(adj_parts))
+
+
+
+def _variant_diff_items(
+    c: dict, base_c: dict, db: "Db", *, bp: dict | None = None, base_bp: dict | None = None
+) -> list[str]:
+    """Return human-readable difference strings between a variant creature and its base.
+
+    `c`/`bp` are the variant's instance struct + blueprint fallback.
+    `base_c`/`base_bp` are the base canonical's struct + blueprint fallback.
+    """
+    def _fv(key):
+        v = fld(c, key)
+        return fld(bp, key) if v is None and bp is not None else v
+
+    def _fb(key):
+        v = fld(base_c, key)
+        return fld(base_bp, key) if v is None and base_bp is not None else v
+
+    def _lstv(key):
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    def _lstb(key):
+        items = list_items(base_c.get(key))
+        if not items and base_bp is not None:
+            items = list_items(base_bp.get(key))
+        return items
+
+    diffs: list[str] = []
+
+    # Abilities
+    ABILITY_KEYS = ("Str", "Dex", "Con", "Int", "Wis", "Cha")
+    ab_diffs = []
+    for key in ABILITY_KEYS:
+        bv, vv = _fb(key), _fv(key)
+        if bv != vv and vv is not None:
+            if bv is not None:
+                delta = int(vv) - int(bv)
+                ab_diffs.append(f"{key} {int(bv)}→{int(vv)} ({'+' if delta > 0 else ''}{delta})")
+            else:
+                ab_diffs.append(f"{key} +{int(vv)}")
+    if ab_diffs:
+        diffs.append("Abilities: " + ", ".join(ab_diffs))
+
+    # Classes
+    base_cls = {fld(cl, "Class"): fld(cl, "ClassLevel") for cl in _lstb("ClassList")}
+    var_cls  = {fld(cl, "Class"): fld(cl, "ClassLevel") for cl in _lstv("ClassList")}
+    cls_diffs = []
+    for cid in sorted(set(base_cls) | set(var_cls), key=lambda x: int(x) if x is not None else 0):
+        bl, vl = base_cls.get(cid), var_cls.get(cid)
+        cname = class_name(cid)
+        if bl is None:
+            cls_diffs.append(f"+{cname} {vl}")
+        elif vl is None:
+            cls_diffs.append(f"−{cname}")
+        elif bl != vl:
+            cls_diffs.append(f"{cname} {bl}→{vl}")
+    if cls_diffs:
+        diffs.append("Classes: " + ", ".join(cls_diffs))
+
+    # Feats
+    base_feats = {int(fld(f, "Feat")) for f in _lstb("FeatList") if fld(f, "Feat") is not None}
+    var_feats  = {int(fld(f, "Feat")) for f in _lstv("FeatList") if fld(f, "Feat") is not None}
+    feat_diffs = (
+        [f"+{feat_name(f)}" for f in sorted(var_feats - base_feats)] +
+        [f"−{feat_name(f)}" for f in sorted(base_feats - var_feats)]
+    )
+    if feat_diffs:
+        diffs.append("Feats: " + ", ".join(feat_diffs))
+
+    # Special abilities
+    base_sab = {(fld(s, "Spell"), fld(s, "SpellCasterLevel")) for s in _lstb("SpecAbilityList")}
+    var_sab  = {(fld(s, "Spell"), fld(s, "SpellCasterLevel")) for s in _lstv("SpecAbilityList")}
+    sab_diffs = (
+        [f"+{spell_name(sp)} (CL {lv})" for sp, lv in sorted(var_sab - base_sab, key=lambda x: str(x))] +
+        [f"−{spell_name(sp)} (CL {lv})" for sp, lv in sorted(base_sab - var_sab, key=lambda x: str(x))]
+    )
+    if sab_diffs:
+        diffs.append("Special abilities: " + ", ".join(sab_diffs))
+
+    # Equipment
+    base_eq = {fld(e, "__struct_id"): (fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or "")
+               for e in _lstb("Equip_ItemList")}
+    var_eq  = {fld(e, "__struct_id"): (fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or "")
+               for e in _lstv("Equip_ItemList")}
+    eq_diffs = []
+    for slot_id in sorted(set(base_eq) | set(var_eq), key=lambda x: int(x) if x is not None else 0):
+        bi, vi = base_eq.get(slot_id, ""), var_eq.get(slot_id, "")
+        if bi == vi:
+            continue
+        slot_label = SLOT_NAMES.get(int(slot_id) if slot_id is not None else 0, f"Slot {slot_id}")
+        bn = db.item_name(bi) or bi
+        vn = db.item_name(vi) or vi
+        if not bi:
+            eq_diffs.append(f"{slot_label}: +{vn}")
+        elif not vi:
+            eq_diffs.append(f"{slot_label}: −{bn}")
+        else:
+            eq_diffs.append(f"{slot_label}: {bn} → {vn}")
+    if eq_diffs:
+        diffs.append("Equipment: " + ", ".join(eq_diffs))
+
+    # Natural AC
+    bac, vac = _fb("NaturalAC"), _fv("NaturalAC")
+    if bac != vac and vac is not None:
+        diffs.append(f"Natural AC: {bac}→{vac}" if bac is not None else f"Natural AC: +{vac}")
+
+    # Race
+    br, vr = _fb("Race"), _fv("Race")
+    if br != vr and vr is not None:
+        diffs.append(f"Race: {race_name(br)} → {race_name(vr)}")
+
+    # Display name (a renamed placement of an otherwise-identical blueprint)
+    def _disp(fc: dict, fbp: dict | None) -> str:
+        f = loc(fc.get("FirstName")) or (loc(fbp.get("FirstName")) if fbp else None)
+        l = loc(fc.get("LastName")) or (loc(fbp.get("LastName")) if fbp else None)
+        return ((f or "") + " " + (l or "")).strip()
+    vname, bname = _disp(c, bp), _disp(base_c, base_bp)
+    if vname and vname != bname:
+        diffs.append(f'Named "{vname}" (vs "{bname}")' if bname else f'Named "{vname}"')
+
+    return diffs
+
+
+def itemprop_oneliner(prop: dict) -> str:
+    """Compact single-line summary (used in tooltips / loot lists)."""
+    f = itemprop_format(prop)
+    bits = [f["property"]]
+    if f["subtype"]:
+        bits.append(f["subtype"])
+    if f["cost"]:
+        bits.append(f["cost"])
+    return " ".join(b for b in bits if b)
+
+
+def _prop_slug(prop_name: str, subtype: str) -> str:
+    s = (prop_name + ("-" + subtype if subtype else "")).lower()
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+
+
+def _prop_value_num(cost_str: str) -> int:
+    m = re.search(r"\d+", cost_str.strip())
+    return int(m.group()) if m else 0
+
+
+def _prop_group(prop_name: str) -> str:
+    n = prop_name.lower()
+    if any(w in n for w in ("resistance", "immunity", "vulnerability", "reduction")):
+        return "Resistances & Immunities"
+    if "saving throw" in n:
+        return "Saving Throws"
+    if any(w in n for w in ("ability", "skill")):
+        return "Ability & Skill Bonuses"
+    if any(w in n for w in ("ac bonus", "attack bonus", "enhancement bonus", "damage bonus",
+                             "damage penalty", "decreased damage", "massive criticals",
+                             "extra melee", "extra ranged", "mighty")):
+        return "AC & Combat"
+    if any(w in n for w in ("spell", "cast", "bonus spell")):
+        return "Spell & Magic"
+    return "Other"
+
+
+def _cost_anchor(cost_str: str) -> str:
+    """Stable URL-fragment for a cost tier (e.g. 'DC 14' → 'dc-14')."""
+    return re.sub(r"[^a-z0-9]+", "-", cost_str.lower()).strip("-")
+
+
+def _cost_tiers(
+    entries: list[tuple[str, str, str, int]],
+) -> list[tuple[str, str, list[tuple[str, str, str, int]]]]:
+    """Group a property's items by cost tier and return sorted (cost_str, anchor, items) triples.
+
+    Tiers are sorted: numeric-descending first (so '+20' before '+1', 'DC 26' before 'DC 14'),
+    then alphabetically for non-numeric tiers.  The empty-string tier (properties with no
+    cost value) is placed last."""
+    from collections import defaultdict as _dd
+    buckets: dict[str, list] = _dd(list)
+    for e in entries:
+        buckets[e[2]].append(e)
+    non_empty_keys = [k for k in buckets if k]
+    _is_dr = bool(non_empty_keys) and all(
+        re.match(r"^\d+/\+\d+$", k.strip()) for k in non_empty_keys
+    )
+    def _tier_key(x: tuple) -> tuple:
+        c = x[0]
+        if not c:
+            return (1, 0, 0, "")
+        if _is_dr:
+            m = re.match(r"^(\d+)/\+(\d+)$", c.strip())
+            if m:
+                return (0, -int(m.group(2)), -int(m.group(1)), "")
+        return (0, 0, -_prop_value_num(c), c.lower())
+    result = []
+    for cost_str, items in sorted(buckets.items(), key=_tier_key):
+        result.append((cost_str, _cost_anchor(cost_str), items))
+    return result
+
+
+def _where_snippet(db: "Db", resref: str) -> str:
+    """Short 'where to find' blurb for property/search listing pages."""
+    sources: list[str] = []
+    for s in db.item_sold_at.get(resref, []):
+        sources.append("Sold: " + nwn_text(s["name"]))
+    for c in db.item_carried_by.get(resref, []):
+        sources.append("Carried by: " + nwn_text(c["cname"]))
+    for c in db.item_in_container.get(resref, []):
+        sources.append("Container: " + nwn_text(c["pname"]))
+    for s in db.item_from_script.get(resref, []):
+        sources.append("Script: " + (s.get("label") or s["script"]))
+    if not sources:
+        return '<span class="muted">—</span>'
+    first = E(sources[0])
+    if len(sources) == 1:
+        return first
+    return first + f' <span class="muted">&amp; {len(sources) - 1} more</span>'
+
+
+def _is_raw_subtype(subtype: str) -> bool:
+    """True when subtype is an unresolved numeric fallback (e.g. '37' or 'spells #5').
+    Used to merge property variants that share a name but differ only in a
+    charge count or other numeric parameter the lookup table didn't resolve."""
+    s = subtype.strip()
+    return bool(re.match(r"^\d+$", s) or re.match(r"^[\w\s]+ #\d+$", s))
+
+
+def _fmt_hp(val: Any) -> str:
+    """Format HP with comma separators; returns '' for missing values."""
+    if val in (None, ''):
+        return ''
+    try:
+        return f"{int(val):,}"
+    except (TypeError, ValueError):
+        return str(val)
+
+
+def _yn(flag: bool) -> str:
+    """Color-coded Yes/No span for boolean flags in tables."""
+    if flag:
+        return '<span style="color:#4a8;font-weight:bold">Yes</span>'
+    return '<span style="color:#888">No</span>'
+
+
+# ---------------------------------------------------------------------------
+# Combat-stat helpers (creature page)
+# ---------------------------------------------------------------------------
+#
+# NWN computes BAB / iterative attacks / AC at runtime from class progression
+# and equipment. The wiki is static, so we approximate from the UTC + items.
+# Where information is missing (custom HAKs, scripted bonuses) we surface the
+# raw fields so the reader can spot it.
+
+def _class_bab(class_id: int, level: int) -> int:
+    """Base attack bonus a class contributes at the given level, looked up from
+    the stock per-class progression (class_bab.json / cls_atk_*.2da).
+
+    Only *pre-epic* levels (≤20) add BAB: epic levels grant no base attack bonus
+    in NWN, so multiclass epic creatures don't keep gaining to-hit per level.
+    Unknown classes (no cached table) fall back to a 3/4 progression."""
+    if level <= 0:
+        return 0
+    eff = min(level, 20)
+    arr = CLASS_BAB.get(class_id)
+    if arr:
+        return arr[min(eff, len(arr)) - 1]
+    return (eff * 3) // 4
+
+
+def creature_bab(classes: list[dict], max_level: int = 0) -> int:
+    """Sum base attack bonus across a creature's class entries.
+
+    When `max_level` > 0 (the server level cap), the creature's total class
+    levels are clamped to it, consuming ClassList in order — so a boss whose
+    blueprint stacks far more HD than the cap doesn't accrue unbounded BAB
+    (e.g. a Fighter60/WeaponMaster10/ArcaneArcher60 on a level-40 server is
+    treated as Fighter40, giving BAB 20). `_class_bab` already counts only
+    pre-epic (≤20) levels per class."""
+    total = 0
+    remaining = max_level if max_level and max_level > 0 else None
+    for cl in classes:
+        cid = fld(cl, "Class")
+        lvl = fld(cl, "ClassLevel", 0) or 0
+        if cid is None:
+            continue
+        lvl = int(lvl)
+        if remaining is not None:
+            if remaining <= 0:
+                break
+            lvl = min(lvl, remaining)
+            remaining -= lvl
+        total += _class_bab(int(cid), lvl)
+    return total
+
+
+def creature_class_bab(classes: list[dict], target_cid: int,
+                       max_level: int = 0) -> int:
+    """Pre-epic BAB contributed by one class, using the same ClassList-order
+    server-cap clamp as creature_bab (so epic/over-cap levels add nothing)."""
+    remaining = max_level if max_level and max_level > 0 else None
+    total = 0
+    for cl in classes:
+        cid = fld(cl, "Class")
+        lvl = fld(cl, "ClassLevel", 0) or 0
+        if cid is None:
+            continue
+        lvl = int(lvl)
+        if remaining is not None:
+            if remaining <= 0:
+                break
+            lvl = min(lvl, remaining)
+            remaining -= lvl
+        if int(cid) == target_cid:
+            total += _class_bab(int(cid), lvl)
+    return total
+
+
+def attack_schedule(bab: int, ability_mod: int = 0,
+                    bonus: int = 0, *, monk_unarmed_bab: int = 0) -> list[int]:
+    """Iterative attack bonuses. NWN caps at 4 attacks/round from BAB; the extra
+    attack from haste / dual-wield is intentionally not modelled (it isn't shown
+    on the in-game character sheet either).
+
+    A monk attacking unarmed (or with creature/claw weapons) instead uses the
+    monk progression: attacks spaced 3 apart (not 5), with the count derived from
+    the monk's pre-epic (cap-clamped) unarmed BAB (monkBAB // 3) — so a level-20+
+    monk (BAB 15) gets five unarmed attacks and epic levels add no further
+    attacks. `monk_unarmed_bab` > 0 selects this mode."""
+    if monk_unarmed_bab > 0:
+        n = max(1, monk_unarmed_bab // 3)
+        return [max(bab, 0) - 3 * i + ability_mod + bonus for i in range(n)]
+    if bab <= 0:
+        return [ability_mod + bonus]
+    n = min(4, 1 + (bab - 1) // 5)
+    return [bab - 5 * i + ability_mod + bonus for i in range(n)]
+
+
+# Feats granting a flat to-hit bonus regardless of weapon (feat id → bonus).
+# Epic Prowess applies to all attacks; Superior Weapon Focus is the Weapon
+# Master's +1 with its chosen weapon (treated as applying to the wielded weapon).
+# Epic Superior Weapon Focus (1071) is intentionally excluded — the engine does
+# not grant a second flat +1 for it on top of Superior Weapon Focus.
+_UNIVERSAL_ATTACK_FEATS = {584: 1, 884: 1}
+
+
+def feat_attack_bonus(feat_ids: Iterable[int], weapon_name: str = "") -> int:
+    """To-hit bonus a creature's feats add for the weapon it's wielding.
+
+    Universal feats (Epic Prowess, Superior / Epic Superior Weapon Focus) always
+    count. (Epic) Weapon Focus is weapon-specific: only counted when the feat's
+    friendly name names the wielded weapon (e.g. 'Epic Weapon Focus (rapier)'
+    with `weapon_name='Rapier'`) — +2 for the epic form, +1 otherwise. Weapon
+    Specialization and crit feats add no to-hit and are ignored."""
+    feat_ids = list(feat_ids)
+    bonus = sum(_UNIVERSAL_ATTACK_FEATS[f] for f in feat_ids
+                if f in _UNIVERSAL_ATTACK_FEATS)
+    # Normalise to alphanumerics so this matches whether FEATS holds the friendly
+    # name ("Epic Weapon Focus (rapier)") or a 2DA-override LABEL
+    # ("FEAT_EPIC_WEAPON_FOCUS_RAPIER") — both reduce to "epicweaponfocusrapier".
+    _norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    wnorm = _norm(weapon_name)
+    if wnorm:
+        for fid in feat_ids:
+            fn = _norm(STOCK_FEAT_NAMES.get(fid, ""))
+            if "weaponfocus" in fn and "superior" not in fn and wnorm in fn:
+                bonus += 2 if "epic" in fn else 1
+    return bonus
+
+
+def ability_mod(score: int | None) -> int:
+    if score is None:
+        return 0
+    return (int(score) - 10) // 2
+
+
+# Inventory slot bitmasks used on Equip_ItemList[*].__struct_id.
+SLOT_HEAD = 0x0001
+SLOT_CHEST = 0x0002
+SLOT_BOOTS = 0x0004
+SLOT_ARMS = 0x0008
+SLOT_RIGHT = 0x0010
+SLOT_LEFT = 0x0020
+SLOT_CLOAK = 0x0040
+SLOT_LRING = 0x0080
+SLOT_RRING = 0x0100
+SLOT_NECK = 0x0200
+SLOT_BELT = 0x0400
+SLOT_ARROWS = 0x0800
+SLOT_BULLETS = 0x1000
+SLOT_BOLTS = 0x2000
+SLOT_CWEAP_R = 0x4000
+SLOT_CWEAP_L = 0x8000
+SLOT_CWEAP_B = 0x10000
+SLOT_CHIDE = 0x20000
+
+SLOT_NAMES = {
+    SLOT_HEAD: "Head", SLOT_CHEST: "Chest", SLOT_BOOTS: "Boots",
+    SLOT_ARMS: "Arms", SLOT_RIGHT: "Right hand", SLOT_LEFT: "Left hand",
+    SLOT_CLOAK: "Cloak", SLOT_LRING: "Left ring", SLOT_RRING: "Right ring",
+    SLOT_NECK: "Neck", SLOT_BELT: "Belt", SLOT_ARROWS: "Arrows",
+    SLOT_BULLETS: "Bullets", SLOT_BOLTS: "Bolts",
+    SLOT_CWEAP_R: "Creature weapon (R)", SLOT_CWEAP_L: "Creature weapon (L)",
+    SLOT_CWEAP_B: "Creature weapon (bite)", SLOT_CHIDE: "Creature hide",
+}
+
+WEAPON_SLOTS = {SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B}
+ARMOR_SLOTS = {SLOT_CHEST, SLOT_LEFT}  # left can hold a shield
+SHIELD_BASEITEMS = {14, 56, 57}  # Small / Large / Tower shields (stock 2da rows)
+
+# Immunity to critical hits is item property 37 (Immunity: Miscellaneous) with
+# subtype 8, which itemprop_format renders through iprp_immunity as this label.
+# Matching the label rather than the raw subtype id keeps this working when a
+# HAK renumbers the table. See nwn_homers_lotr/CLAUDE-devcrit-immunity-audit.md.
+CRIT_IMMUNITY_LABEL = "Critical Hits"
+
+# ---------------------------------------------------------------------------
+# Base item → equippable slots (baseitems.2da "EquipableSlots").
+#
+# The 2DA column is a hex bitmask over exactly the SLOT_* constants above, so it
+# is the authoritative answer to "what can wear this?" — no hand-maintained base
+# item lists needed, and CEP/custom rows come along for free via --2da-dir.
+# BASEITEM_SLOTS starts as the stock table and load_2da_overrides() merges any
+# module baseitems.2da over it (same pattern as BASEITEMS itself).
+# ---------------------------------------------------------------------------
+
+_STOCK_BASEITEM_SLOTS: dict[int, int] = {}
+for _rows, _mask in (
+    ((17,),                                       SLOT_HEAD),
+    ((16,),                                       SLOT_CHEST),
+    ((26,),                                       SLOT_BOOTS),
+    ((36, 78),                                    SLOT_ARMS),
+    ((31, 59, 63),                                SLOT_RIGHT),
+    ((14, 15, 56, 57),                            SLOT_LEFT),
+    ((6, 7, 8, 11, 30, 61),                       SLOT_RIGHT | SLOT_LEFT),
+    ((80,),                                       SLOT_CLOAK),
+    ((52,),                                       SLOT_LRING | SLOT_RRING),
+    ((19,),                                       SLOT_NECK),
+    ((21,),                                       SLOT_BELT),
+    ((20,),                                       SLOT_ARROWS),
+    ((27,),                                       SLOT_BULLETS),
+    ((25,),                                       SLOT_BOLTS),
+    ((69, 70, 71, 72),                            SLOT_CWEAP_R | SLOT_CWEAP_L | SLOT_CWEAP_B),
+    ((10, 12, 13, 18, 32, 33, 35, 45, 50, 55, 111),
+                                                  SLOT_RIGHT | SLOT_CWEAP_R | SLOT_CWEAP_L | SLOT_CWEAP_B),
+    ((0, 1, 2, 3, 4, 5, 9, 22, 28, 37, 38, 40, 41, 42, 47,
+      48, 51, 53, 58, 60, 92, 93, 94, 95, 108),
+                                                  SLOT_RIGHT | SLOT_LEFT | SLOT_CWEAP_R | SLOT_CWEAP_L | SLOT_CWEAP_B),
+    ((73,),                                       SLOT_CHIDE),
+):
+    for _r in _rows:
+        _STOCK_BASEITEM_SLOTS[_r] = _mask
+del _rows, _mask, _r
+
+BASEITEM_SLOTS: dict[int, int] = dict(_STOCK_BASEITEM_SLOTS)
+
+# The slots a player character actually equips, in report order. Creature-only
+# slots (claw/bite/hide) and the three ammo slots are excluded; ammo is folded
+# into one pseudo-slot by PLAYER_SLOT_ORDER's "Ammo" entry below.
+_AMMO_SLOTS = SLOT_ARROWS | SLOT_BULLETS | SLOT_BOLTS
+PLAYER_SLOT_MASK = (SLOT_HEAD | SLOT_CHEST | SLOT_BOOTS | SLOT_ARMS | SLOT_RIGHT
+                    | SLOT_LEFT | SLOT_CLOAK | SLOT_LRING | SLOT_RRING
+                    | SLOT_NECK | SLOT_BELT | _AMMO_SLOTS)
+
+# (report key, label, mask, how many can be worn at once). Rings collapse to one
+# bucket wearable twice; the three ammo types collapse to one "Ammo" bucket.
+PLAYER_SLOTS: list[tuple[str, str, int, int]] = [
+    ("head",   "Head",              SLOT_HEAD,                 1),
+    ("chest",  "Chest",             SLOT_CHEST,                1),
+    ("boots",  "Boots",             SLOT_BOOTS,                1),
+    ("arms",   "Arms",              SLOT_ARMS,                 1),
+    ("right",  "Right hand",        SLOT_RIGHT,                1),
+    ("left",   "Left hand",         SLOT_LEFT,                 1),
+    ("cloak",  "Cloak",             SLOT_CLOAK,                1),
+    ("neck",   "Neck",              SLOT_NECK,                 1),
+    ("belt",   "Belt",              SLOT_BELT,                 1),
+    ("ring",   "Ring",              SLOT_LRING | SLOT_RRING,   2),
+    ("ammo",   "Ammo",              _AMMO_SLOTS,               1),
+]
+
+
+def baseitem_slots(bi: int | None) -> int:
+    """Equippable-slot bitmask for a base item row, 0 when unknown/unequippable."""
+    if bi is None or bi < 0:
+        return 0
+    return BASEITEM_SLOTS.get(int(bi), 0)
+
+
+def item_equip_slots(item: dict | None) -> int:
+    """Equippable-slot bitmask for an item blueprint."""
+    if not item:
+        return 0
+    raw = fld(item, "BaseItem", None)
+    if raw is None:
+        return 0
+    try:
+        return baseitem_slots(int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def slot_label(mask: int) -> str:
+    """Human label for a slot bitmask — a single SLOT_* name where the mask is
+    one known slot, otherwise the names joined with '/'."""
+    if mask in SLOT_NAMES:
+        return SLOT_NAMES[mask]
+    parts = [SLOT_NAMES[b] for b in sorted(SLOT_NAMES) if mask & b]
+    return "/".join(parts) if parts else f"0x{mask:X}"
+
+# Stock 2da row ids used in combat-stat derivation.
+TUMBLE_SKILL_ID = 21       # skills.2da row; Tumble grants +1 dodge AC per 5 ranks
+ARMOR_SKIN_FEAT = 490      # feat.2da FEAT_EPIC_ARMOR_SKIN → +2 natural AC
+WEAPON_FINESSE_FEAT = 42   # feat.2da FEAT_WEAPON_FINESSE → light weapons use Dex
+MONK_CLASS_ID = 5          # classes.2da row; monk unarmed gets a faster schedule
+EPIC_TOUGHNESS_BASE = 754  # feat.2da Epic Toughness I; I..X = 754..763, +20 HP/tier
+
+
+def epic_toughness_hp(feat_ids: Iterable[int]) -> int:
+    """HP NWN:EE adds on spawn from Epic Toughness, on top of the blueprint's
+    stored MaxHitPoints (the toolset's stored value excludes it). Modelled as
+    20 × the highest tier owned (the tiers form a prereq ladder). Returns 0 if
+    none are present."""
+    tiers = [fid - EPIC_TOUGHNESS_BASE + 1 for fid in feat_ids
+             if EPIC_TOUGHNESS_BASE <= fid <= EPIC_TOUGHNESS_BASE + 9]
+    return 20 * max(tiers) if tiers else 0
+
+
+def creature_feat_ids(c: dict | None, bp: dict | None = None) -> list[int]:
+    """Feat ids from a creature's FeatList (instance first, blueprint fallback)."""
+    feats = list_items((c or {}).get("FeatList")) or (
+        list_items(bp.get("FeatList")) if bp else [])
+    return [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
+
+
+def creature_max_hp(c: dict | None, bp: dict | None = None) -> int | None:
+    """Effective max HP the way the engine reports it: stored MaxHitPoints plus
+    Epic Toughness HP applied on spawn (see epic_toughness_hp). Returns None when
+    no HP field is set so callers can render an empty cell."""
+    raw = fld(c, "MaxHitPoints") or fld(c, "HitPoints")
+    if raw in (None, "") and bp is not None:
+        raw = fld(bp, "MaxHitPoints") or fld(bp, "HitPoints")
+    try:
+        base = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return base + epic_toughness_hp(creature_feat_ids(c, bp))
+
+# Stock light/finessable weapon base-item rows (Weapon Finesse uses Dex on
+# these); creature weapons (claw/bite) are also finessable and handled by slot.
+FINESSE_BASEITEMS = frozenset({22, 37, 38, 40, 42, 51, 60, 111})
+# Dagger, Light Hammer, Handaxe, Kama, Kukri, Rapier, Sickle, Whip.
+
+# Physical damage type(s) a base weapon deals, keyed by baseitems.2da WeaponType.
+# weapons.json carries no physical-damage-type column, so this map is the only
+# source. Elemental/divine damage instead comes from item properties.
+_PHYSICAL_DAMAGE_TYPES = ("Bludgeoning", "Piercing", "Slashing")
+_WEAPONTYPE_TO_PHYS: dict[int, frozenset[str]] = {
+    1: frozenset({"Piercing"}),
+    2: frozenset({"Bludgeoning"}),
+    3: frozenset({"Slashing"}),
+    4: frozenset({"Slashing", "Piercing"}),
+    5: frozenset({"Bludgeoning", "Piercing"}),
+}
+
+# BaseItem sets for items-index grouping.
+_ARMOR_BASEITEMS:      frozenset[int] = frozenset({16})
+_HELMET_BASEITEMS:     frozenset[int] = frozenset({17})
+_AMMO_BASEITEMS:       frozenset[int] = frozenset({20, 25, 27})   # Arrow Bolt Bullet
+_WAND_BASEITEMS:       frozenset[int] = frozenset({46, 106})      # Magic Wand, Crafted Wand
+_POTION_BASEITEMS:     frozenset[int] = frozenset({49, 104})      # Potion, Brewed Potion
+_SCROLL_BASEITEMS:     frozenset[int] = frozenset({75, 105})      # Scroll, Enchanted Scroll
+_GRENADE_BASEITEMS:    frozenset[int] = frozenset({81})           # Grenadelike
+
+# Maps specific accessory BaseItem rows to category keys.
+# Bracers (78) and Gauntlets (36) share one key per the items index design.
+_ACCESSORY_BASEITEM_MAP: dict[int, str] = {
+    19: "amulet",
+    21: "belt",
+    26: "boots",
+    36: "bracers_gauntlets",
+    52: "ring",
+    78: "bracers_gauntlets",
+    80: "cloak",
+}
+
+# Base items that are creature-only (not equippable by players).
+_CREATURE_WEAPON_BASEITEMS: frozenset[int] = frozenset({69, 70, 71, 72})
+_CREATURE_ITEM_BASEITEMS:   frozenset[int] = frozenset({73})
+
+# Named misc subtypes matched by base item ID.
+_MISC_TYPE_MAP: dict[int, str] = {
+    39: "tool_kit",   # Healer's Kit
+    44: "magic_rod",
+    45: "magic_staff",
+    62: "tool_kit",   # Thieves' Tools
+    64: "tool_kit",   # Trap Kit
+    74: "book",
+    77: "gem",
+}
+
+# Miscellaneous-subtype base items that get name-based sub-categorization.
+_MISC_LIKE_BASEITEMS: frozenset[int] = frozenset({24, 29, 34, 79, 83, 84, 85, 86, 307, 311})
+
+# CEP weapon base item IDs not present in weapons.json (stock IDs only cover
+# 0–112). Now only a fallback: with --2da-dir, load_2da_overrides merges the
+# module's own baseitems.2da weapon columns into WEAPONS, so these rows get a
+# real WeaponType (and dice, and crit stats) and are recognised on their own.
+# This list still carries runs with no 2DA override.
+_CEP_WEAPON_BASEITEMS: frozenset[int] = frozenset({
+    300, 301, 302, 303, 304, 305, 308, 309, 310,
+    312, 313, 316, 317, 318, 319, 320, 321, 322, 323, 324,
+})
+
+# Fixed display labels for non-weapon category keys.
+_CATEGORY_LABELS: dict[str, str] = {
+    "armor_heavy":       "Heavy Armor",
+    "armor_medium":      "Medium Armor",
+    "armor_light":       "Light Armor",
+    "armor_cloth":       "Cloth & Robes",
+    "shield_small":      "Small Shields",
+    "shield_large":      "Large Shields",
+    "shield_tower":      "Tower Shields",
+    "helmet":            "Helmets",
+    "amulet":            "Amulets",
+    "belt":              "Belts",
+    "boots":             "Boots",
+    "bracers_gauntlets": "Bracers & Gauntlets",
+    "ring":              "Rings",
+    "cloak":             "Cloaks",
+    "ammo":              "Ammunition",
+    "wand":              "Wands",
+    "potion":            "Potions",
+    "scroll":            "Scrolls",
+    "grenade":           "Grenades",
+    "book":              "Books",
+    "magic_rod":         "Magic Rods",
+    "magic_staff":       "Magic Staves",
+    "gem":               "Gems",
+    "dye":               "Dyes",
+    "poison":            "Poisons & Venoms",
+    "tool_kit":          "Tools & Kits",
+    "misc":              "Miscellaneous",
+    "creature_item":     "Creature Items",
+}
+
+# TOC group headings. Sentinels "WEAPONS" and "CREATURE_WEAPONS" expand to
+# dynamically-discovered weapon_* keys at render time.
+_TOC_GROUPS: list[tuple[str, list[str]]] = [
+    ("Weapons",  ["WEAPONS", "ammo"]),
+    ("Armor",    ["armor_heavy", "armor_medium", "armor_light", "armor_cloth", "shield_small", "shield_large", "shield_tower"]),
+    ("Gear",     ["amulet", "belt", "boots", "bracers_gauntlets", "ring", "cloak", "helmet"]),
+    ("Misc.",    ["wand", "potion", "scroll", "grenade", "book", "magic_rod", "magic_staff", "gem", "dye", "poison", "tool_kit", "misc"]),
+]
+# Special heading covers creature weapons, creature items, inaccessible, and broken.
+
+
+def _item_category(item: dict, name: str = "") -> str:
+    """Return the items-index category key for an item dict."""
+    _raw = fld(item, "BaseItem", None)
+    bi = -1 if _raw is None else int(_raw)
+    if bi in _ARMOR_BASEITEMS:
+        ac = _torso_base_ac(item)
+        if ac <= 0:
+            return "armor_cloth"
+        if ac <= 3:
+            return "armor_light"
+        if ac <= 5:
+            return "armor_medium"
+        return "armor_heavy"
+    if bi == 14:
+        return "shield_small"
+    if bi == 56:
+        return "shield_large"
+    if bi == 57:
+        return "shield_tower"
+    if bi in _HELMET_BASEITEMS:
+        return "helmet"
+    if bi in _ACCESSORY_BASEITEM_MAP:
+        return _ACCESSORY_BASEITEM_MAP[bi]
+    if bi in _WAND_BASEITEMS:    return "wand"
+    if bi in _POTION_BASEITEMS:  return "potion"
+    if bi in _SCROLL_BASEITEMS:  return "scroll"
+    if bi in _GRENADE_BASEITEMS: return "grenade"
+    if bi in _AMMO_BASEITEMS:
+        return "ammo"
+    stats = WEAPONS.get(bi)
+    if stats and stats.get("WeaponType", "0") not in ("0", "", None):
+        return f"weapon_{bi}"
+    if bi in _CEP_WEAPON_BASEITEMS:
+        return f"weapon_{bi}"
+    if bi in _CREATURE_ITEM_BASEITEMS:
+        return "creature_item"
+    mapped = _MISC_TYPE_MAP.get(bi)
+    if mapped:
+        return mapped
+    if bi in _MISC_LIKE_BASEITEMS or bi == -1:
+        nl = name.lower()
+        if "gem" in nl or " agate" in nl: return "gem"
+        if "dye" in nl:                   return "dye"
+        if "poison" in nl or "venom" in nl: return "poison"
+    return "misc"
+
+
+def _item_category_label(key: str) -> str:
+    if key in _CATEGORY_LABELS:
+        return _CATEGORY_LABELS[key]
+    if key.startswith("weapon_"):
+        try:
+            bi = int(key[7:])
+            return baseitem_name(bi) or "Weapon"
+        except ValueError:
+            pass
+    return "Miscellaneous"
+
+
+def is_ranged_weapon(base_row: int | None) -> bool:
+    if base_row is None:
+        return False
+    stats = WEAPONS.get(int(base_row))
+    if not stats:
+        return False
+    rw = stats.get("RangedWeapon")
+    return bool(rw and rw not in ("0", ""))
+
+
+def weapon_damage_string(base_row: int | None,
+                         str_mod: int = 0,
+                         is_ranged: bool = False,
+                         iprop_dmg_bonus: int = 0,
+                         iprop_extra: list[str] | None = None) -> str:
+    """Human-readable base damage. Doesn't model two-handed (1.5x Str) or
+    weapon-finesse — those are runtime decisions."""
+    stats = WEAPONS.get(int(base_row)) if base_row is not None else None
+    if not stats:
+        return "—"
+    try:
+        n = int(stats.get("NumDice", "0") or 0)
+        d = int(stats.get("DieToRoll", "0") or 0)
+    except ValueError:
+        n, d = 0, 0
+    if n <= 0 or d <= 0:
+        return "—"
+    bits = [f"{n}d{d}"]
+    flat = (0 if is_ranged else str_mod) + iprop_dmg_bonus
+    if flat > 0:
+        bits.append(f"+{flat}")
+    elif flat < 0:
+        bits.append(str(flat))
+    base = "".join(bits)
+    lo = n + max(flat, -n * d + n)  # min damage clamps at "all ones + flat"
+    hi = n * d + flat
+    rng = f"({lo}–{hi})" if hi > lo else f"({hi})"
+    extras = ", ".join(iprop_extra or [])
+    out = f"{base} {rng}"
+    if extras:
+        out += f" + {extras}"
+    return out
+
+
+def weapon_crit_string(base_row: int | None) -> str:
+    stats = WEAPONS.get(int(base_row)) if base_row is not None else None
+    if not stats:
+        return ""
+    threat = stats.get("CritThreat", "")
+    mult = stats.get("CritHitMult", "")
+    if not threat or not mult:
+        return ""
+    try:
+        t = int(threat)
+        m = int(mult)
+    except ValueError:
+        return ""
+    if t <= 1:
+        return f"20/x{m}"
+    return f"{20 - t + 1}-20/x{m}"
+
+
+def item_ac_bonus(item: dict | None) -> tuple[int, list[str]]:
+    """Sum AC-related item properties on a single item. Returns
+    (numeric_bonus, descriptors) — descriptors lists deflection / dodge /
+    natural / etc. so the reader can see the breakdown."""
+    if not item:
+        return 0, []
+    total = 0
+    notes: list[str] = []
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pdef = IPROP_DEFS.get(int(pname_id), {})
+        pname = (pdef.get("name") or "").lower()
+        cost = fld(p, "CostValue", 0) or 0
+        try:
+            cost_int = int(cost)
+        except (TypeError, ValueError):
+            cost_int = 0
+        if "ac bonus" in pname or pname == "ac":
+            total += cost_int
+            notes.append(f"+{cost_int} {pdef.get('name','AC')}")
+    return total, notes
+
+
+def item_attack_bonus(item: dict | None) -> int:
+    """To-hit bonus from a weapon's Enhancement Bonus (#6) and Attack Bonus (#56).
+
+    These do NOT stack on the attack roll: NWN's enhancement bonus is internally
+    attack+damage bundled, and a separate Attack Bonus property uses the *higher*
+    of the two for to-hit, not the sum (see enhancement-attack-bonus-conflict-
+    report.txt). Same-type props don't stack either, so take the max within each
+    type, then the max across the two. Conditional attack bonuses vs.
+    alignment/racial group (#57/#58) are situational and excluded here."""
+    if not item:
+        return 0
+    enh = atk = 0
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        try:
+            cv = int(fld(p, "CostValue", 0) or 0)
+        except (TypeError, ValueError):
+            cv = 0
+        pid = int(pname_id)
+        if pid == 6:      # Enhancement Bonus
+            enh = max(enh, cv)
+        elif pid == 56:   # Attack Bonus (unconditional)
+            atk = max(atk, cv)
+    return max(enh, atk)
+
+
+def item_damage_bonus(item: dict | None) -> tuple[int, list[str]]:
+    """Sum flat 'Damage Bonus' iprops; collect non-numeric extras (elemental,
+    massive crit, etc.) as descriptive strings."""
+    if not item:
+        return 0, []
+    flat = 0
+    extras: list[str] = []
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pdef = IPROP_DEFS.get(int(pname_id), {})
+        pname = (pdef.get("name") or "").lower()
+        if "damage bonus" in pname:
+            try:
+                cost = int(fld(p, "CostValue", 0) or 0)
+            except (TypeError, ValueError):
+                cost = 0
+            line = itemprop_oneliner(p)
+            # Damage Bonus w/ a "physical" or generic subtype usually flat;
+            # elemental subtypes display as bonus-line extras.
+            sub_id = fld(p, "Subtype")
+            if sub_id in (None, 0, 7):  # 7 = Physical (most flat)
+                flat += cost
+            else:
+                extras.append(line)
+        elif "massive criticals" in pname or "on hit" in pname or "vampiric" in pname:
+            extras.append(itemprop_oneliner(p))
+    return flat, extras
+
+
+def weapon_enhancement(item: dict | None) -> int:
+    """Highest Enhancement Bonus (item-property #6) on the item.
+
+    Unlike item_attack_bonus (which folds in Attack Bonus #56 for to-hit), this
+    is the value that matters for bypassing a creature's Damage Reduction: NWN
+    DR of 'X/+Y' is ignored only by a weapon whose *enhancement* is ≥ Y."""
+    if not item:
+        return 0
+    enh = 0
+    for p in list_items(item.get("PropertiesList")):
+        if fld(p, "PropertyName") != 6:
+            continue
+        try:
+            cv = int(fld(p, "CostValue", 0) or 0)
+        except (TypeError, ValueError):
+            cv = 0
+        enh = max(enh, cv)
+    return enh
+
+
+def _weapon_extra_damage_types(item: dict | None) -> set[str]:
+    """Elemental / divine / etc. damage types a weapon adds via item properties
+    (Damage Bonus #6-style subtypes and On Hit). Physical Damage Bonus adds to
+    existing physical damage and carries no new type, so it is excluded here.
+    Returns canonical _DAMAGE_TYPE_LABELS names."""
+    if not item:
+        return set()
+    _names = set(_DAMAGE_TYPE_LABELS.values())
+    out: set[str] = set()
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pdef = IPROP_DEFS.get(int(pname_id), {})
+        pname = (pdef.get("name") or "").lower()
+        if "damage bonus" not in pname:
+            continue
+        sub_id = fld(p, "Subtype")
+        if sub_id in (None, 0, 7):  # 0/7 = Physical (no new damage type)
+            continue
+        sub = itemprop_format(p)["subtype"]
+        if sub in _names:
+            out.add(sub)
+    return out
+
+
+def _try_int(v: Any, default: int = 0) -> int:
+    """int(v) with a fallback — for 2DA cells and GFF fields that may be blank,
+    '****' or missing."""
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def weapon_damage_props(item: dict | None) -> tuple[float, dict[str, float]]:
+    """Damage a weapon's item properties add, split into (flat_physical, by_type).
+
+    Mirrors _weapon_extra_damage_types' rules — Damage Bonus (#6-style) props
+    with subtype 0/7 are Physical and fold into the flat number, everything else
+    is its own damage type — but returns averaged *amounts* (via avg_roll, so
+    '1d6' is 3.5) instead of just the type names. On Hit properties are excluded:
+    they fire on a chance and often apply an effect rather than damage.
+    """
+    if not item:
+        return 0.0, {}
+    _names = set(_DAMAGE_TYPE_LABELS.values())
+    flat = 0.0
+    by_type: dict[str, float] = {}
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None:
+            continue
+        pdef = IPROP_DEFS.get(int(pname_id), {})
+        if "damage bonus" not in (pdef.get("name") or "").lower():
+            continue
+        pf = itemprop_format(p)
+        amount = avg_roll(pf["cost"])
+        if not amount:
+            continue
+        sub_id = fld(p, "Subtype")
+        if sub_id in (None, 0, 7):          # Physical — no new damage type
+            flat += amount
+            continue
+        sub = pf["subtype"]
+        if sub in _names:
+            by_type[sub] = by_type.get(sub, 0.0) + amount
+        else:
+            flat += amount
+    return flat, by_type
+
+
+def item_gp_value(item: dict | None) -> int:
+    """Gold-piece value the engine reports for an item: the toolset-computed
+    `Cost` plus the builder-set `AddCost`. This is what GetGoldPieceValue()
+    returns; reading `Cost` alone under-values every item a builder priced by
+    hand (288 of this module's blueprints carry a non-zero AddCost)."""
+    if not item:
+        return 0
+    total = 0
+    for key in ("Cost", "AddCost"):
+        try:
+            total += int(fld(item, key, 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def _item_accessible(db: "Db", rr: str) -> bool:
+    """True when players can obtain this item: sold in a store, found in a
+    container, dropped/pickpocketed off a creature, or granted by a script.
+    Mirrors the item_index.json accessibility rule."""
+    return (
+        rr in db.item_sold_at
+        or rr in db.item_in_container
+        or any(e.get("dropable") or e.get("pickpocketable")
+               for e in db.item_carried_by.get(rr, []))
+        or rr in db.item_from_script
+    )
+
+
+def extract_item_offense(db: "Db", item: dict, resref: str) -> dict:
+    """Offensive capability of a single item, as plain data for the
+    counter-gear matcher. Weapons report the damage types they can deal
+    (physical from the base item + elemental from properties), enhancement
+    bonus (for DR bypass) and to-hit bonus; non-weapons report is_weapon=False."""
+    _raw = fld(item, "BaseItem", None)
+    bi = -1 if _raw is None else int(_raw)
+    name = db.item_name(resref)
+    stats = WEAPONS.get(bi)
+    try:
+        _wtype = int(stats.get("WeaponType")) if stats and stats.get("WeaponType") not in (None, "", "*") else 0
+    except (TypeError, ValueError):
+        _wtype = 0
+    is_weapon = bool((stats and _wtype) or bi in _CEP_WEAPON_BASEITEMS)
+    physical = set(_WEAPONTYPE_TO_PHYS.get(_wtype, frozenset())) if is_weapon else set()
+    extra = _weapon_extra_damage_types(item) if is_weapon else set()
+    damage_dtypes = physical | extra
+    _cost = item_gp_value(item)
+    return {
+        "resref": resref,
+        "name": nwn_text(name),
+        "base_item_id": bi,
+        "base_item_name": baseitem_name(bi) if bi >= 0 else "",
+        "category": _item_category(item, nwn_text(name)),
+        "is_weapon": is_weapon,
+        "is_ranged": is_ranged_weapon(bi) if is_weapon else False,
+        "physical_dtypes": sorted(physical),
+        "extra_dtypes": sorted(extra),
+        "damage_dtypes": sorted(damage_dtypes),
+        "enhancement": weapon_enhancement(item),
+        "attack_bonus": item_attack_bonus(item),
+        "cost": _cost,
+        "tag": (fld(item, "Tag", "") or resref).lower(),
+        "accessible": _item_accessible(db, resref),
+    }
+
+
+def extract_item_defense(db: "Db", item: dict, resref: str) -> dict:
+    """Defensive capability of a single item, as plain data for the counter-gear
+    survivability matcher and the combat simulator. Reads the same item-property
+    semantics proven in extract_creature_defenses (ability #0, AC #1, immunity
+    #20, DR #22, resist #23, save #41, regen #51) so the two never drift.
+
+    Slots come from baseitems.2da EquipableSlots (BASEITEM_SLOTS), so every
+    player slot is covered and CEP/custom rows resolve too. Returns the slot
+    bitmask and label, AC granted, per-damage-type resist/immunity, save and
+    ability bonuses, regen, and GP value. `relevant=False` marks items that fill
+    no player slot or grant nothing defensive."""
+    _raw = fld(item, "BaseItem", None)
+    bi = -1 if _raw is None else int(_raw)
+    slots = baseitem_slots(bi) & PLAYER_SLOT_MASK
+    slot = slot_label(slots) if slots else ""
+
+    # AC: deflection/dodge/natural item props, plus armor/shield base AC.
+    ac_bonus, _ = item_ac_bonus(item)
+    if bi == 16:
+        ac_bonus += _torso_base_ac(item)
+    elif bi in SHIELD_BASEITEMS:
+        s_stats = WEAPONS.get(bi)
+        if s_stats:
+            try:
+                ac_bonus += int(s_stats.get("BaseAC", "0") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    resist: dict[str, int] = {}
+    immune: dict[str, int] = {}
+    saves: dict[str, int] = {}
+    abilities: dict[str, int] = {}
+    dr_soak = dr_bypass = 0
+    regen = 0
+    crit_immune = False
+    for p in list_items(item.get("PropertiesList")):
+        pid_raw = fld(p, "PropertyName")
+        if pid_raw is None:
+            continue
+        pid = int(pid_raw)
+        pf = itemprop_format(p)
+        cv = _prop_value_num(pf["cost"]) if pf["cost"] else 0
+        sub = pf["subtype"] or ""
+        if pid == 37 and sub == CRIT_IMMUNITY_LABEL:   # Immunity: Miscellaneous
+            crit_immune = True
+        elif pid == 0 and sub:                     # Ability Bonus
+            key = _ABIL_NAME_KEY.get(sub)
+            if key and cv > abilities.get(key, 0):
+                abilities[key] = cv
+        elif pid == 22:                            # Damage Reduction (soak/+N)
+            if cv > dr_soak:
+                dr_soak = cv
+                dr_bypass = _prop_value_num(pf["param"]) if pf.get("param") else 0
+        elif pid == 23 and sub:                    # Damage Resistance
+            if cv > resist.get(sub, 0):
+                resist[sub] = cv
+        elif pid == 20 and sub:                    # Damage Immunity (%)
+            pct = _prop_value_num(pf["cost"]) if pf["cost"] else cv
+            if pct > immune.get(sub, 0):
+                immune[sub] = pct
+        elif pid == 41:                            # Saving Throw bonus
+            kind = sub or "Universal"
+            if cv > saves.get(kind, 0):
+                saves[kind] = cv
+        elif pid == 51:                            # Regeneration
+            regen += cv
+
+    cost = item_gp_value(item)
+
+    relevant = bool(slots and (ac_bonus or resist or immune or saves
+                               or abilities or regen or dr_soak or crit_immune))
+    return {
+        "resref": resref,
+        "name": nwn_text(db.item_name(resref)),
+        "base_item_id": bi,
+        "slots": slots,
+        "slot": slot,
+        "relevant": relevant,
+        "ac_bonus": ac_bonus,
+        "resist": resist,
+        "immune": immune,
+        "saves": saves,
+        "abilities": abilities,
+        "dr_soak": dr_soak,
+        "dr_bypass": dr_bypass,
+        "regen": regen,
+        "crit_immune": crit_immune,
+        "cost": cost,
+        "accessible": _item_accessible(db, resref),
+    }
+
+
+# ---------------------------------------------------------------------------
+# NWScript function-body extractor (brace counting)
+# ---------------------------------------------------------------------------
+
+def _extract_func_body(text: str, from_pos: int, max_len: int = 8000) -> str:
+    """Return the text of the first balanced-brace block at or after from_pos.
+    Returns "" when no opening brace is found within max_len chars."""
+    i = text.find('{', from_pos, from_pos + max_len)
+    if i < 0:
+        return ""
+    depth = 0
+    end = min(len(text), i + max_len)
+    for j in range(i, end):
+        if text[j] == '{':
+            depth += 1
+        elif text[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return text[i:end]
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+class Db:
+    def __init__(self, src: Path):
+        self.src = src
+        self.areas: dict[str, dict] = {}
+        self.gits: dict[str, dict] = {}
+        self.gics: dict[str, dict] = {}
+        self.creatures: dict[str, dict] = {}
+        self.items: dict[str, dict] = {}
+        self.doors: dict[str, dict] = {}
+        self.triggers: dict[str, dict] = {}
+        self.encounters: dict[str, dict] = {}
+        self.placeables: dict[str, dict] = {}
+        self.stores: dict[str, dict] = {}
+        self.waypoints: dict[str, dict] = {}
+        self.dialogs: dict[str, dict] = {}
+        self.ifo: dict | None = None
+        self.jrl: dict | None = None
+        self.fac: dict | None = None
+
+        # Derived
+        self.waypoint_area: dict[str, str] = {}
+        # Transitions: list of {src_area, dst_area, dst_tag, kind, label, src_resref,
+        #   is_dup_tag?, dst_area_alts?}
+        self.transitions: list[dict] = []
+        # tag → list of {"kind", "area", "tag_label"} for every object carrying that
+        # tag. Only populated for tags that are referenced by a transition AND appear
+        # on more than one object (i.e. the destination is ambiguous).
+        self.dup_dest_tags: dict[str, list[dict]] = {}
+        # Direct-teleport transitions from placeable OnUsed scripts (not dialog-based).
+        self.script_transitions: list[dict] = []
+        self.area_npcs: dict[str, list[dict]] = defaultdict(list)
+        self.area_encounters: dict[str, list[dict]] = defaultdict(list)
+        self.area_placeables: dict[str, list[dict]] = defaultdict(list)
+        self.area_stores: dict[str, list[dict]] = defaultdict(list)
+        self.area_triggers: dict[str, list[dict]] = defaultdict(list)
+        self.area_doors: dict[str, list[dict]] = defaultdict(list)
+        self.area_waypoints: dict[str, list[dict]] = defaultdict(list)
+        # Containers = placeables with a non-empty ItemList. Stored as a
+        # parallel list keyed by area resref + ordinal for stable URLs.
+        self.area_containers: dict[str, list[dict]] = defaultdict(list)
+        # Creature instances: actual placements of creatures inside areas, as
+        # opposed to the blueprint definitions in `creatures`. Each instance
+        # is {"area": area_resref, "idx": ord_in_area, "c": git_creature}.
+        # Keyed by area + ordinal for stable URLs.
+        self.creature_instances: list[dict] = []
+        self.area_creature_instances: dict[str, list[dict]] = defaultdict(list)
+        # Creature blueprint resref → list of {"area": area_rr, "encounter_resref": rr}
+        # entries, one per (encounter placement, creature in its spawn pool).
+        # Lets the creature page surface "spawned from encounter X in area Y"
+        # alongside direct GIT placements.
+        self.creature_encounter_spawns: dict[str, list[dict]] = defaultdict(list)
+        self.faction_friendly: dict[int, bool] = {}  # FactionID → friendly to PC?
+
+        # nss script index (resref → relative path) — used for "this script
+        # exists" checks; not deep parsed.
+        self.scripts: set[str] = set()
+        self.script_paths: dict[str, Path] = {}
+
+        # ---- Dialog / script cross-references (index_scripts_and_dialogs) ----
+        # script resref → set of dialog resrefs the script calls
+        # ActionStartConversation against with a literal first arg.
+        self.script_dialogs: dict[str, set[str]] = defaultdict(set)
+        # script resref → set of z-dialog handler names the script dispatches
+        # via the HoMERs `StartDlg(pc, target, "handler", ...)` helper from
+        # zdlg_include_i.nss. Z-dialogs are an entirely script-driven dialog
+        # system: only `zdlg_converse.dlg` exists as a real GFF dialog, while
+        # the actual conversation logic lives in NWScript handler files. We
+        # synthesize a pseudo-dialog per handler so the wiki can surface them
+        # alongside conventional .dlg conversations.
+        self.script_zdialogs: dict[str, set[str]] = defaultdict(set)
+        # z-dialog handler resref → set of dispatcher script resrefs that
+        # called StartDlg with that handler. Surfaced on the synthesized
+        # conversation page so the reader can trace where the dialog opens.
+        self.zdlg_handler_dispatchers: dict[str, set[str]] = defaultdict(set)
+        # script resref → set of waypoint/object tags the script jumps to.
+        self.script_teleport_tags: dict[str, set[str]] = defaultdict(set)
+        # tag (waypoint, door, trigger, placeable, creature) → area resref.
+        self.tag_to_area: dict[str, str] = {}
+        # Tags added via WP_-prefix stripping fallback (see _build_tag_to_area).
+        # Transitions resolved through these tags may not work in-game if the
+        # script uses the short form but the actual waypoint tag has the WP_ prefix.
+        self.fallback_tags: set[str] = set()
+        # dlg resref → list of caller descriptors:
+        #   {"kind": "creature"|"placeable"|"door", "resref": ..., "areas": [...]}
+        #   {"kind": "module-event", "event": "OnPlayerRest", "script": "..."}
+        #   {"kind": "creature-event", "resref": ..., "event": "ScriptDialogue", "script": ...}
+        #   {"kind": "placeable-event", "resref": ..., "event": "OnUsed", "script": ...}
+        #   {"kind": "trigger-event", "resref": ..., "event": "OnEnter", "script": ...}
+        #   {"kind": "area-event", "resref": ..., "event": "OnEnter", "script": ...}
+        #   {"kind": "item-script", "resref": ..., "script": ...}  (tag-based scripting)
+        self.dialog_callers: dict[str, list[dict]] = defaultdict(list)
+        # dlg resref → list of teleport destinations reachable from the dialog:
+        #   {"tag": <waypoint/object tag>, "area": <area resref or None>,
+        #    "via_script": <script resref>, "node_kind": "entry"|"reply",
+        #    "node_index": <int>}
+        self.dialog_teleports: dict[str, list[dict]] = defaultdict(list)
+        # dlg resref → list of {"resref": script, "kind": "active"|"action",
+        #                       "node_kind": "entry"|"reply", "node_index": int}
+        self.dialog_scripts: dict[str, list[dict]] = defaultdict(list)
+        # script resref → set of store tags the script opens via OpenStore().
+        self.script_store_tags: dict[str, set[str]] = defaultdict(set)
+        # scripts that call OpenStore but without a literal tag lookup —
+        # typically Bedlamson's Dynamic Merchant System (bdm_cnv_opn_stor),
+        # which opens whichever store object was stored in a local var at spawn.
+        self.script_bdm_open: set[str] = set()
+        # store instance tag (lowercase) → list of opener descriptors, same
+        # shape as dialog_callers entries plus optional "via_dialog"/"via_script".
+        self.store_tag_openers: dict[str, list[dict]] = defaultdict(list)
+        # Pseudo-map nodes for conversations triggered "globally" (rest menu etc.)
+        # that contain teleports. id → {label, conv_resref, dests: [area resrefs]}
+        self.global_convo_pseudo: dict[str, dict] = {}
+        # Edges (area-or-pseudo-id → area resref) introduced by conversation
+        # teleports, drawn alongside trigger/door transitions on the map.
+        self.conv_transitions: list[dict] = []
+        # Player-option labels (exact, post-strip, color-tokens removed) whose
+        # subtree of teleport scripts should NOT contribute to the area map.
+        # Lets a builder hide admin/DM teleport menus (e.g. "[Admin Options]")
+        # from cluttering map edges while still surfacing them on the
+        # conversation page. Set via --exclude-conv-option on the CLI.
+        self.exclude_option_texts: list[str] = []
+        # Combat-stat dials (module/server-specific), set from the CLI in main().
+        #   max_character_level: server level cap; a creature's total class
+        #     levels are clamped to this when summing base attack bonus (so a
+        #     130-HD boss on a level-40 server gets BAB for ~40 levels, not 130).
+        #     0 disables the cap. See README "Combat-stat configuration".
+        #   max_ability_bonus: cap on the ability-score bonus an item may grant
+        #     (NWN default +12; some modules raise it, e.g. +24).
+        #   max_player_level: the level cap a *player* can actually reach, used
+        #     only to cap the counter-gear report's reference PC. Deliberately
+        #     separate from max_character_level: a server can raise the player
+        #     cap (NWN_MAXLEVEL=60 here, via NWNX MaxLevel) while creature BAB
+        #     still wants clamping at the engine's own 40 — changing the latter
+        #     would move published creature attack figures.
+        self.max_character_level: int = 40
+        self.max_ability_bonus: int = 12
+        self.max_player_level: int = 40
+        # Set from main(): the resolved --2da-dir (part of the counter-gear
+        # staleness fingerprint) and whether --counter-gear asked for a re-run.
+        self.twoda_dir: "Path | None" = None
+        self.run_counter_gear: bool = False
+        # Replacement dice a module grants on an ordinary critical when it has
+        # disabled the engine's save-or-die Devastating Critical (detected from
+        # baseitems.2da, not configured). 0 = stock behaviour.
+        self.devcrit_bonus_dice: int = 0
+        # Areas whose Comments field contains "WIKI_HIDDEN" (case-insensitive).
+        # These areas, their stores, and their creature placements are omitted
+        # from all wiki output (map, index pages, cross-references).
+        self.hidden_areas: set[str] = set()
+        # Item source cross-references (built in index())
+        # item resref → stores that sell it: [{"area_rr", "slug", "name"}]
+        self.item_sold_at: dict[str, list[dict]] = defaultdict(list)
+        # item resref → containers that hold it: [{"area_rr", "idx", "pname", "locked", "dc"}]
+        self.item_in_container: dict[str, list[dict]] = defaultdict(list)
+        # item resref → creatures that carry it: [{"area_rr", "crr", "cname", "dropable"}]
+        # dropable=True means Dropable=1 on that item's equip/inventory entry — it will
+        # appear in the loot bag when the creature dies.
+        self.item_carried_by: dict[str, list[dict]] = defaultdict(list)
+        # script resref → list of item resrefs created via CreateItemOnObject
+        self.script_creates_items: dict[str, list[str]] = defaultdict(list)
+        # scripts that call GenerateTreasure/GenerateHighTreasure/etc. (random loot)
+        self.script_generates_treasure: set[str] = set()
+        # custom token number → set of script resrefs that call SetCustomToken(N, ...)
+        self.token_setters: dict[int, set[str]] = defaultdict(set)
+        # quest plot tag (lowercased) → {entry id → set of script resrefs that
+        # award that entry via AddJournalQuestEntry("tag", id, ...)}. Surfaced on
+        # the per-quest pages so the reader can trace where each step is granted.
+        self.quest_grants: dict[str, dict[int, set[str]]] = defaultdict(
+            lambda: defaultdict(set))
+        # quest plot tag (lowercased) → {entry id → set of dialog resrefs} for quests
+        # granted via a dialog node's built-in Quest/QuestEntry fields (no script needed).
+        self.quest_dialog_grants: dict[str, dict[int, set[str]]] = defaultdict(
+            lambda: defaultdict(set))
+        # dialog resref → {quest_tag_lower → set of entry_ids granted in that dialog}
+        # (reverse of quest_grants + quest_dialog_grants; built by _build_dialog_quest_index)
+        self.dialog_quest_grants_rev: dict[str, dict[str, set[int]]] = defaultdict(
+            lambda: defaultdict(set))
+        # quest_tag_lower → (display_name, slug) for link generation
+        self.quest_tag_to_info: dict[str, tuple[str, str]] = {}
+        # item resref → list of script-source dicts for the item page
+        # {"kind", "script", "label", "areas", "dlg", "crr", "prr"}
+        self.item_from_script: dict[str, list[dict]] = defaultdict(list)
+        # item resref → [{"area_rr", "kind" (container|door), "name", "idx" (containers only),
+        #                  "required" (bool), "dst_area" (doors only, may be None)}]
+        self.item_is_key_for: dict[str, list[dict]] = defaultdict(list)
+        # script resref → set of item tags checked via GetItemPossessedBy
+        self.script_checks_item_tags: dict[str, set[str]] = defaultdict(set)
+        # script resref → set of item tags that a damage-affecting script (OnDamaged)
+        # requires the damager to wield/hold (e.g. dunharrowking.nss heals back all
+        # damage unless the attacker's weapon Tag == "narsil"). Surfaced on creature
+        # pages as a "can only be damaged by" requirement.
+        self.script_damage_req_tags: dict[str, set[str]] = defaultdict(set)
+        # script resrefs that mitigate the creature's own incoming damage (self-heal,
+        # HP restore, or self-applied damage immunity). Used together with
+        # script_damage_req_tags to decide whether to warn on the creature page.
+        self.script_mitigates_damage: set[str] = set()
+        # script resref → retaliation analysis dict (see _analyze_retaliation) for
+        # OnDamaged scripts that strike back at the attacker / nearby creatures.
+        self.script_retaliation: dict[str, dict] = {}
+        # item resref → list of {kind, script, event, area(s), …} for script-based key checks
+        self.item_script_checks: dict[str, list[dict]] = defaultdict(list)
+        # dialog resref → sorted list of item resrefs whose tags are checked in that dialog
+        self.dialog_item_checks: dict[str, list[str]] = defaultdict(list)
+        # (area_rr, container_idx) pairs for containers with random-treasure OnOpen
+        self.random_treasure_containers: set[tuple[str, int]] = set()
+        # Property-variant tracking: inline items with the same TemplateResRef but
+        # different PropertiesList get synthetic resrefs (base__v2, base__v3 …).
+        # item_variants_of: base_rr → [variant_rr, ...]
+        # item_is_variant_of: variant_rr → base_rr
+        # _item_prop_registry: base_rr → {prop_key → assigned_rr} (internal)
+        self.item_variants_of: dict[str, list[str]] = defaultdict(list)
+        self.item_is_variant_of: dict[str, str] = {}
+        self._item_prop_registry: dict[str, dict[tuple, str]] = {}
+
+        # Canonical creature tracking (built in index() after encounter_spawns).
+        # canonical_rr → {"c": gff_struct, "bp_rr": source_blueprint_rr}
+        # For a blueprint-only canonical, "c" == db.creatures[bp_rr].
+        # For a variant, "c" is the instance GFF struct that first introduced
+        # the differing key, and "bp_rr" is the source blueprint resref.
+        self.canonical_creatures: dict[str, dict] = {}
+        # blueprint_rr → canonical_rr  (equals rr for non-variants)
+        self.canonical_for_bp: dict[str, str] = {}
+        # (area_rr, idx) → canonical_rr
+        self.canonical_for_inst: dict[tuple, str] = {}
+        # canonical_rr → source blueprint_rr (rr → rr for non-variants)
+        self.canonical_bp_of: dict[str, str] = {}
+        # internal: blueprint_rr → {creature_key_tuple → canonical_rr}
+        self._creature_key_registry: dict[str, dict[tuple, str]] = {}
+        # canonical_rr → [{"area", "kind": "placed"|"encounter"|"script", "enc_rr", "count"}]
+        self.canonical_locations: dict[str, list[dict]] = defaultdict(list)
+        # canonical_rr → set of FactionIDs seen across its placed GIT instances
+        self.canonical_inst_factions: dict[str, set[int]] = defaultdict(set)
+        # Script-spawned creatures (built in index_dialogs() after _build_tag_to_area()).
+        # area_rr → [{"bp_rr": str, "can_rr": str, "script": str}]
+        self.area_script_spawns: dict[str, list[dict]] = defaultdict(list)
+
+        # Tag-conflict tracking for stores, areas, and conversations.
+        # store_tag_groups: tag_lower → [resref, ...]  (populated during load())
+        self.store_tag_groups: dict[str, list[str]] = defaultdict(list)
+        # area_tag_groups: tag_lower → [resref, ...]  (populated during load())
+        self.area_tag_groups: dict[str, list[str]] = defaultdict(list)
+        # item_tag_groups: tag_lower → [resref, ...]  (populated during load()).
+        # Used to resolve an item Tag (e.g. a damage-gate requirement parsed from a
+        # script) back to the item blueprint(s) so the wiki can link to its page.
+        self.item_tag_groups: dict[str, list[str]] = defaultdict(list)
+        # _dialog_key_registry: conversation_key → [resref, ...]  (populated during load())
+        self._dialog_key_registry: dict[tuple, list[str]] = defaultdict(list)
+        # script resref → [{"creature_resref": str, "waypoint_tag": str}] raw pairs
+        # extracted during _parse_scripts(); resolved to areas after _build_tag_to_area().
+        self.script_creature_waypoint_spawns: dict[str, list[dict]] = defaultdict(list)
+
+    # ---- Loading ----
+
+    def load(self) -> None:
+        t0 = time.time()
+        files = sorted(self.src.iterdir())
+        n_loaded = 0
+        for path in files:
+            if path.is_dir():
+                continue
+            name = path.name
+            if name.endswith(".nss"):
+                resref = name[:-4]
+                self.scripts.add(resref)
+                self.script_paths[resref] = path
+                continue
+            if not name.endswith(".json"):
+                continue
+            # Examples: bree.are.json, 001.uti.json, module.ifo.json
+            stem = name[:-5]  # strip ".json"
+            # parts[-1] is the gff type tag (lowercase)
+            parts = stem.split(".")
+            if len(parts) < 2:
+                continue
+            kind = parts[-1].lower()
+            resref = ".".join(parts[:-1])
+            try:
+                obj = json.loads(path.read_text())
+            except Exception as e:
+                print(f"  warn: failed to parse {name}: {e}", file=sys.stderr)
+                continue
+            n_loaded += 1
+            if kind == "are":
+                self.areas[resref] = obj
+                _area_tag = (fld(obj, "Tag") or resref).strip().lower()
+                self.area_tag_groups[_area_tag].append(resref)
+            elif kind == "git":
+                self.gits[resref] = obj
+            elif kind == "gic":
+                self.gics[resref] = obj
+            elif kind == "utc":
+                self.creatures[resref] = obj
+            elif kind == "uti":
+                self.items[resref] = obj
+                _item_tag = (fld(obj, "Tag") or resref).strip().lower()
+                if _item_tag:
+                    self.item_tag_groups[_item_tag].append(resref)
+            elif kind == "utd":
+                self.doors[resref] = obj
+            elif kind == "utt":
+                self.triggers[resref] = obj
+            elif kind == "ute":
+                self.encounters[resref] = obj
+            elif kind == "utp":
+                self.placeables[resref] = obj
+            elif kind == "utm":
+                self.stores[resref] = obj
+                _store_tag = (fld(obj, "Tag") or resref).strip().lower()
+                self.store_tag_groups[_store_tag].append(resref)
+            elif kind == "utw":
+                self.waypoints[resref] = obj
+            elif kind == "dlg":
+                self.dialogs[resref] = obj
+                _dlg_key = _conversation_key(obj)
+                self._dialog_key_registry[_dlg_key].append(resref)
+            elif kind == "ifo" and resref == "module":
+                self.ifo = obj
+            elif kind == "jrl" and resref == "module":
+                self.jrl = obj
+            elif kind == "fac" and resref == "repute":
+                self.fac = obj
+            # everything else (palettes, etc.) ignored
+        print(f"  loaded {n_loaded} json files + {len(self.scripts)} scripts in {time.time()-t0:.1f}s")
+
+    # ---- Item variant registry ----
+
+    def _intern_item(self, base_rr: str, it: dict) -> str:
+        """Register an inline item and return the resref to use for cross-references.
+
+        Inline items with no PropertiesList defer to the blueprint — they map to
+        base_rr unchanged.  Items with PropertiesList are compared to what is already
+        stored for base_rr; if the properties differ, a synthetic variant resref
+        (base_rr__v2, __v3 …) is created so each unique property set gets its own
+        wiki page and accurate "where to find" listings.
+        """
+        inline_props = list_items(it.get("PropertiesList"))
+
+        if not inline_props:
+            # Thin reference — ensure the base is registered, return it as-is.
+            if base_rr not in self.items:
+                self.items[base_rr] = it
+            return base_rr
+
+        prop_key = _item_prop_key(inline_props)
+        registry = self._item_prop_registry.setdefault(base_rr, {})
+
+        if prop_key in registry:
+            return registry[prop_key]
+
+        if base_rr not in self.items:
+            # First rich instance for this resref — store as the base.
+            self.items[base_rr] = it
+            registry[prop_key] = base_rr
+            return base_rr
+
+        stored_key = _item_prop_key(list_items(self.items[base_rr].get("PropertiesList")))
+
+        if not stored_key:
+            # Stored version is a thin reference (no props) — promote this rich
+            # version to the base so thin refs don't spawn spurious variants.
+            self.items[base_rr] = it
+            registry[prop_key] = base_rr
+            return base_rr
+
+        if stored_key == prop_key:
+            registry[prop_key] = base_rr
+            return base_rr
+
+        # Properties differ — create a numbered variant resref.
+        n = len(self.item_variants_of[base_rr]) + 2
+        variant_rr = f"{base_rr}__v{n}"
+        self.items[variant_rr] = it
+        self.item_variants_of[base_rr].append(variant_rr)
+        self.item_is_variant_of[variant_rr] = base_rr
+        registry[prop_key] = variant_rr
+        return variant_rr
+
+    def _intern_creature(self, bp_rr: str, c: dict, *, bp: dict | None = None) -> str:
+        """Register a creature (blueprint or GIT instance) and return its
+        canonical_rr.
+
+        If the creature's _creature_key() matches what is already stored for
+        bp_rr, the canonical_rr equals bp_rr (or the previously-assigned rr).
+        If the key differs from the blueprint's key, a variant canonical is
+        created: bp_rr__v2, bp_rr__v3, etc.
+
+        Conversation content is also included in the key: a creature instance
+        whose assigned dialog tree differs from the blueprint's becomes its own
+        canonical variant, exactly like a stat-differing instance.
+        """
+        conv_resref = (fld(c, "Conversation", "") or "").strip().lower()
+        if not conv_resref and bp is not None:
+            conv_resref = (fld(bp, "Conversation", "") or "").strip().lower()
+        conv_key = _conversation_key(self.dialogs[conv_resref]) if conv_resref in self.dialogs else ()
+        # Display name is part of identity: a blueprint placed under different
+        # FirstName overrides (e.g. cultmember002 as both "Numarok The Black Hand"
+        # and "Numanan Numerocks Second Hand") should get one wiki page per name
+        # rather than collapsing to a single combat-identical canonical.
+        first = loc(c.get("FirstName")) or (loc(bp.get("FirstName")) if bp else None)
+        last = loc(c.get("LastName")) or (loc(bp.get("LastName")) if bp else None)
+        name_key = ((first or "") + " " + (last or "")).strip().lower()
+        key = (_creature_key(c, bp), conv_key, name_key)
+        registry = self._creature_key_registry.setdefault(bp_rr, {})
+
+        if key in registry:
+            return registry[key]
+
+        if bp_rr not in self.canonical_creatures:
+            # First registration for this blueprint — it is its own canonical.
+            self.canonical_creatures[bp_rr] = {"c": c, "bp_rr": bp_rr}
+            self.canonical_bp_of[bp_rr] = bp_rr
+            registry[key] = bp_rr
+            return bp_rr
+
+        # Blueprint already registered; check whether this key matches it.
+        existing_key = next(iter(registry))
+        if existing_key == key:
+            registry[key] = bp_rr
+            return bp_rr
+
+        # Different key — create a numbered variant.
+        n = sum(1 for v, src in self.canonical_bp_of.items()
+                if src == bp_rr and v != bp_rr) + 2
+        variant_rr = f"{bp_rr}__v{n}"
+        self.canonical_creatures[variant_rr] = {"c": c, "bp_rr": bp_rr}
+        self.canonical_bp_of[variant_rr] = bp_rr
+        registry[key] = variant_rr
+        return variant_rr
+
+    # ---- Indexing ----
+
+    def index(self) -> None:
+        t0 = time.time()
+        # Faction friendliness: faction is "friendly" if its rep with PC
+        # (faction id 0) is >= 50 in repute.fac.json's RepList. Default
+        # friendly for ids 0/2/3/4 (PC, Commoner, Merchant, Defender by
+        # engine convention). FactionList struct ids correspond to the
+        # FactionID referenced from creatures.
+        self.faction_friendly = {0: True, 2: True, 3: True, 4: True, 1: False}
+        if self.fac:
+            replist = list_items(self.fac.get("RepList"))
+            for rep in replist:
+                f1 = fld(rep, "FactionID1")
+                f2 = fld(rep, "FactionID2")
+                v = fld(rep, "FactionRep", 0) or 0
+                # Reps are pairwise; consult vs faction 0 (PC)
+                if f1 == 0 and isinstance(f2, int):
+                    self.faction_friendly[f2] = (v >= 50)
+                elif f2 == 0 and isinstance(f1, int):
+                    self.faction_friendly[f1] = (v >= 50)
+
+        # Waypoint tag → area resref. Walk every git's WaypointList.
+        for area_resref, git in self.gits.items():
+            for wp in list_items(git.get("WaypointList")):
+                tag = fld(wp, "Tag")
+                if tag and tag not in self.waypoint_area:
+                    self.waypoint_area[tag] = area_resref
+                self.area_waypoints[area_resref].append(wp)
+
+        # Per-area lists for the rest.
+        for area_resref, git in self.gits.items():
+            for idx, c in enumerate(list_items(git.get("Creature List"))):
+                self.area_npcs[area_resref].append(c)
+                inst = {"area": area_resref, "idx": idx, "c": c}
+                self.creature_instances.append(inst)
+                self.area_creature_instances[area_resref].append(inst)
+            for e in list_items(git.get("Encounter List")):
+                self.area_encounters[area_resref].append(e)
+            for p in list_items(git.get("Placeable List")):
+                self.area_placeables[area_resref].append(p)
+            for s in list_items(git.get("StoreList")):
+                self.area_stores[area_resref].append(s)
+            for t in list_items(git.get("TriggerList")):
+                self.area_triggers[area_resref].append(t)
+            for d in list_items(git.get("Door List")):
+                self.area_doors[area_resref].append(d)
+
+        # Door/trigger tag → area indexes. NWN's `LinkedTo` is a tag
+        # reference, not specifically a waypoint tag — door-to-door pairs
+        # (each door's LinkedTo holds the *other door's* tag) are common, and
+        # so are trigger-to-trigger pairs. Resolving against only waypoints
+        # makes those transitions render as "(unresolved waypoint)" and
+        # silently disappear from the overview map.
+        door_tag_area: dict[str, str] = {}
+        trigger_tag_area: dict[str, str] = {}
+        for area_resref, doors in self.area_doors.items():
+            for d in doors:
+                tag = fld(d, "Tag")
+                if tag and tag not in door_tag_area:
+                    door_tag_area[tag] = area_resref
+        for area_resref, triggers in self.area_triggers.items():
+            for t in triggers:
+                tag = fld(t, "Tag")
+                if tag and tag not in trigger_tag_area:
+                    trigger_tag_area[tag] = area_resref
+
+        # Multi-map: tag → ALL objects carrying it (waypoints, doors, triggers).
+        # Used to detect ambiguous LinkedTo targets where the game's "first match"
+        # resolution may send the player to an unexpected area.
+        _tag_all_objects: dict[str, list[dict]] = defaultdict(list)
+        for _ar, _git in self.gits.items():
+            for _wp in list_items(_git.get("WaypointList")):
+                _t = fld(_wp, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "waypoint", "area": _ar, "tag_label": _t})
+        for _ar, _doors in self.area_doors.items():
+            for _d in _doors:
+                _t = fld(_d, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "door", "area": _ar, "tag_label": _t})
+        for _ar, _triggers in self.area_triggers.items():
+            for _tr in _triggers:
+                _t = fld(_tr, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "trigger", "area": _ar, "tag_label": _t})
+
+        def resolve_link(linked: str) -> str | None:
+            return (self.waypoint_area.get(linked)
+                    or door_tag_area.get(linked)
+                    or trigger_tag_area.get(linked))
+
+        # Build transitions from triggers + doors.
+        # Transition X/Y is captured in *area metres* (10 m per tile) so the
+        # map layout can tell which edge each transition exits from.
+        for area_resref, triggers in self.area_triggers.items():
+            for t in triggers:
+                linked = fld(t, "LinkedTo")
+                if not linked:
+                    continue
+                dst = resolve_link(linked)
+                self.transitions.append({
+                    "src_area": area_resref,
+                    "dst_area": dst,
+                    "dst_tag": linked,
+                    "kind": "trigger",
+                    "label": fld(t, "Tag", "") or fld(t, "TemplateResRef", "") or "",
+                    "src_resref": fld(t, "TemplateResRef", ""),
+                    "src_x": fld(t, "XPosition"),
+                    "src_y": fld(t, "YPosition"),
+                })
+        for area_resref, doors in self.area_doors.items():
+            for d in doors:
+                linked = fld(d, "LinkedTo")
+                if not linked:
+                    continue
+                dst = resolve_link(linked)
+                self.transitions.append({
+                    "src_area": area_resref,
+                    "dst_area": dst,
+                    "dst_tag": linked,
+                    "kind": "door",
+                    "label": fld(d, "Tag", "") or fld(d, "TemplateResRef", "") or "",
+                    "src_resref": fld(d, "TemplateResRef", ""),
+                    "src_x": fld(d, "X"),
+                    "src_y": fld(d, "Y"),
+                    "key_tag": (fld(d, "KeyName", "") or "").strip(),
+                    "key_required": bool(int(fld(d, "KeyRequired", 0) or 0)),
+                })
+
+        # Identify transitions whose LinkedTo tag maps to multiple objects.
+        # The game engine resolves to whichever object it finds first, so the
+        # destination is effectively ambiguous and may surprise the builder.
+        _referenced_tags: set[str] = {tr["dst_tag"] for tr in self.transitions if tr.get("dst_tag")}
+        for _tag in _referenced_tags:
+            _all = _tag_all_objects.get(_tag, [])
+            _unique_areas = list(dict.fromkeys(obj["area"] for obj in _all if obj["area"] in self.areas))
+            if len(_unique_areas) > 1:
+                self.dup_dest_tags[_tag] = _all
+        # Annotate each affected transition with is_dup_tag + list of alt destinations.
+        for tr in self.transitions:
+            tag = tr.get("dst_tag")
+            if tag and tag in self.dup_dest_tags:
+                all_areas = list(dict.fromkeys(
+                    obj["area"] for obj in self.dup_dest_tags[tag] if obj["area"] in self.areas
+                ))
+                tr["is_dup_tag"] = True
+                tr["dst_area_alts"] = [a for a in all_areas if a != tr["dst_area"]]
+
+        # Containers: placeables that hold an inventory.
+        for area_resref, placeables in self.area_placeables.items():
+            for idx, p in enumerate(placeables):
+                items = list_items(p.get("ItemList"))
+                if items:
+                    self.area_containers[area_resref].append({"idx": idx, "p": p})
+
+        # Encounter spawn pools: walk every encounter placement, pull its
+        # CreatureList (preferring the placement's, falling back to the
+        # blueprint's), and record which creatures can spawn where. At runtime
+        # NWN spawns from the area-instance (.git) CreatureList — the toolset
+        # copies the blueprint list in on placement but a builder can edit it
+        # afterwards, so the instance is authoritative and the blueprint is only
+        # the fallback for an unedited placement that carries no list of its own.
+        for area_resref, encs in self.area_encounters.items():
+            for e in encs:
+                rr = fld(e, "TemplateResRef", "")
+                blueprint = self.encounters.get(rr, {})
+                spawns = (list_items(e.get("CreatureList"))
+                          or list_items(blueprint.get("CreatureList")))
+                for s in spawns:
+                    crr = fld(s, "ResRef", "") or ""
+                    if crr:
+                        self.creature_encounter_spawns[crr].append(
+                            {"area": area_resref, "encounter_resref": rr,
+                             "cr": fld(s, "CR"), "appearance": fld(s, "Appearance")}
+                        )
+        self.hidden_areas = {
+            rr for rr, a in self.areas.items()
+            if "WIKI_HIDDEN" in (fld(a, "Comments") or "").upper()
+        }
+
+        # ---- Build canonical creature index --------------------------------
+        # Pass 1: register each UTC blueprint as its own canonical.
+        for bp_rr, bp in self.creatures.items():
+            can_rr = self._intern_creature(bp_rr, bp, bp=None)
+            self.canonical_for_bp[bp_rr] = can_rr
+
+        # Pass 2: walk each placed instance; check if it diverges from its
+        # blueprint's canonical key. Instances in WIKI_HIDDEN areas are still
+        # registered (needed for item_carried_by de-dup) but their areas are
+        # excluded from canonical_locations.
+        for area_rr, insts in self.area_creature_instances.items():
+            for inst in insts:
+                c_git = inst["c"]
+                idx = inst["idx"]
+                bp_rr = fld(c_git, "TemplateResRef", "") or ""
+                bp = self.creatures.get(bp_rr)
+                if bp_rr:
+                    can_rr = self._intern_creature(bp_rr, c_git, bp=bp)
+                else:
+                    # Orphan instance — no blueprint on file. Synthesise a
+                    # canonical using area+idx as a unique resref.
+                    synth_rr = f"__orphan_{area_rr}_{idx:03d}"
+                    key = _creature_key(c_git, bp=None)
+                    reg = self._creature_key_registry.setdefault(synth_rr, {})
+                    if key not in reg:
+                        self.canonical_creatures[synth_rr] = {
+                            "c": c_git, "bp_rr": synth_rr
+                        }
+                        self.canonical_bp_of[synth_rr] = synth_rr
+                        reg[key] = synth_rr
+                    can_rr = reg[key]
+                self.canonical_for_inst[(area_rr, idx)] = can_rr
+
+        # Pass 3: canonical_locations from encounter spawn pools.
+        # Aggregate by (can_rr, area_rr, enc_rr) → count.
+        # Skip blueprints not found in the module's files (e.g. stock NWN
+        # resrefs like nw_* that come from the game data, not the module).
+        _enc_agg: dict[tuple, int] = {}
+        for crr, spawns in self.creature_encounter_spawns.items():
+            if crr not in self.canonical_for_bp:
+                # Stock NWN/CEP creature: no module .utc on file and never placed
+                # in a .git. Register it as its own canonical so it shows in the
+                # creatures index and bestiary catalogue (CR/appearance from the
+                # encounter CreatureList entry; name from STOCK_CREATURE_NAMES,
+                # falling back to the resref).
+                cr_val = next((sp["cr"] for sp in spawns
+                               if sp.get("cr") is not None), 0)
+                app_val = next((sp["appearance"] for sp in spawns
+                                if sp.get("appearance") is not None), None)
+                synth_c = {
+                    "FirstName": {"type": "cexolocstring",
+                                  "value": {"0": STOCK_CREATURE_NAMES.get(crr, crr)}},
+                    "ChallengeRating": {"type": "float", "value": float(cr_val or 0)},
+                }
+                if app_val is not None:
+                    synth_c["Appearance_Type"] = {"type": "word", "value": app_val}
+                self.canonical_creatures[crr] = {"c": synth_c, "bp_rr": crr}
+                self.canonical_bp_of[crr] = crr
+                self.canonical_for_bp[crr] = crr
+            can_rr = self.canonical_for_bp[crr]
+            for sp in spawns:
+                area_rr = sp["area"]
+                if area_rr in self.hidden_areas:
+                    continue
+                enc_rr = sp["encounter_resref"]
+                agg_key = (can_rr, area_rr, enc_rr)
+                _enc_agg[agg_key] = _enc_agg.get(agg_key, 0) + 1
+        for (can_rr, area_rr, enc_rr), count in _enc_agg.items():
+            self.canonical_locations[can_rr].append(
+                {"area": area_rr, "kind": "encounter", "enc_rr": enc_rr, "count": count}
+            )
+
+        # Pass 4: canonical_locations from direct placements.
+        _placed_agg: dict[tuple, int] = {}
+        for area_rr, insts in self.area_creature_instances.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for inst in insts:
+                can_rr = self.canonical_for_inst.get((area_rr, inst["idx"]))
+                if can_rr:
+                    agg_key = (can_rr, area_rr)
+                    _placed_agg[agg_key] = _placed_agg.get(agg_key, 0) + 1
+                    raw_fid = fld(inst["c"], "FactionID")
+                    if raw_fid is not None and raw_fid != "":
+                        try:
+                            self.canonical_inst_factions[can_rr].add(int(raw_fid))
+                        except (TypeError, ValueError):
+                            pass
+        for (can_rr, area_rr), count in _placed_agg.items():
+            self.canonical_locations[can_rr].append(
+                {"area": area_rr, "kind": "placed", "enc_rr": None, "count": count}
+            )
+        # ---- End canonical creature index ----------------------------------
+
+        # Build item-source cross-references, absorbing inline items through
+        # _intern_item() so that instances with different PropertiesList get
+        # their own synthetic resref (base__v2, __v3 …) and their own accurate
+        # "where to find" entries rather than being merged under one blueprint.
+
+        # Stand-alone UTM blueprints — absorb items without area cross-refs.
+        for s in self.stores.values():
+            for p in list_items(s.get("StoreList")):
+                for it in list_items(p.get("ItemList")):
+                    base_rr = (fld(it, "TemplateResRef", "")
+                               or fld(it, "InventoryRes", "") or "").strip()
+                    if base_rr:
+                        self._intern_item(base_rr, it)
+
+        # Area store instances — absorb and build item_sold_at.
+        for area_rr, store_list in self.area_stores.items():
+            skip = area_rr in self.hidden_areas
+            for inst in store_list:
+                rr = fld(inst, "ResRef", "") or fld(inst, "TemplateResRef", "")
+                tag = fld(inst, "Tag", "")
+                sname = self.store_name(rr) if rr in self.stores else (tag or rr)
+                slug = _store_instance_slug(area_rr, inst)
+                for p in list_items(inst.get("StoreList")):
+                    for it in list_items(p.get("ItemList")):
+                        base_rr = (fld(it, "TemplateResRef", "")
+                                   or fld(it, "InventoryRes", "")
+                                   or fld(it, "EquippedRes", "") or "").strip()
+                        if base_rr:
+                            actual_rr = self._intern_item(base_rr, it)
+                            if not skip:
+                                self.item_sold_at[actual_rr].append(
+                                    {"area_rr": area_rr, "slug": slug, "name": sname}
+                                )
+
+        # Container placeables — absorb and build item_in_container.
+        for area_rr, containers in self.area_containers.items():
+            skip = area_rr in self.hidden_areas
+            for c in containers:
+                p = c["p"]
+                idx = c["idx"]
+                tag = fld(p, "Tag", "")
+                pname = (loc(p.get("LocName")) or tag
+                         or fld(p, "TemplateResRef", "") or "(unnamed)")
+                locked = bool(int(fld(p, "Locked", 0) or 0))
+                dc = fld(p, "OpenLockDC", 0) or 0
+                for it in list_items(p.get("ItemList")):
+                    base_rr = (fld(it, "TemplateResRef", "")
+                               or fld(it, "InventoryRes", "")
+                               or fld(it, "EquippedRes", "") or "").strip()
+                    if base_rr:
+                        actual_rr = self._intern_item(base_rr, it)
+                        if not skip:
+                            self.item_in_container[actual_rr].append(
+                                {"area_rr": area_rr, "idx": idx,
+                                 "pname": pname, "locked": locked, "dc": dc}
+                            )
+
+        # Creature instances — absorb and build item_carried_by.
+        # crr in item_carried_by entries is now the canonical_rr so item pages
+        # can link directly to the canonical creature page.
+        _seen_carrier: set[tuple[str, str, str]] = set()
+        for area_rr, insts in self.area_creature_instances.items():
+            skip = area_rr in self.hidden_areas
+            for inst in insts:
+                c = inst["c"]
+                bp_rr = fld(c, "TemplateResRef", "") or ""
+                bp = self.creatures.get(bp_rr, {})
+                can_rr = self.canonical_for_inst.get((area_rr, inst["idx"]), bp_rr)
+                cname = self.canonical_creature_name(can_rr) or bp_rr
+                equip_list = (list_items(c.get("Equip_ItemList"))
+                              or list_items(bp.get("Equip_ItemList")))
+                for e in equip_list:
+                    base_rr = (fld(e, "EquippedRes", "")
+                               or fld(e, "TemplateResRef", "") or "").strip()
+                    if base_rr:
+                        actual_rr = self._intern_item(base_rr, e)
+                        dropable = bool(int(fld(e, "Dropable", 0) or 0))
+                        pickpocketable = bool(int(fld(e, "Pickpocketable", 0) or 0))
+                        key = (actual_rr, area_rr, can_rr)
+                        if key not in _seen_carrier and not skip:
+                            _seen_carrier.add(key)
+                            self.item_carried_by[actual_rr].append(
+                                {"area_rr": area_rr, "crr": can_rr,
+                                 "cname": cname, "dropable": dropable,
+                                 "pickpocketable": pickpocketable}
+                            )
+                for it in list_items(c.get("ItemList")):
+                    base_rr = (fld(it, "InventoryRes", "")
+                               or fld(it, "TemplateResRef", "") or "").strip()
+                    if base_rr:
+                        actual_rr = self._intern_item(base_rr, it)
+                        dropable = bool(int(fld(it, "Dropable", 0) or 0))
+                        pickpocketable = bool(int(fld(it, "Pickpocketable", 0) or 0))
+                        key = (actual_rr, area_rr, can_rr)
+                        if key not in _seen_carrier and not skip:
+                            _seen_carrier.add(key)
+                            self.item_carried_by[actual_rr].append(
+                                {"area_rr": area_rr, "crr": can_rr,
+                                 "cname": cname, "dropable": dropable,
+                                 "pickpocketable": pickpocketable}
+                            )
+
+        for crr, spawns in self.creature_encounter_spawns.items():
+            bp = self.creatures.get(crr, {})
+            if not bp:
+                continue
+            can_rr = self.canonical_for_bp.get(crr, crr)
+            cname = self.canonical_creature_name(can_rr)
+            # Resolve each blueprint item to its variant resref once, then reuse
+            # across all spawn areas (the blueprint's items are constant).
+            item_entries: list[tuple[str, bool, bool]] = []  # (actual_rr, dropable, pickpocketable)
+            for e in list_items(bp.get("Equip_ItemList")):
+                base_rr = (fld(e, "EquippedRes", "")
+                           or fld(e, "TemplateResRef", "") or "").strip()
+                if base_rr:
+                    item_entries.append(
+                        (self._intern_item(base_rr, e),
+                         bool(int(fld(e, "Dropable", 0) or 0)),
+                         bool(int(fld(e, "Pickpocketable", 0) or 0)))
+                    )
+            for it in list_items(bp.get("ItemList")):
+                base_rr = (fld(it, "InventoryRes", "")
+                           or fld(it, "TemplateResRef", "") or "").strip()
+                if base_rr:
+                    item_entries.append(
+                        (self._intern_item(base_rr, it),
+                         bool(int(fld(it, "Dropable", 0) or 0)),
+                         bool(int(fld(it, "Pickpocketable", 0) or 0)))
+                    )
+            for spawn in spawns:
+                area_rr = spawn["area"]
+                if area_rr in self.hidden_areas:
+                    continue
+                for actual_rr, dropable, pickpocketable in item_entries:
+                    key = (actual_rr, area_rr, can_rr)
+                    if key not in _seen_carrier:
+                        _seen_carrier.add(key)
+                        self.item_carried_by[actual_rr].append(
+                            {"area_rr": area_rr, "crr": can_rr,
+                             "cname": cname, "dropable": dropable,
+                             "pickpocketable": pickpocketable}
+                        )
+
+        # Back-fill stock BaseItem/Cost/PropertiesList for plain references.
+        # For variant resrefs, use the base resref for stock data lookup; skip
+        # PropertiesList backfill for variants (they already have explicit props).
+        def _backfill_stock_items() -> None:
+            for irr, it in self.items.items():
+                base = self.item_is_variant_of.get(irr, irr)
+                if fld(it, "BaseItem") is None and base in STOCK_ITEM_BASE:
+                    it["BaseItem"] = STOCK_ITEM_BASE[base]
+                if fld(it, "Cost", "") in ("", None) and base in STOCK_ITEM_COST:
+                    it["Cost"] = STOCK_ITEM_COST[base]
+                if (not list_items(it.get("PropertiesList"))
+                        and irr == base and irr in STOCK_ITEM_PROPS):
+                    it["PropertiesList"] = STOCK_ITEM_PROPS[irr]
+        _backfill_stock_items()
+
+        hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
+                      if self.hidden_areas else "")
+        print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
+              f"{len(self.transitions)} transitions, "
+              f"{len(self.creatures)} creatures, {len(self.items)} items{hidden_msg}")
+
+    # ---- Dialog & script cross-referencing ----
+
+    # Module-event field → human label, used when a module-bound event
+    # script is the bridge between a player action (rest, level-up …) and
+    # an ActionStartConversation call.
+    MODULE_EVENT_FIELDS: dict[str, str] = {
+        "Mod_OnAcquirItem": "OnAcquireItem",
+        "Mod_OnActvtItem": "OnActivateItem",
+        "Mod_OnClientEntr": "OnClientEnter",
+        "Mod_OnClientLeav": "OnClientLeave",
+        "Mod_OnCutsnAbort": "OnCutsceneAbort",
+        "Mod_OnHeartbeat": "OnHeartbeat",
+        "Mod_OnModLoad": "OnModuleLoad",
+        "Mod_OnModStart": "OnModuleStart",
+        "Mod_OnPlrDeath": "OnPlayerDeath",
+        "Mod_OnPlrDying": "OnPlayerDying",
+        "Mod_OnPlrEqItm": "OnPlayerEquipItem",
+        "Mod_OnPlrLvlUp": "OnPlayerLevelUp",
+        "Mod_OnPlrRest": "OnPlayerRest",
+        "Mod_OnPlrUnEqItm": "OnPlayerUnequipItem",
+        "Mod_OnSpawnBtnDn": "OnSpawnButtonDown",
+        "Mod_OnUnAqreItem": "OnUnacquireItem",
+        "Mod_OnUsrDefined": "OnUserDefined",
+    }
+
+    # Per-blueprint event slots that we walk for ActionStartConversation
+    # calls. Names mirror the GFF field names on the blueprint.
+    CREATURE_EVENT_FIELDS: dict[str, str] = {
+        "ScriptDialogue": "OnConversation",
+        "ScriptSpawn": "OnSpawn",
+        "ScriptHeartbeat": "OnHeartbeat",
+        "ScriptOnNotice": "OnPerception",
+        "ScriptUserDefine": "OnUserDefined",
+    }
+    PLACEABLE_EVENT_FIELDS: dict[str, str] = {
+        "OnUsed": "OnUsed",
+        "OnDialog": "OnConversation",
+        "OnHeartbeat": "OnHeartbeat",
+        "OnUserDefined": "OnUserDefined",
+        "OnOpen": "OnOpen",
+        "OnClick": "OnClick",
+    }
+    DOOR_EVENT_FIELDS: dict[str, str] = {
+        "OnUsed": "OnUsed",
+        "OnDialog": "OnConversation",
+        "OnOpen": "OnOpen",
+        "OnClick": "OnClick",
+    }
+    TRIGGER_EVENT_FIELDS: dict[str, str] = {
+        "OnEnter": "OnEnter",
+        "OnExit": "OnExit",
+        "OnHeartbeat": "OnHeartbeat",
+        "OnUserDefined": "OnUserDefined",
+        "ScriptOnEnter": "OnEnter",
+        "ScriptOnExit": "OnExit",
+        "ScriptHeartbeat": "OnHeartbeat",
+        "ScriptUserDefine": "OnUserDefined",
+    }
+    AREA_EVENT_FIELDS: dict[str, str] = {
+        "OnEnter": "OnEnter",
+        "OnExit": "OnExit",
+        "OnHeartbeat": "OnHeartbeat",
+        "OnUserDefined": "OnUserDefined",
+    }
+
+    # Regex set used to scrape every .nss file once.
+    # Keep them line-oriented and forgiving on whitespace; the goal is
+    # "good enough to surface the obvious cross-references" not full
+    # NWScript parsing.
+    _RE_START_CONV = re.compile(
+        r"\bActionStartConversation\s*\(\s*[^,)]+,\s*\"([A-Za-z0-9_]+)\""
+    )
+    # HoMERs z-dialog dispatcher: StartDlg(pc, target, "handler", ...).
+    # The third argument names a handler script, not a .dlg file, but it's
+    # the player-visible "conversation" identity, so we treat it the same.
+    _RE_START_DLG = re.compile(
+        r"\bStartDlg\s*\(\s*[^,)]+,\s*[^,)]+,\s*\"([A-Za-z0-9_]+)\""
+    )
+    _RE_GET_TAG = re.compile(
+        r"\b(?:GetWaypointByTag|GetObjectByTag|GetNearestObjectByTag)"
+        r"\s*\(\s*\"([A-Za-z0-9_]+)\"\s*\)"
+    )
+    _RE_JUMP = re.compile(
+        r"\b(?:Action)?(?:JumpToLocation|JumpToObject)\s*\("
+    )
+    _RE_OPEN_STORE = re.compile(
+        r"\b(?:OpenStore|gplotAppraiseOpenStore)\s*\("
+    )
+    _RE_CREATE_ITEM = re.compile(
+        r'\bCreateItemOnObject\s*\(\s*"([A-Za-z0-9_]+)"'
+    )
+    _RE_GENERATE_TREASURE = re.compile(
+        r"\bGenerate(?:High|Medium|Low|Boss|Book)?Treasure\s*\("
+    )
+    _RE_SET_TOKEN = re.compile(r"\bSetCustomToken\s*\(\s*(\d+)\s*,")
+    # AddJournalQuestEntry("plotID", nState, oCreature, ...) — quest progression.
+    # The plot id matches a journal category Tag; nState matches an entry ID.
+    # Tags may contain spaces, so accept anything but a closing quote.
+    _RE_ADD_JOURNAL = re.compile(
+        r'\bAddJournalQuestEntry\s*\(\s*"([^"]*)"\s*,\s*(\d+)'
+    )
+    # Variable-form: AddJournalQuestEntry(CONST_IDENTIFIER, step, ...) where
+    # the first arg is an identifier (not a function call), resolved via
+    # const string declarations found in the script + its includes.
+    _RE_ADD_JOURNAL_VAR = re.compile(
+        r'\bAddJournalQuestEntry\s*\(\s*([A-Za-z_]\w*)\s*,\s*(\d+)'
+    )
+    _RE_CONST_STRING = re.compile(
+        r'\bconst\s+string\s+([A-Za-z_]\w*)\s*=\s*"([^"]*)"'
+    )
+    _RE_INCLUDE = re.compile(r'^\s*#\s*include\s+"([A-Za-z0-9_]+)"', re.MULTILINE)
+    # String-returning function signature: string FNAME(param-list)
+    _RE_STR_FUNC_SIG = re.compile(r'\bstring\s+(\w+)\s*\(([^)]*)\)')
+    # Any function signature (any return type): for finding grant-function bodies
+    _RE_FUNC_ANY_SIG = re.compile(
+        r'\b(?:void|string|int|float|object|vector|location|'
+        r'effect|talent|itemproperty|action|command)\s+(\w+)\s*\(([^)]*)\)'
+    )
+    # if (PARAM == "X") return "Y"; — dispatch table entry
+    _RE_IF_EQ_RETURN_STR = re.compile(
+        r'\bif\s*\(\s*(\w+)\s*==\s*"([^"]*)"\s*\)\s*return\s*"([^"]*)"\s*;'
+    )
+    # return "PREFIX" + INNER_FUNC(PARAM); — prefix-chain composition
+    _RE_RETURN_STR_PREFIX = re.compile(
+        r'\breturn\s+"([^"]*)"\s*\+\s*(\w+)\s*\(\s*(\w+)\s*\)\s*;'
+    )
+    # AddJournalQuestEntry(DISPATCH_FUNC(PARAM), step, ...) inside function bodies
+    _RE_JOURNAL_DISPATCH_CALL = re.compile(
+        r'\bAddJournalQuestEntry\s*\(\s*(\w+)\s*\(\s*(\w+)\s*\)\s*,\s*(\d+)'
+    )
+    _RE_ITEM_POSSESSED_BY = re.compile(
+        r'\bGetItemPossessedBy\s*\((?:[^,()]+|\([^)]*\))+,\s*"([A-Za-z0-9_]+)"'
+    )
+    # Damage-gate by equipped item tag: a script (typically OnDamaged) that compares
+    # the tag of an item in an equip slot against a literal, e.g.
+    #   GetTag(GetItemInSlot(INVENTORY_SLOT_RIGHTHAND, oPC)) != "narsil"
+    # Either operand order is accepted. The captured literal is the required item tag.
+    _RE_DAMAGE_SLOT_TAG = re.compile(
+        r'GetTag\s*\(\s*GetItemInSlot\s*\([^()]*\)\s*\)\s*(?:==|!=)\s*"([A-Za-z0-9_]+)"'
+        r'|"([A-Za-z0-9_]+)"\s*(?:==|!=)\s*GetTag\s*\(\s*GetItemInSlot\s*\([^()]*\)\s*\)'
+    )
+    # Self-mitigation signals: a damage script that restores the creature's own HP
+    # or grants it damage immunity/reduction in response to being hit. These (and a
+    # weapon/equip gate, _RE_DAMAGE_SLOT_TAG) distinguish a damage-altering handler
+    # from a plain retaliation/AI OnDamaged script.
+    _RE_SELF_HEAL = re.compile(r'\bEffectHeal\s*\(')
+    _RE_SET_HP_SELF = re.compile(r'\bSetCurrentHitPoints\s*\(\s*OBJECT_SELF')
+    _RE_SELF_DMG_IMMUNITY = re.compile(
+        r'\bEffectDamage(?:ImmunityIncrease|Reduction|Resistance)\s*\('
+    )
+    _RE_CREATE_CREATURE = re.compile(
+        r'\bCreateObject\s*\(\s*OBJECT_TYPE_CREATURE\s*,\s*"([A-Za-z0-9_]+)"'
+    )
+    _RE_ANY_LITERAL_STR = re.compile(r'"([A-Za-z0-9_]+)"')
+
+    # Stock OnDamaged handlers that do NOT alter how a creature takes damage.
+    # Anything else that ships in the module (i.e. present in script_paths) and is
+    # wired as ScriptDamaged is treated as a custom damage-affecting handler.
+    _STOCK_DAMAGE_SCRIPTS = frozenset({
+        "", "x2_def_ondamage", "nw_c2_default6", "nw_c2_defaultb",
+    })
+
+    def is_custom_damage_script(self, resref: str) -> bool:
+        """True when `resref` is a non-stock OnDamaged handler that ships in this
+        module (so it may change how the creature takes damage)."""
+        if not resref:
+            return False
+        rr = resref.strip()
+        if rr.lower() in self._STOCK_DAMAGE_SCRIPTS:
+            return False
+        return rr in self.script_paths
+
+    def _build_nwstr_dispatch(self, texts: list[str]) -> dict[str, dict[str, str]]:
+        """Build {func_name -> {arg_val -> return_val}} for string functions
+        whose return is fully determined by a single string argument:
+
+        Pass 1 — if-chain dispatch:
+          string F(string P) { if (P=="a") return "X"; if (P=="b") return "Y"; }
+          → dispatch["F"] = {"a": "X", "b": "Y"}
+
+        Pass 2 — prefix-chain composition (iterated until stable):
+          string G(string P) { return "PFX" + F(P); }
+          → dispatch["G"] = {"a": "PFXa", "b": "PFXB"} (using dispatch["F"])
+        """
+        dispatch: dict[str, dict[str, str]] = {}
+
+        # Pass 1: extract if-chain dispatch tables
+        for text in texts:
+            for m in self._RE_STR_FUNC_SIG.finditer(text):
+                fname = m.group(1)
+                str_params = re.findall(r'\bstring\s+(\w+)', m.group(2))
+                if not str_params:
+                    continue
+                param = str_params[0]
+                body = _extract_func_body(text, m.end())
+                if not body:
+                    continue
+                tbl: dict[str, str] = {}
+                for im in self._RE_IF_EQ_RETURN_STR.finditer(body):
+                    if im.group(1) == param:
+                        tbl[im.group(2)] = im.group(3)
+                if tbl:
+                    dispatch.setdefault(fname, {}).update(tbl)
+
+        # Pass 2: compose prefix-chain entries (iterate until stable)
+        changed = True
+        while changed:
+            changed = False
+            for text in texts:
+                for m in self._RE_STR_FUNC_SIG.finditer(text):
+                    fname = m.group(1)
+                    if fname in dispatch:
+                        continue
+                    str_params = re.findall(r'\bstring\s+(\w+)', m.group(2))
+                    if not str_params:
+                        continue
+                    param = str_params[0]
+                    body = _extract_func_body(text, m.end())
+                    if not body:
+                        continue
+                    cm = self._RE_RETURN_STR_PREFIX.search(body)
+                    if cm and cm.group(3) == param and cm.group(2) in dispatch:
+                        prefix = cm.group(1)
+                        inner = cm.group(2)
+                        tbl = {k: prefix + v for k, v in dispatch[inner].items()}
+                        if tbl:
+                            dispatch[fname] = tbl
+                            changed = True
+
+        return dispatch
+
+    def _parse_scripts(self) -> None:
+        """One-shot scan of every .nss file. Populates script_dialogs and
+        script_teleport_tags. Cheap enough (~2300 files in well under 1s on
+        a hot disk) and avoids per-renderer file I/O."""
+        # Pre-read all scripts into cache (avoid re-reading for includes + dispatch build).
+        _include_text_cache: dict[str, str] = {}
+        for _rr, _path in self.script_paths.items():
+            try:
+                _include_text_cache[_rr] = _path.read_text(errors="replace")
+            except Exception:
+                _include_text_cache[_rr] = ""
+
+        def _include_text(inc_rr: str) -> str:
+            if inc_rr not in _include_text_cache:
+                p = self.script_paths.get(inc_rr)
+                try:
+                    _include_text_cache[inc_rr] = p.read_text(errors="replace") if p else ""
+                except Exception:
+                    _include_text_cache[inc_rr] = ""
+            return _include_text_cache[inc_rr]
+
+        # Build string dispatch table from all script texts. Used to resolve
+        # dynamic tag construction like AddJournalQuestEntry(TagFunc(sParam), ...).
+        _nwstr_dispatch = self._build_nwstr_dispatch(
+            list(_include_text_cache.values())
+        )
+
+        for resref, path in self.script_paths.items():
+            text = _include_text_cache.get(resref, "")
+            if not text:
+                continue
+            # ActionStartConversation("dlgresref", ...)
+            for m in self._RE_START_CONV.finditer(text):
+                self.script_dialogs[resref].add(m.group(1).lower())
+            # StartDlg(_, _, "handler", ...) — HoMERs z-dialog dispatcher.
+            for m in self._RE_START_DLG.finditer(text):
+                handler = m.group(1).lower()
+                self.script_zdialogs[resref].add(handler)
+                self.zdlg_handler_dispatchers[handler].add(resref)
+            # Tag-based teleport heuristic: a script that resolves an object
+            # by tag *and* calls JumpTo[Location|Object] is treated as
+            # teleporting to that tag. Imperfect (a script may resolve a
+            # tag for some other reason), but the false-positive rate on
+            # real modules is low and the player-visible value is high.
+            if self._RE_JUMP.search(text):
+                for m in self._RE_GET_TAG.finditer(text):
+                    self.script_teleport_tags[resref].add(m.group(1))
+            # Store-opening heuristic: a script that calls OpenStore (or the
+            # HoMERs appraise variant) and resolves an object by tag is assumed
+            # to be opening the store with that tag.  Scripts that call
+            # OpenStore without any tag lookup (e.g. Bedlamson's Dynamic
+            # Merchant System bdm_cnv_opn_stor, which uses a runtime local
+            # object variable set by proximity) are recorded separately.
+            if self._RE_OPEN_STORE.search(text):
+                tag_matches = list(self._RE_GET_TAG.finditer(text))
+                if tag_matches:
+                    for m in tag_matches:
+                        self.script_store_tags[resref].add(m.group(1))
+                else:
+                    self.script_bdm_open.add(resref)
+            # CreateItemOnObject with a literal resref string.
+            for m in self._RE_CREATE_ITEM.finditer(text):
+                irr = m.group(1).lower()
+                if irr not in self.script_creates_items[resref]:
+                    self.script_creates_items[resref].append(irr)
+            # Random/procedural treasure generation.
+            if self._RE_GENERATE_TREASURE.search(text):
+                self.script_generates_treasure.add(resref)
+            # SetCustomToken(N, ...) — track which scripts set which custom tokens.
+            for m in self._RE_SET_TOKEN.finditer(text):
+                self.token_setters[int(m.group(1))].add(resref)
+            # AddJournalQuestEntry("tag", id, ...) — which script awards which step.
+            for m in self._RE_ADD_JOURNAL.finditer(text):
+                self.quest_grants[m.group(1).strip().lower()][int(m.group(2))].add(resref)
+            # Variable-form: AddJournalQuestEntry(CONST_VAR, id, ...) where
+            # the tag is a const string identifier, possibly from an include.
+            # Merge this script's direct includes so calls inside included
+            # function bodies are attributed to the script that includes them.
+            if "#include" in text or "AddJournalQuestEntry" in text:
+                consts: dict[str, str] = {}
+                for mc in self._RE_CONST_STRING.finditer(text):
+                    consts[mc.group(1)] = mc.group(2)
+                inc_resrefs = [mi.group(1).lower()
+                               for mi in self._RE_INCLUDE.finditer(text)]
+                bodies = text
+                for inc_rr in inc_resrefs:
+                    inc_txt = _include_text(inc_rr)
+                    if inc_txt:
+                        bodies += "\n" + inc_txt
+                        for mc in self._RE_CONST_STRING.finditer(inc_txt):
+                            consts.setdefault(mc.group(1), mc.group(2))
+                if consts and self._RE_ADD_JOURNAL_VAR.search(bodies):
+                    for m in self._RE_ADD_JOURNAL_VAR.finditer(bodies):
+                        var = m.group(1)
+                        if var in consts:
+                            tag_val = consts[var].strip().lower()
+                            self.quest_grants[tag_val][int(m.group(2))].add(resref)
+                # Dynamic tag resolution: find functions in merged text whose body
+                # contains AddJournalQuestEntry(DISPATCH_FUNC(PARAM), step, ...) where
+                # DISPATCH_FUNC is in _nwstr_dispatch, then find call sites to those
+                # functions in the main (non-include) text with a literal string arg.
+                if _nwstr_dispatch and inc_resrefs:
+                    for sig_m in self._RE_FUNC_ANY_SIG.finditer(bodies):
+                        outer_fname = sig_m.group(1)
+                        str_params = re.findall(r'\bstring\s+(\w+)', sig_m.group(2))
+                        if not str_params:
+                            continue
+                        body = _extract_func_body(bodies, sig_m.end())
+                        if not body:
+                            continue
+                        jm = self._RE_JOURNAL_DISPATCH_CALL.search(body)
+                        if not jm:
+                            continue
+                        dispatch_func = jm.group(1)
+                        inner_param = jm.group(2)
+                        step = int(jm.group(3))
+                        if dispatch_func not in _nwstr_dispatch:
+                            continue
+                        if inner_param not in str_params:
+                            continue
+                        # Find call sites in main text with exactly one string literal
+                        for call_m in re.finditer(
+                            r'\b' + re.escape(outer_fname)
+                            + r'\s*\(((?:[^()]*|\([^()]*\))*)\)',
+                            text,
+                        ):
+                            args_str = call_m.group(1)
+                            literals = re.findall(r'"([^"]*)"', args_str)
+                            if len(literals) != 1:
+                                continue
+                            tag = _nwstr_dispatch[dispatch_func].get(literals[0])
+                            if tag:
+                                self.quest_grants[tag.strip().lower()][step].add(resref)
+            # GetItemPossessedBy(obj, "tag") — item-tag checks for key/quest logic.
+            for m in self._RE_ITEM_POSSESSED_BY.finditer(text):
+                self.script_checks_item_tags[resref].add(m.group(1))
+            # GetTag(GetItemInSlot(...)) compared to a literal — a weapon/equip gate
+            # that changes how a creature takes damage (see _RE_DAMAGE_SLOT_TAG).
+            for m in self._RE_DAMAGE_SLOT_TAG.finditer(text):
+                self.script_damage_req_tags[resref].add(m.group(1) or m.group(2))
+            # Self-mitigation: restores own HP or grants self damage immunity on hit.
+            if self._RE_SET_HP_SELF.search(text) or (
+                "OBJECT_SELF" in text
+                and (self._RE_SELF_HEAL.search(text)
+                     or self._RE_SELF_DMG_IMMUNITY.search(text))
+            ):
+                self.script_mitigates_damage.add(resref)
+            # Retaliation: strikes back at the attacker / nearby creatures on hit.
+            _ret = _analyze_retaliation(text)
+            if _ret is not None:
+                self.script_retaliation[resref] = _ret
+            # Detect creature spawns at waypoints (two strategies):
+            # 1. Window scan: GetWaypointByTag("tag")/GetObjectByTag("tag") within
+            #    10 lines before CreateObject(OBJECT_TYPE_CREATURE, "resref", ...).
+            # 2. Co-location: a script that uses GetWaypointByTag+CreateObject with
+            #    variables (e.g. a helper function) may call that helper with literal
+            #    string arguments on the same line — scan for pairs where one literal
+            #    matches a known waypoint tag and the other a known creature blueprint.
+            if ("CreateObject" in text and "OBJECT_TYPE_CREATURE" in text
+                    and "GetWaypointByTag" in text):
+                lines = text.splitlines()
+                # Window scan
+                recent_tags: list[tuple[str, int]] = []
+                for lineno, line in enumerate(lines):
+                    for m in self._RE_GET_TAG.finditer(line):
+                        recent_tags.append((m.group(1), lineno))
+                    for m in self._RE_CREATE_CREATURE.finditer(line):
+                        crr = m.group(1).lower()
+                        for tag, tag_ln in reversed(recent_tags):
+                            if lineno - tag_ln <= 10:
+                                entry = {"creature_resref": crr, "waypoint_tag": tag}
+                                if entry not in self.script_creature_waypoint_spawns[resref]:
+                                    self.script_creature_waypoint_spawns[resref].append(entry)
+                                break
+                # Co-location scan: pairs of literal strings on the same line
+                # where one is a known waypoint tag and the other is a creature resref.
+                for line in lines:
+                    strs = [m.group(1) for m in self._RE_ANY_LITERAL_STR.finditer(line)]
+                    if len(strs) < 2:
+                        continue
+                    wp_strs = [s for s in strs
+                               if s in self.waypoint_area or s.upper() in self.waypoint_area]
+                    cr_strs = [s.lower() for s in strs if s.lower() in self.creatures]
+                    for wp_tag in wp_strs:
+                        actual_tag = wp_tag if wp_tag in self.waypoint_area else wp_tag.upper()
+                        for crr in cr_strs:
+                            entry = {"creature_resref": crr, "waypoint_tag": actual_tag}
+                            if entry not in self.script_creature_waypoint_spawns[resref]:
+                                self.script_creature_waypoint_spawns[resref].append(entry)
+
+    def _build_tag_to_area(self) -> None:
+        """Tag → area resref index spanning every placement (waypoints,
+        doors, triggers, placeables, creatures). Used to resolve the
+        destination area of a teleport script's GetWaypointByTag call."""
+        for area_resref, git in self.gits.items():
+            for wp in list_items(git.get("WaypointList")):
+                tag = fld(wp, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+                # Also expose tag without the conventional WP_ prefix so
+                # GetWaypointByTag("foo") can match a waypoint tagged "WP_foo".
+                if tag and tag.upper().startswith("WP_"):
+                    short = tag[3:]
+                    if short and short not in self.tag_to_area:
+                        self.tag_to_area[short] = area_resref
+                        self.fallback_tags.add(short)
+            for d in list_items(git.get("Door List")):
+                tag = fld(d, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+            for t in list_items(git.get("TriggerList")):
+                tag = fld(t, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+            for p in list_items(git.get("Placeable List")):
+                tag = fld(p, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+            for c in list_items(git.get("Creature List")):
+                tag = fld(c, "Tag")
+                if tag and tag not in self.tag_to_area:
+                    self.tag_to_area[tag] = area_resref
+
+    def _resolve_script_creature_spawns(self) -> None:
+        """Resolve script_creature_waypoint_spawns to area associations and
+        populate canonical_locations (kind='script') and area_script_spawns.
+
+        Must run after _parse_scripts and _build_tag_to_area."""
+        seen: set[tuple[str, str]] = set()  # (can_rr, area_rr) already recorded
+        for script_rr, pairs in self.script_creature_waypoint_spawns.items():
+            for pair in pairs:
+                bp_rr = pair["creature_resref"]
+                wp_tag = pair["waypoint_tag"]
+                if bp_rr not in self.creatures:
+                    continue
+                area_rr = (self.waypoint_area.get(wp_tag)
+                           or self.tag_to_area.get(wp_tag))
+                if not area_rr or area_rr not in self.areas:
+                    continue
+                if area_rr in self.hidden_areas:
+                    continue
+                can_rr = self.canonical_for_bp.get(bp_rr)
+                if not can_rr:
+                    continue
+                key = (can_rr, area_rr)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # Only add if not already covered by a placed or encounter entry
+                # for this (creature, area) pair — script spawn is a fallback.
+                existing = self.canonical_locations.get(can_rr, [])
+                already = any(e["area"] == area_rr and e["kind"] in ("placed", "encounter")
+                              for e in existing)
+                if not already:
+                    self.canonical_locations[can_rr].append(
+                        {"area": area_rr, "kind": "script",
+                         "enc_rr": None, "count": 1}
+                    )
+                self.area_script_spawns[area_rr].append(
+                    {"bp_rr": bp_rr, "can_rr": can_rr, "script": script_rr}
+                )
+
+    def _build_direct_teleport_transitions(self) -> None:
+        """Detect placeables whose OnUsed script directly calls ActionJumpToLocation
+        (not via a dialog) and populate self.script_transitions.
+
+        Must run after _parse_scripts (for script_teleport_tags) and
+        _build_tag_to_area (for tag_to_area) are complete."""
+        for area_resref, placeables in self.area_placeables.items():
+            for p in placeables:
+                bp_rr = (fld(p, "TemplateResRef", "") or "").lower()
+                # Instance-level script takes priority; fall back to blueprint.
+                script = ((fld(p, "OnUsed", "") or "").lower()
+                          or (fld(self.placeables.get(bp_rr, {}), "OnUsed", "") or "").lower())
+                if not script:
+                    continue
+                # Skip dialog-launching scripts — those are in conv_transitions.
+                if self._script_dialog_targets(script):
+                    continue
+                tags = self.script_teleport_tags.get(script)
+                if not tags:
+                    continue
+                p_tag = fld(p, "Tag", "") or bp_rr
+                for tag in tags:
+                    area = self.tag_to_area.get(tag)
+                    if area and area != area_resref and area in self.areas:
+                        self.script_transitions.append({
+                            "src_area": area_resref,
+                            "dst_area": area,
+                            "dst_tag": tag,
+                            "kind": "use",
+                            "label": p_tag,
+                            "fallback": tag in self.fallback_tags,
+                        })
+
+    def _walk_dialog_nodes(self, dlg: dict) -> Iterable[tuple[str, int, dict]]:
+        """Yield (kind, index, node) for every Entry and Reply in a dlg."""
+        for i, e in enumerate(list_items(dlg.get("EntryList"))):
+            yield ("entry", i, e)
+        for i, r in enumerate(list_items(dlg.get("ReplyList"))):
+            yield ("reply", i, r)
+
+    def _excluded_dialog_nodes(self, dlg: dict) -> set[tuple[str, int]]:
+        """Return the set of (kind, idx) dialog nodes whose teleport scripts
+        should be ignored for area-map purposes. A node is excluded if any
+        ancestor entry/reply's text exact-matches (after stripping NWN colour
+        tokens and surrounding whitespace) one of self.exclude_option_texts —
+        we then walk RepliesList/EntriesList from that ancestor to mark the
+        whole subtree."""
+        if not self.exclude_option_texts:
+            return set()
+        targets = {t.strip() for t in self.exclude_option_texts if t.strip()}
+        if not targets:
+            return set()
+        entries = list_items(dlg.get("EntryList"))
+        replies = list_items(dlg.get("ReplyList"))
+        excluded: set[tuple[str, int]] = set()
+
+        def walk(kind: str, idx: int) -> None:
+            if not isinstance(idx, int) or idx < 0:
+                return
+            if (kind, idx) in excluded:
+                return
+            excluded.add((kind, idx))
+            if kind == "entry":
+                if idx >= len(entries):
+                    return
+                for ref in list_items(entries[idx].get("RepliesList")):
+                    walk("reply", fld(ref, "Index"))
+            else:
+                if idx >= len(replies):
+                    return
+                for ref in list_items(replies[idx].get("EntriesList")):
+                    walk("entry", fld(ref, "Index"))
+
+        for i, r in enumerate(replies):
+            if nwn_text(loc(r.get("Text"))).strip() in targets:
+                walk("reply", i)
+        for i, e in enumerate(entries):
+            if nwn_text(loc(e.get("Text"))).strip() in targets:
+                walk("entry", i)
+        return excluded
+
+    def _synthesize_zdialogs(self) -> None:
+        """Inject a pseudo-dialog entry into self.dialogs for every z-dialog
+        handler that we saw via StartDlg(...). Z-dialogs aren't real .dlg
+        files — their content is generated by NWScript at runtime — so the
+        synthesized entry has no EntryList/ReplyList. The handler script's
+        resref is stored in `__zdlg_handler__` so the conversation page can
+        link to its source."""
+        for handler in self.zdlg_handler_dispatchers:
+            if handler in self.dialogs:
+                # An actual .dlg with the same resref already exists; leave
+                # it alone (the generic zdlg_converse.dlg goes here too).
+                continue
+            self.dialogs[handler] = {"__zdlg_handler__": handler}
+
+    def _script_dialog_targets(self, script_resref: str) -> set[str]:
+        """All dialog/z-dialog resrefs that a given event script opens.
+        Unifies the regular ActionStartConversation index with the z-dialog
+        StartDlg index so callers don't have to consult both."""
+        out: set[str] = set()
+        out.update(self.script_dialogs.get(script_resref, ()))
+        out.update(self.script_zdialogs.get(script_resref, ()))
+        return out
+
+    def index_dialogs(self) -> None:
+        """Build dialog_callers, dialog_teleports, dialog_scripts and the
+        pseudo-node + conv_transitions edges for the area map. Must run
+        after index() (relies on tag/transition state) and after
+        _parse_scripts (relies on script→dialog and script→teleport-tag
+        lookups)."""
+        t0 = time.time()
+        self._parse_scripts()
+        self._build_tag_to_area()
+        self._resolve_script_creature_spawns()
+        self._synthesize_zdialogs()
+
+        # Per-dialog: action / active scripts and teleport destinations.
+        for dlg_resref, dlg in self.dialogs.items():
+            for kind, idx, node in self._walk_dialog_nodes(dlg):
+                action = fld(node, "Script", "")
+                if action:
+                    self.dialog_scripts[dlg_resref].append({
+                        "resref": action, "kind": "action",
+                        "node_kind": kind, "node_index": idx,
+                    })
+                    for tag in self.script_teleport_tags.get(action, ()):
+                        self.dialog_teleports[dlg_resref].append({
+                            "tag": tag,
+                            "area": self.tag_to_area.get(tag),
+                            "via_script": action,
+                            "node_kind": kind,
+                            "node_index": idx,
+                        })
+                # Dialog-native quest grant: Quest/QuestEntry fields set a journal
+                # entry directly without a script (e.g. b_miller_convo1.dlg).
+                q_tag = (fld(node, "Quest", "") or "").strip().lower()
+                if q_tag:
+                    q_step = fld(node, "QuestEntry", 0) or 0
+                    self.quest_dialog_grants[q_tag][q_step].add(dlg_resref)
+                # Conditional / starting-list "Active" gates also have
+                # their own scripts, surfaced for completeness.
+                for cond in list_items(node.get("RepliesList")) + list_items(node.get("EntriesList")):
+                    a = fld(cond, "Active", "")
+                    if a:
+                        self.dialog_scripts[dlg_resref].append({
+                            "resref": a, "kind": "active",
+                            "node_kind": kind, "node_index": idx,
+                        })
+            for s in list_items(dlg.get("StartingList")):
+                a = fld(s, "Active", "")
+                if a:
+                    self.dialog_scripts[dlg_resref].append({
+                        "resref": a, "kind": "active",
+                        "node_kind": "start", "node_index": -1,
+                    })
+
+        # Caller bookkeeping helper.
+        def _add_caller(dlg_resref: str, caller: dict) -> None:
+            if dlg_resref in self.dialogs:
+                self.dialog_callers[dlg_resref].append(caller)
+
+        # Where each blueprint is placed (resref → set of area resrefs).
+        creature_areas: dict[str, set[str]] = defaultdict(set)
+        placeable_areas: dict[str, set[str]] = defaultdict(set)
+        door_areas: dict[str, set[str]] = defaultdict(set)
+        trigger_areas: dict[str, set[str]] = defaultdict(set)
+        for ar, npcs in self.area_npcs.items():
+            for c in npcs:
+                rr = fld(c, "TemplateResRef", "")
+                if rr:
+                    creature_areas[rr].add(ar)
+        for ar, ps in self.area_placeables.items():
+            for p in ps:
+                rr = fld(p, "TemplateResRef", "")
+                if rr:
+                    placeable_areas[rr].add(ar)
+        for ar, ds in self.area_doors.items():
+            for d in ds:
+                rr = fld(d, "TemplateResRef", "")
+                if rr:
+                    door_areas[rr].add(ar)
+        for ar, ts in self.area_triggers.items():
+            for t in ts:
+                rr = fld(t, "TemplateResRef", "")
+                if rr:
+                    trigger_areas[rr].add(ar)
+
+        # 1. Direct Conversation field on creature/placeable/door blueprints.
+        for rr, c in self.creatures.items():
+            dlg = (fld(c, "Conversation", "") or "").lower()
+            if dlg and dlg in self.dialogs:
+                _add_caller(dlg, {
+                    "kind": "creature", "resref": rr,
+                    "areas": sorted(creature_areas.get(rr, set())),
+                })
+
+        # 1a. Per-instance Conversation override on placed creatures. The
+        # toolset lets a builder swap the conversation on a single placement
+        # (Crazy Maggie in Bree uses `maggie.dlg` even though her blueprint
+        # `nw_oldwoman` points at the default commoner dialog), so we walk
+        # every placement and capture its effective conversation.
+        for inst in self.creature_instances:
+            c = inst["c"]
+            dlg = (fld(c, "Conversation", "") or "").lower()
+            if dlg and dlg in self.dialogs:
+                _add_caller(dlg, {
+                    "kind": "creature-instance",
+                    "area": inst["area"], "idx": inst["idx"],
+                    "resref": fld(c, "TemplateResRef", "") or "",
+                    "areas": [inst["area"]],
+                })
+        for rr, p in self.placeables.items():
+            dlg = (fld(p, "Conversation", "") or "").lower()
+            if dlg and dlg in self.dialogs:
+                _add_caller(dlg, {
+                    "kind": "placeable", "resref": rr,
+                    "areas": sorted(placeable_areas.get(rr, set())),
+                })
+        for rr, d in self.doors.items():
+            dlg = (fld(d, "Conversation", "") or "").lower()
+            if dlg and dlg in self.dialogs:
+                _add_caller(dlg, {
+                    "kind": "door", "resref": rr,
+                    "areas": sorted(door_areas.get(rr, set())),
+                })
+
+        # 2. Scripts bound to per-blueprint event slots that statically
+        #    call ActionStartConversation (or StartDlg) with a literal
+        #    dlg / z-dialog handler resref.
+        def _add_blueprint_event_callers(blueprints: dict, fields: dict[str, str],
+                                         kind: str, areas_idx: dict[str, set[str]]):
+            for rr, bp in blueprints.items():
+                for fld_name, label in fields.items():
+                    s = (fld(bp, fld_name, "") or "").lower()
+                    if not s:
+                        continue
+                    for dlg in self._script_dialog_targets(s):
+                        _add_caller(dlg, {
+                            "kind": kind, "resref": rr,
+                            "event": label, "script": s,
+                            "areas": sorted(areas_idx.get(rr, set())),
+                        })
+        _add_blueprint_event_callers(self.creatures, self.CREATURE_EVENT_FIELDS,
+                                     "creature-event", creature_areas)
+        _add_blueprint_event_callers(self.placeables, self.PLACEABLE_EVENT_FIELDS,
+                                     "placeable-event", placeable_areas)
+        _add_blueprint_event_callers(self.doors, self.DOOR_EVENT_FIELDS,
+                                     "door-event", door_areas)
+        _add_blueprint_event_callers(self.triggers, self.TRIGGER_EVENT_FIELDS,
+                                     "trigger-event", trigger_areas)
+
+        # 2a. Per-instance overrides on placeables/doors/triggers. The
+        #     toolset lets a builder swap any blueprint script slot (or, for
+        #     placeables/doors, the Conversation field) on a single
+        #     placement — used heavily in HoMERs LotR for things like the
+        #     legendary leveler statue, where a generic statue blueprint is
+        #     overridden per-placement with `OnUsed = hgll_start_dlg`.
+        def _add_instance_event_callers(area_lists: dict, fields: dict[str, str],
+                                         kind_event: str, kind_conv: str | None):
+            for area_rr, items in area_lists.items():
+                for idx, inst in enumerate(items):
+                    tag = fld(inst, "Tag", "") or ""
+                    bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                    if kind_conv is not None:
+                        dlg = (fld(inst, "Conversation", "") or "").lower()
+                        if dlg and dlg in self.dialogs:
+                            _add_caller(dlg, {
+                                "kind": kind_conv,
+                                "area": area_rr, "idx": idx, "tag": tag,
+                                "resref": bp_rr,
+                                "areas": [area_rr],
+                            })
+                    for fld_name, label in fields.items():
+                        s = (fld(inst, fld_name, "") or "").lower()
+                        if not s:
+                            continue
+                        for dlg in self._script_dialog_targets(s):
+                            _add_caller(dlg, {
+                                "kind": kind_event,
+                                "area": area_rr, "idx": idx, "tag": tag,
+                                "resref": bp_rr,
+                                "event": label, "script": s,
+                                "areas": [area_rr],
+                            })
+        _add_instance_event_callers(self.area_placeables, self.PLACEABLE_EVENT_FIELDS,
+                                    "placeable-event-instance", "placeable-instance")
+        _add_instance_event_callers(self.area_doors, self.DOOR_EVENT_FIELDS,
+                                    "door-event-instance", "door-instance")
+        _add_instance_event_callers(self.area_triggers, self.TRIGGER_EVENT_FIELDS,
+                                    "trigger-event-instance", None)
+
+        # 3. Per-area event scripts.
+        for rr, area in self.areas.items():
+            for fld_name, label in self.AREA_EVENT_FIELDS.items():
+                s = (fld(area, fld_name, "") or "").lower()
+                if not s:
+                    continue
+                for dlg in self._script_dialog_targets(s):
+                    _add_caller(dlg, {
+                        "kind": "area-event", "resref": rr,
+                        "event": label, "script": s,
+                        "areas": [rr],
+                    })
+
+        # 4. Module-level event scripts.
+        if self.ifo:
+            for fld_name, label in self.MODULE_EVENT_FIELDS.items():
+                s = (fld(self.ifo, fld_name, "") or "").lower()
+                if not s:
+                    continue
+                for dlg in self._script_dialog_targets(s):
+                    _add_caller(dlg, {
+                        "kind": "module-event", "event": label, "script": s,
+                    })
+
+        # 5. Item tag-based scripting: when a script's resref equals an item's
+        #    tag (or resref) and that script statically starts a conversation,
+        #    treat the item as a caller. This catches the common "wand /
+        #    activate-item" pattern without needing to parse the central
+        #    Mod_OnActvtItem dispatcher's tag table.
+        for rr, item in self.items.items():
+            tag = (fld(item, "Tag", "") or "").lower()
+            for candidate in {rr.lower(), tag}:
+                if not candidate:
+                    continue
+                for dlg in self._script_dialog_targets(candidate):
+                    _add_caller(dlg, {
+                        "kind": "item-script", "resref": rr,
+                        "script": candidate,
+                    })
+
+        # Dedupe caller lists (the same blueprint can match via several
+        # event scripts; collapse identical descriptors).
+        for dlg, callers in self.dialog_callers.items():
+            seen = set()
+            uniq = []
+            for c in callers:
+                key = (c.get("kind"), c.get("resref"), c.get("event"),
+                       c.get("script"), tuple(c.get("areas", [])),
+                       c.get("area"), c.get("idx"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(c)
+            self.dialog_callers[dlg] = uniq
+
+        # Pseudo-nodes + conv_transitions for the area map.
+        # A conversation contributes to the map if it has at least one
+        # teleport destination resolvable to a real area.
+        n_excluded_edges = 0
+        for dlg_resref, teleports in self.dialog_teleports.items():
+            if self.exclude_option_texts and dlg_resref in self.dialogs:
+                excluded = self._excluded_dialog_nodes(self.dialogs[dlg_resref])
+                if excluded:
+                    kept = [t for t in teleports
+                            if (t.get("node_kind"), t.get("node_index"))
+                            not in excluded]
+                    n_excluded_edges += len(teleports) - len(kept)
+                    teleports = kept
+            dest_areas = sorted({t["area"] for t in teleports
+                                 if t["area"] and t["area"] in self.areas})
+            if not dest_areas:
+                continue
+            callers = self.dialog_callers.get(dlg_resref, [])
+            # Source areas: every area that hosts an entity caller.
+            src_areas: set[str] = set()
+            global_kinds: list[dict] = []
+            for c in callers:
+                if c["kind"] in ("module-event",):
+                    global_kinds.append(c)
+                elif c["kind"] == "item-script":
+                    # Items can be carried anywhere; treat as global too,
+                    # unless we later add inventory→area cross-refs.
+                    global_kinds.append(c)
+                else:
+                    for a in c.get("areas", []):
+                        if a in self.areas:
+                            src_areas.add(a)
+            for src in sorted(src_areas):
+                for dst in dest_areas:
+                    if dst == src:
+                        continue
+                    self.conv_transitions.append({
+                        "src": src,
+                        "dst_area": dst,
+                        "conv_resref": dlg_resref,
+                        "kind": "convo",
+                        "label": dlg_resref,
+                    })
+            if global_kinds:
+                # Pick a short label: prefer a module-event name, else
+                # "Convo: <resref>".
+                label = None
+                for c in global_kinds:
+                    if c["kind"] == "module-event":
+                        label = c["event"]
+                        break
+                if label is None:
+                    label = "Item activation"
+                pseudo_id = f"__convo:{dlg_resref}"
+                self.global_convo_pseudo[pseudo_id] = {
+                    "label": label,
+                    "conv_resref": dlg_resref,
+                    "dests": dest_areas,
+                }
+                for dst in dest_areas:
+                    self.conv_transitions.append({
+                        "src": pseudo_id,
+                        "dst_area": dst,
+                        "conv_resref": dlg_resref,
+                        "kind": "convo",
+                        "label": label,
+                    })
+
+        n_glob = len(self.global_convo_pseudo)
+        n_conv_edges = len(self.conv_transitions)
+        n_callers = sum(len(v) for v in self.dialog_callers.values())
+        excl_msg = (f", {n_excluded_edges} edges suppressed by --exclude-conv-option"
+                    if n_excluded_edges else "")
+        print(f"  dialog xref in {time.time()-t0:.1f}s — {len(self.dialogs)} dialogs, "
+              f"{n_callers} callers, {n_glob} global pseudo-nodes, "
+              f"{n_conv_edges} conv map edges{excl_msg}")
+
+        self._build_direct_teleport_transitions()
+        self._build_store_openers()
+        self._index_script_item_sources()
+        self._index_random_treasure_containers()
+        self._index_key_items()
+        self._index_script_item_checks()
+        self._build_dialog_quest_index()
+
+    def _index_script_item_sources(self) -> None:
+        """Trace CreateItemOnObject calls back to their trigger context and
+        populate item_from_script. Sources in WIKI_HIDDEN areas are excluded.
+        Must run after _build_store_openers (index_dialogs fully done)."""
+        if not self.script_creates_items:
+            return
+        scripts_set = set(self.script_creates_items.keys())
+
+        # Inverted dialog_scripts: action-script resref → set of dialog resrefs
+        script_to_dlgs: dict[str, set[str]] = defaultdict(set)
+        for dlg_rr, entries in self.dialog_scripts.items():
+            for e in entries:
+                if e.get("kind") == "action" and e.get("resref") in scripts_set:
+                    script_to_dlgs[e["resref"]].add(dlg_rr)
+
+        # Module events: script resref → human event label.
+        # Skip Mod_OnActvtItem (item activation) — that fires for DM item tools.
+        _SKIP_MOD_FIELDS = {"Mod_OnActvtItem"}
+        script_module_event: dict[str, str] = {}
+        if self.ifo:
+            for field, label in self.MODULE_EVENT_FIELDS.items():
+                if field in _SKIP_MOD_FIELDS:
+                    continue
+                val = (fld(self.ifo, field, "") or "").lower()
+                if val in scripts_set:
+                    script_module_event[val] = label
+
+        # All UTC event fields (superset of CREATURE_EVENT_FIELDS).
+        _ALL_CREATURE_EVENTS: dict[str, str] = {
+            "ScriptDeath": "OnDeath", "ScriptSpawn": "OnSpawn",
+            "ScriptHeartbeat": "OnHeartbeat", "ScriptOnNotice": "OnPerception",
+            "ScriptUserDefine": "OnUserDefined", "ScriptDialogue": "OnConversation",
+            "ScriptAttacked": "OnAttacked", "ScriptDamaged": "OnDamaged",
+            "ScriptDisturbed": "OnDisturbed", "ScriptEndRound": "OnEndCombatRound",
+            "ScriptOnBlocked": "OnBlocked", "ScriptRested": "OnRested",
+            "ScriptSpellAt": "OnSpellCastAt",
+        }
+        # Visible areas per creature blueprint resref.
+        crr_vis: dict[str, set[str]] = defaultdict(set)
+        for area_rr, insts in self.area_creature_instances.items():
+            if area_rr not in self.hidden_areas:
+                for inst in insts:
+                    crr = (fld(inst["c"], "TemplateResRef", "") or "").lower()
+                    if crr:
+                        crr_vis[crr].add(area_rr)
+        for crr, spawns in self.creature_encounter_spawns.items():
+            for sp in spawns:
+                if sp["area"] not in self.hidden_areas:
+                    crr_vis[crr.lower()].add(sp["area"])
+        # script resref → list of {crr, cname, event_label, areas}
+        script_creature_srcs: dict[str, list[dict]] = defaultdict(list)
+        for crr, c in self.creatures.items():
+            vis_areas = crr_vis.get(crr.lower(), set())
+            if not vis_areas:
+                continue
+            for field, ev_label in _ALL_CREATURE_EVENTS.items():
+                val = (fld(c, field, "") or "").lower()
+                if val in scripts_set:
+                    script_creature_srcs[val].append({
+                        "crr": crr, "cname": self.creature_name(crr),
+                        "event_label": ev_label, "areas": sorted(vis_areas),
+                    })
+
+        # Visible areas per placeable blueprint resref.
+        prr_vis: dict[str, set[str]] = defaultdict(set)
+        for area_rr, pls in self.area_placeables.items():
+            if area_rr not in self.hidden_areas:
+                for pl in pls:
+                    prr = (fld(pl, "TemplateResRef", "") or "").lower()
+                    if prr:
+                        prr_vis[prr].add(area_rr)
+        # script resref → list of {prr, pname, event_label, areas}
+        script_placeable_srcs: dict[str, list[dict]] = defaultdict(list)
+        for prr, p in self.placeables.items():
+            vis_areas = prr_vis.get(prr.lower(), set())
+            if not vis_areas:
+                continue
+            pname = loc(p.get("LocName")) or fld(p, "Tag") or prr
+            for field, ev_label in self.PLACEABLE_EVENT_FIELDS.items():
+                val = (fld(p, field, "") or "").lower()
+                if val in scripts_set:
+                    script_placeable_srcs[val].append({
+                        "prr": prr, "pname": pname,
+                        "event_label": ev_label, "areas": sorted(vis_areas),
+                    })
+        # Also catch GIT-instance-level event overrides (no blueprint entry).
+        git_plc_script_areas: dict[str, set[str]] = defaultdict(set)
+        for area_rr, pls in self.area_placeables.items():
+            if area_rr not in self.hidden_areas:
+                for pl in pls:
+                    for field in self.PLACEABLE_EVENT_FIELDS:
+                        val = (fld(pl, field, "") or "").lower()
+                        if val in scripts_set:
+                            git_plc_script_areas[val].add(area_rr)
+        for val, areas in git_plc_script_areas.items():
+            if not script_placeable_srcs[val]:
+                script_placeable_srcs[val].append({
+                    "prr": None, "pname": None,
+                    "event_label": "interaction", "areas": sorted(areas),
+                })
+
+        # Build item_from_script, deduplicating by (irr, kind, dlg-or-crr-or-prr-or-script).
+        seen: set[tuple[str, str, str | None, str]] = set()
+        for script_rr, item_resrefs in self.script_creates_items.items():
+            sources: list[dict] = []
+
+            if script_rr in script_module_event:
+                sources.append({
+                    "kind": "module-event", "script": script_rr,
+                    "label": script_module_event[script_rr],
+                    "areas": [], "dlg": None, "crr": None, "prr": None,
+                })
+            for dlg_rr in sorted(script_to_dlgs.get(script_rr, set())):
+                callers = self.dialog_callers.get(dlg_rr, [])
+                vis: set[str] = set()
+                for caller in callers:
+                    for a in (caller.get("areas") or []):
+                        if a not in self.hidden_areas:
+                            vis.add(a)
+                    if caller.get("area") and caller["area"] not in self.hidden_areas:
+                        vis.add(caller["area"])
+                if callers and not vis:
+                    continue  # every caller in a hidden area
+                sources.append({
+                    "kind": "dialog-action", "script": script_rr,
+                    "label": self.dialog_label(dlg_rr),
+                    "areas": sorted(vis), "dlg": dlg_rr, "crr": None, "prr": None,
+                })
+            for cs in script_creature_srcs.get(script_rr, []):
+                sources.append({
+                    "kind": "creature-event", "script": script_rr,
+                    "label": cs["event_label"], "areas": cs["areas"],
+                    "dlg": None, "crr": cs["crr"], "prr": None,
+                })
+            for ps in script_placeable_srcs.get(script_rr, []):
+                sources.append({
+                    "kind": "placeable-event", "script": script_rr,
+                    "label": ps["event_label"], "areas": ps["areas"],
+                    "dlg": None, "crr": None, "prr": ps["prr"],
+                })
+            if not sources:
+                continue
+            for irr in item_resrefs:
+                if irr not in self.items:
+                    continue
+                for src in sources:
+                    dk = (irr, src["kind"],
+                          src.get("dlg") or src.get("crr") or src.get("prr") or "",
+                          src["script"])
+                    if dk not in seen:
+                        seen.add(dk)
+                        self.item_from_script[irr].append(src)
+
+    def _index_random_treasure_containers(self) -> None:
+        """Mark containers whose OnOpen script generates procedural random treasure.
+        Populates random_treasure_containers. Must run after _parse_scripts."""
+        for area_rr, containers in self.area_containers.items():
+            for c in containers:
+                p = c["p"]
+                idx = c["idx"]
+                on_open = (fld(p, "OnOpen", "") or "").lower()
+                if not on_open:
+                    bp_rr = (fld(p, "TemplateResRef", "") or "").lower()
+                    on_open = (fld(self.placeables.get(bp_rr, {}), "OnOpen", "") or "").lower()
+                if on_open and on_open in self.script_generates_treasure:
+                    self.random_treasure_containers.add((area_rr, idx))
+
+    def _index_key_items(self) -> None:
+        """Build item_is_key_for: maps item resref → containers/doors that require
+        that item's tag as a key (KeyRequired=1, KeyName=<item tag>)."""
+        # Build a lowercase-tag → list[resref] map from known items.
+        tag_to_resrefs: dict[str, list[str]] = defaultdict(list)
+        for rr, it in self.items.items():
+            tag = (fld(it, "Tag", "") or "").strip().lower()
+            if tag:
+                tag_to_resrefs[tag].append(rr)
+
+        for area_rr, containers in self.area_containers.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for c in containers:
+                p = c["p"]
+                idx = c["idx"]
+                key_tag = (fld(p, "KeyName", "") or "").strip().lower()
+                if not key_tag:
+                    continue
+                required = bool(int(fld(p, "KeyRequired", 0) or 0))
+                name = (loc(p.get("LocName")) or fld(p, "Tag", "") or
+                        fld(p, "TemplateResRef", "") or "(unnamed)")
+                for rr in tag_to_resrefs.get(key_tag, []):
+                    self.item_is_key_for[rr].append(
+                        {"area_rr": area_rr, "kind": "container", "name": name,
+                         "idx": idx, "required": required}
+                    )
+
+        for area_rr, doors in self.area_doors.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for d in doors:
+                key_tag = (fld(d, "KeyName", "") or "").strip().lower()
+                if not key_tag:
+                    continue
+                required = bool(int(fld(d, "KeyRequired", 0) or 0))
+                name = (loc(d.get("LocName")) or fld(d, "Tag", "") or
+                        fld(d, "TemplateResRef", "") or "(unnamed door)")
+                linked_to = fld(d, "LinkedTo", "") or ""
+                dst_area = self.tag_to_area.get(linked_to) if linked_to else None
+                if dst_area == area_rr:
+                    dst_area = None  # same-area transition, not worth showing
+                for rr in tag_to_resrefs.get(key_tag, []):
+                    self.item_is_key_for[rr].append(
+                        {"area_rr": area_rr, "kind": "door", "name": name,
+                         "required": required, "dst_area": dst_area}
+                    )
+
+    def _index_script_item_checks(self) -> None:
+        """Populate item_script_checks: item resref → contexts where
+        GetItemPossessedBy is called with the item's tag (event scripts on
+        triggers, placeables, doors, areas, and dialog action nodes).
+        Must run after _parse_scripts, _build_tag_to_area, and index_dialogs."""
+        if not self.script_checks_item_tags:
+            return
+
+        tag_to_resrefs: dict[str, list[str]] = defaultdict(list)
+        for rr, it in self.items.items():
+            tag = (fld(it, "Tag", "") or "").strip()
+            if tag:
+                tag_to_resrefs[tag.lower()].append(rr)
+
+        def _emit(script_rr: str, entry: dict) -> None:
+            for tag in self.script_checks_item_tags.get(script_rr, set()):
+                for item_rr in tag_to_resrefs.get(tag.lower(), []):
+                    self.item_script_checks[item_rr].append(entry)
+
+        # Blueprint → placed areas
+        trigger_areas: dict[str, set[str]] = defaultdict(set)
+        placeable_areas: dict[str, set[str]] = defaultdict(set)
+        door_areas: dict[str, set[str]] = defaultdict(set)
+        for ar, ts in self.area_triggers.items():
+            for t in ts:
+                rr = (fld(t, "TemplateResRef", "") or "").lower()
+                if rr:
+                    trigger_areas[rr].add(ar)
+        for ar, ps in self.area_placeables.items():
+            for p in ps:
+                rr = (fld(p, "TemplateResRef", "") or "").lower()
+                if rr:
+                    placeable_areas[rr].add(ar)
+        for ar, ds in self.area_doors.items():
+            for d in ds:
+                rr = (fld(d, "TemplateResRef", "") or "").lower()
+                if rr:
+                    door_areas[rr].add(ar)
+
+        # Blueprint triggers
+        for rr, bp in self.triggers.items():
+            for fld_name, label in self.TRIGGER_EVENT_FIELDS.items():
+                s = (fld(bp, fld_name, "") or "").lower()
+                if s in self.script_checks_item_tags:
+                    _emit(s, {"kind": "trigger", "resref": rr, "event": label,
+                               "script": s, "areas": sorted(trigger_areas.get(rr, set()))})
+
+        # Instance trigger overrides
+        for area_rr, ts in self.area_triggers.items():
+            for idx, inst in enumerate(ts):
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                inst_tag = fld(inst, "Tag", "") or ""
+                for fld_name, label in self.TRIGGER_EVENT_FIELDS.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if s in self.script_checks_item_tags:
+                        _emit(s, {"kind": "trigger-instance", "resref": bp_rr,
+                                   "tag": inst_tag, "event": label, "script": s,
+                                   "area": area_rr, "areas": [area_rr]})
+
+        # Blueprint placeables
+        for rr, bp in self.placeables.items():
+            for fld_name, label in self.PLACEABLE_EVENT_FIELDS.items():
+                s = (fld(bp, fld_name, "") or "").lower()
+                if s in self.script_checks_item_tags:
+                    name = loc(bp.get("LocName")) or rr
+                    _emit(s, {"kind": "placeable", "resref": rr, "name": name,
+                               "event": label, "script": s,
+                               "areas": sorted(placeable_areas.get(rr, set()))})
+
+        # Instance placeables
+        for area_rr, ps in self.area_placeables.items():
+            for inst in ps:
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                for fld_name, label in self.PLACEABLE_EVENT_FIELDS.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if s in self.script_checks_item_tags:
+                        name = loc(inst.get("LocName")) or bp_rr
+                        _emit(s, {"kind": "placeable-instance", "resref": bp_rr,
+                                   "name": name, "event": label, "script": s,
+                                   "area": area_rr, "areas": [area_rr]})
+
+        # Blueprint doors
+        for rr, bp in self.doors.items():
+            for fld_name, label in self.DOOR_EVENT_FIELDS.items():
+                s = (fld(bp, fld_name, "") or "").lower()
+                if s in self.script_checks_item_tags:
+                    name = loc(bp.get("LocName")) or rr
+                    _emit(s, {"kind": "door", "resref": rr, "name": name,
+                               "event": label, "script": s,
+                               "areas": sorted(door_areas.get(rr, set()))})
+
+        # Instance doors
+        for area_rr, ds in self.area_doors.items():
+            for inst in ds:
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                for fld_name, label in self.DOOR_EVENT_FIELDS.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if s in self.script_checks_item_tags:
+                        name = loc(inst.get("LocName")) or bp_rr
+                        _emit(s, {"kind": "door-instance", "resref": bp_rr,
+                                   "name": name, "event": label, "script": s,
+                                   "area": area_rr, "areas": [area_rr]})
+
+        # Area events
+        for area_rr, area in self.areas.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for fld_name, label in self.AREA_EVENT_FIELDS.items():
+                s = (fld(area, fld_name, "") or "").lower()
+                if s in self.script_checks_item_tags:
+                    _emit(s, {"kind": "area-event", "event": label, "script": s,
+                               "area": area_rr, "areas": [area_rr]})
+
+        # Dialog action/condition scripts → item_script_checks + dialog_item_checks
+        # Both "action" (node fires) and "active" (condition gate) scripts can check items.
+        dlg_script_to_dlgs: dict[str, dict[str, set[str]]] = {
+            "action": defaultdict(set),
+            "active": defaultdict(set),
+        }
+        for dlg_rr, entries in self.dialog_scripts.items():
+            for e in entries:
+                kind = e["kind"]
+                if kind in dlg_script_to_dlgs:
+                    dlg_script_to_dlgs[kind][e["resref"]].add(dlg_rr)
+
+        # Build dialog_item_checks: dialog → item resrefs checked in any script
+        for script_kind, script_to_dlgs in dlg_script_to_dlgs.items():
+            for script_rr, dlg_set in script_to_dlgs.items():
+                if script_rr not in self.script_checks_item_tags:
+                    continue
+                for tag in self.script_checks_item_tags[script_rr]:
+                    for item_rr in tag_to_resrefs.get(tag.lower(), []):
+                        for dlg_rr in dlg_set:
+                            if item_rr not in self.dialog_item_checks[dlg_rr]:
+                                self.dialog_item_checks[dlg_rr].append(item_rr)
+
+        # Emit item_script_checks entries for dialog-action and dialog-condition.
+        # If a dialog has no static caller, still emit an entry so the item page
+        # can link back to the conversation (areas will be empty).
+        item_check_kind = {"action": "dialog-action", "active": "dialog-condition"}
+        for script_kind, script_to_dlgs in dlg_script_to_dlgs.items():
+            entry_kind = item_check_kind[script_kind]
+            for script_rr, dlg_set in script_to_dlgs.items():
+                if script_rr not in self.script_checks_item_tags:
+                    continue
+                for dlg_rr in dlg_set:
+                    callers = self.dialog_callers.get(dlg_rr, [])
+                    if callers:
+                        for caller in callers:
+                            _emit(script_rr, {
+                                "kind": entry_kind, "script": script_rr,
+                                "dialog": dlg_rr,
+                                "caller_kind": caller.get("kind", ""),
+                                "caller_resref": caller.get("resref", ""),
+                                "areas": caller.get("areas", []),
+                            })
+                    else:
+                        _emit(script_rr, {
+                            "kind": entry_kind, "script": script_rr,
+                            "dialog": dlg_rr,
+                            "caller_kind": "", "caller_resref": "", "areas": [],
+                        })
+
+        # Deduplicate per item
+        for rr in list(self.item_script_checks.keys()):
+            seen: set[tuple] = set()
+            uniq = []
+            for entry in self.item_script_checks[rr]:
+                key = (entry.get("kind"), entry.get("resref"), entry.get("script"),
+                       entry.get("area"), entry.get("event"), entry.get("dialog"))
+                if key not in seen:
+                    seen.add(key)
+                    uniq.append(entry)
+            self.item_script_checks[rr] = uniq
+
+    def _build_dialog_quest_index(self) -> None:
+        """Populate dialog_quest_grants_rev and quest_tag_to_info.
+        Must run after _index_script_item_checks (all quest_grants/quest_dialog_grants built)."""
+        if not self.jrl:
+            return
+
+        # Build quest_tag_to_info from the journal categories.
+        used_slugs: set[str] = set()
+        for c in list_items(self.jrl.get("Categories")):
+            if _quest_hidden(fld(c, "Comment", "")):
+                continue
+            q_tag = (fld(c, "Tag", "") or "").strip().lower()
+            q_name = loc(c.get("Name")) or q_tag
+            slug = _quest_slug(q_tag, q_name, used_slugs)
+            if q_tag:
+                self.quest_tag_to_info[q_tag] = (q_name, slug)
+
+        # Invert quest_dialog_grants: q_tag/eid/dlg_rr → dialog_quest_grants_rev
+        for q_tag, eid_map in self.quest_dialog_grants.items():
+            if q_tag not in self.quest_tag_to_info:
+                continue
+            for eid, dlg_set in eid_map.items():
+                for dlg_rr in dlg_set:
+                    self.dialog_quest_grants_rev[dlg_rr][q_tag].add(eid)
+
+        # Script-based grants: action scripts in a dialog that call AddJournalQuestEntry
+        script_to_dlgs: dict[str, set[str]] = defaultdict(set)
+        for dlg_rr, entries in self.dialog_scripts.items():
+            for e in entries:
+                if e["kind"] == "action":
+                    script_to_dlgs[e["resref"]].add(dlg_rr)
+        for q_tag, eid_map in self.quest_grants.items():
+            if q_tag not in self.quest_tag_to_info:
+                continue
+            for eid, script_set in eid_map.items():
+                for script_rr in script_set:
+                    for dlg_rr in script_to_dlgs.get(script_rr, set()):
+                        self.dialog_quest_grants_rev[dlg_rr][q_tag].add(eid)
+
+    def _build_store_openers(self) -> None:
+        """Populate store_tag_openers. Must be called after index_dialogs so
+        that dialog_callers and dialog_scripts are fully built."""
+        # 1. Dialog action scripts that open stores: trace caller → dialog → script → store.
+        for dlg_resref, script_list in self.dialog_scripts.items():
+            for s in script_list:
+                if s["kind"] != "action":
+                    continue
+                store_tags = self.script_store_tags.get(s["resref"], set())
+                if not store_tags:
+                    continue
+                for caller in self.dialog_callers.get(dlg_resref, []):
+                    for tag in store_tags:
+                        self.store_tag_openers[tag.lower()].append({
+                            **caller,
+                            "via_script": s["resref"],
+                            "via_dialog": dlg_resref,
+                        })
+
+        # 1b. Proximity-based store openers (Bedlamson's Dynamic Merchant
+        # System and similar patterns): the action script calls OpenStore on a
+        # runtime local-variable object, not by tag. At spawn the NPC stores
+        # GetNearestObject(OBJECT_TYPE_STORE) in a local var, so in practice
+        # the store opened is the one placed in the same area. Link the dialog
+        # caller to every store in its placement area(s).
+        for dlg_resref, script_list in self.dialog_scripts.items():
+            bdm_script = next(
+                (s["resref"] for s in script_list
+                 if s["kind"] == "action" and s["resref"] in self.script_bdm_open),
+                None,
+            )
+            if bdm_script is None:
+                continue
+            for caller in self.dialog_callers.get(dlg_resref, []):
+                caller_areas = caller.get("areas") or (
+                    [caller["area"]] if "area" in caller else []
+                )
+                for area_rr in caller_areas:
+                    for store_inst in self.area_stores.get(area_rr, []):
+                        tag = fld(store_inst, "Tag", "")
+                        if not tag:
+                            continue
+                        self.store_tag_openers[tag.lower()].append({
+                            **caller,
+                            "via_script": bdm_script,
+                            "via_dialog": dlg_resref,
+                        })
+
+        # 2. Entity event scripts that directly open stores (trigger OnEnter, etc.).
+        creature_areas: dict[str, set[str]] = defaultdict(set)
+        trigger_areas: dict[str, set[str]] = defaultdict(set)
+        placeable_areas: dict[str, set[str]] = defaultdict(set)
+        for ar, npcs in self.area_npcs.items():
+            for c in npcs:
+                rr = fld(c, "TemplateResRef", "")
+                if rr:
+                    creature_areas[rr].add(ar)
+        for ar, ts in self.area_triggers.items():
+            for t in ts:
+                rr = fld(t, "TemplateResRef", "")
+                if rr:
+                    trigger_areas[rr].add(ar)
+        for ar, ps in self.area_placeables.items():
+            for p in ps:
+                rr = fld(p, "TemplateResRef", "")
+                if rr:
+                    placeable_areas[rr].add(ar)
+
+        def _add_direct(blueprints: dict, fields: dict[str, str],
+                        kind: str, areas_idx: dict[str, set[str]]) -> None:
+            for rr, bp in blueprints.items():
+                for fld_name, label in fields.items():
+                    s = (fld(bp, fld_name, "") or "").lower()
+                    if not s:
+                        continue
+                    for tag in self.script_store_tags.get(s, set()):
+                        self.store_tag_openers[tag.lower()].append({
+                            "kind": kind, "resref": rr, "event": label, "script": s,
+                            "areas": sorted(areas_idx.get(rr, set())),
+                        })
+
+        _add_direct(self.creatures, self.CREATURE_EVENT_FIELDS, "creature-event", creature_areas)
+        _add_direct(self.triggers, self.TRIGGER_EVENT_FIELDS, "trigger-event", trigger_areas)
+        _add_direct(self.placeables, self.PLACEABLE_EVENT_FIELDS, "placeable-event", placeable_areas)
+
+        # 2a. Per-instance trigger overrides.
+        for area_rr, ts in self.area_triggers.items():
+            for idx, inst in enumerate(ts):
+                inst_tag = fld(inst, "Tag", "") or ""
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                for fld_name, label in self.TRIGGER_EVENT_FIELDS.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if not s:
+                        continue
+                    for store_tag in self.script_store_tags.get(s, set()):
+                        self.store_tag_openers[store_tag.lower()].append({
+                            "kind": "trigger-event-instance",
+                            "area": area_rr, "idx": idx, "tag": inst_tag,
+                            "resref": bp_rr, "event": label, "script": s,
+                            "areas": [area_rr],
+                        })
+
+        # Dedupe: prefer instance entries over blueprint entries for the same
+        # NPC+area+dialog combination so each NPC only shows once.
+        for tag, openers in self.store_tag_openers.items():
+            # First pass: collect by exact key
+            exact_seen: set[tuple] = set()
+            exact_uniq = []
+            for o in openers:
+                key = (o.get("kind"), o.get("resref"), o.get("event"),
+                       o.get("script"), o.get("area"), o.get("idx"),
+                       o.get("via_dialog"))
+                if key not in exact_seen:
+                    exact_seen.add(key)
+                    exact_uniq.append(o)
+            # Second pass: drop blueprint-level entries when an instance entry
+            # for the same resref+area+dialog already exists (instance is more precise).
+            instance_keys: set[tuple] = {
+                (o["resref"], o.get("area") or (o.get("areas") or [""])[0],
+                 o.get("via_dialog"))
+                for o in exact_uniq
+                if o.get("kind") in ("creature-instance", "placeable-instance",
+                                     "door-instance", "trigger-event-instance",
+                                     "placeable-event-instance", "door-event-instance")
+            }
+            uniq = []
+            for o in exact_uniq:
+                kind = o.get("kind", "")
+                is_bp = kind in ("creature", "creature-event", "placeable",
+                                 "placeable-event", "door", "door-event",
+                                 "trigger-event")
+                if is_bp:
+                    # Drop if a corresponding instance entry already covers it.
+                    areas = o.get("areas") or []
+                    via_dlg = o.get("via_dialog")
+                    rr = o.get("resref", "")
+                    covered = any(
+                        (rr, a, via_dlg) in instance_keys for a in areas
+                    )
+                    if covered:
+                        continue
+                uniq.append(o)
+            self.store_tag_openers[tag] = uniq
+
+    # ---- Convenience getters ----
+
+    def area_name(self, resref: str) -> str:
+        a = self.areas.get(resref)
+        if not a:
+            return resref
+        return loc(a.get("Name")) or resref
+
+    def creature_name(self, resref: str) -> str:
+        c = self.creatures.get(resref)
+        if not c:
+            return STOCK_CREATURE_NAMES.get(resref, resref)
+        first = loc(c.get("FirstName"))
+        last = loc(c.get("LastName"))
+        full = (first + " " + last).strip()
+        return full or STOCK_CREATURE_NAMES.get(resref, resref)
+
+    def item_name(self, resref: str) -> str:
+        i = self.items.get(resref)
+        if not i:
+            return STOCK_ITEM_NAMES.get(resref, resref)
+        resolved = loc(i.get("LocalizedName"))
+        if not resolved or resolved.startswith("[TLK#"):
+            base = self.item_is_variant_of.get(resref, resref)
+            return (STOCK_ITEM_NAMES.get(base)
+                    or STOCK_ITEM_NAMES.get(resref)
+                    or resolved or resref)
+        return resolved
+
+    def store_name(self, resref: str) -> str:
+        s = self.stores.get(resref)
+        if not s:
+            return resref
+        return loc(s.get("LocName")) or resref
+
+    def is_friendly(self, faction_id: int | None) -> bool:
+        if faction_id is None:
+            return True
+        return self.faction_friendly.get(int(faction_id), True)
+
+    def faction_name(self, faction_id) -> str:
+        """Human-readable faction name from repute.fac.json's FactionList.
+        Falls back to the numeric id if the faction can't be resolved."""
+        if faction_id is None or faction_id == "":
+            return ""
+        try:
+            i = int(faction_id)
+        except (TypeError, ValueError):
+            return str(faction_id)
+        if i == 65535:
+            return "(None)"
+        if not self.fac:
+            return str(i)
+        flist = list_items(self.fac.get("FactionList"))
+        if 0 <= i < len(flist):
+            name = fld(flist[i], "FactionName", "") or ""
+            return nwn_text(name) if name else str(i)
+        return str(i)
+
+    def creature_instance_name(self, area: str, idx: int) -> str:
+        """Display name for a creature INSTANCE (uses overridden FirstName/
+        LastName on the placement, falling back to the blueprint's name)."""
+        insts = self.area_creature_instances.get(area, [])
+        if not (0 <= idx < len(insts)):
+            return ""
+        c = insts[idx]["c"]
+        first = loc(c.get("FirstName"))
+        last = loc(c.get("LastName"))
+        full = (first + " " + last).strip()
+        if full:
+            return full
+        rr = fld(c, "TemplateResRef", "") or ""
+        return self.creature_name(rr) if rr else "(unnamed)"
+
+    def canonical_creature_name(self, canonical_rr: str) -> str:
+        """Display name for a canonical creature entry.
+        Uses FirstName/LastName from the canonical struct (which may be a
+        GIT instance override), falling back to the source blueprint's name.
+        """
+        entry = self.canonical_creatures.get(canonical_rr)
+        if not entry:
+            return canonical_rr
+        c = entry["c"]
+        first = loc(c.get("FirstName"))
+        last = loc(c.get("LastName"))
+        full = (first + " " + last).strip()
+        if full:
+            return full
+        bp_rr = entry["bp_rr"]
+        if bp_rr and bp_rr != canonical_rr and bp_rr in self.creatures:
+            return self.creature_name(bp_rr)
+        return self.creature_name(canonical_rr) or canonical_rr
+
+    def dialog_label(self, resref: str) -> str:
+        """A short human label for a dialog: the first line of its first
+        Starting entry, truncated. Falls back to the resref."""
+        dlg = self.dialogs.get(resref)
+        if not dlg:
+            return resref
+        starts = list_items(dlg.get("StartingList"))
+        entries = list_items(dlg.get("EntryList"))
+        for s in starts:
+            i = fld(s, "Index")
+            if isinstance(i, int) and 0 <= i < len(entries):
+                txt = nwn_text(loc(entries[i].get("Text")))
+                txt = txt.strip().splitlines()[0] if txt else ""
+                if txt:
+                    return (txt[:60] + "…") if len(txt) > 63 else txt
+        # Fall back to the first non-empty entry text.
+        for e in entries:
+            txt = nwn_text(loc(e.get("Text")))
+            txt = txt.strip().splitlines()[0] if txt else ""
+            if txt:
+                return (txt[:60] + "…") if len(txt) > 63 else txt
+        return resref
+
+
+# ---------------------------------------------------------------------------
+# Directional area layout
+# ---------------------------------------------------------------------------
+#
+# NWN areas are tile grids: the in-game X axis runs east, the Y axis runs
+# north. A trigger or door at X≈Width*10 sits on the east edge of its area —
+# meaning the area it links to "is to the east" in the player's mental map.
+# We exploit that to place adjacent areas on the correct side of each other,
+# so the resulting overview map looks like a real overworld instead of a
+# random force-directed blob.
+
+def _transition_dir(tr: dict, src_w: float, src_h: float) -> tuple[float, float] | None:
+    """Unit vector pointing out of the source area in the direction the
+    transition exits. Returns None if the transition has no usable position
+    or is well inside the area (we don't want noise near the centre to push
+    nodes around)."""
+    x, y = tr.get("src_x"), tr.get("src_y")
+    if x is None or y is None or src_w <= 0 or src_h <= 0:
+        return None
+    # Distance from each edge (in metres).
+    d_w = x                  # west
+    d_e = src_w - x          # east
+    d_s = y                  # south
+    d_n = src_h - y          # north
+    # Closest edge wins; ignore transitions deep inside the area.
+    edges = [("w", d_w, (-1.0, 0.0)),
+             ("e", d_e, (1.0, 0.0)),
+             ("s", d_s, (0.0, -1.0)),
+             ("n", d_n, (0.0, 1.0))]
+    edges.sort(key=lambda e: e[1])
+    name, dist, vec = edges[0]
+    # Threshold = 25% of the smaller dimension. Anything further from any
+    # edge is ambiguous (e.g. internal door inside a building).
+    thresh = 0.25 * min(src_w, src_h)
+    if dist > thresh:
+        return None
+    return vec
+
+
+def layout_areas(
+    node_ids: list[str],
+    edges: list[tuple[str, str]],
+    *,
+    db: "Db | None" = None,
+    iterations: int = 600,
+    seed: int = 1,
+) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]]]:
+    """Place areas on a 2D canvas so the resulting map respects in-game
+    orientation.
+
+    Phase 1: BFS from the most-connected node in each connected component,
+    seeding positions from transition-direction hints so adjacents start near
+    each other in the correct cardinal direction.  Same-direction siblings are
+    spread perpendicular to avoid initial overlap.  Disconnected components are
+    packed in a grid below the main component.
+
+    Phase 2: A short force-directed simulation (weak repulsion + strong spring
+    + directional bias) fine-tunes the layout.
+
+    Returns (positions, sizes). Sizes are in the same units as positions
+    (one unit ≈ one tile, so a 16×10 area becomes a 16×10 box). Positions
+    are box centres.
+    """
+    if not node_ids:
+        return {}, {}
+    rng = random.Random(seed)
+
+    # Box size in tile units. 1.5× the area's tile dims gives enough room for
+    # text labels while keeping boxes visually proportionate on the map.
+    box_scale = 1.5
+    sizes: dict[str, tuple[float, float]] = {}
+    for nid in node_ids:
+        a = db.areas.get(nid, {}) if db else {}
+        w = float(fld(a, "Width", 8) or 8)
+        h = float(fld(a, "Height", 8) or 8)
+        sizes[nid] = (max(w, 4.0) * box_scale, max(h, 4.0) * box_scale)
+
+    avg_dim = sum(w + h for w, h in sizes.values()) / max(1, 2 * len(sizes))
+    node_set = set(node_ids)
+
+    # Per-edge desired direction (averaged over both endpoints' transitions).
+    edge_dirs: dict[tuple[str, str], tuple[float, float]] = {}
+    if db is not None:
+        for tr in db.transitions:
+            a, b = tr["src_area"], tr["dst_area"]
+            if a not in node_set or not b or b not in node_set or a == b:
+                continue
+            sw, sh = sizes[a]
+            v = _transition_dir(tr, sw * 10.0, sh * 10.0)  # tile→metres
+            if v is None:
+                continue
+            cur = edge_dirs.get((a, b), (0.0, 0.0))
+            edge_dirs[(a, b)] = (cur[0] + v[0], cur[1] + v[1])
+    # Normalise.
+    for k, v in list(edge_dirs.items()):
+        m = math.hypot(*v)
+        if m > 1e-6:
+            edge_dirs[k] = (v[0] / m, v[1] / m)
+
+    # "Ideal" edge length: enough that two boxes don't overlap, plus margin.
+    def ideal_len(a: str, b: str) -> float:
+        wa, ha = sizes[a]
+        wb, hb = sizes[b]
+        return 0.5 * (max(wa, ha) + max(wb, hb)) + avg_dim * 0.25
+
+    # Adjacency used by both BFS placement and the force simulation.
+    adj: dict[str, set[str]] = {nid: set() for nid in node_ids}
+    for a, b in edges:
+        if a in node_set and b in node_set and a != b:
+            adj[a].add(b)
+            adj[b].add(a)
+    edge_pairs = [(a, b) for a, b in edges
+                  if a in node_set and b in node_set and a != b]
+
+    # --- BFS-based initial placement ---
+    # Phase 1: discover connected components, sorted largest-first.
+    comp_list: list[list[str]] = []
+    disc_seen: set[str] = set()
+    disc_remaining: set[str] = set(node_ids)
+    while disc_remaining:
+        root0 = max(disc_remaining, key=lambda n: len(adj[n]))
+        disc_q: list[str] = [root0]; disc_comp: list[str] = [root0]
+        disc_seen.add(root0); disc_remaining.discard(root0)
+        dh = 0
+        while dh < len(disc_q):
+            u0 = disc_q[dh]; dh += 1
+            for nb0 in adj[u0]:
+                if nb0 not in disc_seen:
+                    disc_seen.add(nb0); disc_remaining.discard(nb0)
+                    disc_q.append(nb0); disc_comp.append(nb0)
+        comp_list.append(disc_comp)
+    comp_list.sort(key=len, reverse=True)
+
+    def _bfs_place_comp(comp_nodes: list[str]) -> dict[str, list[float]]:
+        """BFS-place a connected component, returning positions relative to (0,0)."""
+        cpos: dict[str, list[float]] = {}
+        cplaced: set[str] = set()
+        root = max(comp_nodes, key=lambda n: len(adj[n]))
+        cpos[root] = [0.0, 0.0]; cplaced.add(root)
+        bfs_q: list[str] = [root]; head = 0
+        while head < len(bfs_q):
+            u = bfs_q[head]; head += 1
+            ux, uy = cpos[u]
+            neighbors = [nb for nb in sorted(adj[u]) if nb not in cplaced]
+            # Group by quantized direction so same-direction siblings spread
+            # perpendicular, avoiding the initial-overlap explosion.
+            by_sector: dict[int, list[tuple[str, float, float]]] = defaultdict(list)
+            no_hint: list[str] = []
+            for nb in neighbors:
+                dir_fwd = edge_dirs.get((u, nb))
+                dir_rev = edge_dirs.get((nb, u))
+                if dir_fwd:
+                    ddx, ddy = dir_fwd
+                elif dir_rev:
+                    ddx, ddy = -dir_rev[0], -dir_rev[1]
+                else:
+                    no_hint.append(nb); continue
+                sector = round(math.atan2(ddy, ddx) / (math.pi / 4)) % 8
+                by_sector[sector].append((nb, ddx, ddy))
+            used_sectors = set(by_sector.keys())
+            for sector, group in by_sector.items():
+                angle = sector * math.pi / 4
+                mdx, mdy = math.cos(angle), math.sin(angle)
+                pdx, pdy = -mdy, mdx
+                n = len(group)
+                for j, (nb, _, _) in enumerate(group):
+                    if nb in cplaced: continue
+                    L = ideal_len(u, nb)
+                    perp_off = (j - (n - 1) / 2) * (sizes[nb][0] + avg_dim * 0.15)
+                    cpos[nb] = [ux + mdx * L + pdx * perp_off,
+                                uy + mdy * L + pdy * perp_off]
+                    cplaced.add(nb); bfs_q.append(nb)
+            avail_angles = [k * math.pi / 4 for k in range(8)
+                            if k not in used_sectors]
+            for j, nb in enumerate(no_hint):
+                if nb in cplaced: continue
+                angle = (avail_angles[j % len(avail_angles)] if avail_angles
+                         else 2 * math.pi * j / max(1, len(no_hint)))
+                L = ideal_len(u, nb)
+                cpos[nb] = [ux + math.cos(angle) * L, uy + math.sin(angle) * L]
+                cplaced.add(nb); bfs_q.append(nb)
+        return cpos
+
+    # Phase 2: place each component; arrange smaller ones in a grid below the main.
+    pos: dict[str, list[float]] = {}
+    comp_positioned: list[tuple[list[str], dict[str, list[float]], float, float]] = []
+    for comp_nodes in comp_list:
+        cpos = _bfs_place_comp(comp_nodes)
+        # Bounding box of this component relative to its own origin
+        cx0 = min(cpos[n][0] - sizes[n][0] / 2 for n in comp_nodes)
+        cx1 = max(cpos[n][0] + sizes[n][0] / 2 for n in comp_nodes)
+        cy0 = min(cpos[n][1] - sizes[n][1] / 2 for n in comp_nodes)
+        cy1 = max(cpos[n][1] + sizes[n][1] / 2 for n in comp_nodes)
+        # Normalise to local (0,0) top-left
+        for n in comp_nodes:
+            cpos[n][0] -= cx0
+            cpos[n][1] -= cy0
+        comp_positioned.append((comp_nodes, cpos, cx1 - cx0, cy1 - cy0))
+
+    # Main component at origin; secondary components below in a grid.
+    # NOTE: layout_areas flips Y at return time (-pos_y → screen coords where
+    # +Y = down). Here pre-flip: +Y = north (top of screen), -Y = south (bottom).
+    # Main component cpos-Y is normalised so 0 = south edge, ch = north edge.
+    # To appear BELOW main on screen, secondary components must use negative
+    # pre-flip Y so that after the flip they have positive screen Y.
+    sep = avg_dim * 2
+    main_nodes, main_cpos, main_w, main_h = comp_positioned[0]
+    # Centre the main component horizontally; place with south edge at Y=0.
+    for n in main_nodes:
+        pos[n] = [main_cpos[n][0] - main_w / 2, main_cpos[n][1]]
+
+    # Secondary components: north edge at -sep (sep below main's south edge),
+    # then south edge at -(sep + ch). Track rows, wrap when width exceeds budget.
+    # row_top_y is the pre-flip Y of each row's north edge (negative and growing).
+    row_top_y = -sep
+    row_x = 0.0
+    row_max_ch = 0.0
+    row_budget = max(main_w, avg_dim * 4)
+    for comp_nodes, cpos, cw, ch in comp_positioned[1:]:
+        if row_x > 0 and row_x + cw > row_budget:
+            row_top_y -= (row_max_ch + sep)
+            row_x = 0.0
+            row_max_ch = 0.0
+        # cpos-Y 0=south ch=north; north edge aligns with row_top_y.
+        for n in comp_nodes:
+            pos[n] = [row_x + cpos[n][0] - main_w / 2,
+                      row_top_y - ch + cpos[n][1]]
+        row_x += cw + sep
+        row_max_ch = max(row_max_ch, ch)
+
+    # Small jitter to break symmetry before the force simulation.
+    for nid in pos:
+        pos[nid][0] += rng.uniform(-avg_dim * 0.05, avg_dim * 0.05)
+        pos[nid][1] += rng.uniform(-avg_dim * 0.05, avg_dim * 0.05)
+
+    # Temperature: small since BFS starts nodes near-correct — simulation
+    # mainly resolves residual overlaps and sharpens directional alignment.
+    t = avg_dim * 0.8
+    cooling = (t - 0.5) / iterations
+
+    for _ in range(iterations):
+        disp = {nid: [0.0, 0.0] for nid in pos}
+
+        # Repulsion — only between boxes whose AABBs are close enough to
+        # potentially overlap, with a soft falloff.
+        ids = list(pos.keys())
+        for i, u in enumerate(ids):
+            ux, uy = pos[u]
+            uw, uh = sizes[u]
+            for v in ids[i + 1:]:
+                vx, vy = pos[v]
+                vw, vh = sizes[v]
+                # AABB overlap distance in each axis (negative = overlap).
+                gap_x = abs(ux - vx) - 0.5 * (uw + vw) - avg_dim * 0.15
+                gap_y = abs(uy - vy) - 0.5 * (uh + vh) - avg_dim * 0.15
+                gap = max(gap_x, gap_y)
+                if gap > avg_dim * 0.3:
+                    continue  # well clear; no force
+                dx = ux - vx
+                dy = uy - vy
+                d = math.hypot(dx, dy)
+                if d < 1e-3:
+                    dx = rng.uniform(-0.5, 0.5)
+                    dy = rng.uniform(-0.5, 0.5)
+                    d = math.hypot(dx, dy) + 1e-3
+                # Strong push when overlapping, gentle nudge when close.
+                strength = (avg_dim * 1.0) ** 2 / max(d, 1.0)
+                if gap < 0:
+                    strength *= 6.0
+                fx, fy = dx / d * strength, dy / d * strength
+                disp[u][0] += fx
+                disp[u][1] += fy
+                disp[v][0] -= fx
+                disp[v][1] -= fy
+
+        # Attractive forces toward an ideal length, with directional bias.
+        for a, b in edge_pairs:
+            ax, ay = pos[a]
+            bx, by = pos[b]
+            dx = bx - ax
+            dy = by - ay
+            d = math.hypot(dx, dy) + 1e-6
+            L = ideal_len(a, b)
+            # Spring toward L
+            f = (d - L) * 0.4
+            fx, fy = dx / d * f, dy / d * f
+            disp[a][0] += fx
+            disp[a][1] += fy
+            disp[b][0] -= fx
+            disp[b][1] -= fy
+
+            # Directional bias: dst should be at src + L*dir (and vice versa
+            # for dst→src direction if recorded).
+            for s, t_id, sign in [(a, b, 1.0), (b, a, -1.0)]:
+                v = edge_dirs.get((s, t_id))
+                if v is None:
+                    continue
+                # Target offset of t_id from s.
+                target_dx = v[0] * L
+                target_dy = v[1] * L
+                cur_dx = pos[t_id][0] - pos[s][0]
+                cur_dy = pos[t_id][1] - pos[s][1]
+                err_x = target_dx - cur_dx
+                err_y = target_dy - cur_dy
+                bias = 0.15
+                disp[t_id][0] += err_x * bias
+                disp[t_id][1] += err_y * bias
+                disp[s][0]    -= err_x * bias * 0.5
+                disp[s][1]    -= err_y * bias * 0.5
+
+        # Apply, capped by current temperature.
+        for nid in ids:
+            dx, dy = disp[nid]
+            d = math.hypot(dx, dy) + 1e-9
+            scale = min(d, t) / d
+            pos[nid][0] += dx * scale
+            pos[nid][1] += dy * scale
+
+        t = max(0.5, t - cooling)
+
+    # Flip Y to screen coords (NWN +Y = north; SVG +Y = down).
+    return ({nid: (pos[nid][0], -pos[nid][1]) for nid in pos}, sizes)
+
+
+# ---------------------------------------------------------------------------
+# HTML helpers
+# ---------------------------------------------------------------------------
+
+def E(s: Any) -> str:
+    """HTML-escape a value, treating None as ''."""
+    if s is None:
+        return ""
+    return html.escape(str(s), quote=True)
+
+
+# ---------------------------------------------------------------------------
+# NWN colour token rendering
+# ---------------------------------------------------------------------------
+#
+# NWN strings can embed colour codes in two related forms:
+#   <cRGB>...</c>      – the normal in-game form (R,G,B are raw bytes 0–255).
+#   <<cRGB>...<</c>    – the doubled-bracket form used inside conversation,
+#                        journal, and description fields so the toolset
+#                        editors don't strip the angle brackets.
+# The byte values arrive here as Unicode code points after JSON decoding,
+# usually 1:1 (Latin-1 style); a few values in 0x80–0x9F may have been
+# remapped through CP-1252 (e.g. 0x80 → U+20AC '€'), which we reverse so
+# the original byte can be recovered.
+#
+# Module text is loaded straight from GFF and may contain unbalanced tokens
+# (e.g. <c…> with no </c>); we auto-close any open spans at the end.
+
+def _colour_byte(ch: str) -> int:
+    """Recover the 0–255 NWN channel byte from a single decoded character."""
+    o = ord(ch)
+    if o <= 0xFF:
+        return o
+    try:
+        return ch.encode("cp1252")[0]
+    except (UnicodeEncodeError, IndexError):
+        return min(o, 0xFF)
+
+
+def nwn_html(s: Any) -> str:
+    """Render an NWN string with <cRGB>/</c> tokens to HTML-safe markup.
+
+    Plain text is HTML-escaped; colour tokens become <span style="color:#rrggbb">
+    so the intended colour is shown and the raw bytes are hidden."""
+    if s is None:
+        return ""
+    s = str(s)
+    if not s:
+        return ""
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+
+    def flush() -> None:
+        if buf:
+            out.append(html.escape("".join(buf), quote=True))
+            buf.clear()
+
+    i = 0
+    n = len(s)
+    while i < n:
+        # Doubled-bracket open: <<cRGB>
+        if (i + 7 <= n and s[i] == "<" and s[i + 1] == "<"
+                and s[i + 2] == "c" and s[i + 6] == ">"):
+            flush()
+            r, g, b = (_colour_byte(s[i + 3]), _colour_byte(s[i + 4]),
+                       _colour_byte(s[i + 5]))
+            out.append(f'<span style="color:#{r:02x}{g:02x}{b:02x}">')
+            depth += 1
+            i += 7
+            continue
+        # Doubled-bracket close: <</c>
+        if i + 5 <= n and s[i:i + 5] == "<</c>":
+            flush()
+            if depth > 0:
+                out.append("</span>")
+                depth -= 1
+            i += 5
+            continue
+        # Standard open: <cRGB>
+        if (i + 6 <= n and s[i] == "<" and s[i + 1] == "c"
+                and s[i + 5] == ">"):
+            flush()
+            r, g, b = (_colour_byte(s[i + 2]), _colour_byte(s[i + 3]),
+                       _colour_byte(s[i + 4]))
+            out.append(f'<span style="color:#{r:02x}{g:02x}{b:02x}">')
+            depth += 1
+            i += 6
+            continue
+        # Standard close: </c>
+        if i + 4 <= n and s[i:i + 4] == "</c>":
+            flush()
+            if depth > 0:
+                out.append("</span>")
+                depth -= 1
+            i += 4
+            continue
+        buf.append(s[i])
+        i += 1
+
+    flush()
+    out.extend(["</span>"] * depth)
+    return "".join(out)
+
+
+_C_TOKEN_RE = re.compile(r"<<?/c>|<<?c.{3}>|</?[A-Za-z][^>]*>", re.DOTALL)
+_C_OPEN_RE = re.compile(r"<<?c(.)(.)(.)>", re.DOTALL)
+
+
+# Canonical NWN1 in-game text colours for damage / effect / save types.
+# Source: https://nwn.wiki/spaces/NWN1/pages/38177018/Colour+Tokens
+# Applied to property subtypes, weapon damage extras, and creature feat /
+# spell labels so the wiki echoes the colour cues a player sees in the game.
+NWN_DAMAGE_COLORS: dict[str, str] = {
+    "Acid":       "#01ff01",
+    "Cold":       "#99ffff",
+    "Divine":     "#ffff01",
+    "Electrical": "#0166ff",
+    "Fire":       "#ff0101",
+    "Magical":    "#cc77ff",
+    "Negative":   "#999999",
+    "Positive":   "#ffffff",
+    "Sonic":      "#ff9901",
+}
+
+_DMG_WORD_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in NWN_DAMAGE_COLORS) + r")\b"
+)
+
+
+def colorize_damage_words(s: str) -> str:
+    """Wrap NWN damage / effect type words in spans with their canonical
+    in-game hex colour. Safe to call on either plain text or already-escaped
+    HTML — the substitution only matches bare words, never markup. The CSS
+    class `nwn-dmg` adds a text-shadow so the lighter NWN colours (Cold,
+    Divine, Positive) stay legible on the wiki's light background."""
+    if not s:
+        return s
+    return _DMG_WORD_RE.sub(
+        lambda m: (
+            f'<span class="nwn-dmg nwn-dmg-{m.group(1).lower()}" '
+            f'style="color:{NWN_DAMAGE_COLORS[m.group(1)]}">'
+            f"{m.group(1)}</span>"
+        ),
+        s,
+    )
+
+
+def nwn_text(s: Any) -> str:
+    """Strip NWN colour tokens, returning plain text (no HTML escaping).
+
+    Use for places that can't render markup: HTML <title>, alt attributes,
+    sort keys."""
+    if s is None:
+        return ""
+    return _C_TOKEN_RE.sub("", str(s))
+
+
+def nwn_first_color(s: Any) -> str | None:
+    """Return '#rrggbb' for the first <cRGB>/<<cRGB> token in s, or None.
+
+    Useful for elements that can carry a single colour (SVG <text> fill)
+    but not inline runs."""
+    if s is None:
+        return None
+    m = _C_OPEN_RE.search(str(s))
+    if not m:
+        return None
+    r, g, b = (_colour_byte(m.group(1)), _colour_byte(m.group(2)),
+               _colour_byte(m.group(3)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def link(href: str, text: str) -> str:
+    return f'<a href="{E(href)}">{nwn_html(text)}</a>'
+
+
+def _script_link(db: "Db", resref: str | None, root_rel: str = "..") -> str:
+    """Render a script resref as a link to its source-view page when the
+    script is shipped with the module; otherwise render it as plain code."""
+    if not resref:
+        return ""
+    if resref in db.script_paths:
+        return link(f"{root_rel}/scripts/{resref}.html", resref)
+    return f"<code>{E(resref)}</code>"
+
+
+def _conv_link(db: "Db", resref: str | None, root_rel: str = "..") -> str:
+    """Render a dialog resref as a link to its conversation page when the
+    dialog is in the module; otherwise render it as plain code (lets the
+    user see resrefs that point at engine-default dialogs that don't ship
+    in the module's dlg files)."""
+    if not resref:
+        return ""
+    if resref.lower() in db.dialogs:
+        return link(f"{root_rel}/conversations/{resref.lower()}.html", resref)
+    return f"<code>{E(resref)}</code>"
+
+
+def _faction_dd(db: Db, faction_id, root_rel: str = ".") -> str:
+    """Render a faction id as <name> (<id>) linking to the factions page,
+    falling back to just the raw id when no name is resolvable."""
+    if faction_id is None or faction_id == "":
+        return ""
+    name = db.faction_name(faction_id)
+    try:
+        _fid_int = int(faction_id)
+    except (TypeError, ValueError):
+        _fid_int = None
+    if name and str(name) != str(faction_id):
+        id_suffix = (
+            "" if _fid_int == 65535
+            else f' <small class="muted">(id {E(faction_id)})</small>'
+        )
+        return f'<a href="{E(root_rel)}/factions.html">{nwn_html(name)}</a>{id_suffix}'
+    return (f'<a href="{E(root_rel)}/factions.html">{E(faction_id)}</a>')
+
+
+def _faction_cell(db: Db, canonical_rr: str, bp_faction_id, root_rel: str = ".") -> str:
+    """Render faction for a creature detail page.
+
+    Prefers FactionIDs from placed GIT instances (canonical_inst_factions) over
+    the blueprint's stored value, since instances override the blueprint in-game.
+    Falls back to bp_faction_id when no placed instances exist.
+    When instances span multiple factions, renders each one separated by " / ".
+    """
+    inst_fids = sorted(db.canonical_inst_factions.get(canonical_rr, set()))
+    if inst_fids:
+        return " / ".join(_faction_dd(db, fid, root_rel) for fid in inst_fids)
+    return _faction_dd(db, bp_faction_id, root_rel)
+
+
+def _race_link(race_raw, root_rel: str = ".") -> str:
+    """Render a race value as its name, linking to the by-race page anchor."""
+    if race_raw is None or race_raw == "":
+        return ""
+    try:
+        rid = int(race_raw)
+    except (TypeError, ValueError):
+        return E(str(race_raw))
+    anchor = f"race-{rid}"
+    return f'<a href="{E(root_rel)}/creatures/by-race/index.html#{anchor}">{E(race_name(rid))}</a>'
+
+
+def md_to_html(text: str) -> str:
+    """Convert a subset of Markdown to HTML (no third-party deps)."""
+    import html as _html
+
+    lines = text.splitlines()
+    out: list[str] = []
+    in_ul = False
+    in_ol = False
+    in_code = False
+    code_buf: list[str] = []
+
+    def close_lists():
+        nonlocal in_ul, in_ol
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+        if in_ol:
+            out.append("</ol>")
+            in_ol = False
+
+    def inline(s: str) -> str:
+        s = _html.escape(s, quote=False)
+        # inline code
+        s = re.sub(r"`([^`]+)`", lambda m: f"<code>{m.group(1)}</code>", s)
+        # bold
+        s = re.sub(r"\*\*(.+?)\*\*|__(.+?)__",
+                   lambda m: f"<strong>{m.group(1) or m.group(2)}</strong>", s)
+        # italic
+        s = re.sub(r"\*([^*]+)\*|_([^_]+)_",
+                   lambda m: f"<em>{m.group(1) or m.group(2)}</em>", s)
+        # links
+        s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)",
+                   lambda m: f'<a href="{_html.escape(m.group(2), quote=True)}">'
+                             f"{m.group(1)}</a>", s)
+        return s
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+
+        # fenced code block
+        if raw.startswith("```"):
+            if in_code:
+                out.append(f"<pre><code>{''.join(code_buf)}</code></pre>")
+                code_buf.clear()
+                in_code = False
+            else:
+                close_lists()
+                in_code = True
+            i += 1
+            continue
+        if in_code:
+            code_buf.append(_html.escape(raw) + "\n")
+            i += 1
+            continue
+
+        stripped = raw.strip()
+
+        # blank line
+        if not stripped:
+            close_lists()
+            i += 1
+            continue
+
+        # ATX headings
+        m = re.match(r"^(#{1,3})\s+(.*)", stripped)
+        if m:
+            close_lists()
+            lvl = len(m.group(1))
+            out.append(f"<h{lvl}>{inline(m.group(2))}</h{lvl}>")
+            i += 1
+            continue
+
+        # horizontal rule
+        if re.match(r"^[-*_]{3,}$", stripped):
+            close_lists()
+            out.append("<hr>")
+            i += 1
+            continue
+
+        # unordered list
+        m = re.match(r"^[-*]\s+(.*)", stripped)
+        if m:
+            if in_ol:
+                out.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                out.append("<ul>")
+                in_ul = True
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            i += 1
+            continue
+
+        # ordered list
+        m = re.match(r"^\d+\.\s+(.*)", stripped)
+        if m:
+            if in_ul:
+                out.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                out.append("<ol>")
+                in_ol = True
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            i += 1
+            continue
+
+        # paragraph: collect consecutive non-blank, non-heading lines
+        close_lists()
+        para: list[str] = []
+        while i < len(lines):
+            r = lines[i].strip()
+            if (not r or r.startswith("#") or r.startswith("```")
+                    or re.match(r"^[-*_]{3,}$", r)
+                    or re.match(r"^[-*]\s+", r)
+                    or re.match(r"^\d+\.\s+", r)):
+                break
+            para.append(inline(r))
+            i += 1
+        out.append(f"<p>{'<br>'.join(para)}</p>")
+
+    close_lists()
+    if in_code and code_buf:
+        out.append(f"<pre><code>{''.join(code_buf)}</code></pre>")
+    return "\n".join(out)
+
+
+def _manual_menu_rows(entries: list[dict], root_rel: str) -> list[str]:
+    """Return nav row HTML (links / submenus) for a list of manual-page entries."""
+    rows: list[str] = []
+    for entry in entries:
+        if entry["kind"] == "file":
+            rows.append(
+                f'<a href="{E(root_rel)}/manual/{E(entry["stem"])}.html">'
+                f'{E(entry["title"])}</a>'
+            )
+        else:
+            sub_items = "\n".join(
+                f'<a href="{E(root_rel)}/manual/{E(entry["dirname"])}/{E(it["stem"])}.html">'
+                f'{E(it["title"])}</a>'
+                for it in entry["items"]
+            )
+            rows.append(
+                f'<div class="nav-submenu">'
+                f'<span class="nav-submenu-label">{E(entry["title"])}</span>'
+                f'<div class="nav-submenu-menu">{sub_items}</div>'
+                f'</div>'
+            )
+    return rows
+
+
+def _quests_nav(root_rel: str) -> str:
+    """Return the Quests nav entry: a plain link to the generated quest index,
+    or a dropdown when manual pages target @menu 'Quests'.
+
+    Modules that declare no @menu 'Quests' page keep the single "Quests" link
+    exactly as before; declaring one turns the entry into a dropdown and the
+    generated index becomes "Journal Entries" inside it.
+    """
+    index_link = f'{E(root_rel)}/quests/index.html'
+    rows = _manual_menu_rows(_MANUAL_MENUS.get("Quests", []), root_rel)
+    if not rows:
+        return f'<a href="{index_link}">Quests</a>'
+    rows.append(f'<a href="{index_link}">Journal Entries</a>')
+    inner = "\n".join(rows)
+    return (
+        '<div class="nav-dropdown">'
+        '<span class="nav-dropdown-label">Quests &#9660;</span>'
+        f'<div class="nav-dropdown-menu">{inner}</div>'
+        '</div>'
+    )
+
+
+def _activity_dropdown(root_rel: str) -> str:
+    """Return the Activity nav dropdown HTML (manual pages targeting @menu
+    'Activity', then Player Activity + Server Firsts).
+
+    Player Activity / Server Firsts are refreshed more often than the rest of
+    the wiki (via nwn-wiki-activity). Shown only when at least one entry exists.
+    """
+    manual_rows = _manual_menu_rows(_MANUAL_MENUS.get("Activity", []), root_rel)
+    if not (_HAS_ACTIVITY_PAGE or _HAS_SERVER_FIRSTS or manual_rows):
+        return ""
+    rows: list[str] = list(manual_rows)
+    if _HAS_ACTIVITY_PAGE:
+        rows.append(f'<a href="{E(root_rel)}/activity.html">Player Activity</a>')
+    if _HAS_SERVER_FIRSTS:
+        rows.append(
+            f'<a href="{E(root_rel)}/manual/ServerFirsts.html">Server Firsts</a>'
+        )
+    inner = "\n".join(rows)
+    return (
+        '<div class="nav-dropdown">'
+        '<span class="nav-dropdown-label">Activity &#9660;</span>'
+        f'<div class="nav-dropdown-menu">{inner}</div>'
+        '</div>'
+    )
+
+
+def _docs_dropdown(root_rel: str) -> str:
+    """Return the Documents nav dropdown HTML, or empty string if none."""
+    entries = _MANUAL_MENUS.get("Documents", [])
+    if not entries:
+        return ""
+    inner = "\n".join(_manual_menu_rows(entries, root_rel))
+    return (
+        '<div class="nav-dropdown">'
+        '<span class="nav-dropdown-label">Documents &#9660;</span>'
+        f'<div class="nav-dropdown-menu">{inner}</div>'
+        '</div>'
+    )
+
+
+def _custom_manual_dropdowns(root_rel: str) -> str:
+    """Return nav dropdown HTML for any custom @menu names (excluding the
+    built-in Documents/Activity/Quests dropdowns), ordered by @menu-order then
+    first-seen position."""
+    custom_names = [n for n in _MANUAL_MENUS
+                    if n not in ("Documents", "Activity", "Quests")]
+    custom_names.sort(key=lambda n: (_MANUAL_MENU_ORDER.get(n, 10**9),
+                                      list(_MANUAL_MENUS).index(n)))
+    blocks: list[str] = []
+    for name in custom_names:
+        inner = "\n".join(_manual_menu_rows(_MANUAL_MENUS[name], root_rel))
+        blocks.append(
+            '<div class="nav-dropdown">'
+            f'<span class="nav-dropdown-label">{E(name)} &#9660;</span>'
+            f'<div class="nav-dropdown-menu">{inner}</div>'
+            '</div>'
+        )
+    return "\n".join(blocks)
+
+
+def _md_title(text: str, stem: str) -> str:
+    """Extract title from first # heading, or derive from filename stem."""
+    for line in text.splitlines():
+        m = re.match(r"^#\s+(.*)", line.strip())
+        if m:
+            return m.group(1).strip()
+    return stem.replace("-", " ").replace("_", " ").title()
+
+
+def _brand_html(root_rel: str) -> str:
+    """Return the site-header brand: a banner image when the theme supplies one,
+    otherwise plain text.
+
+    The banner is emitted with width/height attributes (read from the file by
+    _img_pixel_size) so the browser reserves the right box before the image
+    downloads — without them the whole nav bar shifts once the header decodes.
+    When a theme ships several banners one is picked at random by a tiny inline
+    script that runs the moment the <img> is parsed, so only the chosen image is
+    ever fetched and the reserved box matches it.
+    """
+    home = f'{E(root_rel)}/index.html'
+    if not _THEME_HEADER_IMGS:
+        return f'<a class="brand" href="{home}">Module Wiki</a>'
+
+    srcs = [f"{root_rel}/assets/{n}" for n in _THEME_HEADER_IMGS]
+    dims = _THEME_HEADER_DIMS or [None] * len(srcs)
+
+    def size_attrs(i: int) -> str:
+        d = dims[i] if i < len(dims) else None
+        return f' width="{d[0]}" height="{d[1]}"' if d else ""
+
+    if len(srcs) == 1:
+        return (f'<a class="brand" href="{home}">'
+                f'<img class="site-header-img" src="{E(srcs[0])}"{size_attrs(0)}'
+                f' alt="Home"></a>')
+
+    entries = [{"src": s, "w": d[0], "h": d[1]} if d else {"src": s}
+               for s, d in zip(srcs, dims)]
+    imgs_attr = E(json.dumps(entries, separators=(",", ":")))
+    picker = ('(function(){var i=document.currentScript.previousElementSibling,'
+              'a=JSON.parse(i.dataset.headerImages),'
+              'p=a[Math.floor(Math.random()*a.length)];'
+              'if(p.w){i.width=p.w;i.height=p.h;}i.src=p.src;})();')
+    # No src on the <img>: the picker assigns it synchronously, so the browser
+    # never starts a fetch for a banner it is about to discard.
+    return (f'<a class="brand" href="{home}">'
+            f'<img class="site-header-img"{size_attrs(0)}'
+            f' data-header-images="{imgs_attr}" alt="Home">'
+            f'<script>{picker}</script>'
+            f'<noscript><img class="site-header-img" src="{E(srcs[0])}"'
+            f'{size_attrs(0)} alt="Home"></noscript></a>')
+
+
+def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") -> str:
+    """Wrap body in the standard wiki page shell."""
+    extra_css = (f'\n  <link rel="stylesheet" href="{E(root_rel)}/assets/{E(_THEME_EXTRA_CSS)}">'
+                 if _THEME_EXTRA_CSS else "")
+    favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(_THEME_FAVICON)}">'
+               if _THEME_FAVICON else "")
+    brand = _brand_html(root_rel)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{E(nwn_text(title))}</title>
+  <script>document.documentElement.classList.add('js-nav','nav-pending');</script>
+  <link rel="stylesheet" href="{E(root_rel)}/assets/style.css">{extra_css}{favicon}
+  <script src="{E(root_rel)}/assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    {brand}
+    <nav>
+      <a href="{E(root_rel)}/map/index.html">Map</a>
+      <a href="{E(root_rel)}/areas/index.html">Areas</a>
+      <div class="nav-dropdown">
+        <span class="nav-dropdown-label">Creatures &#9660;</span>
+        <div class="nav-dropdown-menu">
+          <a href="{E(root_rel)}/creatures/index.html">All Creatures</a>
+          <a href="{E(root_rel)}/creatures/by-area/index.html">By Area</a>
+          <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
+          <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
+          <a href="{E(root_rel)}/creatures/search.html">Search</a>
+          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if _BOSS_REGISTRY else ''}
+          <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>
+        </div>
+      </div>
+      <div class="nav-dropdown">
+        <span class="nav-dropdown-label">Items &#9660;</span>
+        <div class="nav-dropdown-menu">
+          <a href="{E(root_rel)}/items/index.html">Accessible</a>
+          <a href="{E(root_rel)}/items/inaccessible/index.html">Inaccessible</a>
+          <a href="{E(root_rel)}/items/properties/index.html">By Property</a>
+          <a href="{E(root_rel)}/items/search.html">Search</a>
+        </div>
+      </div>
+      <a href="{E(root_rel)}/stores/index.html">Stores</a>
+      <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
+      <a href="{E(root_rel)}/factions.html">Factions</a>
+      {_quests_nav(root_rel)}
+      {_activity_dropdown(root_rel)}
+      {_docs_dropdown(root_rel)}
+      {_custom_manual_dropdowns(root_rel)}
+    </nav>
+  </header>
+  <main>
+{body}
+  </main>
+  <footer>generated by <a href="https://github.com/mrprice22/nwn-manager">nwn-manager</a> &mdash; <span id="wiki-generated-at" data-meta-url="{E(root_rel)}/assets/meta.json">{E(f"last updated {page_updated_at}") if page_updated_at else ""}</span></footer>
+</body>
+</html>
+"""
+
+
+def write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def _img_pixel_size(path: Path) -> tuple[int, int] | None:
+    """Intrinsic (width, height) of a PNG/GIF/JPEG/WebP, or None if unreadable.
+
+    Stdlib-only header parse — Pillow is not a dependency of this script. Used to
+    emit width/height on the header banner so the browser reserves its box before
+    the bytes arrive; None (SVG, odd encodings) just means no attributes.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+                w, h = struct.unpack(">II", head[16:24])
+                return int(w), int(h)
+            if head[:6] in (b"GIF87a", b"GIF89a"):
+                w, h = struct.unpack("<HH", head[6:10])
+                return int(w), int(h)
+            if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+                chunk = head[12:16]
+                if chunk == b"VP8X":
+                    # 24-bit little-endian canvas size minus one, at offset 24.
+                    d = head[24:30]
+                    return (d[0] | d[1] << 8 | d[2] << 16) + 1, (d[3] | d[4] << 8 | d[5] << 16) + 1
+                if chunk == b"VP8 ":
+                    d = head[26:30]     # after the 3-byte start code + 0x9d012a
+                    return (d[0] | d[1] << 8) & 0x3FFF, (d[2] | d[3] << 8) & 0x3FFF
+                if chunk == b"VP8L":
+                    b = head[21:25]
+                    n = b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24
+                    return (n & 0x3FFF) + 1, ((n >> 14) & 0x3FFF) + 1
+                return None
+            if head[:2] == b"\xff\xd8":
+                # Walk the marker chain to the start-of-frame, which carries the size.
+                fh.seek(2)
+                while True:
+                    b = fh.read(1)
+                    if not b:
+                        return None
+                    if b != b"\xff":
+                        continue
+                    marker = fh.read(1)
+                    while marker == b"\xff":     # fill bytes
+                        marker = fh.read(1)
+                    if not marker:
+                        return None
+                    m = marker[0]
+                    if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+                        continue                # standalone markers, no payload
+                    seg = fh.read(2)
+                    if len(seg) < 2:
+                        return None
+                    length = struct.unpack(">H", seg)[0]
+                    if m in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                             0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                        body = fh.read(5)
+                        if len(body) < 5:
+                            return None
+                        h, w = struct.unpack(">HH", body[1:5])
+                        return int(w), int(h)
+                    fh.seek(length - 2, 1)
+    except (OSError, struct.error, IndexError):
+        return None
+    return None
+
+
+def load_wiki_theme(project_root: Path, out: Path) -> None:
+    """Copy files from <project_root>/wiki-theme/ into output assets and set theme globals."""
+    global _THEME_FAVICON, _THEME_HEADER_IMGS, _THEME_HEADER_DIMS, _THEME_EXTRA_CSS
+    theme_dir = project_root / "wiki-theme"
+    if not theme_dir.is_dir():
+        return
+    assets_out = out / "assets"
+    assets_out.mkdir(parents=True, exist_ok=True)
+    favicon_exts = {".ico", ".png", ".svg", ".gif"}
+    img_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
+    loaded: list[str] = []
+    for f in sorted(theme_dir.iterdir()):
+        if not f.is_file():
+            continue
+        shutil.copy2(f, assets_out / f.name)
+        stem, ext = f.stem.lower(), f.suffix.lower()
+        if stem == "favicon" and ext in favicon_exts:
+            _THEME_FAVICON = f.name
+            loaded.append(f"favicon={f.name}")
+        elif stem.startswith("header") and ext in img_exts:
+            _THEME_HEADER_IMGS.append(f.name)
+            _THEME_HEADER_DIMS.append(_img_pixel_size(f))
+            loaded.append(f"header={f.name}")
+        elif f.name == "theme.css":
+            _THEME_EXTRA_CSS = f.name
+            loaded.append("css=theme.css")
+    if loaded:
+        print(f"[nwn-wiki] loaded wiki-theme ({', '.join(loaded)}) from {theme_dir}")
+
+
+def _creature_cr_value(db: Db, can_rr: str) -> float:
+    """Numeric ChallengeRating for a canonical creature, or -1 if absent/blank."""
+    entry = db.canonical_creatures.get(can_rr)
+    if not entry:
+        return -1.0
+    c = entry["c"]
+    bp_rr = entry["bp_rr"]
+    bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+    raw = fld(c, "ChallengeRating")
+    if raw is None and bp is not None:
+        raw = fld(bp, "ChallengeRating")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def scan_creature_pics(project_root: Path, db: Db) -> None:
+    """Index <project_root>/creature-pics/ artwork against creature names.
+
+    Populates the module-level globals _CREATURE_PICS (canonical resref ->
+    [image filename]) and _CREATURE_PIC_GROUPS (display groups for the Pictures
+    page, sorted by descending CR with unmatched groups last).
+
+    Filename rules: the stem (minus extension) is matched case-insensitively to
+    a creature's display name. A trailing "_NN" sets the display order of
+    multiple images for the same creature (e.g. "Gimli_01.png", "Gimli_02.png").
+    """
+    global _CREATURE_PICS, _CREATURE_PIC_GROUPS
+    _CREATURE_PICS = {}
+    _CREATURE_PIC_GROUPS = []
+    pics_dir = project_root / "creature-pics"
+    if not pics_dir.is_dir():
+        return
+
+    # Build a case-insensitive name -> [canonical resref] index once.
+    name_index: dict[str, list[str]] = defaultdict(list)
+    for can_rr in db.canonical_creatures:
+        name_index[db.canonical_creature_name(can_rr).strip().lower()].append(can_rr)
+
+    suffix_re = re.compile(r"^(?P<base>.*?)_(?P<num>\d+)$")
+    # base_name (original case) -> {"matches": [...], "images": [(order, filename)]}
+    groups: dict[str, dict] = {}
+    for f in sorted(pics_dir.iterdir(), key=lambda p: p.name.lower()):
+        if not f.is_file() or f.suffix.lower() not in CREATURE_PIC_EXTS:
+            continue
+        stem = f.stem
+        m = suffix_re.match(stem)
+        if m:
+            base_name = m.group("base")
+            order = int(m.group("num"))
+        else:
+            base_name = stem
+            order = 0
+        key = base_name.strip().lower()
+        g = groups.setdefault(base_name, {"matches": name_index.get(key, []),
+                                          "images": []})
+        g["images"].append((order, f.name))
+
+    for base_name, g in groups.items():
+        if not g["matches"]:
+            print(f"warn: creature-pics: '{base_name}' matches no creature; "
+                  f"shown under 'Unmatched'", file=sys.stderr)
+        images = [fn for _o, fn in sorted(g["images"], key=lambda t: (t[0], t[1].lower()))]
+        if g["matches"]:
+            cr = max(_creature_cr_value(db, rr) for rr in g["matches"])
+        else:
+            cr = -1.0
+        _CREATURE_PIC_GROUPS.append({
+            "name": base_name,
+            "matches": g["matches"],
+            "images": images,
+            "cr": cr,
+        })
+        for rr in g["matches"]:
+            _CREATURE_PICS.setdefault(rr, []).extend(images)
+
+    # Descending CR; unmatched (cr < 0) sink to the bottom; tie-break by name.
+    _CREATURE_PIC_GROUPS.sort(
+        key=lambda grp: (grp["matches"] == [], -grp["cr"], grp["name"].lower())
+    )
+    if _CREATURE_PIC_GROUPS:
+        print(f"[nwn-wiki] indexed creature-pics: {len(_CREATURE_PIC_GROUPS)} "
+              f"group(s) from {pics_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Renderers
+# ---------------------------------------------------------------------------
+
+def render_index(db: Db, out: Path, module_title: str,
+                 positions: dict[str, tuple[float, float]],
+                 sizes: dict[str, tuple[float, float]],
+                 base_url: str = "", project_root: Path | None = None) -> None:
+    # Author-supplied landing page replaces the generated overview/map index.
+    # .html takes precedence over .md. Body fragment only (same handling as
+    # docs.manual pages) — page() adds the nav header/footer. The map still
+    # lives on its own dedicated /map page (see render_map_page).
+    if project_root is not None:
+        override = next((project_root / f"index.{ext}" for ext in ("html", "md")
+                         if (project_root / f"index.{ext}").is_file()), None)
+        if override is not None:
+            _, body_html = _manual_doc_body(override)
+            write(out / "index.html", page(module_title, body_html, root_rel="."))
+            print(f"[nwn-wiki] index: using override {override}")
+            return
+
+    # Module overview block
+    ifo = db.ifo or {}
+    start_area = fld(ifo, "Mod_Entry_Area", "")
+    haks = list_items(ifo.get("Mod_HakList"))
+    hak_names = [fld(h, "Mod_Hak", "") for h in haks]
+    tlk = fld(ifo, "Mod_CustomTlk", "")
+    xp = fld(ifo, "Mod_XPScale")
+    desc = loc(ifo.get("Mod_Description")) if ifo else ""
+
+    overview = [
+        f'<h1>{nwn_html(module_title)}</h1>',
+        '<dl class="meta">',
+        f'<dt>Areas</dt><dd>{len(db.areas)}</dd>',
+        f'<dt>Creatures</dt><dd>{len(db.creatures)}</dd>',
+        f'<dt>Items</dt><dd>{len(db.items)}</dd>',
+        f'<dt>Stores</dt><dd>{len(db.stores)}</dd>',
+        f'<dt>Dialogues</dt><dd>{len(db.dialogs)}</dd>',
+        f'<dt>Scripts</dt><dd>{len(db.scripts)}</dd>',
+    ]
+    if start_area:
+        overview.append(f'<dt>Entry area</dt><dd>{link(f"areas/{start_area}.html", db.area_name(start_area))}</dd>')
+    if tlk:
+        overview.append(f'<dt>Custom TLK</dt><dd>{E(tlk)}</dd>')
+    if xp is not None:
+        overview.append(f'<dt>XP scale</dt><dd>{E(xp)}%</dd>')
+    if hak_names:
+        overview.append(f'<dt>HAKs</dt><dd>{E(", ".join(hak_names))}</dd>')
+    overview.append('</dl>')
+    if desc:
+        overview.append(f'<p class="desc">{nwn_html(desc)}</p>')
+
+    # Global-triggered conversations (rest menu, item activators, …) get
+    # called out above the map: a player can fire them from anywhere, and
+    # they often hide teleport destinations the map otherwise can't show.
+    global_dlgs = sorted(
+        db.global_convo_pseudo.values(),
+        key=lambda info: info["conv_resref"],
+    )
+    if global_dlgs:
+        overview.append("<h2>Global-trigger conversations</h2>")
+        overview.append('<p class="muted">Reachable from anywhere via a '
+                        'module-level event (rest, level-up, etc.) or a '
+                        'tag-based item activator. Each contains at least '
+                        'one teleport.</p>')
+        rows = []
+        for info in global_dlgs:
+            rr = info["conv_resref"]
+            callers = db.dialog_callers.get(rr, [])
+            kinds = sorted({(c["kind"], c.get("event") or c.get("script", ""))
+                            for c in callers
+                            if c["kind"] in ("module-event", "item-script")})
+            via = ", ".join(
+                f"<code>{E(ev)}</code>" if k == "module-event"
+                else f"item <code>{E(ev)}</code>"
+                for k, ev in kinds
+            )
+            dests = ", ".join(
+                link(f"areas/{a}.html", db.area_name(a))
+                for a in info["dests"] if a in db.areas and a not in db.hidden_areas)
+            rows.append(
+                f"<tr><td>{link(f'conversations/{rr}.html', db.dialog_label(rr))}</td>"
+                f"<td><code>{E(rr)}</code></td>"
+                f"<td>{via}</td>"
+                f"<td>{dests}</td></tr>"
+            )
+        overview.append(
+            '<table class="data"><thead><tr>'
+            "<th>Conversation</th><th>ResRef</th><th>Triggered via</th>"
+            "<th>Teleports to</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    overview.append('<h2>Area map</h2>')
+    overview.append(_MAP_HINT_HTML)
+    overview.append(render_map_svg(db, positions, sizes, base_url=base_url))
+
+    body = "\n".join(overview)
+    write(out / "index.html", page(module_title, body, root_rel="."))
+
+
+# Shared between the home index and the dedicated /map page so the legend stays
+# in sync. Excludes the <h2> so each caller can title its own heading.
+_MAP_HINT_HTML = (
+    '<p class="map-hint">Click an area to open its page. Lines: '
+    '<span class="legend trigger">trigger</span> '
+    '<span class="legend door">door</span> '
+    '<span class="legend convo">conversation teleport</span>. '
+    '<span class="legend pseudo">★</span> = a global-trigger '
+    'conversation node (e.g. Rest Menu).</p>'
+)
+
+
+def render_map_page(db: Db, out: Path,
+                    positions: dict[str, tuple[float, float]],
+                    sizes: dict[str, tuple[float, float]],
+                    base_url: str = "") -> None:
+    """Dedicated Map page (map/index.html) rendering the same area-map SVG as the
+    home index. Targeted by the header 'Map' nav link so the map remains reachable
+    even when the index is replaced by an author-supplied override."""
+    body = "\n".join([
+        '<h1>Area map</h1>',
+        _MAP_HINT_HTML,
+        render_map_svg(db, positions, sizes, base_url=base_url),
+    ])
+    write(out / "map" / "index.html", page("Map", body, root_rel=".."))
+
+
+def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
+                   sizes: dict[str, tuple[float, float]],
+                   base_url: str = "") -> str:
+    if not positions:
+        return "<p>(no areas)</p>"
+
+    # When a publish URL is given, rewrite node anchor hrefs as absolute URLs
+    # so the downloaded standalone SVG keeps clickable links.
+    url_prefix = base_url.rstrip("/") + "/" if base_url else ""
+
+    # Box sizes are in "tile units"; positions share those units. We scale
+    # everything up to give text room — bigger labels, bigger boxes — so the
+    # map is readable instead of cramming tiny rects on the borders.
+    scale = 14.0  # px per tile unit
+    inset = 0.5  # leave a small visual gap inside each AABB
+
+    # Compute extents from rect bounds (not just centres) so labels never
+    # get clipped at the edge.
+    min_x = min(x - sizes[r][0] / 2 for r, (x, y) in positions.items())
+    max_x = max(x + sizes[r][0] / 2 for r, (x, y) in positions.items())
+    min_y = min(y - sizes[r][1] / 2 for r, (x, y) in positions.items())
+    max_y = max(y + sizes[r][1] / 2 for r, (x, y) in positions.items())
+    pad = 6.0
+    min_x -= pad; max_x += pad
+    min_y -= pad; max_y += pad
+
+    vx = min_x * scale
+    vy = min_y * scale
+    vw = (max_x - min_x) * scale
+    vh = (max_y - min_y) * scale
+
+    # Edges connect rect *boundaries* — not centres — so lines visibly
+    # terminate at the nearest edge of each box.
+    def rect_edge_point(r: str, towards: tuple[float, float]) -> tuple[float, float]:
+        cx, cy = positions[r]
+        w, h = sizes[r]
+        dx = towards[0] - cx
+        dy = towards[1] - cy
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return cx, cy
+        # Scale to land on rect boundary.
+        sx = (w / 2 - inset) / abs(dx) if dx else float('inf')
+        sy = (h / 2 - inset) / abs(dy) if dy else float('inf')
+        s = min(sx, sy)
+        return cx + dx * s, cy + dy * s
+
+    def node_label(nid: str) -> str:
+        if nid in db.global_convo_pseudo:
+            return db.global_convo_pseudo[nid]["label"]
+        return nwn_text(db.area_name(nid))
+
+    edge_lines = []
+    drawn = set()
+    for tr in db.transitions:
+        a = tr["src_area"]
+        b = tr["dst_area"]
+        if a not in positions or not b or b not in positions:
+            continue
+        key = (min(a, b), max(a, b), tr["kind"])
+        if key in drawn:
+            continue
+        drawn.add(key)
+        ax, ay = rect_edge_point(a, positions[b])
+        bx, by = rect_edge_point(b, positions[a])
+        cls = "edge-trigger" if tr["kind"] == "trigger" else "edge-door"
+        names = sorted([node_label(a), node_label(b)], key=str.lower)
+        title = f"{names[0]} connected to {names[1]}"
+        # Pair each visible thin line with a transparent thick hit-area line
+        # so the <title> tooltip is easy to trigger by hovering the edge.
+        edge_lines.append(
+            f'<g class="edge-group"><title>{E(title)}</title>'
+            f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="edge-hit"/>'
+            f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="{cls}"/>'
+            f'</g>'
+        )
+        # Draw dashed edges for alt destinations of dup-tag transitions.
+        if tr.get("is_dup_tag"):
+            for alt in tr.get("dst_area_alts", []):
+                if alt not in positions:
+                    continue
+                alt_key = (min(a, alt), max(a, alt), tr["kind"])
+                if alt_key in drawn:
+                    continue
+                drawn.add(alt_key)
+                ax2, ay2 = rect_edge_point(a, positions[alt])
+                bx2, by2 = rect_edge_point(alt, positions[a])
+                title2 = f"{node_label(a)} ↔ {node_label(alt)} (duplicate tag: may not work)"
+                edge_lines.append(
+                    f'<g class="edge-group"><title>{E(title2)}</title>'
+                    f'<line x1="{ax2 * scale:.1f}" y1="{ay2 * scale:.1f}" '
+                    f'x2="{bx2 * scale:.1f}" y2="{by2 * scale:.1f}" class="edge-hit"/>'
+                    f'<line x1="{ax2 * scale:.1f}" y1="{ay2 * scale:.1f}" '
+                    f'x2="{bx2 * scale:.1f}" y2="{by2 * scale:.1f}" class="edge-dup-tag"/>'
+                    f'</g>'
+                )
+
+    # Conversation-teleport edges. Drawn as a separate, dashed style so a
+    # quest hub's "rest menu can teleport you to X" doesn't get confused
+    # with a real walkable transition. Use an arrowhead because these
+    # edges are directional (src → dst); regular transitions are drawn
+    # bidirectionally already.
+    conv_drawn = set()
+    for tr in db.conv_transitions:
+        s = tr["src"]
+        d = tr["dst_area"]
+        if s not in positions or d not in positions:
+            continue
+        key = (s, d)
+        if key in conv_drawn:
+            continue
+        conv_drawn.add(key)
+        ax, ay = rect_edge_point(s, positions[d])
+        bx, by = rect_edge_point(d, positions[s])
+        title = f"From: {node_label(s)} To: {node_label(d)}"
+        edge_lines.append(
+            f'<g class="edge-group"><title>{E(title)}</title>'
+            f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" class="edge-hit"/>'
+            f'<line x1="{ax * scale:.1f}" y1="{ay * scale:.1f}" '
+            f'x2="{bx * scale:.1f}" y2="{by * scale:.1f}" '
+            f'class="edge-convo" marker-end="url(#convo-arrow)"/>'
+            f'</g>'
+        )
+
+    # Nodes — rendered in three ordered layers so edges always appear over box
+    # fills but text labels appear over edges.
+    # layer_boxes : the rect/polygon fills + hover hit-area (behind edges)
+    # layer_labels: text labels + click anchors             (in front of edges)
+    font_size = 44.0
+
+    def _label_lines(name: str, pw: float, ph: float) -> list[str]:
+        """Word-wrap name to fit pw, returning 1-3 lines.  Single words that
+        exceed pw are allowed to overflow rather than being mangled."""
+        char_w = font_size * 0.55
+        line_h = font_size * 1.3
+        max_ln = max(1, int(ph / line_h))
+        cpl = max(3, int(pw / char_w))  # chars per line
+        if len(name) <= cpl:
+            return [name]
+        words = name.split()
+        lines: list[str] = []
+        cur = ""
+        for word in words:
+            cand = (cur + " " + word).strip() if cur else word
+            if len(cand) <= cpl:
+                cur = cand
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = word
+                if len(lines) >= max_ln - 1 and cur:
+                    # Last allowed line — truncate if still too long
+                    if len(cur) > cpl:
+                        cur = cur[: cpl - 1] + "…"
+                    break
+        if cur:
+            lines.append(cur)
+        return lines[:max_ln] or [name]
+
+    layer_boxes: list[str] = []
+    layer_labels: list[str] = []
+    for nid, (x, y) in positions.items():
+        w, h = sizes[nid]
+        px = (x - w / 2) * scale
+        py = (y - h / 2) * scale
+        pw = w * scale
+        ph = h * scale
+        cx = x * scale
+        cy = y * scale
+        if nid in db.global_convo_pseudo:
+            info = db.global_convo_pseudo[nid]
+            label = info["label"]
+            href = url_prefix + f"conversations/{info['conv_resref']}.html"
+            r = min(pw, ph) * 0.45
+            pts = []
+            for k in range(8):
+                ang = math.pi / 8 + k * math.pi / 4
+                pts.append(f"{cx + r * math.cos(ang):.1f},{cy + r * math.sin(ang):.1f}")
+            layer_boxes.append(
+                f'<a href="{E(href)}"><g class="convo-node">'
+                f'<polygon points="{" ".join(pts)}" />'
+                f'<title>Conversation: {E(info["conv_resref"])} '
+                f'({E(label)} — global trigger)</title>'
+                f'</g></a>'
+            )
+            layer_labels.append(
+                f'<a href="{E(href)}">'
+                f'<text x="{cx:.1f}" y="{cy:.1f}" '
+                f'text-anchor="middle" dominant-baseline="middle" '
+                f'font-size="{font_size * 0.7:.0f}" class="convo-label">{E(label)}</text>'
+                f'</a>'
+            )
+            continue
+        # SVG <text> can't render mid-string colour changes without <tspan>s,
+        # so collapse to the first colour token and strip the rest.
+        raw = db.area_name(nid)
+        name = nwn_text(raw)
+        fill = nwn_first_color(raw)
+        fill_attr = f' style="fill:{fill}"' if fill else ""
+        href = url_prefix + f"areas/{nid}.html"
+        # Box fill + hover area
+        layer_boxes.append(
+            f'<a href="{E(href)}"><g class="area-node">'
+            f'<rect x="{px:.1f}" y="{py:.1f}" '
+            f'width="{pw:.1f}" height="{ph:.1f}" rx="6"/>'
+            f'<title>{E(name)} ({E(nid)}, {int(w)}×{int(h)})</title>'
+            f'</g></a>'
+        )
+        # Text label: word-wrapped, allowed to overflow the box horizontally
+        lines = _label_lines(name, pw, ph)
+        if len(lines) == 1:
+            text_el = (
+                f'<text x="{cx:.1f}" y="{cy:.1f}" '
+                f'text-anchor="middle" dominant-baseline="middle" '
+                f'font-size="{font_size:.0f}" class="area-label"{fill_attr}>{E(lines[0])}</text>'
+            )
+        else:
+            lh = font_size * 1.3
+            ty0 = cy - lh * (len(lines) - 1) / 2
+            tspans = "".join(
+                f'<tspan x="{cx:.1f}" y="{ty0 + i * lh:.1f}">{E(ln)}</tspan>'
+                for i, ln in enumerate(lines)
+            )
+            text_el = (
+                f'<text text-anchor="middle" '
+                f'font-size="{font_size:.0f}" class="area-label"{fill_attr}>{tspans}</text>'
+            )
+        layer_labels.append(f'<a href="{E(href)}">{text_el}</a>')
+
+    # Cap the rendered *width* so the map fits a normal screen horizontally
+    # at default browser zoom; height scales proportionally so aspect ratio
+    # is preserved. We deliberately don't cap height — for tall modules that
+    # makes display_w shrink and leaves a wide whitespace gap inside the
+    # 96vw wrap, plus it kills vertical panning. Letting height grow means
+    # .map-wrap (overflow:auto) scrolls vertically for tall layouts, and
+    # browser zoom magnifies these CSS pixels so the user can pan in both
+    # axes once the map exceeds the wrap.
+    # The .map-wrap has a fixed viewport (~96vw). Draw the SVG at 4× the size
+    # that would fit in that viewport so the user pans via scrollbars / middle
+    # mouse instead of seeing the entire map shrunk to fit.
+    target_w = 1400.0
+    fit = min(target_w / vw, 1.0) if vw > 0 else 1.0
+    zoom = 4.0
+    display_w = vw * fit * zoom
+    display_h = vh * fit * zoom
+    # Inline styles so the SVG renders correctly when downloaded and opened
+    # standalone (the page's external stylesheet won't be available there).
+    # Kept in sync with wiki_assets/style.css's svg .* rules.
+    embedded_css = (
+        'svg{background:#fff;font-family:"Iowan Old Style",Georgia,serif}'
+        '.area-node rect{fill:#fff;stroke:#3a5a8a;stroke-width:2.4}'
+        '.area-node:hover rect{fill:#e6efff}'
+        '.area-label{fill:#222;pointer-events:none}'
+        '.edge-trigger{stroke:#6b3a1c;stroke-width:3;opacity:0.8;fill:none}'
+        '.edge-door{stroke:#2d6a3a;stroke-width:3;opacity:0.8;fill:none}'
+        '.edge-convo{stroke:#9b4dca;stroke-width:3;opacity:0.85;fill:none;'
+        'stroke-dasharray:8,5}'
+        '.edge-dup-tag{stroke:#cc6600;stroke-width:2;opacity:0.75;fill:none;'
+        'stroke-dasharray:5,4}'
+        '.edge-hit{stroke:transparent;stroke-width:30;fill:none;'
+        'pointer-events:stroke;cursor:help}'
+        '.convo-node polygon{fill:#f3e8ff;stroke:#9b4dca;stroke-width:2.4}'
+        '.convo-node:hover polygon{fill:#e3c9ff}'
+        '.convo-label{fill:#5a2b78;pointer-events:none}'
+    )
+    defs = (
+        '<defs>'
+        f'<style>{embedded_css}</style>'
+        '<marker id="convo-arrow" viewBox="0 0 12 12" refX="10" refY="6" '
+        'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
+        '<path d="M0,0 L12,6 L0,12 Z" fill="#9b4dca"/>'
+        '</marker>'
+        '</defs>'
+    )
+    # Three-layer SVG: box fills → edges → text labels.
+    # Edges are drawn over box fills so connections are always visible even at
+    # box boundaries, and text is drawn last so it's never obscured by edges.
+    svg_body = (
+        "\n".join(layer_boxes)   # layer 1: rect/polygon fills
+        + "\n"
+        + "\n".join(edge_lines)  # layer 2: edges on top of fills
+        + "\n"
+        + "\n".join(layer_labels)  # layer 3: text labels on top of edges
+    )
+    return (
+        '<div class="map-toolbar">'
+        '<span class="map-zoom-controls">'
+        '<button type="button" class="map-zoom-btn" id="area-map-zoom-out" '
+        'title="Zoom out">−</button>'
+        '<button type="button" class="map-zoom-btn" id="area-map-zoom-reset" '
+        'title="Reset zoom">1:1</button>'
+        '<button type="button" class="map-zoom-btn" id="area-map-zoom-in" '
+        'title="Zoom in">+</button>'
+        '</span>'
+        '<button type="button" id="area-map-download" '
+        'onclick="downloadAreaMap()">Download SVG</button>'
+        '</div>'
+        + f'<div class="map-wrap" id="area-map-wrap">'
+        + f'<svg class="area-map" id="area-map-svg" '
+        + 'xmlns="http://www.w3.org/2000/svg" '
+        + 'xmlns:xlink="http://www.w3.org/1999/xlink" '
+        + f'width="{display_w:.0f}" height="{display_h:.0f}" '
+        + f'viewBox="{vx:.1f} {vy:.1f} {vw:.1f} {vh:.1f}" '
+        + f'preserveAspectRatio="xMidYMid meet">'
+        + defs
+        + svg_body
+        + '</svg></div>'
+        + '<script>(function(){'
+          'var wrap=document.getElementById("area-map-wrap");'
+          'var svg=document.getElementById("area-map-svg");'
+          'if(!wrap||!svg)return;'
+          # Zoom. Capture the 1:1 baseline size before any resize, then default
+          # the view to 20% out (zoom=0.8); the "1:1" reset returns to baseline.
+          'var baseW=parseFloat(svg.getAttribute("width"));'
+          'var baseH=parseFloat(svg.getAttribute("height"));'
+          'var zoom=0.8;'
+          'svg.setAttribute("width",Math.round(baseW*zoom));'
+          'svg.setAttribute("height",Math.round(baseH*zoom));'
+          # Center now that the SVG is at its initial (20%-out) size.
+          'wrap.scrollLeft=(wrap.scrollWidth-wrap.clientWidth)/2;'
+          'wrap.scrollTop=(wrap.scrollHeight-wrap.clientHeight)/2;'
+          'function applyZoom(z,px,py){'
+            'z=Math.max(0.2,Math.min(5,z));'
+            'if(z===zoom)return;'
+            'px=px!==undefined?px:wrap.clientWidth/2;'
+            'py=py!==undefined?py:wrap.clientHeight/2;'
+            'var fx=(wrap.scrollLeft+px)/(baseW*zoom);'
+            'var fy=(wrap.scrollTop+py)/(baseH*zoom);'
+            'zoom=z;'
+            'svg.setAttribute("width",Math.round(baseW*zoom));'
+            'svg.setAttribute("height",Math.round(baseH*zoom));'
+            'wrap.scrollLeft=fx*baseW*zoom-px;'
+            'wrap.scrollTop=fy*baseH*zoom-py;'
+          '}'
+          'document.getElementById("area-map-zoom-in").onclick=function(){applyZoom(zoom*1.25);};'
+          'document.getElementById("area-map-zoom-out").onclick=function(){applyZoom(zoom/1.25);};'
+          'document.getElementById("area-map-zoom-reset").onclick=function(){applyZoom(1);};'
+          'wrap.addEventListener("wheel",function(e){'
+            'e.preventDefault();'
+            'var r=wrap.getBoundingClientRect();'
+            'applyZoom(e.deltaY<0?zoom*1.12:zoom/1.12,e.clientX-r.left,e.clientY-r.top);'
+          '},{passive:false});'
+          # Download
+          'window.downloadAreaMap=function(){'
+          'var src=new XMLSerializer().serializeToString(svg);'
+          'if(!src.match(/^<\\?xml/))src=\'<?xml version="1.0" encoding="UTF-8"?>\\n\'+src;'
+          'var blob=new Blob([src],{type:"image/svg+xml;charset=utf-8"});'
+          'var url=URL.createObjectURL(blob);'
+          'var a=document.createElement("a");'
+          'a.href=url;a.download="area-map.svg";'
+          'document.body.appendChild(a);a.click();'
+          'document.body.removeChild(a);'
+          'setTimeout(function(){URL.revokeObjectURL(url);},100);'
+          '};'
+          '})();</script>'
+    )
+
+
+_OMIT: object = object()  # sentinel: "no path-from section on this page"
+
+
+def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str, bool, bool]]]:
+    """Directed area→area edge graph from door/trigger transitions and conv teleports.
+
+    Uses db.conv_transitions (not db.dialog_teleports directly) so that any
+    --exclude-conv-option labels (e.g. "[Admin Options]") are already stripped
+    out — the same exclusion that applies to the area map SVG edges.
+
+    Each edge is (dst, kind, label, is_fallback, is_dup_tag) where:
+      is_fallback=True  — resolved via WP_-prefix-stripping fallback; may not work in-game
+      is_dup_tag=True   — LinkedTo tag matches multiple objects; actual destination is ambiguous
+    """
+    graph: dict[str, list[tuple[str, str, str, bool, bool]]] = {rr: [] for rr in db.areas}
+    seen: set[tuple[str, str, str, str]] = set()
+    for tr in db.transitions:
+        src, dst = tr["src_area"], tr["dst_area"]
+        is_dup = tr.get("is_dup_tag", False)
+        if dst and src in graph and dst in graph and src != dst:
+            key = (src, dst, tr["kind"], tr["label"])
+            if key not in seen:
+                seen.add(key)
+                graph[src].append((dst, tr["kind"], tr["label"], False, is_dup))
+        # Add edges to all alt destinations for duplicate-tag transitions.
+        if is_dup:
+            for alt_dst in tr.get("dst_area_alts", []):
+                if alt_dst and alt_dst in graph and src != alt_dst:
+                    key = (src, alt_dst, tr["kind"], tr["label"])
+                    if key not in seen:
+                        seen.add(key)
+                        graph[src].append((alt_dst, tr["kind"], tr["label"], False, True))
+    for tr in db.conv_transitions:
+        src, dst = tr["src"], tr["dst_area"]
+        if src not in graph or dst not in graph or src == dst:
+            continue
+        conv_rr = tr.get("conv_resref", "")
+        label = db.dialog_label(conv_rr) if conv_rr else conv_rr
+        key = (src, dst, "talk", label)
+        if key not in seen:
+            seen.add(key)
+            graph[src].append((dst, "talk", label, False, False))
+    for tr in db.script_transitions:
+        src, dst = tr["src_area"], tr["dst_area"]
+        if not dst or src not in graph or dst not in graph or src == dst:
+            continue
+        key = (src, dst, tr["kind"], tr["label"])
+        if key not in seen:
+            seen.add(key)
+            graph[src].append((dst, tr["kind"], tr["label"], tr.get("fallback", False), False))
+    return graph
+
+
+def bfs_shortest_path(
+    graph: dict[str, list[tuple[str, str, str, bool, bool]]], src: str, dst: str
+) -> list[tuple[str, str, str, str, bool, bool]] | None:
+    """BFS shortest path; returns list of (from, to, kind, label, is_fallback, is_dup_tag) or None."""
+    if src == dst:
+        return []
+    came_from: dict[str, str | None] = {src: None}
+    edge_in: dict[str, tuple[str, str, bool, bool]] = {}
+    q: deque[str] = deque([src])
+    while q:
+        cur = q.popleft()
+        for dest, kind, label, is_fallback, is_dup_tag in graph.get(cur, []):
+            if dest in came_from:
+                continue
+            came_from[dest] = cur
+            edge_in[dest] = (kind, label, is_fallback, is_dup_tag)
+            if dest == dst:
+                steps: list[tuple[str, str, str, str, bool, bool]] = []
+                node = dst
+                while came_from[node] is not None:
+                    prev = came_from[node]
+                    k, l, fb, dup = edge_in[node]
+                    steps.append((prev, node, k, l, fb, dup))
+                    node = prev
+                return list(reversed(steps))
+            q.append(dest)
+    return None
+
+
+def render_areas_index(db: Db, out: Path, *,
+                       area_paths: "dict[str, list | None] | None" = None,
+                       path_from_resref: str = "",
+                       path_from_name: str = "") -> None:
+    # Classify areas by reachability via fallback transitions.
+    # An area is "fallback-only reachable" if every incoming transition that
+    # could lead to it from another area uses a WP_-prefix-stripped fallback tag
+    # (i.e., the script uses "foo" but the waypoint is tagged "WP_foo"), with no
+    # confirmed non-fallback route (door, trigger, conversation, or direct-tag script).
+    has_real_incoming: set[str] = set()
+    has_fallback_incoming: set[str] = set()
+    # Areas that are a primary or alternative destination of a dup-tag transition.
+    has_dup_tag_incoming: set[str] = set()
+    for tr in db.transitions:
+        if tr["dst_area"]:
+            has_real_incoming.add(tr["dst_area"])
+        if tr.get("is_dup_tag"):
+            if tr["dst_area"] and tr["dst_area"] in db.areas:
+                has_dup_tag_incoming.add(tr["dst_area"])
+            for alt in tr.get("dst_area_alts", []):
+                if alt in db.areas:
+                    has_dup_tag_incoming.add(alt)
+    for tr in db.conv_transitions:
+        dst = tr.get("dst_area", "")
+        if dst and dst in db.areas:
+            has_real_incoming.add(dst)
+    for tr in db.script_transitions:
+        dst = tr.get("dst_area", "")
+        if not dst or dst not in db.areas:
+            continue
+        if tr.get("fallback"):
+            has_fallback_incoming.add(dst)
+        else:
+            has_real_incoming.add(dst)
+    has_any_fallback = has_fallback_incoming  # areas with at least one fallback route
+
+    def _dominant_faction_cell(resref: str) -> str:
+        faction_votes: dict[int, int] = {}
+        for c in db.area_npcs.get(resref, []):
+            try:
+                fid = int(fld(c, "FactionID"))
+            except (TypeError, ValueError):
+                continue
+            faction_votes[fid] = faction_votes.get(fid, 0) + 1
+        for e in db.area_encounters.get(resref, []):
+            rr = fld(e, "TemplateResRef", "")
+            blueprint = db.encounters.get(rr, {})
+            # Instance (.git) CreatureList is what spawns at runtime; blueprint is fallback.
+            spawns = list_items(e.get("CreatureList")) or list_items(blueprint.get("CreatureList"))
+            for s in spawns:
+                srr = fld(s, "ResRef", "")
+                bp = db.creatures.get(srr, {})
+                try:
+                    fid = int(fld(bp, "FactionID"))
+                except (TypeError, ValueError):
+                    continue
+                faction_votes[fid] = faction_votes.get(fid, 0) + 1
+        total = sum(faction_votes.values())
+        if not total:
+            return "<td>None</td>"
+        max_count = max(faction_votes.values())
+        top_fids = [fid for fid, cnt in faction_votes.items() if cnt == max_count]
+        if len(top_fids) > 1:
+            return "<td>Tie</td>"
+        dominant_fid = top_fids[0]
+        pct = round(100 * max_count / total)
+        raw_name = db.faction_name(dominant_fid)
+        slug = re.sub(r"[^a-z0-9]+", "-", raw_name.lower()).strip("-")
+        anchor = f"faction-{dominant_fid}-{slug}" if slug else f"faction-{dominant_fid}"
+        href = f"../factions.html#{anchor}"
+        return f'<td><a href="{E(href)}">{nwn_html(raw_name)}</a> {pct}%</td>'
+
+    def _area_row(resref: str) -> str:
+        a = db.areas[resref]
+        npc_count = len(db.area_npcs.get(resref, []))
+        enc_count = len(db.area_encounters.get(resref, []))
+        store_count = len(db.area_stores.get(resref, []))
+        cont_count = len(db.area_containers.get(resref, []))
+        return (
+            f'<tr>'
+            f'<td>{link(f"{resref}.html", db.area_name(resref))}</td>'
+            f'<td>{E(tileset_name(fld(a, "Tileset", "")))}</td>'
+            f'<td>{E(fld(a, "Width", ""))}×{E(fld(a, "Height", ""))}</td>'
+            f'<td>{npc_count}</td>'
+            f'<td>{enc_count}</td>'
+            + _dominant_faction_cell(resref) +
+            f'<td>{store_count}</td>'
+            f'<td>{cont_count}</td>'
+            f'</tr>'
+        )
+
+    sorted_resrefs = sorted(
+        (r for r in db.areas if r not in db.hidden_areas),
+        key=lambda r: nwn_text(db.area_name(r)).lower(),
+    )
+
+    # When --path-from is active, split into reachable vs. no-known-path.
+    # The source area itself is always reachable; area_paths[rr] is None
+    # when BFS found no route, or a list (possibly empty) when a route exists.
+    use_path_split = bool(area_paths is not None and path_from_resref)
+    if use_path_split:
+        reachable_resrefs = [
+            r for r in sorted_resrefs
+            if r == path_from_resref or area_paths.get(r) is not None
+        ]
+        no_path_resrefs = [
+            r for r in sorted_resrefs
+            if r != path_from_resref and area_paths.get(r) is None
+        ]
+    else:
+        reachable_resrefs = sorted_resrefs
+        no_path_resrefs = []
+
+    # Prioritise fallback > dup-tag > normal so each area appears in exactly one bucket.
+    normal_resrefs = [r for r in reachable_resrefs
+                      if r not in has_any_fallback and r not in has_dup_tag_incoming]
+    dup_tag_resrefs = [r for r in reachable_resrefs
+                       if r not in has_any_fallback and r in has_dup_tag_incoming]
+    suspect_resrefs = [r for r in reachable_resrefs if r in has_any_fallback]
+
+    table_head = (
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>Tileset</th><th>Size</th>"
+        "<th>NPCs</th><th>Encounters</th><th>Dominant Faction</th><th>Stores</th><th>Containers</th>"
+        "</tr></thead><tbody>"
+    )
+
+    body_parts = [
+        "<h1>Areas</h1>",
+        f"<p>{len(db.areas)} areas total.</p>",
+        table_head,
+        "\n".join(_area_row(r) for r in normal_resrefs),
+        "</tbody></table>",
+    ]
+
+    if dup_tag_resrefs:
+        body_parts += [
+            '<h2 id="dup-dest-tags">Areas with duplicate destination tags</h2>',
+            '<p class="warn-dup-tag-note">&#9888; The areas below are destinations of'
+            ' transitions whose <code>LinkedTo</code> tag matches multiple objects'
+            ' (waypoints, doors, or triggers) across the module. The game engine'
+            ' resolves to whichever it finds first, so these routes may send the'
+            ' player to an unexpected area. See each area\'s shortest-path section'
+            ' for affected steps.</p>',
+            table_head,
+            "\n".join(_area_row(r) for r in dup_tag_resrefs),
+            "</tbody></table>",
+        ]
+
+    if suspect_resrefs:
+        body_parts += [
+            '<h2 id="possibly-inaccessible">Areas with possibly broken routes</h2>',
+            '<p class="warn-fallback-note">&#9888; The areas below have at least one'
+            ' incoming transition resolved via a waypoint-tag fallback — the script'
+            ' references a short tag (e.g. <code>foo</code>) while the actual waypoint'
+            ' is tagged <code>WP_foo</code>. That route may not work in-game and could'
+            ' indicate a typo in a waypoint tag or script. Other routes into these'
+            ' areas may still work normally.</p>',
+            table_head,
+            "\n".join(_area_row(r) for r in suspect_resrefs),
+            "</tbody></table>",
+        ]
+
+    if no_path_resrefs:
+        src_label = nwn_html(path_from_name) if path_from_name else E(path_from_resref)
+        body_parts += [
+            f'<h2 id="no-path">No known path from {src_label}</h2>',
+            f'<p class="warn-fallback-note">&#9888; The areas below have no known route'
+            f' from {src_label} via door, trigger, or conversation teleport. They may be'
+            f' accessible by other means (login spawn, admin, DM warp), or their'
+            f' transitions may not yet be indexed.</p>',
+            table_head,
+            "\n".join(_area_row(r) for r in no_path_resrefs),
+            "</tbody></table>",
+        ]
+
+    # Unresolved transitions: door/trigger LinkedTo targets that don't match any
+    # waypoint, door, or trigger tag in the module.
+    unresolved: dict[str, list[dict]] = {}
+    for tr in db.transitions:
+        if not tr["dst_area"] and tr.get("dst_tag"):
+            unresolved.setdefault(tr["dst_tag"], []).append(tr)
+    if unresolved:
+        rows = []
+        for tag in sorted(unresolved, key=str.lower):
+            refs = unresolved[tag]
+            for tr in refs:
+                src = tr["src_area"]
+                rows.append(
+                    f"<tr>"
+                    f"<td><code>{E(tag)}</code></td>"
+                    f"<td>{link(f'{src}.html', db.area_name(src))}</td>"
+                    f"<td>{E(tr['kind'])}</td>"
+                    f"<td>{E(tr['label'])}</td>"
+                    f"</tr>"
+                )
+        body_parts += [
+            '<h2 id="unresolved-transitions">Unresolved transition targets</h2>',
+            '<p class="warn-fallback-note">&#9888; The tags below are referenced by'
+            ' door or trigger <code>LinkedTo</code> fields but do not exist as a'
+            ' waypoint, door, or trigger tag in any area. Each likely indicates a'
+            ' missing waypoint, a typo, or unfinished content.</p>',
+            '<table class="data"><thead><tr>'
+            '<th>Target tag</th><th>From area</th><th>Kind</th><th>Label</th>'
+            '</tr></thead><tbody>',
+            "\n".join(rows),
+            "</tbody></table>",
+        ]
+
+    body = "".join(body_parts)
+    write(out / "areas" / "index.html", page("Areas", body, root_rel=".."))
+
+
+def render_area_page(db: Db, resref: str, out: Path,
+                     path_from_name: str = "", path_steps: Any = _OMIT) -> None:
+    a = db.areas.get(resref)
+    if not a:
+        return
+    name = db.area_name(resref)
+    sections: list[str] = []
+
+    # Header dl
+    width = fld(a, "Width", "")
+    height = fld(a, "Height", "")
+    tileset = fld(a, "Tileset", "")
+    tag = fld(a, "Tag", "")
+    on_enter = fld(a, "OnEnter", "")
+    on_exit = fld(a, "OnExit", "")
+    on_hb = fld(a, "OnHeartbeat", "")
+    on_user = fld(a, "OnUserDefined", "")
+
+    sections.append(f"<h1>{nwn_html(name)}</h1>")
+    event_rows = "".join(
+        f'<dt>{label}</dt><dd>{E(val)}</dd>'
+        for label, val in [
+            ("OnEnter", on_enter), ("OnExit", on_exit),
+            ("OnHeartbeat", on_hb), ("OnUserDefined", on_user),
+        ]
+        if val
+    )
+    sections.append(
+        '<dl class="meta">'
+        f'<dt>ResRef</dt><dd>{E(resref)}</dd>'
+        f'<dt>Tag</dt><dd>{E(tag)}</dd>'
+        f'<dt>Tileset</dt><dd>{tileset_label(tileset)}</dd>'
+        f'<dt>Size</dt><dd>{E(width)}×{E(height)} tiles</dd>'
+        + event_rows +
+        '</dl>'
+    )
+
+    # Shortest path from the configured source area
+    if path_steps is not _OMIT:
+        sections.append(f"<h2>Path from {nwn_html(path_from_name)}</h2>")
+        if path_steps is None:
+            sections.append(
+                f'<p class="muted">No path found from {nwn_html(path_from_name)} to this area.</p>'
+            )
+        else:
+            n = len(path_steps)
+            hop_word = "hop" if n == 1 else "hops"
+            items = []
+            has_fallback_step = False
+            has_dup_tag_step = False
+            for a, b, kind, label, is_fallback, is_dup_tag in path_steps:
+                a_link = link(f"{a}.html", db.area_name(a))
+                b_link = link(f"{b}.html", db.area_name(b))
+                if kind == "door":
+                    via = f'use the &#8220;{E(label)}&#8221; door'
+                elif kind == "trigger":
+                    via = f'step on the &#8220;{E(label)}&#8221; trigger'
+                elif kind in ("talk", "convo"):
+                    via = E(label)
+                else:
+                    via = f'{E(kind)}: {E(label)}'
+                warn = ""
+                if is_fallback:
+                    has_fallback_step = True
+                    warn += (' <span class="warn-fallback" title="This transition was'
+                             ' resolved via a WP_-prefix fallback — the waypoint tag'
+                             ' in the script may not match the actual waypoint tag,'
+                             ' making this transition possibly broken in-game."'
+                             '>&#9888; possibly broken</span>')
+                if is_dup_tag:
+                    has_dup_tag_step = True
+                    warn += (' <span class="warn-dup-tag" title="The destination tag'
+                             ' for this transition matches multiple objects in the'
+                             ' module. The game engine resolves to whichever it finds'
+                             ' first, which may not be this area."'
+                             '>&#9888; duplicate tag</span>')
+                items.append(
+                    f"<li>{a_link} &rarr; {b_link}"
+                    f" <em class=\"muted\">[{via}]</em>{warn}</li>"
+                )
+            fallback_note = (
+                '<p class="warn-fallback-note">&#9888; One or more steps use a'
+                ' waypoint-tag fallback and may not work in-game — the script'
+                ' references a short tag (e.g. <code>foo</code>) while the actual'
+                ' waypoint is tagged <code>WP_foo</code>.</p>'
+                if has_fallback_step else ""
+            )
+            dup_tag_note = (
+                '<p class="warn-dup-tag-note">&#9888; One or more steps use a'
+                ' destination tag that matches multiple objects across the module.'
+                ' The game engine picks whichever it finds first, so the actual'
+                ' in-game destination may differ from what this path shows.</p>'
+                if has_dup_tag_step else ""
+            )
+            sections.append(
+                f"<p><strong>{n} {hop_word}</strong></p>"
+                + fallback_note
+                + dup_tag_note
+                + f"<ol>{''.join(items)}</ol>"
+            )
+
+    # Transitions (out)
+    out_trans = ([t for t in db.transitions if t["src_area"] == resref]
+                 + [t for t in db.script_transitions if t["src_area"] == resref])
+    if out_trans:
+        sections.append("<h2>Outgoing transitions</h2>")
+        has_key_out = any(t.get("key_required") and t.get("key_tag") for t in out_trans)
+        if has_key_out:
+            tag_to_item_rr: dict[str, str] = {}
+            for _rr, _it in db.items.items():
+                _tag = (fld(_it, "Tag", "") or "").strip().lower()
+                if _tag and _tag not in tag_to_item_rr:
+                    tag_to_item_rr[_tag] = _rr
+        rows = []
+        for t in out_trans:
+            dst = t["dst_area"]
+            dst_link = (link(f"{dst}.html", db.area_name(dst))
+                        if dst else f'<em>(unresolved waypoint <code>{E(t["dst_tag"])}</code>)</em>')
+            key_cell = ""
+            if has_key_out:
+                kt = t.get("key_tag", "")
+                if t.get("key_required") and kt:
+                    item_rr = tag_to_item_rr.get(kt.lower())
+                    key_cell = (f"<td>{link(f'../items/{item_rr}.html', db.item_name(item_rr))}</td>"
+                                if item_rr else f"<td><code>{E(kt)}</code></td>")
+                else:
+                    key_cell = "<td></td>"
+            rows.append(
+                f"<tr><td>{E(t['kind'])}</td>"
+                f"<td>{E(t['label'])}</td>"
+                f"<td>{dst_link}</td>"
+                f"<td><code>{E(t['dst_tag'])}</code></td>"
+                + key_cell + "</tr>"
+            )
+        key_th = "<th>Requires Key</th>" if has_key_out else ""
+        sections.append(
+            '<table class="data"><thead><tr>'
+            f"<th>Kind</th><th>Label</th><th>Destination</th><th>Waypoint tag</th>{key_th}"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Transitions (in)
+    in_trans = ([t for t in db.transitions if t["dst_area"] == resref]
+                + [t for t in db.script_transitions if t["dst_area"] == resref])
+    if in_trans:
+        sections.append("<h2>Incoming transitions</h2>")
+        has_key_in = any(t.get("key_required") and t.get("key_tag") for t in in_trans)
+        if has_key_in:
+            tag_to_item_rr = {}
+            for _rr, _it in db.items.items():
+                _tag = (fld(_it, "Tag", "") or "").strip().lower()
+                if _tag and _tag not in tag_to_item_rr:
+                    tag_to_item_rr[_tag] = _rr
+        rows = []
+        for t in in_trans:
+            src = t["src_area"]
+            key_cell = ""
+            if has_key_in:
+                kt = t.get("key_tag", "")
+                if t.get("key_required") and kt:
+                    item_rr = tag_to_item_rr.get(kt.lower())
+                    key_cell = (f"<td>{link(f'../items/{item_rr}.html', db.item_name(item_rr))}</td>"
+                                if item_rr else f"<td><code>{E(kt)}</code></td>")
+                else:
+                    key_cell = "<td></td>"
+            rows.append(
+                f"<tr><td>{E(t['kind'])}</td>"
+                f"<td>{link(f'{src}.html', db.area_name(src))}</td>"
+                f"<td>{E(t['label'])}</td>"
+                + key_cell + "</tr>"
+            )
+        key_th = "<th>Requires Key</th>" if has_key_in else ""
+        sections.append(
+            '<table class="data"><thead><tr>'
+            f"<th>Kind</th><th>From</th><th>Label</th>{key_th}"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # NPCs / hostile residents — split by friendliness. Each row is one
+    # placement (instance), so we link the name to the per-instance page and
+    # separately surface the blueprint it was spawned from.
+    insts = db.area_creature_instances.get(resref, [])
+    friendly, hostile = [], []
+    for inst in insts:
+        c = inst["c"]
+        fid = fld(c, "FactionID")
+        (friendly if db.is_friendly(fid) else hostile).append(inst)
+
+    def npc_table(rows_data: list[dict], heading: str) -> None:
+        if not rows_data:
+            return
+        sections.append(f"<h2>{heading}</h2>")
+        rows = []
+        for inst in rows_data:
+            c = inst["c"]
+            idx = inst["idx"]
+            rr = fld(c, "TemplateResRef", "") or ""
+            disp = db.creature_instance_name(resref, idx) or rr or "(unnamed)"
+            classes = list_items(c.get("ClassList"))
+            cls_str = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes
+            )
+            bp = db.creatures.get(rr.lower())
+            _eff_hp = creature_max_hp(c, bp)
+            hp = _eff_hp if _eff_hp is not None else ""
+            cr = fld(c, "ChallengeRating", "")
+            conv = fld(c, "Conversation", "")
+            if not conv and bp:
+                conv = fld(bp, "Conversation", "") or ""
+            can_rr = db.canonical_for_inst.get((resref, idx), rr)
+            inst_url = f"../creatures/{can_rr}.html"
+            name_cell = f'<a href="{E(inst_url)}">{nwn_html(disp)}</a>'
+            bp_cell = (link(f"../creatures/{can_rr}.html", db.canonical_creature_name(can_rr))
+                       if can_rr in db.canonical_creatures else
+                       (f"<code>{E(rr)}</code>" if rr else ""))
+            rows.append(
+                f"<tr><td>{name_cell}</td>"
+                f"<td>{E(rr)}</td>"
+                f"<td>{E(race_name(fld(c, 'Race')))}</td>"
+                f"<td>{E(cls_str)}</td>"
+                f"<td>{E(hp)}</td>"
+                f"<td>{E(cr)}</td>"
+                f"<td>{E(db.faction_name(fld(c, 'FactionID', '')))}</td>"
+                f"<td>{_conv_link(db, conv, root_rel='..')}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>ResRef</th>"
+            "<th>Race</th><th>Class</th><th>HP</th><th>CR</th>"
+            "<th>Faction</th><th>Conversation</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    npc_table(friendly, "NPCs")
+    npc_table(hostile, "Hostile residents")
+
+    # Encounters
+    encs = db.area_encounters.get(resref, [])
+    if encs:
+        sections.append("<h2>Encounters</h2>")
+        enc_groups: dict[str, dict] = {}
+        enc_order: list[str] = []
+        for e in encs:
+            tag = fld(e, "Tag", "")
+            rr = fld(e, "TemplateResRef", "")
+            if rr not in enc_groups:
+                blueprint = db.encounters.get(rr, {})
+                ename = loc(blueprint.get("LocalizedName")) or loc(e.get("LocalizedName")) or rr
+                max_c = fld(blueprint, "MaxCreatures", fld(e, "MaxCreatures", ""))
+                diff = fld(blueprint, "DifficultyIndex", fld(e, "DifficultyIndex", ""))
+                # Instance (.git) CreatureList is what spawns at runtime; blueprint is fallback.
+                spawns = list_items(e.get("CreatureList")) or list_items(blueprint.get("CreatureList"))
+                spawn_cells = []
+                for s in spawns:
+                    srr = fld(s, "ResRef", "")
+                    cr = fld(s, "CR", "")
+                    can_srr = db.canonical_for_bp.get(srr, srr)
+                    disp = db.canonical_creature_name(can_srr) if can_srr in db.canonical_creatures else (db.creature_name(srr) if srr in db.creatures else srr)
+                    cell = (link(f"../creatures/{can_srr}.html", disp)
+                            if can_srr in db.canonical_creatures else nwn_html(disp))
+                    spawn_cells.append(f"{cell}<small> CR {E(cr)}</small>")
+                enc_groups[rr] = {
+                    "ename": ename, "max_c": max_c, "diff": diff,
+                    "spawn_cells": spawn_cells,
+                    "tags": [tag] if tag else [], "count": 1,
+                }
+                enc_order.append(rr)
+            else:
+                enc_groups[rr]["count"] += 1
+                if tag:
+                    enc_groups[rr]["tags"].append(tag)
+        rows = []
+        for rr in enc_order:
+            g = enc_groups[rr]
+            tags_str = ", ".join(E(t) for t in g["tags"]) if g["tags"] else ""
+            rows.append(
+                f"<tr><td>{nwn_html(g['ename'])}</td>"
+                f"<td>{E(rr)}</td>"
+                f"<td>{tags_str}</td>"
+                f"<td>{E(g['max_c'])}</td>"
+                f"<td>{E(g['diff'])}</td>"
+                f"<td>{', '.join(g['spawn_cells']) if g['spawn_cells'] else '—'}</td>"
+                f"<td>{g['count']}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>ResRef</th><th>Tag</th><th>Max</th><th>Diff</th><th>Spawn pool</th><th>Count</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Script-spawned NPCs (creatures created by OnModuleLoad/OnEnter scripts
+    # at waypoint locations rather than placed as instances in the GIT).
+    script_spawns = db.area_script_spawns.get(resref, [])
+    if script_spawns:
+        sections.append("<h2>Script-spawned NPCs</h2>")
+        ss_rows = []
+        seen_ss: set[str] = set()
+        for sp in script_spawns:
+            can_rr2 = sp["can_rr"]
+            if can_rr2 in seen_ss:
+                continue
+            seen_ss.add(can_rr2)
+            bp2 = db.creatures.get(sp["bp_rr"], {})
+            name2 = db.canonical_creature_name(can_rr2) or sp["bp_rr"]
+            classes2 = list_items(db.canonical_creatures.get(can_rr2, {}).get("c", {}).get("ClassList")) or list_items(bp2.get("ClassList"))
+            cls_str2 = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes2
+            )
+            _eff_hp2 = creature_max_hp(bp2)
+            hp2 = _eff_hp2 if _eff_hp2 is not None else ""
+            cr2 = fld(bp2, "ChallengeRating", "")
+            conv2 = fld(bp2, "Conversation", "")
+            ss_rows.append(
+                f"<tr><td>{link(f'../creatures/{can_rr2}.html', name2)}</td>"
+                f"<td><code>{E(sp['bp_rr'])}</code></td>"
+                f"<td>{E(race_name(fld(bp2, 'Race')))}</td>"
+                f"<td>{E(cls_str2)}</td>"
+                f"<td>{E(hp2)}</td>"
+                f"<td>{E(cr2)}</td>"
+                f"<td>{_conv_link(db, conv2, root_rel='..')}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th>"
+            "<th>HP</th><th>CR</th><th>Conversation</th>"
+            "</tr></thead><tbody>" + "\n".join(ss_rows) + "</tbody></table>"
+        )
+
+    # Containers (placeables with non-empty inventory). Detail lives on a
+    # per-container page so this row can stay scannable.
+    containers = db.area_containers.get(resref, [])
+    if containers:
+        sections.append(
+            f"<h2>Containers <small class=\"muted\">({len(containers)})</small></h2>"
+        )
+        rows = []
+        for c in containers:
+            p = c["p"]
+            idx = c["idx"]
+            tag = fld(p, "Tag", "")
+            rr = fld(p, "TemplateResRef", "")
+            pname = loc(p.get("LocName")) or tag or rr or "(unnamed)"
+            n_items = len(list_items(p.get("ItemList")))
+            is_rand = (resref, idx) in db.random_treasure_containers
+            x = fld(p, "X", 0.0) or 0.0
+            y = fld(p, "Y", 0.0) or 0.0
+            z = fld(p, "Z", 0.0) or 0.0
+            locked = "yes" if int(fld(p, "Locked", 0) or 0) else "no"
+            dc = fld(p, "OpenLockDC", "")
+            href = f"../containers/{resref}-{idx:03d}.html"
+            rand_tag = ' <small class="muted">+random</small>' if is_rand else ""
+            rows.append(
+                f"<tr><td>{link(href, pname)}</td>"
+                f"<td>{n_items}{rand_tag}</td>"
+                f"<td><code>{E(tag)}</code></td>"
+                f"<td>{E(rr)}</td>"
+                f"<td>{x:.1f}, {y:.1f}, {z:.1f}</td>"
+                f"<td>{E(locked)}</td>"
+                f"<td>{E(dc)}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Container</th><th>Items</th><th>Tag</th><th>ResRef</th>"
+            "<th>X, Y, Z</th><th>Locked</th><th>Open DC</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Stores in the area
+    stores = db.area_stores.get(resref, [])
+    if stores:
+        sections.append("<h2>Stores</h2>")
+        rows = []
+        for inst in stores:
+            rr = fld(inst, "ResRef", "") or fld(inst, "TemplateResRef", "")
+            tag = fld(inst, "Tag", "")
+            store_label = db.store_name(rr) if rr in db.stores else (tag or rr)
+            slug = _store_instance_slug(resref, inst)
+            name_cell = link(f"../stores/{slug}.html", store_label)
+
+            pages = list_items(inst.get("StoreList"))
+            n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+
+            mu_val = fld(inst, "MarkUp", None)
+            md_val = fld(inst, "MarkDown", None)
+            buy_html, buys_any = _store_buy_summary(inst)
+            mu_str = f"{mu_val}%" if mu_val is not None else "—"
+            md_str = (f"{md_val}%" if md_val is not None else "—") if buys_any else "N/A"
+            mbp_raw = fld(inst, "MaxBuyPrice", None)
+
+            area_openers = [o for o in db.store_tag_openers.get(tag.lower(), [])
+                            if resref in o.get("areas", []) or o.get("area") == resref]
+            if area_openers:
+                seen_html: set[str] = set()
+                opener_parts = []
+                for o in area_openers[:3]:
+                    h = _store_opener_html(db, o, root_rel="..")
+                    if h not in seen_html:
+                        seen_html.add(h)
+                        opener_parts.append(h)
+                opener_cell = "<br>".join(opener_parts)
+                if len(area_openers) > 3:
+                    opener_cell += f" <em class=\"muted\">(+{len(area_openers)-3} more)</em>"
+            else:
+                opener_cell = '<em class="muted">unknown</em>'
+
+            max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
+            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
+            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
+            rows.append(
+                f"<tr>"
+                f"<td>{name_cell}</td>"
+                f"<td>{n_items}</td>"
+                f"<td>{opener_cell}</td>"
+                f"<td>{mu_str}</td>"
+                f"<td>{buy_html}</td>"
+                f"<td>{md_str}</td>"
+                f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
+                f"<td>{max_gp_str}</td>"
+                f"<td>{avg_gp_str}</td>"
+                f"</tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Items</th><th>Opened By</th>"
+            '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+            '<th title="Item types the store will buy from you">Buys</th>'
+            '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
+            '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+            '<th title="Highest base item value in stock (before markup)">Max GP</th>'
+            '<th title="Average base item value in stock (before markup)">Avg GP</th>'
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Conversations reachable from this area — every dlg whose callers
+    # include an entity (NPC, placeable, door, trigger, area-event) bound
+    # to this area. Useful as a jump-off point when chasing a quest hook.
+    area_dlgs: list[tuple[str, list[dict]]] = []
+    for dlg_resref in sorted(db.dialogs):
+        callers = [c for c in db.dialog_callers.get(dlg_resref, [])
+                   if resref in c.get("areas", []) or
+                   (c.get("kind") == "area-event" and c.get("resref") == resref)]
+        if callers:
+            area_dlgs.append((dlg_resref, callers))
+    if area_dlgs:
+        sections.append("<h2>Conversations triggered here</h2>")
+        rows = []
+        for dlg_resref, callers in area_dlgs:
+            tps = db.dialog_teleports.get(dlg_resref, [])
+            tp_str = ""
+            if tps:
+                dests = sorted({t["area"] for t in tps if t.get("area")})
+                tp_str = ", ".join(
+                    link(f"{a}.html", db.area_name(a)) for a in dests if a in db.areas)
+            def _via_one(c: dict) -> str:
+                k = c["kind"]
+                if k == "creature":
+                    return f"NPC blueprint <code>{E(c['resref'])}</code>"
+                if k == "creature-instance":
+                    a = c.get("area", "")
+                    idx = c.get("idx", 0)
+                    can_rr2 = db.canonical_for_inst.get((a, idx), "")
+                    nm = db.canonical_creature_name(can_rr2) if can_rr2 else (db.creature_instance_name(a, idx) or c.get("resref", ""))
+                    href = f"../creatures/{can_rr2}.html" if can_rr2 else "#"
+                    return f'NPC <a href="{E(href)}">{nwn_html(nm)}</a>'
+                if k == "placeable":
+                    return f"placeable <code>{E(c['resref'])}</code>"
+                if k == "door":
+                    return f"door <code>{E(c['resref'])}</code>"
+                if k in ("placeable-instance", "door-instance"):
+                    ent = "placeable" if k == "placeable-instance" else "door"
+                    tag = c.get("tag") or ""
+                    return f"{ent} placement <code>{E(tag or c.get('resref',''))}</code>"
+                if k.endswith("-event-instance"):
+                    ent = k.split("-")[0]  # placeable / door / trigger
+                    tag = c.get("tag") or ""
+                    return (f"<code>{E(c.get('event',''))}</code> on {ent} placement "
+                            f"<code>{E(tag or c.get('resref',''))}</code>")
+                if k.endswith("-event"):
+                    return (f"<code>{E(c.get('event',''))}</code> on "
+                            f"<code>{E(c['resref'])}</code>")
+                return k
+            via = "; ".join(_via_one(c) for c in callers)
+            rows.append(
+                f"<tr><td>{link(f'../conversations/{dlg_resref}.html', db.dialog_label(dlg_resref))}</td>"
+                f"<td><code>{E(dlg_resref)}</code></td>"
+                f"<td>{via}</td>"
+                f"<td>{tp_str or '—'}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Conversation</th><th>ResRef</th><th>Triggered via</th>"
+            "<th>Teleports to</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Waypoints (just for completeness — useful for checking spawn-walk paths
+    # and trigger destinations)
+    wps = db.area_waypoints.get(resref, [])
+    if wps:
+        sections.append("<h2>Waypoints</h2>")
+        rows = []
+        for w in wps:
+            tag = fld(w, "Tag", "")
+            rr = fld(w, "TemplateResRef", "")
+            rows.append(f"<tr><td><code>{E(tag)}</code></td><td>{E(rr)}</td></tr>")
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Tag</th><th>ResRef</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    write(out / "areas" / f"{resref}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
+    """One page per container (a placeable with a non-empty inventory).
+    Surfaces the in-area position, lock state, and items it holds — useful
+    for tracing the player's loot path through an area without having to
+    open the placeable in the toolset."""
+    p = c["p"]
+    idx = c["idx"]
+    tag = fld(p, "Tag", "")
+    rr = fld(p, "TemplateResRef", "")
+    pname = loc(p.get("LocName")) or tag or rr or "(unnamed container)"
+    items = list_items(p.get("ItemList"))
+
+    x = fld(p, "X", 0.0) or 0.0
+    y = fld(p, "Y", 0.0) or 0.0
+    z = fld(p, "Z", 0.0) or 0.0
+    bearing = fld(p, "Bearing", "")
+    appearance = fld(p, "Appearance")
+    hp = fld(p, "HP", "")
+    cur_hp = fld(p, "CurrentHP", "")
+    hardness = fld(p, "Hardness", "")
+    plot = "yes" if int(fld(p, "Plot", 0) or 0) else "no"
+    static = "yes" if int(fld(p, "Static", 0) or 0) else "no"
+    useable = "yes" if int(fld(p, "Useable", 0) or 0) else "no"
+    lockable = "yes" if int(fld(p, "Lockable", 0) or 0) else "no"
+    locked = "yes" if int(fld(p, "Locked", 0) or 0) else "no"
+    open_dc = fld(p, "OpenLockDC", "")
+    close_dc = fld(p, "CloseLockDC", "")
+    key_required = "yes" if int(fld(p, "KeyRequired", 0) or 0) else "no"
+    key_name = fld(p, "KeyName", "")
+    auto_key = "yes" if int(fld(p, "AutoRemoveKey", 0) or 0) else "no"
+    trap_flag = "yes" if int(fld(p, "TrapFlag", 0) or 0) else "no"
+    trap_dc = fld(p, "TrapDetectDC", "")
+    disarm_dc = fld(p, "DisarmDC", "")
+    conv = fld(p, "Conversation", "")
+    faction = fld(p, "Faction", "")
+
+    sections = [
+        f"<h1>{nwn_html(pname)}</h1>",
+        '<dl class="meta">',
+        f"<dt>Area</dt><dd>{link(f'../areas/{area_resref}.html', db.area_name(area_resref))}</dd>",
+        f"<dt>Tag</dt><dd><code>{E(tag)}</code></dd>",
+        f"<dt>ResRef</dt><dd>{E(rr)}</dd>",
+        f"<dt>Position (X, Y, Z)</dt><dd>{x:.2f}, {y:.2f}, {z:.2f}</dd>",
+        f"<dt>Bearing</dt><dd>{E(bearing)}</dd>",
+        f"<dt>Appearance</dt><dd>{E(placeable_name(appearance))} "
+        f"<small class=\"muted\">(placeables.2da row {E(appearance) if appearance is not None else ''})</small></dd>",
+        f"<dt>HP</dt><dd>{E(cur_hp)} / {E(hp)} (hardness {E(hardness)})</dd>",
+        f"<dt>Plot / Static / Useable</dt><dd>{plot} / {static} / {useable}</dd>",
+        f"<dt>Lockable</dt><dd>{lockable}</dd>",
+        f"<dt>Locked</dt><dd>{locked}</dd>",
+        f"<dt>Open lock DC</dt><dd>{E(open_dc)}</dd>",
+        f"<dt>Close lock DC</dt><dd>{E(close_dc)}</dd>",
+        f"<dt>Key required</dt><dd>{key_required}</dd>",
+        f"<dt>Key name</dt><dd>{E(key_name)}</dd>",
+        f"<dt>Auto-remove key</dt><dd>{auto_key}</dd>",
+        f"<dt>Trap</dt><dd>{trap_flag} (detect DC {E(trap_dc)}, disarm DC {E(disarm_dc)})</dd>",
+        f"<dt>Conversation</dt><dd>{E(conv)}</dd>",
+        f"<dt>Faction ID</dt><dd>{E(faction)}</dd>",
+        '</dl>',
+    ]
+
+    desc = loc(p.get("Description"))
+    if desc:
+        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
+
+    if (area_resref, idx) in db.random_treasure_containers:
+        on_open = (fld(p, "OnOpen", "") or "").lower()
+        if not on_open:
+            on_open = (fld(db.placeables.get(rr, {}), "OnOpen", "") or "").lower()
+        sections.append(
+            '<p class="muted"><em>This container generates random treasure via '
+            f'script <code>{E(on_open)}</code> when opened. '
+            "Specific items are not predetermined and cannot be listed here.</em></p>"
+        )
+
+    if items:
+        sections.append(f"<h2>Contents ({len(items)})</h2>")
+        rows = []
+        for it in items:
+            irr = fld(it, "TemplateResRef") or fld(it, "InventoryRes") or fld(it, "EquippedRes") or ""
+            iname = loc(it.get("LocalizedName"))
+            if not iname and irr in db.items:
+                iname = db.item_name(irr)
+            if not iname:
+                iname = irr or "(unknown)"
+            stack = fld(it, "StackSize", 1)
+            base = baseitem_label(fld(it, "BaseItem"))
+            cost = item_gp_value(it) or fld(it, "Cost", "")
+            cell = (link(f"../items/{irr}.html", iname)
+                    if irr in db.items else nwn_html(iname))
+            rows.append(
+                f"<tr><td>{cell}</td>"
+                f"<td>{E(irr)}</td>"
+                f"<td>{base}</td>"
+                f"<td>{E(stack)}</td>"
+                f"<td>{E(cost)}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Item</th><th>ResRef</th><th>Base item</th><th>Stack</th><th>GP Value</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    title = f"{pname} — {db.area_name(area_resref)}"
+    write(out / "containers" / f"{area_resref}-{idx:03d}.html",
+          page(title, "\n".join(sections), root_rel=".."))
+
+
+def render_creatures_index(db: Db, out: Path) -> None:
+    rows_present = []
+    rows_absent = []
+    for can_rr in sorted(db.canonical_creatures.keys(),
+                         key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        entry = db.canonical_creatures[can_rr]
+        c = entry["c"]
+        bp_rr = entry["bp_rr"]
+        bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+
+        def _f(key, default=None):
+            v = fld(c, key)
+            if v is None and bp is not None:
+                v = fld(bp, key)
+            return default if v is None else v
+
+        classes = list_items(c.get("ClassList")) or (list_items(bp.get("ClassList")) if bp else [])
+        cls_str = "/".join(
+            f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+            for cl in classes
+        )
+        is_variant = db.canonical_bp_of.get(can_rr) != can_rr
+        if is_variant:
+            base_rr = db.canonical_bp_of[can_rr]
+            variant_note = (
+                f' <small class="muted">(variant of '
+                f'{link(f"{base_rr}.html", db.canonical_creature_name(base_rr))})</small>'
+            )
+        else:
+            variant_note = ""
+        _eff_hp = creature_max_hp(c, bp)
+        total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
+        if _BESTIARY_ACTIVE:
+            k = _BESTIARY_KILLS.get(can_rr)
+            kills_cells = (
+                f"<td>{k['total'] if k else '—'}</td>"
+                f"<td>{k['solo'] if k else '—'}</td>"
+                f"<td>{k['party'] if k else '—'}</td>"
+            )
+        else:
+            kills_cells = ""
+        row = (
+            f"<tr><td>{link(f'{can_rr}.html', db.canonical_creature_name(can_rr))}"
+            f"{variant_note}</td>"
+            f"<td>{total_count if total_count else '—'}</td>"
+            f"<td>{E(race_name(_f('Race')))}</td>"
+            f"<td>{E(cls_str)}</td>"
+            f"<td>{E(_eff_hp if _eff_hp is not None else '')}</td>"
+            f"<td>{E(_f('ChallengeRating', ''))}</td>"
+            f"<td>{E(db.faction_name(_f('FactionID', '')))}</td>"
+            f"{kills_cells}</tr>"
+        )
+        if total_count:
+            rows_present.append(row)
+        else:
+            rows_absent.append(row)
+    n_unique = len(db.canonical_creatures)
+    n_variants = sum(1 for r in db.canonical_creatures
+                     if db.canonical_bp_of.get(r) != r)
+    variant_note_str = (
+        f" ({n_variants} equipment/class/name variant{'s' if n_variants != 1 else ''})"
+        if n_variants else ""
+    )
+    kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
+                  if _BESTIARY_ACTIVE else "")
+    TABLE_HEAD = (
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>Count</th><th>Race</th><th>Class</th>"
+        "<th>HP</th><th>CR</th><th>Faction</th>"
+        f"{kills_head}"
+        "</tr></thead><tbody>"
+    )
+    toc_parts = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="by-area/index.html">By Area</a></div>',
+        '<div><a href="by-cr/index.html">By Challenge Rating</a></div>',
+        '<div><a href="by-race/index.html">By Race</a></div>',
+        '<div><a href="search.html">Search</a></div>',
+        '<div class="toc-group-heading">Sections</div>',
+    ]
+    if rows_present:
+        toc_parts.append(
+            f'<div><a href="#present">In Module'
+            f' <span class="muted">({len(rows_present)})</span></a></div>'
+        )
+    if rows_absent:
+        toc_parts.append(
+            f'<div><a href="#absent">Blueprint Only'
+            f' <span class="muted">({len(rows_absent)})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sections: list[str] = [
+        "<h1>Creatures</h1>",
+        f"<p>{n_unique} unique creature{'s' if n_unique != 1 else ''}{variant_note_str}.</p>",
+    ]
+    if rows_present:
+        sections.append(
+            f'<h2 id="present">In Module'
+            f' <small class="muted">({len(rows_present)})</small></h2>'
+            + TABLE_HEAD + "\n".join(rows_present) + "</tbody></table>"
+        )
+    if rows_absent:
+        sections.append(
+            f'<h2 id="absent">Blueprint Only'
+            f' <small class="muted">({len(rows_absent)})</small></h2>'
+            + TABLE_HEAD + "\n".join(rows_absent) + "</tbody></table>"
+        )
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "index.html",
+          page("Creatures",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel=".."))
+
+
+# --- Boss respawn tracker ("Roll of the Fallen") ---------------------------
+# The module's brd_db.nss seeds a curated boss registry into the respawndb
+# campaign DB on every module load; the same seed rows are the wiki's boss
+# list. Regexes mirror tests/check_boss_registry.py in the module repo.
+
+_BOSS_SEED_RE = re.compile(
+    r'BRD_SeedBoss\(\s*"(?P<resref>[^"]*)"\s*,\s*"(?P<name>[^"]*)"\s*,'
+    r'\s*"(?P<tag>[^"]*)"\s*,\s*"(?P<area>[^"]*)"\s*,\s*"(?P<area_name>[^"]*)"\s*,'
+    r'\s*(?P<cr>[0-9.]+)f?\s*,\s*(?P<respawn>\d+)\s*,\s*"(?P<type>[^"]*)"\s*\)'
+)
+_BOSS_ALIAS_RE = re.compile(
+    r'BRD_SeedAlias\(\s*"(?P<resref>[^"]*)"\s*,\s*"(?P<canonical>[^"]*)"\s*\)'
+)
+
+
+def _load_boss_registry_from_path(p: Path | None) -> None:
+    """Populate _BOSS_REGISTRY/_BOSS_ALIASES from a brd_db.nss path.
+    No-op (empty registry, no Bosses page/nav link) when the path is missing —
+    i.e. the module doesn't use the boss respawn tracker."""
+    global _BOSS_REGISTRY, _BOSS_ALIASES
+    _BOSS_REGISTRY = []
+    _BOSS_ALIASES = {}
+    if not p or not p.is_file():
+        return
+    text = _strip_nss_comments(p.read_text())
+    for m in _BOSS_SEED_RE.finditer(text):
+        d = m.groupdict()
+        d["cr"] = float(d["cr"])
+        _BOSS_REGISTRY.append(d)
+    for m in _BOSS_ALIAS_RE.finditer(text):
+        _BOSS_ALIASES[m.group("resref")] = m.group("canonical")
+    if _BOSS_REGISTRY:
+        print(f"[nwn-wiki] boss registry: {len(_BOSS_REGISTRY)} bosses"
+              f" ({len(_BOSS_ALIASES)} variant aliases) from brd_db.nss")
+
+
+def load_boss_registry(db: Db) -> None:
+    """Populate _BOSS_REGISTRY/_BOSS_ALIASES from the module's brd_db.nss."""
+    _load_boss_registry_from_path(db.script_paths.get("brd_db"))
+
+
+def load_boss_registry_from_src(src: Path) -> None:
+    """Populate _BOSS_REGISTRY/_BOSS_ALIASES from <src>/brd_db.nss.
+
+    For callers (e.g. nwn-wiki-activity) that render pages without building a
+    full Db. Mirrors how Db.load maps the 'brd_db' resref to <src>/brd_db.nss."""
+    _load_boss_registry_from_path(Path(src) / "brd_db.nss")
+
+
+def render_bosses_index(db: Db, out: Path) -> None:
+    """creatures/bosses.html — every boss tracked by the in-game Roll of the
+    Fallen board, same columns as the creatures index, sorted by CR desc."""
+    if not _BOSS_REGISTRY:
+        return
+    rows = []
+    for boss in sorted(_BOSS_REGISTRY, key=lambda b: (-b["cr"], b["name"].lower())):
+        rr = boss["resref"]
+        entry = db.canonical_creatures.get(rr)
+        if entry:
+            name_cell = link(f"{rr}.html", db.canonical_creature_name(rr))
+            c = entry["c"]
+            bp_rr = entry["bp_rr"]
+            bp = db.creatures.get(bp_rr) if bp_rr != rr else None
+
+            def _f(key, default=None):
+                v = fld(c, key)
+                if v is None and bp is not None:
+                    v = fld(bp, key)
+                return default if v is None else v
+
+            classes = (list_items(c.get("ClassList"))
+                       or (list_items(bp.get("ClassList")) if bp else []))
+            cls_str = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes
+            )
+            race = race_name(_f("Race"))
+            hp = creature_max_hp(c, bp)
+            cr = _f("ChallengeRating", boss["cr"])
+            faction = db.faction_name(_f("FactionID", ""))
+        else:
+            # Registry row without a matching creature page — registry/module
+            # drift; render unlinked and surface it in lookup_warnings.json.
+            _warn_once(f"boss registry resref '{rr}' has no creature page "
+                       f"(check BRD_SeedBoss rows in brd_db.nss)")
+            name_cell = E(boss["name"])
+            cls_str, race, hp, faction = "", "", None, ""
+            cr = boss["cr"]
+        area_rr = boss["area"]
+        if area_rr in db.areas and area_rr not in db.hidden_areas:
+            lair_cell = link(f"../areas/{area_rr}.html", boss["area_name"])
+        else:
+            lair_cell = E(boss["area_name"])
+        if _BESTIARY_ACTIVE:
+            # Sum kills across the boss's variant blueprints (e.g. the five
+            # leveled Xanith .utcs all count as one boss on the board).
+            variant_rrs = [rr] + [v for v, canon in _BOSS_ALIASES.items()
+                                  if canon == rr]
+            ks = [_BESTIARY_KILLS[v] for v in variant_rrs if v in _BESTIARY_KILLS]
+            if ks:
+                kills_cells = (
+                    f"<td>{sum(k['total'] for k in ks)}</td>"
+                    f"<td>{sum(k['solo'] for k in ks)}</td>"
+                    f"<td>{sum(k['party'] for k in ks)}</td>"
+                )
+            else:
+                kills_cells = "<td>—</td><td>—</td><td>—</td>"
+        else:
+            kills_cells = ""
+        rows.append(
+            f"<tr><td>{name_cell}</td>"
+            f"<td>{lair_cell}</td>"
+            f"<td>{E(race)}</td>"
+            f"<td>{E(cls_str)}</td>"
+            f"<td>{E(hp if hp is not None else '')}</td>"
+            f"<td>{E(cr)}</td>"
+            f"<td>{E(faction)}</td>"
+            f"{kills_cells}</tr>"
+        )
+    kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
+                  if _BESTIARY_ACTIVE else "")
+    n = len(_BOSS_REGISTRY)
+    body = (
+        "<h1>Bosses</h1>"
+        f"<p>The {n} great powers of Middle-earth tracked by the "
+        '<a href="../manual/Customizations.html#boss-respawn-tracker">Roll of the '
+        "Fallen</a> board in the Well of Eru. This list is generated from the same "
+        "registry the game loads, so it always matches the in-game board.</p>"
+        "<p>Think a boss is missing and should be tracked? Suggest it on Discord "
+        "or via the roadmap so it can be considered for the list.</p>"
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>Lair</th><th>Race</th><th>Class</th>"
+        "<th>HP</th><th>CR</th><th>Faction</th>"
+        f"{kills_head}"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "creatures" / "bosses.html", page("Bosses", body, root_rel=".."))
+
+
+def _pic_src(filename: str, prefix: str = "pics") -> str:
+    """URL for a creature-pics image; filenames may contain spaces/apostrophes."""
+    return f"{prefix}/{urllib.parse.quote(filename)}"
+
+
+def _pic_figures(images: list[str], alt: str, prefix: str = "pics") -> str:
+    """Render a list of image filenames as full-width <figure><img> blocks."""
+    return "".join(
+        f'<figure><img class="creature-pic" src="{E(_pic_src(fn, prefix))}" '
+        f'alt="{E(alt)}" loading="lazy"></figure>'
+        for fn in images
+    )
+
+
+def render_creature_pictures(db: Db, out: Path) -> None:
+    """Gallery page grouping creature artwork (from creature-pics/) by NPC,
+    sorted by descending CR, with a floating left-hand name navigation."""
+    if not _CREATURE_PIC_GROUPS:
+        return
+
+    def _slug(name: str) -> str:
+        s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        return s or "pic"
+
+    # Disambiguate any colliding slugs.
+    used: dict[str, int] = {}
+    for grp in _CREATURE_PIC_GROUPS:
+        base = _slug(grp["name"])
+        n = used.get(base, 0)
+        used[base] = n + 1
+        grp["_slug"] = base if n == 0 else f"{base}-{n + 1}"
+
+    toc_parts = [
+        '<div><a href="index.html">All Creatures</a></div>',
+        '<div class="toc-group-heading">Pictures</div>',
+    ]
+    for grp in _CREATURE_PIC_GROUPS:
+        toc_parts.append(f'<div><a href="#{E(grp["_slug"])}">{nwn_html(grp["name"])}</a></div>')
+    sidebar = '<aside class="items-toc items-toc--wide">' + "".join(toc_parts) + "</aside>"
+
+    sections = [
+        "<h1>Creature Pictures</h1>",
+        f"<p>{len(_CREATURE_PIC_GROUPS)} creature"
+        f"{'s' if len(_CREATURE_PIC_GROUPS) != 1 else ''} with artwork, "
+        f"sorted by descending Challenge Rating.</p>",
+    ]
+    for grp in _CREATURE_PIC_GROUPS:
+        name = grp["name"]
+        sections.append(f'<section id="{E(grp["_slug"])}">')
+        sections.append(f"<h2>{nwn_html(name)}</h2>")
+        if grp["matches"]:
+            links = ", ".join(
+                link(f"{rr}.html", db.canonical_creature_name(rr))
+                for rr in sorted(grp["matches"],
+                                 key=lambda r: db.canonical_creature_name(r).lower())
+            )
+            sections.append(f'<p class="muted">Appears as: {links}</p>')
+        else:
+            sections.append('<p class="muted">No matching creature in the module.</p>')
+        sections.append('<div class="creature-pics">'
+                        + _pic_figures(grp["images"], name) + "</div>")
+        sections.append("</section>")
+
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "pictures.html",
+          page("Creature Pictures",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel=".."))
+
+
+# --- Retaliation (OnDamaged strike-back) analysis ------------------------------
+# Friendly labels for NWN DAMAGE_TYPE_* constants used in retaliation summaries.
+_DAMAGE_TYPE_LABELS = {
+    "BLUDGEONING": "Bludgeoning", "PIERCING": "Piercing", "SLASHING": "Slashing",
+    "MAGICAL": "Magical", "ACID": "Acid", "COLD": "Cold", "DIVINE": "Divine",
+    "ELECTRICAL": "Electrical", "FIRE": "Fire", "NEGATIVE": "Negative",
+    "POSITIVE": "Positive", "SONIC": "Sonic",
+}
+_RE_STRIP_LINE_COMMENT = re.compile(r'//[^\n]*')
+_RE_STRIP_BLOCK_COMMENT = re.compile(r'/\*.*?\*/', re.S)
+_RE_RET_APPLY_EFFECT = re.compile(r'\bApplyEffect(?:ToObject|AtLocation)\s*\(')
+_RE_RET_HARM_EFFECT = re.compile(r'\bEffect(?:Death|Damage|DamageOverTime)\s*\(')
+_RE_RET_DAMAGE_TYPE = re.compile(r'\bDAMAGE_TYPE_([A-Z]+)\b')
+_RE_RET_DICE = re.compile(r'\bd(\d+)\s*\(\s*(\d+)\s*\)')          # dX(Y) -> "YdX"
+_RE_RET_EFFECT_DAMAGE_ARG = re.compile(r'\bEffectDamage\s*\(\s*([A-Za-z_]\w*|\d+)')
+
+
+def _strip_nss_comments(text: str) -> str:
+    return _RE_STRIP_LINE_COMMENT.sub("", _RE_STRIP_BLOCK_COMMENT.sub("", text))
+
+
+def _ret_dice_to_text(expr: str) -> str:
+    """Translate NWN dice calls dX(Y) -> 'YdX' and tidy whitespace."""
+    s = _RE_RET_DICE.sub(lambda m: f"{m.group(2)}d{m.group(1)}", expr)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _analyze_retaliation(raw: str) -> dict | None:
+    """Inspect an OnDamaged script and, if it strikes back at the attacker or
+    nearby creatures (rather than just running AI), return a structured summary:
+    {slay, aoe, dtype, amount, align, chance_pct, pc_only}. Returns None for
+    scripts that do not apply a harmful effect to someone other than themselves."""
+    text = _strip_nss_comments(raw)
+    if not (_RE_RET_APPLY_EFFECT.search(text) and _RE_RET_HARM_EFFECT.search(text)):
+        return None
+    aoe = "GetFirstObjectInShape" in text
+    targets_attacker = "GetLastDamager" in text or "GetLastHostileActor" in text
+    if not (aoe or targets_attacker):
+        return None
+    info: dict = {"slay": "EffectDeath" in text, "aoe": aoe,
+                  "pc_only": "GetIsPC" in text}
+    dt = _RE_RET_DAMAGE_TYPE.search(text)
+    if dt:
+        info["dtype"] = _DAMAGE_TYPE_LABELS.get(dt.group(1), dt.group(1).title())
+    # Damage amount: resolve EffectDamage's first argument (often a local variable).
+    m = _RE_RET_EFFECT_DAMAGE_ARG.search(text)
+    if m:
+        arg = m.group(1)
+        if arg.isdigit():
+            info["amount"] = arg
+        else:
+            am = re.search(r'\b' + re.escape(arg) + r'\s*=\s*([^;]+);', text)
+            if am:
+                info["amount"] = _ret_dice_to_text(am.group(1))
+    if "ALIGNMENT_GOOD" in text:
+        info["align"] = "Good-aligned"
+    elif "ALIGNMENT_EVIL" in text:
+        info["align"] = "Evil-aligned"
+    # Chance gate: a dN() roll compared against a threshold, e.g. d10() >= 9, or
+    # the same via a local variable: `int roll = d10(); if (roll >= 9)`.
+    nN = nK = None
+    cm = re.search(r'\bd(\d+)\s*\(\s*\)\s*>=\s*(\d+)', text)
+    if cm:
+        nN, nK = int(cm.group(1)), int(cm.group(2))
+    else:
+        rv = re.search(r'(\w+)\s*=\s*d(\d+)\s*\(\s*\)\s*;', text)
+        if rv:
+            kk = re.search(r'\b' + re.escape(rv.group(1)) + r'\s*>=\s*(\d+)', text)
+            if kk:
+                nN, nK = int(rv.group(2)), int(kk.group(1))
+    if nN and nK is not None and 0 < nK <= nN:
+        info["chance_pct"] = round((nN - nK + 1) / nN * 100)
+    return info
+
+
+def _retaliation_sentence(info: dict) -> str:
+    """Render a one-sentence, player-facing description of a retaliation effect."""
+    if info.get("slay"):
+        who = (info["align"] + " ") if info.get("align") else ""
+        whom = "player characters" if info.get("pc_only") else "creatures"
+        core = f"instantly slay {who}{whom} that strike it"
+    else:
+        dmg = " ".join(x for x in (info.get("amount", ""), info.get("dtype", "")) if x)
+        dmg = (dmg + " damage") if dmg else "damage"
+        scope = "everything nearby (area of effect)" if info.get("aoe") else "its attacker"
+        verb = "unleash" if info.get("aoe") else "deal"
+        core = f"{verb} {dmg} to {scope}"
+    if info.get("chance_pct"):
+        return f"When struck, this creature has a ~{info['chance_pct']}% chance to {core}."
+    return f"When struck, this creature will {core}."
+
+
+_ABIL_NAME_KEY = {"Strength": "Str", "Dexterity": "Dex", "Constitution": "Con",
+                  "Intelligence": "Int", "Wisdom": "Wis", "Charisma": "Cha"}
+_CWEAP_SLOTS = frozenset({SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B})
+
+
+def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
+    """Compute a creature's effective combat defenses once, as plain data, so
+    both the HTML detail page and the counter-gear analysis read from the same
+    source of truth (the NWN combat rules here are subtle — duplicating them
+    would drift).  When `bp` is provided, fields missing from the instance
+    struct fall back to the blueprint.
+
+    Returns a dict carrying the rendered-display values the creature page needs
+    (ac_total/ac_breakdown, fort/ref/will, sr, hp_display, cprop_by_pid, …) as
+    well as structured defenses for analysis (dr, resistances, immunities,
+    spell_immunities, regen, vampiric, hard_required_tags, mitigates_damage)."""
+
+    def _f(key: str, default: Any = None) -> Any:
+        v = fld(c, key, None)
+        if v is None and bp is not None:
+            v = fld(bp, key, default)
+        return default if v is None else v
+
+    def _list(key: str) -> list[dict]:
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    classes = _list("ClassList")
+    feats = _list("FeatList")
+    skills = _list("SkillList")
+    equip = _list("Equip_ItemList")
+
+    def _equip_resref(e: dict) -> str:
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _equip_item(e: dict) -> dict | None:
+        irr = _equip_resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        return e if "BaseItem" in e else None
+
+    # Effective ability scores = stored UTC score + racial adjustment + item
+    # bonus. The UTC stores pre-racial scores; the engine adds the race's +/- at
+    # runtime (e.g. Elf +2 Dex / -2 Con) plus any Ability Bonus from equipped
+    # gear (capped per the module's max).
+    _race_id = _f("Race")
+    race_adj = (RACE_ABILITY_ADJ.get(int(_race_id), {})
+                if _race_id is not None else {})
+
+    item_abil: dict[str, int] = {}
+    for _e in equip:
+        _it = _equip_item(_e)
+        if _it is None:
+            continue
+        for _p in list_items(_it.get("PropertiesList")):
+            if fld(_p, "PropertyName") != 0:  # 0 = Ability Bonus
+                continue
+            _pf = itemprop_format(_p)
+            _key = _ABIL_NAME_KEY.get(_pf["subtype"])
+            if not _key:
+                continue
+            _val = _prop_value_num(_pf["cost"]) if _pf["cost"] else 0
+            if _val > item_abil.get(_key, 0):  # same-ability enhancement: max
+                item_abil[_key] = _val
+    _abil_cap = db.max_ability_bonus
+    if _abil_cap and _abil_cap > 0:
+        item_abil = {k: min(v, _abil_cap) for k, v in item_abil.items()}
+
+    def _ability(ab: str) -> int | None:
+        base = _f(ab)
+        if base is None:
+            return None
+        return int(base) + race_adj.get(ab, 0) + item_abil.get(ab, 0)
+
+    ability_scores = {ab: _ability(ab) for ab in
+                      ("Str", "Dex", "Con", "Int", "Wis", "Cha")}
+
+    # ----- Combat: saves / AC / BAB -----------------------------------------
+    str_score = ability_scores["Str"] or 10
+    dex_score = ability_scores["Dex"] or 10
+    con_score = ability_scores["Con"] or 10
+    wis_score = ability_scores["Wis"] or 10
+    str_mod = ability_mod(str_score)
+    dex_mod = ability_mod(dex_score)
+    con_mod = ability_mod(con_score)
+    wis_mod = ability_mod(wis_score)
+
+    # Saves: NWN UTC stores per-save *bonus* fields; the per-class progression
+    # is added at runtime. We surface the override + ability mod as a floor.
+    fort = (_f("fortbonus", 0) or 0) + con_mod
+    ref = (_f("refbonus", 0) or 0) + dex_mod
+    will = (_f("willbonus", 0) or 0) + wis_mod
+
+    bab = creature_bab(classes, db.max_character_level)
+
+    equip_by_slot: dict[int, dict] = {}
+    for e in equip:
+        slot = fld(e, "__struct_id")
+        if isinstance(slot, int):
+            equip_by_slot[slot] = e
+
+    def _equipped_item(slot: int) -> dict | None:
+        e = equip_by_slot.get(slot)
+        return _equip_item(e) if e else None
+
+    # ----- Combined equipment combat properties -----------------------------
+    # Creature weapons (R/L/bite) share the same item blueprint; skip duplicates
+    # to avoid triple-counting properties. AC Bonus (ID 1) on armor/shield slots
+    # is the armor/shield type (handled separately); on other slots it is dodge.
+    _seen_cweap_resrefs: set[str] = set()
+    _ARMOR_SHIELD_SLOTS = frozenset({SLOT_CHEST, SLOT_LEFT})
+    cprop_by_pid: dict[int, list[tuple[dict, int]]] = {}
+    cprop_dodge_ac: list[int] = []
+
+    for _ce in equip:
+        _cslot = fld(_ce, "__struct_id")
+        if isinstance(_cslot, int) and _cslot in _CWEAP_SLOTS:
+            _cirr = _equip_resref(_ce)
+            if _cirr in _seen_cweap_resrefs:
+                continue
+            if _cirr:
+                _seen_cweap_resrefs.add(_cirr)
+        _ci = _equip_item(_ce)
+        if _ci is None:
+            continue
+        _is_armor_shield = isinstance(_cslot, int) and _cslot in _ARMOR_SHIELD_SLOTS
+        for _cp in list_items(_ci.get("PropertiesList")):
+            _cpid_raw = fld(_cp, "PropertyName")
+            if _cpid_raw is None:
+                continue
+            _cpid = int(_cpid_raw)
+            _cpf = itemprop_format(_cp)
+            _ccv = _prop_value_num(_cpf["cost"]) if _cpf["cost"] else 0
+            if _cpid not in cprop_by_pid:
+                cprop_by_pid[_cpid] = []
+            cprop_by_pid[_cpid].append((_cpf, _ccv))
+            if _cpid == 1 and not _is_armor_shield:
+                cprop_dodge_ac.append(_ccv)
+
+    armor_item = _equipped_item(SLOT_CHEST)
+    armor_base_ac = _torso_base_ac(armor_item)
+    shield_item = None
+    left = equip_by_slot.get(SLOT_LEFT)
+    if left:
+        irr = fld(left, "EquippedRes", "")
+        li = db.items.get(irr)
+        if li and int(fld(li, "BaseItem", -1) or -1) in SHIELD_BASEITEMS:
+            shield_item = li
+    shield_base_ac = 0
+    if shield_item is not None:
+        s_stats = WEAPONS.get(int(fld(shield_item, "BaseItem", -1) or -1))
+        if s_stats:
+            try:
+                shield_base_ac = int(s_stats.get("BaseAC", "0") or 0)
+            except ValueError:
+                shield_base_ac = 0
+
+    armor_ac_bonus, armor_notes = item_ac_bonus(armor_item)
+    shield_ac_bonus, shield_notes = item_ac_bonus(shield_item)
+    feat_ids = [int(fld(f, "Feat")) for f in feats if fld(f, "Feat") is not None]
+    natural_ac = _f("NaturalAC", 0) or 0
+    _armor_skin_ac = 2 if ARMOR_SKIN_FEAT in feat_ids else 0
+    _tumble_rank = 0
+    if TUMBLE_SKILL_ID < len(skills):
+        _tumble_rank = int(fld(skills[TUMBLE_SKILL_ID], "Rank", 0) or 0)
+    _tumble_ac = _tumble_rank // 5
+    _item_dodge = min(sum(cprop_dodge_ac), 20) if cprop_dodge_ac else 0
+    _haste_ac = 4 if 35 in cprop_by_pid else 0
+    ac_total = (10 + dex_mod + int(natural_ac) + _armor_skin_ac
+                + armor_base_ac + armor_ac_bonus
+                + shield_base_ac + shield_ac_bonus
+                + _item_dodge + _haste_ac + _tumble_ac)
+
+    ac_breakdown = [
+        "10 base",
+        f"{dex_mod:+d} Dex",
+    ]
+    if natural_ac:
+        ac_breakdown.append(f"+{natural_ac} natural (NaturalAC)")
+    if _armor_skin_ac:
+        ac_breakdown.append(f"+{_armor_skin_ac} natural (Armor Skin)")
+    if armor_base_ac:
+        ac_breakdown.append(f"+{armor_base_ac} armor")
+    if armor_ac_bonus:
+        ac_breakdown.append(f"+{armor_ac_bonus} armor enchant")
+    if shield_base_ac:
+        ac_breakdown.append(f"+{shield_base_ac} shield")
+    if shield_ac_bonus:
+        ac_breakdown.append(f"+{shield_ac_bonus} shield enchant")
+    if _item_dodge:
+        ac_breakdown.append(f"+{_item_dodge} dodge (items)")
+    if _haste_ac:
+        ac_breakdown.append(f"+{_haste_ac} dodge (haste)")
+    if _tumble_ac:
+        ac_breakdown.append(f"+{_tumble_ac} dodge (Tumble, {_tumble_rank} ranks)")
+    ac_extra = armor_notes + shield_notes
+
+    # Item saving throw bonuses (ID 41) — max per save type (don't stack).
+    _iprp_save_univ = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                           if not _pf["subtype"] or _pf["subtype"] == "Universal"), default=0)
+    _iprp_save_fort = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                           if _pf["subtype"] == "Fortitude"), default=0)
+    _iprp_save_ref = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                          if _pf["subtype"] == "Reflex"), default=0)
+    _iprp_save_will = max((cv for _pf, cv in cprop_by_pid.get(41, [])
+                           if _pf["subtype"] == "Will"), default=0)
+    fort = fort + _iprp_save_univ + _iprp_save_fort
+    ref = ref + _iprp_save_univ + _iprp_save_ref
+    will = will + _iprp_save_univ + _iprp_save_will
+
+    # Monk Wisdom AC bonus: ≥1 monk level and neither armor nor shield.
+    _monk_levels = sum(
+        int(fld(cl, "ClassLevel", 0) or 0)
+        for cl in classes
+        if int(fld(cl, "Class", -1) or -1) == MONK_CLASS_ID
+    )
+    _monk_bab = creature_class_bab(classes, MONK_CLASS_ID, db.max_character_level)
+    _monk_wis_ac = 0
+    if _monk_levels >= 1 and armor_base_ac == 0 and shield_item is None:
+        _monk_wis_ac = max(wis_mod, 0)
+        if _monk_wis_ac:
+            ac_total += _monk_wis_ac
+            ac_breakdown.append(f"+{_monk_wis_ac} Wis (monk)")
+        _monk_lvl_ac = _monk_levels // 5
+        if _monk_lvl_ac:
+            ac_total += _monk_lvl_ac
+            ac_breakdown.append(f"+{_monk_lvl_ac} dodge (monk level)")
+
+    # Spell resistance: max across sources (they don't stack).
+    _ISR_FEAT_BASE = 699
+    _feat_sr = max(
+        (12 + 2 * (fid - _ISR_FEAT_BASE) for fid in feat_ids
+         if _ISR_FEAT_BASE <= fid <= _ISR_FEAT_BASE + 9),
+        default=0,
+    )
+    _diamond_soul_sr = (10 + _monk_levels) if 215 in feat_ids else 0
+    _item_sr = max((cv for _, cv in cprop_by_pid.get(39, [])), default=0)
+    sr_total = max(_feat_sr, _diamond_soul_sr, _item_sr)
+
+    _hp_raw = _f('MaxHitPoints', _f('HitPoints', ''))
+    try:
+        _base_hp = int(_hp_raw)
+    except (TypeError, ValueError):
+        _base_hp = None
+    _et_hp = epic_toughness_hp(feat_ids)
+    if _base_hp is not None and _et_hp:
+        hp_display = (f"{_fmt_hp(_base_hp + _et_hp)} "
+                      f"({_fmt_hp(_base_hp)} + {_et_hp} Epic Toughness)")
+    else:
+        hp_display = _fmt_hp(_hp_raw)
+    hp_value = (_base_hp + _et_hp) if _base_hp is not None else None
+
+    # ----- Structured defenses (for analysis/export) ------------------------
+    # The HTML "combined combat properties" table is built separately in
+    # _creature_detail_sections from cprop_by_pid; these mirror the same
+    # max-per-subtype rules into plain data.
+    dr: dict | None = None
+    if 22 in cprop_by_pid:
+        _best = None
+        for _pf, _cv in cprop_by_pid[22]:
+            if _best is None or _cv > _best[0]:
+                _best = (_cv, _pf["subtype"], _pf["cost"])
+        if _best:
+            dr = {"soak": (_best[2] or "").strip(), "bypass": (_best[1] or "").strip()}
+
+    resistances: dict[str, int] = {}
+    for _pf, _cv in cprop_by_pid.get(23, []):
+        _sub = _pf["subtype"] or "?"
+        if _cv > resistances.get(_sub, 0):
+            resistances[_sub] = _cv
+
+    immunities: dict[str, int] = {}
+    for _pf, _cv in cprop_by_pid.get(20, []):
+        _sub = _pf["subtype"] or "?"
+        _pct = _prop_value_num(_pf["cost"]) if _pf["cost"] else _cv
+        if _pct > immunities.get(_sub, 0):
+            immunities[_sub] = _pct
+
+    spell_immunities = sorted({_pf["cost"] for _pf, _ in cprop_by_pid.get(53, [])
+                               if _pf["cost"]})
+
+    # Miscellaneous immunities (crit, sneak attack, mind-affecting, …) come from
+    # two independent sources: equipped gear (property 37) and the creature's
+    # racial type (engine rule, nothing in the .utc). Merge them into one map so
+    # callers can filter on the effective immunity and still see where it came from.
+    race_immunities = creature_race_immunities(_race_id)
+    misc_immunities: dict[str, str] = {}
+    for _lbl in race_immunities:
+        misc_immunities[_lbl] = "race"
+    for _pf, _ in cprop_by_pid.get(37, []):
+        _lbl = _pf["subtype"] or "?"
+        misc_immunities[_lbl] = "race+gear" if _lbl in misc_immunities else "gear"
+
+    regen = sum(cv for _, cv in cprop_by_pid.get(51, []))
+    vampiric = sum(cv for _, cv in cprop_by_pid.get(67, []))
+
+    # Damage gate: a non-stock OnDamaged handler can change how this creature
+    # takes damage (require a specific weapon tag, self-heal, etc.).
+    dmg_script = (_f("ScriptDamaged", "") or "").strip()
+    _is_custom = bool(dmg_script) and db.is_custom_damage_script(dmg_script)
+    hard_required_tags = (sorted(db.script_damage_req_tags.get(dmg_script, set()))
+                          if _is_custom else [])
+    mitigates_damage = bool(_is_custom and dmg_script in db.script_mitigates_damage)
+    retaliation = db.script_retaliation.get(dmg_script) if _is_custom else None
+
+    return {
+        "ability_scores": ability_scores,
+        "race_adj": race_adj,
+        "item_abil": item_abil,
+        "str_mod": str_mod, "dex_mod": dex_mod,
+        "con_mod": con_mod, "wis_mod": wis_mod,
+        "bab": bab,
+        "feat_ids": feat_ids,
+        "equip_by_slot": equip_by_slot,
+        "monk_levels": _monk_levels, "monk_bab": _monk_bab,
+        "ac": ac_total, "ac_breakdown": ac_breakdown, "ac_extra": ac_extra,
+        "fort": fort, "ref": ref, "will": will,
+        "sr": sr_total, "sr_feat": _feat_sr,
+        "sr_diamond_soul": _diamond_soul_sr, "sr_item": _item_sr,
+        "hp_display": hp_display, "hp": hp_value,
+        "cprop_by_pid": cprop_by_pid, "cprop_dodge_ac": cprop_dodge_ac,
+        "dr": dr, "resistances": resistances, "immunities": immunities,
+        "race_immunities": race_immunities, "misc_immunities": misc_immunities,
+        "spell_immunities": spell_immunities, "regen": regen, "vampiric": vampiric,
+        "dmg_script": dmg_script, "hard_required_tags": hard_required_tags,
+        "mitigates_damage": mitigates_damage, "retaliation": retaliation,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Combat simulation primitives.
+#
+# One damage model, used for both sides of a fight: the creature swinging at the
+# reference PC and the reference PC swinging back. Everything here is expected
+# value (no dice are rolled) — the question the report answers is "does this kit
+# win", not "what happened in one particular fight".
+# ---------------------------------------------------------------------------
+
+_DICE_RE = re.compile(r"^\s*(\d+)\s*d\s*(\d+)\s*$", re.I)
+
+
+def avg_roll(cost_str: str) -> float:
+    """Average value of an iprp cost label. '1d6' → 3.5, '2d10' → 11.0, '5' → 5.0.
+
+    Note this is NOT _prop_value_num, which pulls the first integer out of the
+    string and would read '1d6' as 1 — fine for '+N' tables, wrong for damage.
+    """
+    if not cost_str:
+        return 0.0
+    m = _DICE_RE.match(cost_str)
+    if m:
+        n, d = int(m.group(1)), int(m.group(2))
+        return n * (d + 1) / 2.0
+    m = re.search(r"\d+", cost_str)
+    return float(m.group()) if m else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Critical-hit feats.
+#
+# The engine resolves these per base item: baseitems.2da names the exact feat id
+# for this weapon's Weapon Focus, Improved Critical, Overwhelming Critical and
+# Devastating Critical. A blank column means the feat does not exist for that
+# weapon and cannot be taken — which is precisely how nwn_homers_lotr disables
+# Devastating Critical server-wide (bin/gen-devcrit-map.py blanks the column, so
+# the engine's own check can never succeed and no save is ever rolled).
+#
+# Reading the columns rather than hardcoding a rule keeps this module-agnostic:
+# a stock module keeps its save-or-die, this one does not, and neither has to be
+# told which it is.
+# ---------------------------------------------------------------------------
+
+# Overwhelming Critical adds damage scaling with the weapon's crit multiplier:
+# +1d6 for a x2 weapon, +2d6 for x3, +3d6 for x4 — i.e. (mult - 1) six-sided
+# dice. Isolated here so it can be corrected in one place if a module's own
+# rules differ.
+_OVERWHELMING_DIE = 6
+
+# Devastating Critical's replacement damage, when a module has disabled the
+# engine's save-or-die and re-implemented it as bonus dice (--devcrit-bonus-dice).
+# Die size follows baseitems.2da WeaponSize, matching this module's
+# unpacked/devcrit_inc.nss: 1-2 small, 3 medium, 4+ large.
+_DEVCRIT_DIE_BY_SIZE = {1: 6, 2: 6, 3: 8}
+_DEVCRIT_DIE_LARGE = 10
+
+# Feat prerequisites the simulation actually enforces. Improved Critical needs
+# BAB +8; the epic critical chain needs Strength 25, which is what stops a
+# Dexterity/finesse build from taking it.
+_IMPROVED_CRIT_MIN_BAB = 8
+_EPIC_CRIT_MIN_STR = 25
+
+
+def _devcrit_die(weapon_size: int) -> int:
+    """Die size for a replacement devastating-critical bonus die."""
+    return _DEVCRIT_DIE_BY_SIZE.get(weapon_size, _DEVCRIT_DIE_LARGE)
+
+
+def weapon_feat_id(bi: int, column: str) -> int:
+    """Feat id this base item names in `column`, or 0 when it names none.
+
+    Zero is the answer that matters: it means the engine has no feat to check,
+    so nobody wielding this weapon can have it.
+    """
+    return _try_int((WEAPONS.get(bi) or {}).get(column), 0)
+
+
+def crit_feat_effects(bi: int, *, bab: int, str_score: int,
+                      has_feat: "Callable[[int], bool] | None" = None,
+                      devcrit_bonus_dice: int = 0) -> dict:
+    """Resolve the critical-hit feats for one weapon in one wielder's hands.
+
+    `has_feat(feat_id) -> bool` decides whether the wielder actually has a given
+    feat; pass None for the reference PC, which is assumed specced into whatever
+    it holds (subject to the real prerequisites below). Creatures pass a lookup
+    over their own FeatList so they only get what they were built with.
+
+    Returns {threat_mult, crit_bonus, devcrit_save_dc, feats} where `feats` names
+    what was granted, for the report.
+    """
+    stats = WEAPONS.get(bi) or {}
+    size = _try_int(stats.get("WeaponSize"), 0)
+    crit_mult = _try_int(stats.get("CritHitMult"), 2) or 2
+
+    def _granted(column: str, *, prereq: bool) -> bool:
+        feat_id = weapon_feat_id(bi, column)
+        if not feat_id or not prereq:
+            return False
+        return has_feat(feat_id) if has_feat is not None else True
+
+    names: list[str] = []
+    threat_mult = 1
+    crit_bonus = 0.0
+    devcrit_dc = 0
+
+    if _granted("WeaponImprovedCriticalFeat", prereq=bab >= _IMPROVED_CRIT_MIN_BAB):
+        threat_mult = 2          # NWN doubles the range: 20 -> 19-20, 19-20 -> 17-20
+        names.append("Improved Critical")
+
+    epic_ok = str_score >= _EPIC_CRIT_MIN_STR and threat_mult > 1
+    overwhelming = _granted("EpicWeaponOverwhelmingCriticalFeat", prereq=epic_ok)
+    if overwhelming:
+        crit_bonus += max(1, crit_mult - 1) * (_OVERWHELMING_DIE + 1) / 2.0
+        names.append("Overwhelming Critical")
+
+    # Devastating Critical requires Overwhelming. Which of its two forms applies
+    # is decided by the 2DA, not by configuration: a named feat means the engine
+    # still rolls its save-or-die, a blank column means the module disabled it
+    # and any replacement damage comes from --devcrit-bonus-dice.
+    if overwhelming:
+        _col = "EpicWeaponDevastatingCriticalFeat"
+        # A blank column means the module disabled the mechanic; a column we
+        # never loaded means we have no evidence, so assume the engine default.
+        if weapon_feat_id(bi, _col) or _col not in BASEITEM_COLUMNS_SEEN:
+            # Stock: Fort save or die. DC 10 + half character level + Str mod;
+            # the caller supplies the level via `bab` for creatures whose level
+            # we do not track separately.
+            devcrit_dc = 10 + bab // 2 + ability_mod(str_score)
+            names.append("Devastating Critical (save-or-die)")
+        elif devcrit_bonus_dice > 0:
+            die = _devcrit_die(size)
+            crit_bonus += devcrit_bonus_dice * (die + 1) / 2.0
+            names.append(f"Devastating Critical ({devcrit_bonus_dice}d{die})")
+
+    return {"threat_mult": threat_mult, "crit_bonus": crit_bonus,
+            "devcrit_save_dc": devcrit_dc, "feats": names}
+
+
+def hit_chance(ab: int, ac: int) -> float:
+    """Probability a single attack lands. A natural 1 always misses and a
+    natural 20 always hits, so the result is clamped to [0.05, 0.95]."""
+    return min(0.95, max(0.05, (21 - (ac - ab)) / 20.0))
+
+
+def attack_profile(schedule: list[int], *, num_dice: int, die: int,
+                   flat: float, crit_threat: int, crit_mult: int,
+                   phys_types: Iterable[str], elem: dict[str, float],
+                   enhancement: int, crit_bonus: float = 0.0,
+                   devcrit_save_dc: int = 0) -> dict:
+    """Everything the simulator needs about one weapon in one wielder's hands.
+
+    schedule     iterative to-hit bonuses (from attack_schedule)
+    num_dice/die base weapon damage dice
+    flat         flat physical damage added (Str mod, Damage Bonus props, feats)
+    crit_threat  threat range width in natural-roll numbers (2 ⇒ 19-20)
+    crit_mult    critical multiplier
+    phys_types   physical damage types the weapon can deal; the engine uses the
+                 attacker-favourable one, so the simulator mitigates with the
+                 *least* resisted of them
+    elem         extra non-physical damage, average per hit, keyed by type
+    enhancement  weapon enhancement, for damage-reduction bypass
+    crit_bonus   average extra *physical* damage on a confirmed critical only,
+                 from Overwhelming Critical and (where the module replaces the
+                 engine's save-or-die) Devastating Critical. Not multiplied by
+                 the crit multiplier — these are flat extra dice.
+    devcrit_save_dc  when non-zero, a confirmed critical forces a Fortitude save
+                 at this DC or the target dies outright — the stock Devastating
+                 Critical. Zero when the base item has no devastating-critical
+                 feat, which is how a module disables the mechanic wholesale.
+    """
+    return {
+        "schedule": list(schedule),
+        "num_dice": max(0, num_dice), "die": max(0, die),
+        "flat": flat,
+        "crit_threat": max(1, crit_threat), "crit_mult": max(1, crit_mult),
+        "phys_types": sorted(set(phys_types)),
+        "elem": dict(elem),
+        "enhancement": enhancement,
+        "crit_bonus": max(0.0, crit_bonus),
+        "devcrit_save_dc": max(0, devcrit_save_dc),
+    }
+
+
+def defense_profile(*, ac: int, hp: int, dr_soak: int = 0, dr_bypass: int = 0,
+                    resist: dict[str, int] | None = None,
+                    immune: dict[str, int] | None = None,
+                    regen: int = 0, fort: int = 0, ref: int = 0,
+                    will: int = 0, crit_immune: bool = False) -> dict:
+    """The receiving end of a fight: what has to be chewed through.
+
+    `crit_immune` suppresses critical hits outright — no multiplier, no
+    Overwhelming Critical damage, no Devastating Critical — which is the whole
+    point of the property.
+    """
+    return {
+        "ac": ac, "hp": max(1, hp),
+        "dr_soak": dr_soak, "dr_bypass": dr_bypass,
+        "resist": dict(resist or {}), "immune": dict(immune or {}),
+        "regen": regen, "fort": fort, "ref": ref, "will": will,
+        "crit_immune": crit_immune,
+    }
+
+
+def _mitigate(amount: float, dtype: str, dfn: dict, *, physical: bool,
+              enhancement: int) -> float:
+    """Apply one defender's mitigation to `amount` damage of type `dtype`.
+
+    Order matches the engine: percentage immunity first, then flat damage
+    resistance, then (physical only, and only when the attacker's enhancement
+    is below the bypass) damage reduction. Never goes below zero.
+    """
+    if amount <= 0:
+        return 0.0
+    pct = dfn["immune"].get(dtype, 0)
+    if pct >= 100:
+        return 0.0
+    if pct:
+        amount *= (1 - pct / 100.0)
+    amount -= dfn["resist"].get(dtype, 0)
+    if physical and dfn["dr_soak"] and enhancement < dfn["dr_bypass"]:
+        amount -= dfn["dr_soak"]
+    return max(0.0, amount)
+
+
+def _hit_damage(att: dict, dfn: dict, *, crit: bool) -> float:
+    """Post-mitigation damage from one landed hit.
+
+    Critical hits multiply the *physical* portion only — NWN does not multiply
+    item-property elemental damage. Mitigation is applied per hit rather than to
+    the round's expectation, because flat resistance and DR soak each attack
+    separately (applying them to an average would understate a many-small-hits
+    defence).
+    """
+    phys = att["num_dice"] * (att["die"] + 1) / 2.0 + att["flat"]
+    phys = max(0.0, phys)
+    if crit:
+        # The multiplier applies to the weapon's own damage; the crit-feat dice
+        # are added afterwards, not multiplied.
+        phys = phys * att["crit_mult"] + att["crit_bonus"]
+    total = 0.0
+    if phys > 0:
+        types = att["phys_types"] or ["Bludgeoning"]
+        # The wielder gets the attacker-favourable physical type.
+        total += max(
+            _mitigate(phys, t, dfn, physical=True, enhancement=att["enhancement"])
+            for t in types
+        )
+    for t, amt in att["elem"].items():
+        total += _mitigate(amt, t, dfn, physical=False, enhancement=att["enhancement"])
+    return total
+
+
+def dpr(att: dict, dfn: dict) -> float:
+    """Expected damage per round for one weapon against one defender."""
+    if not att["schedule"]:
+        return 0.0
+    p_norm_hit = _hit_damage(att, dfn, crit=False)
+    if dfn["crit_immune"]:
+        return sum(hit_chance(ab, dfn["ac"]) for ab in att["schedule"]) * p_norm_hit
+    p_crit_hit = _hit_damage(att, dfn, crit=True)
+    threat_p = min(1.0, att["crit_threat"] / 20.0)
+    total = 0.0
+    for ab in att["schedule"]:
+        p_hit = hit_chance(ab, dfn["ac"])
+        # A crit needs a threatening roll that hits, then a confirmation roll
+        # against the same AC.
+        p_crit = min(p_hit, threat_p) * p_hit
+        total += p_crit * p_crit_hit + (p_hit - p_crit) * p_norm_hit
+    return total
+
+
+def crit_chance_per_round(att: dict, dfn: dict) -> float:
+    """Probability that at least one attack this round lands a confirmed crit.
+
+    Needed on its own by the stock Devastating Critical rule, which is a
+    save-or-die triggered per critical rather than a lump of damage. Zero
+    against a crit-immune defender.
+    """
+    if not att["schedule"] or dfn["crit_immune"]:
+        return 0.0
+    threat_p = min(1.0, att["crit_threat"] / 20.0)
+    p_none = 1.0
+    for ab in att["schedule"]:
+        p_hit = hit_chance(ab, dfn["ac"])
+        p_none *= 1.0 - min(p_hit, threat_p) * p_hit
+    return 1.0 - p_none
+
+
+def _rounds_to_drop(att: dict, dfn: dict) -> tuple[float, float]:
+    """Rounds to take a defender from full HP to zero, and the net damage per
+    round behind that figure.
+
+    Returns (rounds, raw_dpr). `rounds` is math.inf when the damage never
+    outpaces regeneration. The raw (pre-regeneration) DPR is returned alongside
+    because the kit solver needs a value that keeps moving even while the fight
+    is unwinnable: if it only saw "infinity" it would see every candidate item
+    as equally useless and equip nothing at all.
+    """
+    raw = dpr(att, dfn)
+    net = raw - dfn["regen"]
+    if net <= 0.01:
+        return math.inf, raw
+    return dfn["hp"] / net, raw
+
+
+def _devcrit_rounds(rounds: float, att: dict, dfn: dict) -> float:
+    """Shorten `rounds` by the stock Devastating Critical save-or-die.
+
+    Each confirmed critical forces a Fortitude save; failing it ends the fight
+    immediately, so the expected number of rounds to a kill is 1 / (chance of a
+    crit landing x chance of the save failing). Returns whichever is sooner:
+    grinding the target's hit points down, or rolling the kill.
+    """
+    dc = att["devcrit_save_dc"]
+    if not dc:
+        return rounds
+    p = crit_chance_per_round(att, dfn) * save_fail_chance(dc, dfn["fort"])
+    if p <= 0.0:
+        return rounds
+    return min(rounds, 1.0 / p)
+
+
+def save_fail_chance(dc: int, save_bonus: int) -> float:
+    """Probability of failing a saving throw. A natural 1 always fails and a
+    natural 20 always succeeds, so this is clamped to [0.05, 0.95]."""
+    return min(0.95, max(0.05, (dc - save_bonus) / 20.0))
+
+
+def simulate(pc: dict, creature: dict) -> dict:
+    """Run one fight: the PC's best weapon against the creature, and the
+    creature's best weapon back.
+
+    `pc` is a reference_pc() result; `creature` is a dict with "attack" (an
+    attack_profile), "defense" (a defense_profile) and "save_threats".
+
+    `wins` means the PC drops the creature before the creature drops the PC.
+    Saving throws deliberately do NOT gate that: the data cannot tell a
+    save-or-die apart from a save-for-half, so failing one is reported as a risk
+    (`save_fail`) and folded into `score` rather than counted as a loss.
+
+    `score` is the scalar the kit solver maximises, and it must be strictly
+    monotonic in "how much better did that item make things" even when the
+    fight is hopeless. A score that flattened to zero for every losing kit
+    would leave the solver unable to tell a legendary sword from a stick, so
+    the outgoing damage is kept in the score directly.
+    """
+    to_kill, raw_out = _rounds_to_drop(pc["attack"], creature["defense"])
+    unhealed_to_die, _raw_in = _rounds_to_drop(creature["attack"], pc["defense"])
+
+    # Stock Devastating Critical is not damage — it is a Fortitude save or die
+    # on every confirmed critical. Expressed as a per-round kill probability, it
+    # caps how long the fight can last regardless of hit points. Both directions,
+    # because the rule is symmetric.
+    to_kill = _devcrit_rounds(to_kill, pc["attack"], creature["defense"])
+    unhealed_to_die = _devcrit_rounds(unhealed_to_die, creature["attack"], pc["defense"])
+
+    # The PC has a free full heal off a fixed cooldown. Outlasting one cooldown
+    # therefore means outlasting the fight: the heal lands before the damage
+    # does, and then the clock restarts. Below that threshold the heal never
+    # arrives in time and changes nothing. The pre-heal figure is still what
+    # gets reported, since "survives 40 rounds per heal" is the useful number.
+    heal_rounds = pc.get("full_heal_rounds", 0)
+    outlasts = bool(heal_rounds) and unhealed_to_die >= heal_rounds
+    to_die = math.inf if outlasts else unhealed_to_die
+
+    # The creature gets at most one special ability per round; assume it leads
+    # with its highest-DC one against the PC's weakest relevant save.
+    fail = 0.0
+    for threat in creature.get("save_threats", ())[:1]:
+        worst = min(pc["defense"]["fort"], pc["defense"]["ref"], pc["defense"]["will"])
+        fail = save_fail_chance(int(threat.get("dc_est", 0) or 0), worst)
+
+    survive = 999.0 if math.isinf(to_die) else to_die
+    if math.isinf(to_kill):
+        # Hopeless so far, but still rank kits by raw progress: outgoing damage
+        # first (even below the regeneration threshold), then survivability.
+        margin = 0.0
+        score = raw_out / (creature["defense"]["hp"] + 1.0) + survive / 1e6
+    elif math.isinf(to_die):
+        # The creature cannot hurt this PC at all, so however long the kill
+        # takes the fight is never in doubt — a flat maximum, not survive/to_kill,
+        # which would otherwise rank a harmless-but-tanky creature as the
+        # hardest fight in its band.
+        margin = 999.0
+        score = margin + 1.0
+    else:
+        margin = survive / to_kill
+        score = margin + 1.0
+    return {
+        "rounds_to_kill": None if math.isinf(to_kill) else round(to_kill, 1),
+        "rounds_to_die": (None if math.isinf(unhealed_to_die)
+                          else round(unhealed_to_die, 1)),
+        "outlasts_heal_cooldown": outlasts,
+        "no_damage": raw_out <= 0.01,
+        "save_fail": round(fail, 3),
+        "margin": round(margin, 3),
+        "wins": margin >= 1.0,
+        "score": score / (1.0 + fail),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The reference PC.
+#
+# The counter-gear report is build-agnostic in the sense that it models no
+# *particular* character, but a fight needs two sides, so it models a canonical
+# one: a single-class fighter at the level the tier implies, with all ability
+# points in Strength and assumed specced into whatever weapon is being tested
+# (so weapons stay comparable with each other).
+#
+# Two NWN facts keep this simple and are load-bearing:
+#   * There is no epic attack bonus and no epic save bonus. BAB and base saves
+#     stop advancing at class level 20 — which is why a level-60 character's
+#     power comes almost entirely from gear, and why this report is worth
+#     running at all.
+#   * bin/serve sets always-roll-max-hitpoints-on-levelup, so HP is the maximum
+#     roll per level rather than an average.
+# ---------------------------------------------------------------------------
+
+REFERENCE_PC_CLASS = 4      # classes.2da row 4 = Fighter (d10, full BAB)
+_PC_HIT_DIE = 10
+_PRE_EPIC_CAP = 20          # class level past which BAB and saves stop growing
+
+# ---- feat budget ----------------------------------------------------------
+#
+# A pure single-class build draws on TWO pools, and they are not interchangeable:
+# a class bonus feat may only be spent from that class's own list. Great
+# Constitution is not on the Fighter list, so it cannot be bought with one; Epic
+# Toughness is, and is where spare Fighter feats go.
+#
+#   Pool A, Fighter bonus feats — level 1, then every even level, continuing
+#       every 2 levels into epic. Spent on the weapon chain (Focus,
+#       Specialization, Improved Critical, then the epic critical feats), Epic
+#       Prowess, and finally Epic Toughness.
+#   Pool B, general feats — level 1, then every 3 levels. Spent on Great
+#       Strength (Great Dexterity behind a finesse or ranged weapon), then Great
+#       Constitution.
+#
+# Legendary feats are deliberately NOT modelled: they are still in development
+# in nwn_homers_lotr, so simulating them would report power no character has.
+# Do not add them here until that lands.
+_GREAT_ABILITY_TIERS = 10       # Great <Ability> I..X
+_EPIC_TOUGHNESS_TIERS = 10      # Epic Toughness I..X, +20 HP each
+_FIRST_EPIC_LEVEL = 21
+
+# Fighter weapon/combat feats bought out of pool A before anything else. The
+# epic critical feats are counted here too, but only claim a slot when the
+# weapon and the build actually qualify for them (see crit_feat_effects).
+_FIGHTER_CORE_FEATS = 4         # Weapon Focus, Specialization + their epic tiers
+_EPIC_PROWESS_FEATS = 1
+
+# The reference PC is assumed to have a free full heal off a 150-second
+# cooldown, which is 25 six-second rounds. Surviving one cooldown therefore
+# means surviving indefinitely.
+_FULL_HEAL_ROUNDS = 150 // 6
+
+
+def _general_feat_slots(level: int) -> int:
+    """General feats: one at level 1, then one every 3 levels."""
+    return 1 + level // 3
+
+
+def _fighter_bonus_slots(level: int) -> int:
+    """Fighter bonus feats: level 1 and every even level, continuing every 2
+    levels past 20."""
+    return 1 + level // 2
+
+
+def _great_ability_tiers(level: int, *, spent: int = 0) -> int:
+    """Tiers of Great <Ability> pool B can afford at `level`.
+
+    Only epic levels can buy them, so the pre-epic general feats are set aside
+    as already spent on the ordinary prerequisites (Weapon Finesse, Toughness
+    and friends) rather than counted here.
+    """
+    if level < _FIRST_EPIC_LEVEL:
+        return 0
+    epic_general = _general_feat_slots(level) - _general_feat_slots(_FIRST_EPIC_LEVEL - 1)
+    return max(0, min(_GREAT_ABILITY_TIERS, epic_general - spent))
+
+
+def _epic_toughness_tiers(level: int, *, spent: int) -> int:
+    """Epic Toughness tiers left over in pool A once the weapon chain, the epic
+    critical feats and Epic Prowess have been paid for."""
+    if level < _FIRST_EPIC_LEVEL:
+        return 0
+    epic_bonus = _fighter_bonus_slots(level) - _fighter_bonus_slots(_FIRST_EPIC_LEVEL - 1)
+    return max(0, min(_EPIC_TOUGHNESS_TIERS, epic_bonus - spent))
+
+
+def _kit_pieces(kit: dict) -> list[dict]:
+    """Flatten a kit (slot key → piece or list of pieces) to a piece list."""
+    out: list[dict] = []
+    for v in kit.values():
+        if not v:
+            continue
+        out.extend(v if isinstance(v, list) else [v])
+    return out
+
+
+def reference_pc(level: int, kit: dict, db: "Db") -> dict:
+    """Build the reference PC at `level` wearing `kit`.
+
+    Returns {"level", "attack", "defense", "cost", "weapon", ...} where "attack"
+    is an attack_profile and "defense" a defense_profile, ready for simulate().
+
+    Known simplifications, all in the conservative direction: armour maximum-Dex
+    limits are not modelled (baseitems.2da's Dex cap is not in our caches), AC
+    bonuses from different sources are summed rather than resolved by AC type,
+    and no spells, potions or class abilities are used.
+    """
+    pieces = _kit_pieces(kit)
+    lvl = max(1, int(level))
+    pre_epic = min(lvl, _PRE_EPIC_CAP)
+    bab = _class_bab(REFERENCE_PC_CLASS, pre_epic)
+
+    # ----- weapon -----------------------------------------------------------
+    # Resolved before ability scores, because a finesse weapon changes which
+    # ability the whole build pumps.
+    weapon = kit.get("right")
+    if isinstance(weapon, list):
+        weapon = weapon[0] if weapon else None
+    have_weapon = bool(weapon is not None and weapon["off"] and weapon["off"]["is_weapon"])
+    off = weapon["off"] if have_weapon else None
+    bi = off["base_item_id"] if have_weapon else -1
+    stats = (WEAPONS.get(bi) or {}) if have_weapon else {}
+    ranged = bool(off["is_ranged"]) if have_weapon else False
+    two_handed = have_weapon and _try_int(stats.get("WeaponSize"), 0) >= 4 and not ranged
+    # Weapon Finesse on a light weapon puts Dexterity on the attack roll, so a
+    # character wielding one builds Dex instead of Strength. Damage still comes
+    # from Strength either way — NWN's finesse affects to-hit only.
+    finesse = have_weapon and not ranged and bi in FINESSE_BASEITEMS
+    primary = "Dex" if (finesse or ranged) else "Str"
+
+    # ----- feats: two pools, spent in priority order -------------------------
+    # Pool A (Fighter bonus feats) buys the weapon chain first. The epic
+    # critical feats each claim a slot only when the weapon names them and the
+    # build qualifies, which is resolved below once Strength is known — so
+    # provisionally reserve them and correct after.
+    great_tiers = _great_ability_tiers(lvl)
+
+    # ----- ability scores ---------------------------------------------------
+    # Base array, with every level-up point and every tier of Great <Ability>
+    # from pool B spent on the attacking stat.
+    scores = {"Str": 14, "Dex": 14, "Con": 16, "Wis": 12}
+    scores[primary] = 18 + lvl // 4 + great_tiers
+
+    # Ability bonuses from *different* items stack; the module's
+    # --max-ability-bonus dial caps the resulting total per ability (NWN's
+    # default is +12, this module raises it to +24). So two +12 belts-and-rings
+    # reach the cap where one cannot — which is why this sums and then clamps
+    # rather than taking the largest single item.
+    item_abil: dict[str, int] = defaultdict(int)
+    for p in pieces:
+        for ab, val in p["def"]["abilities"].items():
+            item_abil[ab] += val
+    cap = db.max_ability_bonus
+    for ab, val in item_abil.items():
+        scores[ab] = scores.get(ab, 10) + (min(val, cap) if cap and cap > 0 else val)
+
+    str_mod = ability_mod(scores["Str"])
+    dex_mod = ability_mod(scores["Dex"])
+    con_mod = ability_mod(scores["Con"])
+    wis_mod = ability_mod(scores["Wis"])
+
+    # Weapon Focus / Specialization only exist for a base item that names them,
+    # so a weapon with a blank column correctly grants nothing here rather than
+    # a blanket bonus. The PC is assumed specced into whatever it holds.
+    def _has(column: str, min_level: int = 1) -> bool:
+        return lvl >= min_level and bool(weapon_feat_id(bi, column))
+
+    feat_hit = (1 if _has("WeaponFocusFeat") else 0) \
+        + (2 if _has("EpicWeaponFocusFeat", _FIRST_EPIC_LEVEL) else 0) \
+        + (1 if lvl >= _FIRST_EPIC_LEVEL else 0)          # Epic Prowess
+    feat_dmg = (2 if _has("WeaponSpecializationFeat", 4) else 0) \
+        + (4 if _has("EpicWeaponSpecializationFeat", _FIRST_EPIC_LEVEL) else 0)
+
+    crit = crit_feat_effects(bi, bab=bab, str_score=scores["Str"],
+                             devcrit_bonus_dice=db.devcrit_bonus_dice)
+
+    if have_weapon:
+        # Two-handed melee gets 1.5x Strength to damage; ranged gets none.
+        str_dmg = 0 if ranged else int(str_mod * (1.5 if two_handed else 1.0))
+        prop_flat, elem = weapon_damage_props(weapon["item"])
+        # Finesse uses the better of the two, matching the engine.
+        melee_ab = max(str_mod, dex_mod) if finesse else str_mod
+        atk_mod = (dex_mod if ranged else melee_ab) + off["attack_bonus"] + feat_hit
+        attack = attack_profile(
+            attack_schedule(bab, ability_mod=atk_mod),
+            num_dice=_try_int(stats.get("NumDice"), 0),
+            die=_try_int(stats.get("DieToRoll"), 0),
+            flat=str_dmg + feat_dmg + prop_flat,
+            crit_threat=(_try_int(stats.get("CritThreat"), 1) or 1) * crit["threat_mult"],
+            crit_mult=_try_int(stats.get("CritHitMult"), 2) or 2,
+            phys_types=off["physical_dtypes"] or ["Bludgeoning"],
+            elem=elem,
+            enhancement=off["enhancement"],
+            crit_bonus=crit["crit_bonus"],
+            devcrit_save_dc=crit["devcrit_save_dc"],
+        )
+    else:
+        attack = attack_profile(
+            attack_schedule(bab, ability_mod=str_mod + feat_hit),
+            num_dice=1, die=3, flat=str_mod + feat_dmg,
+            crit_threat=1, crit_mult=2,
+            phys_types=["Bludgeoning"], elem={}, enhancement=0)
+
+    # Pool A's leftovers go to Epic Toughness. The epic critical feats only cost
+    # a slot when they were actually granted.
+    epic_crit_spent = sum(1 for f in crit["feats"] if f != "Improved Critical")
+    toughness = _epic_toughness_tiers(
+        lvl, spent=_FIGHTER_CORE_FEATS + _EPIC_PROWESS_FEATS + epic_crit_spent)
+
+    # ----- defences ---------------------------------------------------------
+    ac = 10 + dex_mod
+    resist: dict[str, int] = {}
+    immune: dict[str, int] = {}
+    save_bonus = {"Fortitude": 0, "Reflex": 0, "Will": 0, "Universal": 0}
+    regen = 0
+    dr_soak = dr_bypass = 0
+    cost = 0
+    crit_immune = False
+    for p in pieces:
+        d = p["def"]
+        ac += d["ac_bonus"]
+        cost += p["cost"]
+        regen += d["regen"]
+        crit_immune = crit_immune or d["crit_immune"]
+        if d["dr_soak"] > dr_soak:
+            dr_soak, dr_bypass = d["dr_soak"], d["dr_bypass"]
+        for t, v in d["resist"].items():
+            resist[t] = max(resist.get(t, 0), v)      # same-type resist: max
+        for t, v in d["immune"].items():
+            immune[t] = max(immune.get(t, 0), v)
+        for k, v in d["saves"].items():
+            if k in save_bonus:
+                save_bonus[k] = max(save_bonus[k], v)
+
+    univ = save_bonus["Universal"]
+    # Epic Toughness adds a flat block on top of the per-level HP, exactly as it
+    # does for creatures — reusing that helper so the two sides cannot drift.
+    toughness_hp = epic_toughness_hp(
+        range(EPIC_TOUGHNESS_BASE, EPIC_TOUGHNESS_BASE + toughness))
+    defense = defense_profile(
+        ac=ac,
+        hp=lvl * (_PC_HIT_DIE + con_mod) + toughness_hp,
+        dr_soak=dr_soak, dr_bypass=dr_bypass,
+        resist=resist, immune=immune, regen=regen,
+        crit_immune=crit_immune,
+        # Fighter: good Fortitude (2 + L/2), poor Reflex and Will (L/3).
+        fort=2 + pre_epic // 2 + con_mod + save_bonus["Fortitude"] + univ,
+        ref=pre_epic // 3 + dex_mod + save_bonus["Reflex"] + univ,
+        will=pre_epic // 3 + wis_mod + save_bonus["Will"] + univ,
+    )
+    return {
+        "level": lvl, "bab": bab, "attack": attack, "defense": defense,
+        "cost": cost, "two_handed": two_handed, "finesse": finesse,
+        "full_heal_rounds": _FULL_HEAL_ROUNDS,
+        "crit_feats": crit["feats"], "epic_toughness": toughness,
+        "great_ability": (primary, great_tiers),
+        "weapon": weapon, "kit": kit, "scores": scores,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gear pool + kit solver.
+# ---------------------------------------------------------------------------
+
+def build_gear_pool(db: "Db") -> dict[str, list[dict]]:
+    """Bucket every player-attainable item by the slots it can fill.
+
+    A piece carries its blueprint plus the pre-computed offense/defense
+    extracts, so the solver never re-parses item properties. Items appear under
+    every slot they fit (a longsword under both hands). Right hand takes weapons
+    only; left hand takes weapons and shields.
+    """
+    pool: dict[str, list[dict]] = {key: [] for key, _, _, _ in PLAYER_SLOTS}
+    for rr in sorted(db.items):
+        if not _item_accessible(db, rr):
+            continue
+        item = db.items[rr]
+        slots = item_equip_slots(item) & PLAYER_SLOT_MASK
+        if not slots:
+            continue
+        off = extract_item_offense(db, item, rr)
+        if off["name"].startswith("[TLK#") or off["name"] == rr:
+            continue                              # broken/unnamed blueprint
+        d = extract_item_defense(db, item, rr)
+        piece = {
+            "resref": rr, "name": off["name"], "cost": off["cost"],
+            "slots": slots, "item": item, "off": off, "def": d,
+            "is_weapon": off["is_weapon"],
+        }
+        is_shield = off["base_item_id"] in SHIELD_BASEITEMS
+        for key, _label, mask, _n in PLAYER_SLOTS:
+            if not (slots & mask):
+                continue
+            if key == "right":
+                keep = off["is_weapon"]
+            elif key == "left":
+                keep = off["is_weapon"] or is_shield
+            else:
+                keep = d["relevant"]
+            if keep:
+                pool[key].append(piece)
+    return pool
+
+
+def _prune_pool(pool: dict[str, list[dict]], per_axis: int = 6) -> dict[str, list[dict]]:
+    """Cut each slot down to the items that could plausibly be the best pick.
+
+    An exhaustive search over thousands of items is pointless: for any given
+    axis (AC, a save, resistance to one damage type, raw damage, price) only the
+    leaders can ever win. Keep the top `per_axis` on every axis and union them —
+    a few dozen candidates per slot instead of hundreds, with no realistic
+    chance of dropping the item the solver would have chosen.
+    """
+    out: dict[str, list[dict]] = {}
+    for key, pieces in pool.items():
+        axes: list[Callable[[dict], float]] = [
+            lambda p: p["def"]["ac_bonus"],
+            lambda p: p["def"]["regen"],
+            lambda p: p["def"]["dr_soak"],
+            lambda p: -p["cost"],                       # cheapest
+            lambda p: max(p["def"]["abilities"].values(), default=0),
+            lambda p: p["def"]["abilities"].get("Str", 0),
+            lambda p: p["def"]["abilities"].get("Con", 0),
+            lambda p: p["def"]["abilities"].get("Dex", 0),
+        ]
+        axes += [(lambda p, _k=k: p["def"]["saves"].get(_k, 0))
+                 for k in ("Fortitude", "Reflex", "Will", "Universal")]
+        dtypes = {t for p in pieces for t in
+                  set(p["def"]["resist"]) | set(p["def"]["immune"])}
+        axes += [(lambda p, _t=t: max(p["def"]["immune"].get(_t, 0),
+                                      p["def"]["resist"].get(_t, 0))) for t in sorted(dtypes)]
+        if key in ("right", "left"):
+            axes += [
+                lambda p: p["off"]["enhancement"],
+                lambda p: p["off"]["attack_bonus"],
+                lambda p: _weapon_raw_damage(p),
+                lambda p: len(p["off"]["damage_dtypes"]),
+            ]
+        keep: dict[str, dict] = {}
+        for axis in axes:
+            for p in sorted(pieces, key=axis, reverse=True)[:per_axis]:
+                keep[p["resref"]] = p
+        # Plus a price ladder: evenly spaced samples across the slot's whole
+        # cost range. Without it every candidate is either top-end or bargain-
+        # bin, and the "cheapest kit that still wins" pass has nothing to step
+        # down to — it would report a 2M gp sword as the minimum for a CR 3 orc
+        # simply because no mid-priced weapon survived pruning.
+        by_cost = sorted(pieces, key=lambda p: (p["cost"], p["resref"]))
+        rungs = min(len(by_cost), per_axis * 3)
+        for i in range(rungs):
+            p = by_cost[i * (len(by_cost) - 1) // max(1, rungs - 1)]
+            keep[p["resref"]] = p
+        out[key] = sorted(keep.values(), key=lambda p: p["resref"])
+    return out
+
+
+def _weapon_raw_damage(piece: dict) -> float:
+    """Average un-mitigated damage of a weapon piece — a pruning heuristic."""
+    stats = WEAPONS.get(piece["off"]["base_item_id"]) or {}
+    n, d = _try_int(stats.get("NumDice"), 0), _try_int(stats.get("DieToRoll"), 0)
+    flat, elem = weapon_damage_props(piece["item"])
+    return n * (d + 1) / 2.0 + flat + sum(elem.values())
+
+
+def _kit_conflicts(kit: dict, key: str, piece: dict) -> bool:
+    """True when installing `piece` in `key` is illegal for the current kit.
+
+    The only rule that matters here: a two-handed weapon leaves no hand for a
+    shield or off-hand weapon.
+    """
+    def _two_handed(p: dict | None) -> bool:
+        if not p or not p["is_weapon"] or p["off"]["is_ranged"]:
+            return False
+        return _try_int((WEAPONS.get(p["off"]["base_item_id"]) or {}).get("WeaponSize"), 0) >= 4
+
+    if key == "left":
+        return _two_handed(kit.get("right"))
+    if key == "right" and _two_handed(piece):
+        return bool(kit.get("left"))
+    return False
+
+
+def best_in_slot_kit(level: int, creature: dict, pool: dict[str, list[dict]],
+                     db: "Db") -> tuple[dict, dict]:
+    """The strongest kit the reference PC can field against `creature`.
+
+    Returns (kit, sim). One pass over the slots in a fixed order, taking the
+    candidate that most improves simulate()'s score given what is already
+    equipped — greedy, but the slots barely interact so it lands on the same
+    answer a full search would, at a fraction of the cost. Cost is ignored: this
+    is the ceiling, not the shopping list (see minimum_viable_kit).
+    """
+    kit: dict[str, dict | None] = {}
+
+    def _sim(k: dict) -> dict:
+        return simulate(reference_pc(level, k, db), creature)
+
+    for key, _label, _mask, count in PLAYER_SLOTS:
+        for _ in range(count):
+            best_piece, best_score = None, _sim(kit)["score"]
+            already = {p["resref"] for p in _kit_pieces(kit)}
+            for piece in pool.get(key, ()):
+                if piece["resref"] in already or _kit_conflicts(kit, key, piece):
+                    continue
+                trial = dict(kit)
+                existing = trial.get(key)
+                trial[key] = ((existing if isinstance(existing, list) else [existing])
+                              + [piece]) if existing and count > 1 else piece
+                score = _sim(trial)["score"]
+                if score > best_score + 1e-9:
+                    best_piece, best_score = piece, score
+            if best_piece is None:
+                break
+            existing = kit.get(key)
+            kit[key] = ((existing if isinstance(existing, list) else [existing])
+                        + [best_piece]) if existing and count > 1 else best_piece
+
+    return kit, _sim(kit)
+
+
+def minimum_viable_kit(level: int, creature: dict, pool: dict[str, list[dict]],
+                       db: "Db", start_kit: dict) -> tuple[dict, dict]:
+    """Strip `start_kit` (a best_in_slot_kit result) down to the cheapest gear
+    that still beats `creature`.
+
+    Every slot is first tested empty — if the fight is still won, the slot was
+    never needed — and otherwise re-filled with the cheapest candidate that
+    keeps the win. This is what separates "the minimum kit that actually beats
+    this creature" from the old report's "cheapest item that isn't literally
+    useless", which is how every tier ended up recommending a 2 gp club.
+
+    Returns the input kit unchanged when it does not win in the first place.
+    """
+    kit = dict(start_kit)
+
+    def _sim(k: dict) -> dict:
+        return simulate(reference_pc(level, k, db), creature)
+
+    sim = _sim(kit)
+    if not sim["wins"]:
+        return kit, sim
+
+    for key, _label, _mask, _count in PLAYER_SLOTS:
+        if not kit.get(key):
+            continue
+        held = kit[key]
+        trial = dict(kit)
+        trial[key] = None
+        if _sim(trial)["wins"]:
+            kit[key] = None                       # the slot was never needed
+            continue
+        # Needed, but maybe a cheaper item does the job.
+        current_cost = sum(p["cost"] for p in (held if isinstance(held, list) else [held]))
+        for piece in sorted(pool.get(key, ()), key=lambda p: (p["cost"], p["resref"])):
+            if piece["cost"] >= current_cost:
+                break
+            if _kit_conflicts(trial, key, piece):
+                continue
+            cand = dict(kit)
+            cand[key] = piece
+            if _sim(cand)["wins"]:
+                kit[key] = piece
+                break
+    return kit, _sim(kit)
+
+
+def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> dict:
+    """Compute a creature's *offensive* threat (what the player must survive), as
+    plain data for the counter-gear survivability matcher. Reuses the ability
+    mods / BAB / feats / equipment already resolved by extract_creature_defenses
+    (passed in as `D`) so the combat math is computed once. Returns:
+
+      attack_bonus       best (first-iterative) to-hit across its weapons
+      ac_target          AC at which the creature misses ~half the time
+      damage_types_dealt damage types its attacks deal (weapon physical + extras)
+      save_threats       special abilities the player must save against, with an
+                         *estimated* DC (innate spell level is not in our caches,
+                         so it is derived from caster level — labelled an estimate)
+      attack_profiles    one attack_profile() per wielded weapon (see that
+                         function) — the full iterative schedule plus damage
+                         dice/crit/elemental data the combat simulator needs.
+                         `attack_bonus` is still just the best schedule[0], so
+                         the published creature-page figure is unaffected.
+    """
+    equip_by_slot: dict[int, dict] = D["equip_by_slot"]
+    str_mod, dex_mod = D["str_mod"], D["dex_mod"]
+    bab, feat_ids = D["bab"], D["feat_ids"]
+    monk_bab, monk_levels = D["monk_bab"], D["monk_levels"]
+
+    def _resref(e: dict) -> str:
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _item(e: dict) -> dict | None:
+        irr = _resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        return e if "BaseItem" in e else None
+
+    best_atk: int | None = None
+    dtypes: set[str] = set()
+    have_weapon = False
+    profiles: list[dict] = []
+
+    # Creatures get only the critical feats they were actually built with — no
+    # "assume specced" here, unlike the reference PC.
+    _feat_set = set(feat_ids)
+    _str_score = D.get("ability_scores", {}).get("Str") or 10
+
+    def _profile(sched: list[int], bi: int, item: dict | None, off: dict,
+                 str_bonus: int) -> dict:
+        """Build the simulator's attack_profile for one wielded weapon."""
+        stats = WEAPONS.get(bi) or {}
+        prop_flat, elem = weapon_damage_props(item)
+        crit = crit_feat_effects(
+            bi, bab=bab, str_score=_str_score,
+            has_feat=lambda fid: fid in _feat_set,
+            devcrit_bonus_dice=db.devcrit_bonus_dice)
+        return attack_profile(
+            sched,
+            num_dice=_try_int(stats.get("NumDice"), 0),
+            die=_try_int(stats.get("DieToRoll"), 0),
+            flat=str_bonus + prop_flat,
+            crit_threat=(_try_int(stats.get("CritThreat"), 1) or 1) * crit["threat_mult"],
+            crit_mult=_try_int(stats.get("CritHitMult"), 2) or 2,
+            phys_types=off["physical_dtypes"],
+            elem=elem,
+            enhancement=off["enhancement"],
+            crit_bonus=crit["crit_bonus"],
+            devcrit_save_dc=crit["devcrit_save_dc"],
+        )
+
+    for slot in (SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B):
+        e = equip_by_slot.get(slot)
+        if not e:
+            continue
+        item = _item(e)
+        if item is None:
+            continue
+        base_row = fld(item, "BaseItem")
+        bi = int(base_row) if base_row is not None else -1
+        if slot == SLOT_LEFT and bi in SHIELD_BASEITEMS:
+            continue
+        off = extract_item_offense(db, item, _resref(e) or "")
+        if not off["is_weapon"]:
+            continue
+        have_weapon = True
+        dtypes.update(off["damage_dtypes"])
+        ranged = off["is_ranged"]
+        _is_cweap = slot in _CWEAP_SLOTS
+        _finesse = (WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+                    and (_is_cweap or bi in FINESSE_BASEITEMS))
+        _melee_ab = dex_mod if _finesse else str_mod
+        _feat_ab = feat_attack_bonus(feat_ids, baseitem_name(bi) if bi >= 0 else "")
+        atk_mod = (dex_mod if ranged else _melee_ab) + off["attack_bonus"] + _feat_ab
+        _monk_atk_bab = monk_bab if (_is_cweap and monk_levels >= 1 and not ranged) else 0
+        sched = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_bab=_monk_atk_bab)
+        if sched and (best_atk is None or sched[0] > best_atk):
+            best_atk = sched[0]
+        if sched:
+            # Ranged weapons add no Str to damage unless Mighty; melee adds the
+            # same ability the attack used (finesse switches to Dex for to-hit
+            # only — damage stays Str in NWN).
+            profiles.append(_profile(sched, bi, item, off, 0 if ranged else str_mod))
+
+    if not have_weapon:
+        dtypes = {"Bludgeoning"}  # unarmed
+        if bab > 0:
+            _u_finesse = WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+            _u_ability = (dex_mod if _u_finesse else str_mod) + feat_attack_bonus(feat_ids, "unarmed")
+            sched = attack_schedule(
+                bab, ability_mod=_u_ability,
+                monk_unarmed_bab=(monk_bab if monk_levels >= 1 else 0))
+            if sched:
+                best_atk = sched[0]
+                # Unarmed: 1d3 bludgeoning + Str, no crit multiplier beyond x2.
+                profiles.append(attack_profile(
+                    sched, num_dice=1, die=3, flat=str_mod,
+                    crit_threat=1, crit_mult=2,
+                    phys_types=["Bludgeoning"], elem={}, enhancement=0))
+
+    attack_bonus = best_atk if best_atk is not None else 0
+
+    # ----- Special abilities: what the player must save against --------------
+    spec = list_items(c.get("SpecAbilityList"))
+    if not spec and bp is not None:
+        spec = list_items(bp.get("SpecAbilityList"))
+    scores = D.get("ability_scores", {})
+    _mental = max((ability_mod(scores.get(a)) for a in ("Int", "Wis", "Cha")
+                   if scores.get(a) is not None), default=0)
+    seen: set[tuple] = set()
+    save_threats: list[dict] = []
+    for s in spec:
+        sid = fld(s, "Spell")
+        if sid is None:
+            continue
+        cl = fld(s, "SpellCasterLevel", 0) or 0
+        try:
+            cl = int(cl)
+        except (TypeError, ValueError):
+            cl = 0
+        key = (sid, cl)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Innate spell level isn't in our caches; estimate it from caster level
+        # (≈ half, capped at 9) for a build-agnostic DC ballpark.
+        lvl_est = max(1, min(9, (cl + 1) // 2))
+        save_threats.append({
+            "name": nwn_text(spell_name(sid)),
+            "caster_level": cl,
+            "dc_est": 10 + lvl_est + _mental,
+        })
+    save_threats.sort(key=lambda t: t["dc_est"], reverse=True)
+
+    return {
+        "attack_bonus": attack_bonus,
+        "ac_target": attack_bonus + 10,
+        "damage_types_dealt": sorted(dtypes),
+        "save_threats": save_threats,
+        "attack_profiles": profiles,
+    }
+
+
+def _creature_detail_sections(
+    db: Db,
+    c: dict,
+    *,
+    bp: dict | None = None,
+    root_rel: str = "..",
+) -> list[str]:
+    """Body sections (abilities, combat, weapons, equipment, inventory,
+    feats, skills, spells, scripts) shared by blueprint and instance pages.
+    When `bp` is provided, fields missing from the instance struct fall
+    back to the blueprint — most GIT placements keep the UTC defaults."""
+    items_dir = f"{root_rel}/items"
+
+    def _f(key: str, default: Any = None) -> Any:
+        v = fld(c, key, None)
+        if v is None and bp is not None:
+            v = fld(bp, key, default)
+        return default if v is None else v
+
+    def _list(key: str) -> list[dict]:
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    classes = _list("ClassList")
+    feats = _list("FeatList")
+    skills = _list("SkillList")
+    equip = _list("Equip_ItemList")
+    inv = list_items(c.get("ItemList"))
+
+    def _equip_resref(e: dict) -> str:
+        # Blueprint equip entries reference an external UTI via EquippedRes;
+        # GIT instances inline the item but still carry TemplateResRef.
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _equip_item(e: dict) -> dict | None:
+        irr = _equip_resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        # GIT instances embed the full item struct (BaseItem, PropertiesList,
+        # LocalizedName, …) directly into the equip entry.
+        return e if "BaseItem" in e else None
+
+    # Combat defenses (AC, saves, SR, HP, resistances, damage gate) are computed
+    # once by extract_creature_defenses() so this page and the counter-gear
+    # analysis stay in lockstep; see that function for the NWN rule details.
+    D = extract_creature_defenses(db, c, bp)
+    race_adj = D["race_adj"]
+    item_abil = D["item_abil"]
+    ability_scores = D["ability_scores"]
+
+    def _abil_cell(ab: str) -> str:
+        val = ability_scores.get(ab)
+        if val is None:
+            return ""
+        adj = race_adj.get(ab, 0)
+        item = item_abil.get(ab, 0)
+        notes = []
+        if adj:
+            notes.append(f"{adj:+d} racial")
+        if item:
+            notes.append(f"+{item} item")
+        note = (f" <small class=\"muted\">({', '.join(notes)})</small>" if notes else "")
+        return f"{val}{note}"
+
+    sections: list[str] = [
+        '<h2>Abilities</h2>',
+        '<table class="data"><tr>'
+        f"<th>Str</th><td>{_abil_cell('Str')}</td>"
+        f"<th>Dex</th><td>{_abil_cell('Dex')}</td>"
+        f"<th>Con</th><td>{_abil_cell('Con')}</td>"
+        f"<th>Int</th><td>{_abil_cell('Int')}</td>"
+        f"<th>Wis</th><td>{_abil_cell('Wis')}</td>"
+        f"<th>Cha</th><td>{_abil_cell('Cha')}</td>"
+        "</tr></table>",
+    ]
+
+    if classes:
+        cls_rows = "".join(
+            f"<tr><td>{E(class_name(fld(cl, 'Class')))}</td>"
+            f"<td>{E(fld(cl, 'ClassLevel', ''))}</td></tr>"
+            for cl in classes
+        )
+        sections.append(
+            "<h2>Classes</h2>"
+            '<table class="data"><thead><tr><th>Class</th><th>Level</th></tr></thead>'
+            f"<tbody>{cls_rows}</tbody></table>"
+        )
+
+    desc = loc(c.get("Description"))
+    if not desc and bp is not None:
+        desc = loc(bp.get("Description"))
+    if desc:
+        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
+
+    # ----- Combat: read the precomputed defenses (see extract_creature_defenses) -----
+    str_mod = D["str_mod"]
+    dex_mod = D["dex_mod"]
+    bab = D["bab"]
+    feat_ids = D["feat_ids"]
+    equip_by_slot = D["equip_by_slot"]
+    _monk_levels = D["monk_levels"]
+    _monk_bab = D["monk_bab"]
+    cprop_by_pid = D["cprop_by_pid"]
+    cprop_dodge_ac = D["cprop_dodge_ac"]
+    race_immunities = D["race_immunities"]
+    misc_immunities = D["misc_immunities"]
+    ac_total = D["ac"]
+    ac_breakdown = D["ac_breakdown"]
+    ac_extra = D["ac_extra"]
+    fort, ref, will = D["fort"], D["ref"], D["will"]
+    sr_total = D["sr"]
+    _feat_sr = D["sr_feat"]
+    _diamond_soul_sr = D["sr_diamond_soul"]
+    _item_sr = D["sr_item"]
+    _hp_display = D["hp_display"]
+
+    sections.append("<h2>Combat</h2>")
+    _combat_rows = (
+        '<tr>'
+        f"<th>HP</th><td>{E(_hp_display)}</td>"
+        f"<th>AC</th><td>{ac_total} <small class=\"muted\">"
+        f"({E(' + '.join(ac_breakdown))})</small></td>"
+        f"<th>BAB</th><td>+{bab}</td>"
+        '</tr><tr>'
+        f"<th>Fort</th><td>{fort:+d}</td>"
+        f"<th>Ref</th><td>{ref:+d}</td>"
+        f"<th>Will</th><td>{will:+d}</td>"
+        '</tr>'
+    )
+    if sr_total:
+        _sr_sources: list[str] = []
+        if _feat_sr:
+            _sr_sources.append(f"feats ({_feat_sr})")
+        if _diamond_soul_sr:
+            _sr_sources.append(f"Diamond Soul ({_diamond_soul_sr})")
+        if _item_sr:
+            _sr_sources.append(f"items ({_item_sr})")
+        _sr_note = f" <small class=\"muted\">(max of: {E(', '.join(_sr_sources))})</small>" if len(_sr_sources) > 1 else ""
+        _combat_rows += (
+            '<tr>'
+            f"<th>Spell Resistance</th><td>{sr_total}{_sr_note}</td>"
+            '<td></td><td></td>'
+            '</tr>'
+        )
+    sections.append(f'<table class="data">{_combat_rows}</table>')
+    if ac_extra:
+        sections.append(f"<p class=\"muted\">AC extras: {E(', '.join(ac_extra))}</p>")
+    # Saves caveat — class-progression bonuses (good-save tables) are added
+    # by the engine at load time, so the wiki can't reproduce them exactly.
+    sections.append('<p class="muted">'
+                    'Saves shown = stored bonus + ability mod + item bonuses '
+                    '(Saving Throw Bonus: Specific); class-table progression '
+                    'and feat bonuses (Great Fortitude, etc.) are applied at runtime.</p>')
+
+    # Damage-gate warning: a non-stock OnDamaged handler can change how this
+    # creature takes damage (e.g. heal back all damage from the "wrong" weapon).
+    dmg_script = (_f("ScriptDamaged", "") or "").strip()
+    dmg_req_tags = db.script_damage_req_tags.get(dmg_script) if dmg_script else None
+    if db.is_custom_damage_script(dmg_script) and (
+        dmg_script in db.script_mitigates_damage or dmg_req_tags
+    ):
+        req_links: list[str] = []
+        for tag in sorted(db.script_damage_req_tags.get(dmg_script, set())):
+            resrefs = db.item_tag_groups.get(tag.lower(), [])
+            if resrefs:
+                req_links.extend(
+                    link(f"{items_dir}/{irr}.html", db.item_name(irr))
+                    for irr in resrefs
+                )
+            else:
+                req_links.append(f"<code>{E(tag)}</code>")
+        banner = (
+            '<p class="warn-damage-gate"><strong>Note: this creature uses a custom '
+            "damage script.</strong> Its <code>OnDamaged</code> handler "
+            f"(<code>{E(dmg_script)}</code>) changes how it takes damage — reported "
+            "damage may be healed back or ignored."
+        )
+        if req_links:
+            banner += (
+                " It can only be reliably harmed by a character wielding: "
+                + ", ".join(req_links) + "."
+            )
+        banner += "</p>"
+        sections.append(banner)
+
+    # Retaliation: a custom OnDamaged handler that strikes back at attackers.
+    ret_info = db.script_retaliation.get(dmg_script) if dmg_script else None
+    if db.is_custom_damage_script(dmg_script) and ret_info:
+        sections.append(
+            '<p class="note-retaliation"><strong>Retaliation.</strong> '
+            f"{E(_retaliation_sentence(ret_info))} "
+            f'<span class="muted">(<code>OnDamaged</code>: <code>{E(dmg_script)}</code>)</span></p>'
+        )
+
+    # ----- Combined abilities / combat properties display --------------------
+    # (cprop_by_pid and cprop_dodge_ac are built earlier, before ac_total.)
+    # Racial immunities have no gear behind them, so this section renders even
+    # for a creature carrying nothing.
+    cprop_rows: list[str] = []
+    if cprop_by_pid or misc_immunities:
+        # Dodge AC from non-armor/non-shield accessories (already in main AC above).
+        if cprop_dodge_ac:
+            _dodge_sum = sum(cprop_dodge_ac)
+            _dodge_eff = min(_dodge_sum, 20)
+            _dodge_cap = f" (capped from +{_dodge_sum})" if _dodge_sum > 20 else ""
+            cprop_rows.append(f"<tr><th>AC Bonus (Dodge, items)</th><td>+{_dodge_eff}{E(_dodge_cap)}</td></tr>")
+
+        # Saving Throw Bonus (IDs 40, 41) — max per subtype
+        _st_max: dict[str, int] = {}
+        for _stpid in (40, 41):
+            for _pf, _cv in cprop_by_pid.get(_stpid, []):
+                _sub = _pf["subtype"] or "All"
+                _st_max[_sub] = max(_st_max.get(_sub, 0), _cv)
+        for _sub, _val in sorted(_st_max.items()):
+            _lbl = f"Save vs. {_sub}" if _sub != "All" else "Saving Throw (all)"
+            cprop_rows.append(f"<tr><th>{E(_lbl)}</th><td>+{_val}</td></tr>")
+
+        # Ability Bonus (ID 0) — max per ability (enhancement doesn't stack)
+        if 0 in cprop_by_pid:
+            _ab_max: dict[str, int] = {}
+            for _pf, _cv in cprop_by_pid[0]:
+                _sub = _pf["subtype"] or "?"
+                _ab_max[_sub] = max(_ab_max.get(_sub, 0), _cv)
+            _ab_parts = [f"{_sub} +{_val}" for _sub, _val in sorted(_ab_max.items())]
+            cprop_rows.append(f"<tr><th>Ability Bonuses</th><td>{E(', '.join(_ab_parts))}</td></tr>")
+
+        # Skill Bonus (ID 52) — max per skill
+        if 52 in cprop_by_pid:
+            _sk_max: dict[str, int] = {}
+            for _pf, _cv in cprop_by_pid[52]:
+                _sub = _pf["subtype"] or "?"
+                _sk_max[_sub] = max(_sk_max.get(_sub, 0), _cv)
+            _sk_parts = [f"{_sub} +{_val}" for _sub, _val in sorted(_sk_max.items())]
+            cprop_rows.append(f"<tr><th>Skill Bonuses</th><td>{E(', '.join(_sk_parts))}</td></tr>")
+
+        # Damage Resistance (ID 23) — max per damage type
+        if 23 in cprop_by_pid:
+            _dr_max: dict[str, tuple[int, str]] = {}
+            for _pf, _cv in cprop_by_pid[23]:
+                _sub = _pf["subtype"] or "?"
+                _cstr = _pf["cost"] or str(_cv)
+                if _sub not in _dr_max or _cv > _dr_max[_sub][0]:
+                    _dr_max[_sub] = (_cv, _cstr)
+            _dr_parts = [f"{_sub} {_cstr}" for _sub, (_, _cstr) in sorted(_dr_max.items())]
+            cprop_rows.append(f"<tr><th>Damage Resistance</th><td>{E(', '.join(_dr_parts))}</td></tr>")
+
+        # Damage Reduction (ID 22) — physical soak X / bypassed by +Y; best only.
+        if 22 in cprop_by_pid:
+            _best_dr: tuple[int, str, str] | None = None
+            for _pf, _cv in cprop_by_pid[22]:
+                if _best_dr is None or _cv > _best_dr[0]:
+                    _best_dr = (_cv, _pf["subtype"], _pf["cost"])
+            if _best_dr:
+                _, _byp, _soak = _best_dr
+                _drtxt = (_soak or "").strip()
+                if _byp:
+                    _drtxt = f"{_drtxt}, bypass {_byp}" if _drtxt else f"bypass {_byp}"
+                cprop_rows.append(f"<tr><th>Damage Reduction</th><td>{E(_drtxt or '—')}</td></tr>")
+
+        # Immunity: Damage Type (ID 20) — max % per damage type
+        if 20 in cprop_by_pid:
+            _imm_max: dict[str, tuple[int, str]] = {}
+            for _pf, _cv in cprop_by_pid[20]:
+                _sub = _pf["subtype"] or "?"
+                _cstr = _pf["cost"] or str(_cv)
+                if _sub not in _imm_max or _cv > _imm_max[_sub][0]:
+                    _imm_max[_sub] = (_cv, _cstr)
+            _imm_parts = [f"{_sub} ({_cstr})" for _sub, (_, _cstr) in sorted(_imm_max.items())]
+            cprop_rows.append(f"<tr><th>Damage Immunity</th><td>{E(', '.join(_imm_parts))}</td></tr>")
+
+        # Immunity: Miscellaneous — gear (ID 37) merged with racial-type
+        # immunities, tagged so the two sources stay distinguishable.
+        if misc_immunities:
+            _SRC_TAG = {"race": " (racial)", "race+gear": " (racial, gear)", "gear": ""}
+            _misc = [f"{_lbl}{_SRC_TAG[_src]}"
+                     for _lbl, _src in sorted(misc_immunities.items())]
+            cprop_rows.append(f"<tr><th>Misc Immunity</th><td>{E(', '.join(_misc))}</td></tr>")
+
+        # Immunity: Specific Spell (ID 53) — list every spell the creature is
+        # immune to (spell name lives in the formatted cost field).
+        # Entries like "Breath, Petrification" / "Gaze, Petrification" are grouped
+        # by spell name and shown as "Petrification (Breath, Gaze)".
+        if 53 in cprop_by_pid:
+            _DELIVERY_PREFIXES = {"Breath", "Gaze", "Touch"}
+            _spell_deliveries: dict[str, list[str]] = {}
+            for _pf, _ in cprop_by_pid[53]:
+                _cost = _pf["cost"]
+                if not _cost:
+                    continue
+                _parts = _cost.split(", ", 1)
+                if len(_parts) == 2 and _parts[0] in _DELIVERY_PREFIXES:
+                    _sname, _prefix = _parts[1], _parts[0]
+                else:
+                    _sname, _prefix = _cost, None
+                if _sname not in _spell_deliveries:
+                    _spell_deliveries[_sname] = []
+                if _prefix and _prefix not in _spell_deliveries[_sname]:
+                    _spell_deliveries[_sname].append(_prefix)
+            _imm_spells = [
+                f"{_sn} ({', '.join(sorted(_ps))})" if _ps else _sn
+                for _sn, _ps in sorted(_spell_deliveries.items())
+            ]
+            if _imm_spells:
+                cprop_rows.append(f"<tr><th>Immunity: Spells</th><td>{E(', '.join(_imm_spells))}</td></tr>")
+
+        # Immunity: Spells by Level (ID 78) — list the level thresholds
+        if 78 in cprop_by_pid:
+            _imm_lvls = sorted({_pf["cost"] for _pf, _ in cprop_by_pid[78] if _pf["cost"]})
+            if _imm_lvls:
+                cprop_rows.append(f"<tr><th>Immunity: Spell Level</th><td>{E(', '.join(_imm_lvls))}</td></tr>")
+
+        # Regeneration (ID 51) — stacks without limit
+        if 51 in cprop_by_pid:
+            _regen = sum(cv for _, cv in cprop_by_pid[51])
+            cprop_rows.append(f"<tr><th>Regeneration</th><td>+{_regen} HP/round</td></tr>")
+
+        # Vampiric Regeneration (ID 67) — stacks without limit
+        if 67 in cprop_by_pid:
+            _vregen = sum(cv for _, cv in cprop_by_pid[67])
+            cprop_rows.append(f"<tr><th>Regen: Vampiric</th><td>+{_vregen} HP/hit</td></tr>")
+
+        # Turn Resistance (ID 73) — stacks
+        if 73 in cprop_by_pid:
+            _tr = sum(cv for _, cv in cprop_by_pid[73])
+            cprop_rows.append(f"<tr><th>Turn Resistance</th><td>+{_tr}</td></tr>")
+
+        # Flag properties — present/absent, rolled into one Misc Abilities row.
+        _misc_abil: list[str] = []
+        if 35 in cprop_by_pid:
+            _misc_abil.append("Haste (+4 dodge AC, factored into main AC)")
+        for _fp_id, _fp_name in (
+            (75, "Freedom of Movement"), (71, "True Seeing"), (26, "Darkvision"),
+        ):
+            if _fp_id in cprop_by_pid:
+                _misc_abil.append(_fp_name)
+        if _misc_abil:
+            cprop_rows.append(f"<tr><th>Misc Abilities</th><td>{E(', '.join(_misc_abil))}</td></tr>")
+
+    if cprop_rows:
+        sections.append(
+            "<h3>Abilities &amp; combat properties</h3>"
+            '<table class="data"><tbody>' + "\n".join(cprop_rows) + "</tbody></table>"
+            '<p class="muted">Dodge AC and save bonuses are factored into the main '
+            'combat stats above. Dodge AC stacks (cap +20); haste adds +4 more (separate). '
+            'All other same-type bonuses do not stack — only the highest is shown. '
+            'Regeneration stacks without limit. Immunities marked <em>(racial)</em> are '
+            'granted by the creature\'s racial type by the engine, not by its equipment.</p>'
+        )
+
+    # ----- Weapons / attack schedule ----------------------------------------
+    weapon_rows: list[str] = []
+    for slot in (SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B):
+        e = equip_by_slot.get(slot)
+        if not e:
+            continue
+        irr = _equip_resref(e)
+        item = _equip_item(e)
+        base_row = fld(item, "BaseItem") if item else None
+        # Skip non-weapons in the left-hand slot (shields).
+        if slot == SLOT_LEFT and item and int(base_row or -1) in SHIELD_BASEITEMS:
+            continue
+        ranged = is_ranged_weapon(base_row)
+        kind = "Ranged" if ranged else "Melee"
+        ab_iprop = item_attack_bonus(item)
+        dmg_flat, dmg_extras = item_damage_bonus(item)
+        # Weapon Finesse lets creature weapons (claw/bite) and finessable light
+        # weapons use the Dex modifier — but the engine uses the *better* of Str
+        # and Dex, so only switch to Dex when it actually beats Str.
+        _is_cweap = slot in _CWEAP_SLOTS
+        _finesse = (
+            WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+            and (_is_cweap or int(base_row or -1) in FINESSE_BASEITEMS)
+        )
+        _melee_ab = dex_mod if _finesse else str_mod
+        _wname = baseitem_name(base_row) if base_row is not None else ""
+        _feat_ab = feat_attack_bonus(feat_ids, _wname)
+        atk_mod = (dex_mod if ranged else _melee_ab) + ab_iprop + _feat_ab
+        # Monk unarmed/creature-weapon flurry: faster schedule with ≥1 monk level.
+        _monk_atk_bab = _monk_bab if (_is_cweap and _monk_levels >= 1 and not ranged) else 0
+        attacks = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_bab=_monk_atk_bab)
+        atk_str = "/".join(f"{a:+d}" for a in attacks)
+        dmg_str = weapon_damage_string(
+            base_row, str_mod=str_mod, is_ranged=ranged,
+            iprop_dmg_bonus=dmg_flat, iprop_extra=dmg_extras,
+        )
+        crit_str = weapon_crit_string(base_row)
+        if irr in db.items:
+            wname = db.item_name(irr)
+        else:
+            wname = loc(e.get("LocalizedName")) or irr or "(empty)"
+        wlink = (link(f"{items_dir}/{irr}.html", wname)
+                 if irr in db.items else nwn_html(wname))
+        bname = baseitem_name(base_row) if base_row is not None else ""
+        rng_str = ""
+        stats = WEAPONS.get(int(base_row)) if base_row is not None else None
+        if ranged and stats:
+            rng_str = f"{stats.get('MaxRange', '?')}"
+        weapon_rows.append(
+            f"<tr><td>{E(SLOT_NAMES.get(slot, slot))}</td>"
+            f"<td>{wlink}</td>"
+            f"<td>{E(bname)}</td>"
+            f"<td>{E(kind)}{(' (' + rng_str + ')') if rng_str else ''}</td>"
+            f"<td>{E(atk_str)}</td>"
+            f"<td>{colorize_damage_words(E(dmg_str))}</td>"
+            f"<td>{E(crit_str)}</td></tr>"
+        )
+    if weapon_rows:
+        sections.append(
+            "<h3>Weapons</h3>"
+            '<table class="data"><thead><tr>'
+            "<th>Slot</th><th>Item</th><th>Base</th><th>Type</th>"
+            "<th>Attack schedule</th><th>Damage</th><th>Crit</th>"
+            "</tr></thead><tbody>" + "\n".join(weapon_rows) + "</tbody></table>"
+        )
+    elif bab > 0:
+        # Unarmed — show the schedule with Str-mod damage so the reader still
+        # has something to work with. Unarmed is finessable (Dex when it beats
+        # Str), and ≥1 monk level gives the faster unarmed flurry.
+        _u_finesse = WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+        _u_ability = (dex_mod if _u_finesse else str_mod) + feat_attack_bonus(feat_ids, "unarmed")
+        attacks = attack_schedule(
+            bab, ability_mod=_u_ability,
+            monk_unarmed_bab=(_monk_bab if _monk_levels >= 1 else 0))
+        atk_str = "/".join(f"{a:+d}" for a in attacks)
+        sections.append(
+            "<h3>Weapons</h3>"
+            f"<p>Unarmed: {E(atk_str)} · 1d{3 if str_mod < 5 else 6} "
+            f"{('+' + str(str_mod)) if str_mod > 0 else (str(str_mod) if str_mod < 0 else '')}"
+            "</p>"
+        )
+
+    # ----- Spells (memorized + known) ---------------------------------------
+    spell_blocks: list[str] = []
+    for cl in classes:
+        cid = fld(cl, "Class")
+        if cid is None:
+            continue
+        # Detect any per-level memorized / known list on this class entry.
+        per_level: list[tuple[int, str, list[dict]]] = []
+        for lvl in range(10):
+            mem = list_items(cl.get(f"MemorizedList{lvl}"))
+            if mem:
+                per_level.append((lvl, "Memorized", mem))
+            known = list_items(cl.get(f"KnownList{lvl}"))
+            if known:
+                per_level.append((lvl, "Known", known))
+        if not per_level:
+            continue
+        cls_label = class_name(int(cid))
+        block = [f"<h3>{E(cls_label)}</h3>"]
+        rows: list[str] = []
+        for lvl, kind, lst in per_level:
+            _sc_order: list[tuple] = []
+            _sc_count: dict[tuple, int] = {}
+            for s in lst:
+                sid = fld(s, "Spell")
+                meta = fld(s, "SpellMetaMagic", 0) or 0
+                key = (sid, meta)
+                if key not in _sc_count:
+                    _sc_count[key] = 0
+                    _sc_order.append(key)
+                _sc_count[key] += 1
+            spell_cells: list[str] = []
+            for (sid, meta) in _sc_order:
+                n = _sc_count[(sid, meta)]
+                label = colorize_damage_words(spell_name(sid))
+                if meta:
+                    label = f"{label} <small>[mm:{meta}]</small>"
+                if n > 1:
+                    label = f"{label} ×{n}"
+                spell_cells.append(label)
+            label = ("Cantrips" if lvl == 0 else f"Level {lvl}") + f" ({kind})"
+            rows.append(
+                f"<tr><th>{E(label)}</th>"
+                f"<td>{', '.join(spell_cells)}</td></tr>"
+            )
+        block.append(
+            '<table class="data"><tbody>' + "\n".join(rows) + "</tbody></table>"
+        )
+        spell_blocks.append("\n".join(block))
+
+    # SpecAbilityList — innate spell-likes (SR feats, monster abilities).
+    # Group identical (spell, caster_level) entries; many UTCs list the same
+    # ability ten times to give it ten uses/day.
+    spec_abil = list_items(c.get("SpecAbilityList"))
+    if not spec_abil and bp is not None:
+        spec_abil = list_items(bp.get("SpecAbilityList"))
+    if spec_abil:
+        bucket: dict[tuple[Any, Any], int] = defaultdict(int)
+        for s in spec_abil:
+            key = (fld(s, "Spell"), fld(s, "SpellCasterLevel", ""))
+            bucket[key] += 1
+        rows = []
+        for (sid, slvl), n in sorted(
+                bucket.items(),
+                key=lambda kv: spell_name(kv[0][0]).lower()):
+            uses = f"{n}/day" if n > 1 else "1/day"
+            rows.append(
+                f"<tr><td>{colorize_damage_words(E(spell_name(sid)))}</td>"
+                f"<td>{E(slvl)}</td>"
+                f"<td>{E(uses)}</td></tr>"
+            )
+        spell_blocks.append(
+            "<h3>Special abilities</h3>"
+            '<table class="data"><thead><tr>'
+            "<th>Spell/ability</th><th>Caster level</th><th>Uses</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    if spell_blocks:
+        sections.append("<h2>Spells</h2>")
+        sections.extend(spell_blocks)
+
+    # Equipment
+    if equip:
+        sections.append("<h2>Equipment</h2>")
+        rows = []
+        for e in equip:
+            irr = _equip_resref(e)
+            if irr in db.items:
+                cell = link(f"{items_dir}/{irr}.html", db.item_name(irr))
+            else:
+                disp = loc(e.get("LocalizedName")) or irr or "(empty)"
+                cell = nwn_html(disp)
+            slot = fld(e, "__struct_id", "")
+            slot_label = SLOT_NAMES.get(int(slot), str(slot)) if isinstance(slot, int) else str(slot)
+            droppable = bool(int(fld(e, "Dropable", 0) or 0))
+            rows.append(f"<tr><td>{E(slot_label)}</td><td>{cell}</td><td>{_yn(droppable)}</td></tr>")
+        sections.append(
+            '<table class="data"><thead><tr><th>Slot</th><th>Item</th><th>Lootable</th></tr></thead>'
+            "<tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # Inventory
+    if inv:
+        sections.append(f"<h2>Inventory <small class=\"muted\">({len(inv)})</small></h2>")
+        rows = []
+        for it in inv:
+            irr = (fld(it, "InventoryRes", "") or
+                   fld(it, "TemplateResRef", "") or
+                   fld(it, "EquippedRes", ""))
+            if irr in db.items:
+                iname = db.item_name(irr)
+                iobj = db.items[irr]
+                cat_key = _item_category(iobj, nwn_text(iname))
+                cat_label = _item_category_label(cat_key)
+                cat_slug = cat_key.replace("_", "-")
+                type_cell = link(f"{items_dir}/index.html#{E(cat_slug)}", cat_label)
+            else:
+                iname = loc(it.get("LocalizedName")) or irr or "(unknown)"
+                type_cell = ""
+            cell = (link(f"{items_dir}/{irr}.html", iname)
+                    if irr in db.items else nwn_html(iname))
+            droppable = bool(int(fld(it, "Dropable", 0) or 0))
+            pickpocketable = bool(int(fld(it, "Pickpocketable", 0) or 0))
+            rows.append(
+                f"<tr><td>{cell}</td><td>{type_cell}</td>"
+                f"<td>{_yn(droppable)}</td><td>{_yn(pickpocketable)}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            '<th>Item</th><th>Item Type</th><th>Lootable</th><th>Pickpocketable</th>'
+            '</tr></thead>'
+            "<tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # ----- Feats ------------------------------------------------------------
+    if feats:
+        # Group identical feat ids (some appear multiple times for stacking
+        # epic feats like Epic Toughness 1..10).
+        counts = Counter(feat_ids)
+        feat_cells: list[str] = []
+        for fid, n in sorted(counts.items(), key=lambda kv: feat_name(kv[0]).lower()):
+            label = feat_name(fid)
+            cell = colorize_damage_words(E(label)) + (f" ×{n}" if n > 1 else "")
+            feat_cells.append(f"<li>{cell}</li>")
+        sections.append(
+            f"<h2>Feats <small class=\"muted\">({len(feats)})</small></h2>"
+            f'<ul class="featlist">{"".join(feat_cells)}</ul>'
+        )
+
+    # ----- Skills (skip zero ranks) -----------------------------------------
+    if skills:
+        skill_rows: list[str] = []
+        for idx, s in enumerate(skills):
+            rank = fld(s, "Rank", 0) or 0
+            if int(rank) <= 0:
+                continue
+            skill_rows.append(
+                f"<tr><td>{E(skill_name(idx))}</td><td>{E(rank)}</td></tr>"
+            )
+        if skill_rows:
+            sections.append(
+                "<h2>Skills</h2>"
+                '<table class="data"><thead><tr>'
+                "<th>Skill</th><th>Ranks</th>"
+                "</tr></thead><tbody>" + "\n".join(skill_rows) + "</tbody></table>"
+            )
+
+    # Scripts
+    sections.append("<h2>Scripts</h2>")
+    script_fields = [
+        "ScriptHeartbeat", "ScriptOnNotice", "ScriptEndRound", "ScriptDialogue",
+        "ScriptAttacked", "ScriptDamaged", "ScriptDeath", "ScriptDisturbed",
+        "ScriptSpawn", "ScriptRested", "ScriptSpellAt", "ScriptUserDefine",
+        "ScriptOnBlocked",
+    ]
+    rows = []
+    for sf in script_fields:
+        v = _f(sf, "")
+        rows.append(f"<tr><td>{E(sf)}</td><td>{E(v)}</td></tr>")
+    sections.append(
+        '<table class="data"><thead><tr><th>Event</th><th>Script</th></tr></thead>'
+        "<tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+
+    return sections
+
+
+def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
+    """One page per unique creature (canonical entity).  Replaces the old
+    separate blueprint page + instance page model."""
+    entry = db.canonical_creatures.get(canonical_rr)
+    if not entry:
+        return
+    c = entry["c"]
+    bp_rr = entry["bp_rr"]
+    bp = db.creatures.get(bp_rr) if bp_rr != canonical_rr else None
+    name = db.canonical_creature_name(canonical_rr)
+
+    def _meta(key: str, default: Any = None) -> Any:
+        v = fld(c, key, None)
+        if v is None and bp is not None:
+            v = fld(bp, key, default)
+        return default if v is None else v
+
+    classes = list_items(c.get("ClassList")) or (list_items(bp.get("ClassList")) if bp else [])
+    cls_str = "/".join(
+        f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+        for cl in classes
+    )
+    conv = _meta("Conversation", "")
+    _eff_hp_meta = creature_max_hp(c, bp)
+
+    sections = [
+        f"<h1>{nwn_html(name)}</h1>",
+        '<dl class="meta">',
+        f"<dt>ResRef</dt><dd>{E(canonical_rr)}</dd>",
+        f"<dt>Tag</dt><dd>{E(_meta('Tag', ''))}</dd>",
+        f"<dt>Race</dt><dd>{_race_link(_meta('Race'), root_rel='..')}</dd>",
+        f"<dt>Appearance</dt><dd>{E(appearance_name(_meta('Appearance_Type')))}</dd>",
+        f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
+        f"<dt>HP</dt><dd>{E(_fmt_hp(_eff_hp_meta) if _eff_hp_meta is not None else _fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
+        f"<dt>CR</dt><dd>{E(_meta('ChallengeRating', ''))}</dd>",
+        f"<dt>Faction</dt><dd>{_faction_cell(db, canonical_rr, _meta('FactionID', ''), root_rel='..')}</dd>",
+        f"<dt>Conversation</dt><dd>{_conv_link(db, conv, root_rel='..') if conv else '—'}</dd>",
+    ]
+
+    # Variant notice
+    is_variant = db.canonical_bp_of.get(canonical_rr) != canonical_rr
+    if is_variant:
+        base_rr = db.canonical_bp_of[canonical_rr]
+        base_entry = db.canonical_creatures.get(base_rr, {})
+        base_c = base_entry.get("c", {})
+        base_bp_rr = base_entry.get("bp_rr", base_rr)
+        base_bp = db.creatures.get(base_bp_rr) if base_bp_rr != base_rr else None
+        diff_items = _variant_diff_items(c, base_c, db, bp=bp, base_bp=base_bp)
+        if diff_items:
+            diff_detail = "; ".join(diff_items)
+        else:
+            diff_detail = "differs in equipment, class levels, or feats"
+        sections.append(
+            f'<dt>Variant of</dt><dd>'
+            f'{link(f"{base_rr}.html", db.canonical_creature_name(base_rr))}'
+            f'<br><small class="muted">{E(diff_detail)}</small></dd>'
+        )
+    sections.append('</dl>')
+
+    # Creature artwork (from creature-pics/), just after the meta box.
+    pics = _CREATURE_PICS.get(canonical_rr)
+    if pics:
+        sections.append('<div class="creature-pics">'
+                        + _pic_figures(pics, name) + "</div>")
+
+    # Bestiary kill stats (when the module runs the kill-tracking system).
+    if _BESTIARY_ACTIVE:
+        sf = next((s for s in _SERVER_FIRSTS if s["resref"] == canonical_rr), None)
+        if sf:
+            slayer = E(sf["name"])
+            if sf.get("player_name"):
+                slayer += f" [{E(sf['player_name'])}]"
+            sections.append(
+                '<p class="server-first-badge"><strong>&#9733; Server First:</strong> '
+                f"first slain by {slayer}"
+                + (f" on {E(_utc_to_local(sf['at']))}" if sf["at"] else "") + ".</p>"
+            )
+        k = _BESTIARY_KILLS.get(canonical_rr)
+        if k:
+            sections.append(
+                "<h2>Kills</h2>"
+                '<table class="data"><thead><tr>'
+                "<th>Total</th><th>Solo</th><th>Party</th></tr></thead><tbody>"
+                f"<tr><td>{k['total']}</td><td>{k['solo']}</td>"
+                f"<td>{k['party']}</td></tr></tbody></table>"
+            )
+        else:
+            sections.append("<h2>Kills</h2><p>Not yet slain by any adventurer.</p>")
+        # Top Killers leaderboard — per-character kill counts for this
+        # creature. Merge boss variant blueprints into their canonical (same
+        # summing the Bosses index does) so e.g. the leveled Xanith .utcs
+        # don't split a character's count. Omitted when nobody has a kill.
+        variant_rrs = [canonical_rr] + [v for v, canon in _BOSS_ALIASES.items()
+                                        if canon == canonical_rr]
+        merged: dict[str, dict] = {}
+        for v_rr in variant_rrs:
+            for r in _BESTIARY_TOP.get(v_rr, []):
+                m = merged.get(r["uuid"])
+                if m is None:
+                    merged[r["uuid"]] = dict(r)
+                else:
+                    m["solo"] += r["solo"]
+                    m["party"] += r["party"]
+                    m["total"] += r["total"]
+                    if r["last"] >= m["last"]:
+                        m["last"] = r["last"]
+                        m["name"] = r["name"] or m["name"]
+                        m["player"] = r["player"] or m["player"]
+        top = sorted(merged.values(),
+                     key=lambda r: (-r["total"], r["name"].lower()))[:10]
+        if top:
+            tk_rows = "\n".join(
+                f"<tr><td>{i}</td><td>{E(r.get('player', ''))}</td>"
+                f"<td>{E(r['name'])}</td>"
+                f"<td>{r['solo']}</td><td>{r['party']}</td>"
+                f"<td>{r['total']}</td>"
+                f"<td>{E(_utc_to_local(r['last'])[:10] if r['last'] else '')}</td></tr>"
+                for i, r in enumerate(top, 1)
+            )
+            sections.append(
+                "<h3>Top Killers</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>#</th><th>Player</th><th>Character</th><th>Solo</th><th>Party</th>"
+                "<th>Total</th><th>Last Kill</th>"
+                "</tr></thead><tbody>" + tk_rows + "</tbody></table>"
+            )
+
+    # "Where to find" section
+    locs = db.canonical_locations.get(canonical_rr, [])
+    placed_locs  = [l for l in locs if l["kind"] == "placed"]
+    enc_locs     = [l for l in locs if l["kind"] == "encounter"]
+    script_locs  = [l for l in locs if l["kind"] == "script"]
+
+    if placed_locs or enc_locs or script_locs:
+        sections.append("<h2>Where to find</h2>")
+        if placed_locs:
+            # Aggregate by area
+            placed_by_area: dict[str, int] = {}
+            for l in placed_locs:
+                placed_by_area[l["area"]] = placed_by_area.get(l["area"], 0) + l["count"]
+            place_rows = []
+            for area_rr in sorted(placed_by_area.keys(),
+                                  key=lambda r: db.area_name(r).lower()):
+                cnt = placed_by_area[area_rr]
+                place_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{cnt}</td></tr>"
+                )
+            sections.append(
+                "<h3>Placed directly</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Count</th>"
+                "</tr></thead><tbody>" + "\n".join(place_rows) + "</tbody></table>"
+            )
+        if enc_locs:
+            # Aggregate by (area, enc_rr)
+            enc_by_key: dict[tuple[str, str], int] = {}
+            for l in enc_locs:
+                k = (l["area"], l["enc_rr"] or "")
+                enc_by_key[k] = enc_by_key.get(k, 0) + l["count"]
+            enc_rows = []
+            for (area_rr, enc_rr) in sorted(
+                enc_by_key.keys(),
+                key=lambda k: (db.area_name(k[0]).lower(), k[1]),
+            ):
+                blueprint = db.encounters.get(enc_rr, {})
+                ename = loc(blueprint.get("LocalizedName")) or enc_rr or "(unnamed)"
+                enc_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{nwn_html(ename)}</td>"
+                    f"<td><code>{E(enc_rr)}</code></td></tr>"
+                )
+            sections.append(
+                "<h3>Encounter pools</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Encounter</th><th>Encounter ResRef</th>"
+                "</tr></thead><tbody>" + "\n".join(enc_rows) + "</tbody></table>"
+            )
+        if script_locs:
+            script_by_area: dict[str, list[str]] = defaultdict(list)
+            for l in script_locs:
+                srcs = [e["script"] for e in db.area_script_spawns.get(l["area"], [])
+                        if e["can_rr"] == canonical_rr]
+                script_by_area[l["area"]].extend(srcs)
+            script_rows = []
+            for area_rr in sorted(script_by_area.keys(),
+                                  key=lambda r: db.area_name(r).lower()):
+                scripts = sorted(set(script_by_area[area_rr]))
+                script_cell = (", ".join(f"<code>{E(s)}</code>" for s in scripts)
+                               if scripts else "—")
+                script_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{script_cell}</td></tr>"
+                )
+            sections.append(
+                "<h3>Script-spawned</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Spawn script</th>"
+                "</tr></thead><tbody>" + "\n".join(script_rows) + "</tbody></table>"
+            )
+    else:
+        sections.append("<h2>Where to find</h2><p>Not placed in any area.</p>")
+
+    store_section = _creature_store_section(db, bp_rr, filter_area=None, root_rel="..")
+    if store_section:
+        sections.append(store_section)
+
+    sections.extend(_creature_detail_sections(db, c, bp=bp, root_rel=".."))
+
+    write(out / "creatures" / f"{canonical_rr}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_creatures_by_area(db: Db, out: Path) -> None:
+    """Creatures grouped by area. One row per unique creature per area, with
+    spawn-method badges and a count of total appearances."""
+    # Build area → {can_rr → {"placed": N, "enc": N, "script": N, "enc_rrs": set}}
+    area_map: dict[str, dict[str, dict]] = defaultdict(dict)
+    for can_rr, locs in db.canonical_locations.items():
+        for loc_entry in locs:
+            area_rr = loc_entry["area"]
+            if area_rr not in area_map[can_rr]:
+                area_map[can_rr][area_rr] = {"placed": 0, "enc": 0, "script": 0, "enc_rrs": set()}
+            if loc_entry["kind"] == "placed":
+                area_map[can_rr][area_rr]["placed"] += loc_entry["count"]
+            elif loc_entry["kind"] == "script":
+                area_map[can_rr][area_rr]["script"] += loc_entry["count"]
+            else:
+                area_map[can_rr][area_rr]["enc"] += loc_entry["count"]
+                if loc_entry["enc_rr"]:
+                    area_map[can_rr][area_rr]["enc_rrs"].add(loc_entry["enc_rr"])
+
+    # Invert to area → [can_rr, ...]
+    by_area: dict[str, list[str]] = defaultdict(list)
+    for can_rr, areas in area_map.items():
+        for area_rr in areas:
+            by_area[area_rr].append(can_rr)
+
+    visible_areas = [a for a in by_area if a not in db.hidden_areas]
+
+    # Build sidebar TOC
+    toc_parts = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="../index.html">All Creatures</a></div>',
+        '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
+        '<div><a href="../by-race/index.html">By Race</a></div>',
+        '<div><a href="../search.html">Search</a></div>',
+        '<div class="toc-group-heading">Areas</div>',
+    ]
+    for area_rr in sorted(visible_areas, key=lambda r: db.area_name(r).lower()):
+        cnt = len(by_area[area_rr])
+        slug = f"area-{area_rr}"
+        toc_parts.append(
+            f'<div><a href="#{E(slug)}">{E(db.area_name(area_rr))}'
+            f' <span class="muted">({cnt})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    sections: list[str] = [
+        "<h1>Creatures by Area</h1>",
+        f"<p>{len(visible_areas)} areas with creatures. "
+        f'See <a href="../index.html">All Creatures</a> for a flat list.</p>',
+    ]
+    for area_rr in sorted(visible_areas, key=lambda r: db.area_name(r).lower()):
+        can_rrs = by_area[area_rr]
+        slug = f"area-{area_rr}"
+        sections.append(
+            f'<h2 id="{E(slug)}">'
+            f'{link(f"../../areas/{area_rr}.html", db.area_name(area_rr))} '
+            f'<small class="muted">({len(can_rrs)})</small></h2>'
+        )
+        rows = []
+        for can_rr in sorted(can_rrs,
+                              key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+            entry = db.canonical_creatures[can_rr]
+            c2 = entry["c"]
+            bp2_rr = entry["bp_rr"]
+            bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+
+            def _f2(key, default=None):
+                v = fld(c2, key)
+                if v is None and bp2 is not None:
+                    v = fld(bp2, key)
+                return default if v is None else v
+
+            classes2 = list_items(c2.get("ClassList")) or (
+                list_items(bp2.get("ClassList")) if bp2 else [])
+            cls_str2 = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes2
+            )
+            info = area_map[can_rr][area_rr]
+            placed = info["placed"]
+            enc = info["enc"]
+            script = info["script"]
+            badges = []
+            if placed:
+                badges.append('<span class="badge">placed</span>')
+            if enc:
+                badges.append('<span class="badge">encounter</span>')
+            if script:
+                badges.append('<span class="badge">script</span>')
+            method = " + ".join(badges) if badges else "—"
+            count = placed + enc + script
+            _eff_hp2 = creature_max_hp(c2, bp2)
+            rows.append(
+                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
+                f"<td>{E(race_name(_f2('Race')))}</td>"
+                f"<td>{E(cls_str2)}</td>"
+                f"<td>{E(_eff_hp2 if _eff_hp2 is not None else '')}</td>"
+                f"<td>{E(_f2('ChallengeRating', ''))}</td>"
+                f"<td>{method}</td>"
+                f"<td>{count}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Race</th><th>Class</th>"
+            "<th>HP</th><th>CR</th><th>Spawn Method</th><th>Count</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "by-area" / "index.html",
+          page("Creatures by Area",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel="../.."))
+
+
+def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> None:
+    """Creatures grouped by Challenge Rating range, with a left-sidebar TOC.
+
+    Each bucket spans at least cr_bucket_size CR levels AND contains at least
+    cr_bucket_size creatures; adjacent natural buckets are merged until both
+    conditions are met.
+    """
+
+    def _cr_val(can_rr: str) -> float | None:
+        entry = db.canonical_creatures[can_rr]
+        c2 = entry["c"]
+        bp2_rr = entry["bp_rr"]
+        bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+        raw = fld(c2, "ChallengeRating")
+        if raw is None and bp2 is not None:
+            raw = fld(bp2, "ChallengeRating")
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    # Separate known-CR from unknown-CR canonicals
+    known: list[tuple[float, str]] = []
+    unknown: list[str] = []
+    for can_rr in db.canonical_creatures:
+        cr = _cr_val(can_rr)
+        if cr is None:
+            unknown.append(can_rr)
+        else:
+            known.append((cr, can_rr))
+    known.sort(key=lambda x: x[0])
+
+    # Build natural fixed-width buckets
+    natural: dict[int, list[str]] = {}
+    for cr, can_rr in known:
+        b = int(cr // cr_bucket_size) * cr_bucket_size
+        natural.setdefault(b, []).append(can_rr)
+
+    # Merge adjacent natural buckets until each has >= cr_bucket_size creatures
+    all_starts = sorted(natural.keys())
+    merged: list[tuple[int, int, list[str]]] = []  # (start, end_inclusive, creatures)
+    i = 0
+    while i < len(all_starts):
+        start = all_starts[i]
+        end = start + cr_bucket_size - 1
+        creatures = list(natural[start])
+        i += 1
+        while len(creatures) < cr_bucket_size and i < len(all_starts):
+            next_start = all_starts[i]
+            end = next_start + cr_bucket_size - 1
+            creatures.extend(natural[next_start])
+            i += 1
+        merged.append((start, end, creatures))
+
+    # Build sidebar TOC
+    toc_parts = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="../index.html">All Creatures</a></div>',
+        '<div><a href="../by-area/index.html">By Area</a></div>',
+        '<div><a href="../by-race/index.html">By Race</a></div>',
+        '<div><a href="../search.html">Search</a></div>',
+        '<div class="toc-group-heading">Challenge Rating</div>',
+    ]
+    for start, end, creatures in merged:
+        anchor = f"cr-{start}"
+        label = f"CR {start}–{end}"
+        toc_parts.append(
+            f'<div><a href="#{E(anchor)}">{E(label)}'
+            f' <span class="muted">({len(creatures)})</span></a></div>'
+        )
+    if unknown:
+        toc_parts.append(
+            f'<div><a href="#cr-unknown">Unknown CR'
+            f' <span class="muted">({len(unknown)})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    sections: list[str] = [
+        "<h1>Creatures by Challenge Rating</h1>",
+        f"<p>Each group spans at least {cr_bucket_size} CR levels and contains at least "
+        f"{cr_bucket_size} creatures (adjacent ranges are merged as needed). "
+        f'See <a href="../index.html">All Creatures</a> for a flat list.</p>',
+    ]
+
+    def _render_cr_section(anchor: str, label: str, can_rrs: list[str]) -> str:
+        sorted_rrs = sorted(
+            can_rrs,
+            key=lambda r: nwn_text(db.canonical_creature_name(r)).lower(),
+        )
+        rows = []
+        for can_rr in sorted_rrs:
+            entry = db.canonical_creatures[can_rr]
+            c2 = entry["c"]
+            bp2_rr = entry["bp_rr"]
+            bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+
+            def _f3(key, default=None, _c2=c2, _bp2=bp2):
+                v = fld(_c2, key)
+                if v is None and _bp2 is not None:
+                    v = fld(_bp2, key)
+                return default if v is None else v
+
+            classes3 = list_items(c2.get("ClassList")) or (
+                list_items(bp2.get("ClassList")) if bp2 else [])
+            cls_str3 = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes3
+            )
+            _eff_hp3 = creature_max_hp(c2, bp2)
+            rows.append(
+                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
+                f"<td>{E(race_name(_f3('Race')))}</td>"
+                f"<td>{E(cls_str3)}</td>"
+                f"<td>{E(_eff_hp3 if _eff_hp3 is not None else '')}</td>"
+                f"<td>{E(_f3('ChallengeRating', ''))}</td>"
+                f"<td>{E(db.faction_name(_f3('FactionID', '')))}</td></tr>"
+            )
+        return (
+            f'<h2 id="{E(anchor)}">{E(label)}'
+            f' <small class="muted">({len(rows)})</small></h2>'
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Race</th><th>Class</th>"
+            "<th>HP</th><th>CR</th><th>Faction</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    for start, end, creatures in merged:
+        sections.append(_render_cr_section(f"cr-{start}", f"CR {start}–{end}", creatures))
+    if unknown:
+        sections.append(_render_cr_section("cr-unknown", "Unknown CR", unknown))
+
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "by-cr" / "index.html",
+          page("Creatures by Challenge Rating",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel="../.."))
+
+
+def render_creatures_by_race(db: Db, out: Path) -> None:
+    """Creatures grouped by Race, with a left-sidebar TOC."""
+
+    def _race_id(can_rr: str) -> "int | None":
+        entry = db.canonical_creatures[can_rr]
+        c2 = entry["c"]
+        bp2_rr = entry["bp_rr"]
+        bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+        raw = fld(c2, "Race")
+        if raw is None and bp2 is not None:
+            raw = fld(bp2, "Race")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    by_race: dict = defaultdict(list)
+    for can_rr in db.canonical_creatures:
+        by_race[_race_id(can_rr)].append(can_rr)
+
+    sorted_races = sorted(
+        by_race.keys(),
+        key=lambda r: race_name(r).lower() if r is not None else "\xff",
+    )
+
+    def _race_anchor(rid) -> str:
+        return "race-unset" if rid is None else f"race-{rid}"
+
+    toc_parts = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="../index.html">All Creatures</a></div>',
+        '<div><a href="../by-area/index.html">By Area</a></div>',
+        '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
+        '<div><a href="../search.html">Search</a></div>',
+        '<div class="toc-group-heading">Races</div>',
+    ]
+    for rid in sorted_races:
+        rname = race_name(rid) if rid is not None else "(unset)"
+        toc_parts.append(
+            f'<div><a href="#{E(_race_anchor(rid))}">{E(rname)}'
+            f' <span class="muted">({len(by_race[rid])})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    TABLE_HEAD = (
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>Count</th><th>Class</th>"
+        "<th>HP</th><th>CR</th><th>Faction</th>"
+        "</tr></thead><tbody>"
+    )
+
+    sections: list[str] = [
+        "<h1>Creatures by Race</h1>",
+        f"<p>{len(db.canonical_creatures)} unique creature{'s' if len(db.canonical_creatures) != 1 else ''}"
+        f" across {len(sorted_races)} race{'s' if len(sorted_races) != 1 else ''}. "
+        f'See <a href="../index.html">All Creatures</a> for a flat list.</p>',
+    ]
+
+    for rid in sorted_races:
+        rname = race_name(rid) if rid is not None else "(unset)"
+        anchor = _race_anchor(rid)
+        def _race_sort_key(r):
+            total = sum(l["count"] for l in db.canonical_locations.get(r, []))
+            has_any = 0 if total > 0 else 1
+            _e2 = db.canonical_creatures[r]
+            _c2 = _e2["c"]
+            _bp2 = db.creatures.get(_e2["bp_rr"]) if _e2["bp_rr"] != r else None
+            raw_cr = fld(_c2, "ChallengeRating") or (_bp2 and fld(_bp2, "ChallengeRating"))
+            try:
+                cr_val = float(raw_cr) if raw_cr else float("-inf")
+            except (TypeError, ValueError):
+                cr_val = float("-inf")
+            return (has_any, -cr_val, nwn_text(db.canonical_creature_name(r)).lower())
+        can_rrs = sorted(by_race[rid], key=_race_sort_key)
+        rows = []
+        for can_rr in can_rrs:
+            entry = db.canonical_creatures[can_rr]
+            c2 = entry["c"]
+            bp2_rr = entry["bp_rr"]
+            bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
+
+            def _f4(key, default=None, _c2=c2, _bp2=bp2):
+                v = fld(_c2, key)
+                if v is None and _bp2 is not None:
+                    v = fld(_bp2, key)
+                return default if v is None else v
+
+            classes4 = list_items(c2.get("ClassList")) or (
+                list_items(bp2.get("ClassList")) if bp2 else [])
+            cls_str4 = "/".join(
+                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                for cl in classes4
+            )
+            total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
+            _eff_hp4 = creature_max_hp(c2, bp2)
+            rows.append(
+                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
+                f"<td>{total_count if total_count else '&#x2014;'}</td>"
+                f"<td>{E(cls_str4)}</td>"
+                f"<td>{E(_eff_hp4 if _eff_hp4 is not None else '')}</td>"
+                f"<td>{E(_f4('ChallengeRating', ''))}</td>"
+                f"<td>{E(db.faction_name(_f4('FactionID', '')))}</td></tr>"
+            )
+        sections.append(
+            f'<h2 id="{E(anchor)}">{E(rname)}'
+            f' <small class="muted">({len(rows)})</small></h2>'
+            + TABLE_HEAD + "\n".join(rows) + "</tbody></table>"
+        )
+
+    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    write(out / "creatures" / "by-race" / "index.html",
+          page("Creatures by Race",
+               '<div class="items-layout">' + body + "</div>",
+               root_rel="../.."))
+
+
+_CREATURE_SEARCH_JS = r"""(function(){
+var N=4,data=[],form=document.getElementById('cf'),results=document.getElementById('cr_out');
+var modeSels=[],propSels=[],subSels=[],minVals=[];
+for(var i=1;i<=N;i++){
+  modeSels.push(document.getElementById('cm'+i));
+  propSels.push(document.getElementById('cp'+i));
+  subSels.push(document.getElementById('cs'+i));
+  minVals.push(document.getElementById('cv'+i));
+}
+function $(id){return document.getElementById(id);}
+function num(id){var v=parseFloat($(id).value);return isNaN(v)?null:v;}
+
+fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
+  data=d; populateFilters();
+  results.innerHTML='<p class="muted">'+data.length+' creatures indexed. Set filters above and click Search.</p>';
+});
+
+function fillSel(sel,vals){
+  vals.forEach(function(v){sel.appendChild(new Option(v,v));});
+}
+
+function populateFilters(){
+  var props={},subs={},races={},classes={},areas={},factions={};
+  data.forEach(function(cr){
+    if(cr.race)races[cr.race]=1;
+    if(cr.faction)factions[cr.faction]=1;
+    (cr.classes||[]).forEach(function(c){classes[c.n]=1;});
+    (cr.areas||[]).forEach(function(a){areas[a]=1;});
+    (cr.props||[]).forEach(function(p){
+      props[p.p]=1;
+      if(p.s){if(!subs[p.p])subs[p.p]={};subs[p.p][p.s]=1;}
+    });
+  });
+  window._csubs=subs;
+  fillSel($('frace'),Object.keys(races).sort());
+  fillSel($('fclass'),Object.keys(classes).sort());
+  fillSel($('farea'),Object.keys(areas).sort());
+  fillSel($('ffac'),Object.keys(factions).sort());
+  var propOpts=Object.keys(props).sort();
+  propSels.forEach(function(sel){fillSel(sel,propOpts);});
+}
+
+propSels.forEach(function(sel,idx){
+  sel.addEventListener('change',function(){
+    var chosen=sel.value,sub=(window._csubs||{})[chosen]||{};
+    subSels[idx].innerHTML='<option value="">— any —</option>';
+    Object.keys(sub).sort().forEach(function(s){subSels[idx].appendChild(new Option(s,s));});
+    subSels[idx].disabled=!chosen||!Object.keys(sub).length;
+  });
+});
+
+function propMatches(cr,c){
+  return (cr.props||[]).filter(function(p){
+    if(c.prop&&p.p!==c.prop)return false;
+    if(c.sub&&p.s!==c.sub)return false;
+    if(c.minv>0&&(p.v||0)<c.minv)return false;
+    return true;
+  });
+}
+
+form.addEventListener('submit',function(e){
+  e.preventDefault();
+  var q=($('fq').value||'').trim().toLowerCase();
+  var race=$('frace').value,cls=$('fclass').value,area=$('farea').value,fac=$('ffac').value;
+  var clvl=parseInt($('fclvl').value,10)||0;
+  var crMin=num('fcrmin'),crMax=num('fcrmax');
+  var hpMin=num('fhpmin'),hpMax=num('fhpmax');
+  var acMin=num('facmin'),babMin=num('fbabmin'),srMin=num('fsrmin');
+  var saveMin=num('fsavemin');
+  var inMod=$('fim').checked;
+  var bossEl=$('fboss'),bossOnly=bossEl&&bossEl.checked;
+  var sortBy=$('fo').value,asc=$('fd').value==='asc';
+
+  var conds=[];
+  for(var i=0;i<N;i++){
+    var prop=propSels[i].value,sub=subSels[i].value;
+    var minv=parseInt(minVals[i].value,10)||0;
+    if(prop||sub||minv>0)conds.push({prop:prop,sub:sub,minv:minv,neg:modeSels[i].value==='lacks'});
+  }
+
+  var out=[];
+  data.forEach(function(cr){
+    if(q&&cr.name.toLowerCase().indexOf(q)<0)return;
+    if(race&&cr.race!==race)return;
+    if(fac&&cr.faction!==fac)return;
+    if(area&&(cr.areas||[]).indexOf(area)<0)return;
+    if(inMod&&!cr.count)return;
+    if(bossOnly&&!cr.boss)return;
+    if(cls){
+      var hit=(cr.classes||[]).some(function(c){return c.n===cls&&c.l>=clvl;});
+      if(!hit)return;
+    }else if(clvl>0){
+      if(!(cr.classes||[]).some(function(c){return c.l>=clvl;}))return;
+    }
+    if(crMin!==null&&(cr.cr===null||cr.cr<crMin))return;
+    if(crMax!==null&&(cr.cr===null||cr.cr>crMax))return;
+    if(hpMin!==null&&(cr.hp===null||cr.hp<hpMin))return;
+    if(hpMax!==null&&(cr.hp===null||cr.hp>hpMax))return;
+    if(acMin!==null&&(cr.ac||0)<acMin)return;
+    if(babMin!==null&&(cr.bab||0)<babMin)return;
+    if(srMin!==null&&(cr.sr||0)<srMin)return;
+    if(saveMin!==null&&Math.min(cr.fort||0,cr.ref||0,cr.will||0)<saveMin)return;
+
+    var matched=[];
+    var ok=conds.every(function(c){
+      var mp=propMatches(cr,c);
+      if(c.neg)return mp.length===0;
+      if(!mp.length)return false;
+      matched.push(mp[0]);
+      return true;
+    });
+    if(!ok)return;
+    out.push({c:cr,matched:matched});
+  });
+
+  out.sort(function(a,b){
+    var v;
+    if(sortBy==='name')v=a.c.name.localeCompare(b.c.name);
+    else if(sortBy==='value')v=(a.matched[0]?(a.matched[0].v||0):0)-(b.matched[0]?(b.matched[0].v||0):0);
+    else v=(a.c[sortBy]===null?-Infinity:(a.c[sortBy]||0))-(b.c[sortBy]===null?-Infinity:(b.c[sortBy]||0));
+    if(v===0)v=a.c.name.localeCompare(b.c.name);
+    return asc?v:-v;
+  });
+  render(out,conds.length>0);
+});
+
+function crBucket(cr){
+  if(cr===null)return 'CR unset';
+  var lo=Math.floor(cr/5)*5;
+  return 'CR '+lo+'–'+(lo+4);
+}
+
+function tally(rows,keyFn){
+  var m={};
+  rows.forEach(function(r){var k=keyFn(r.c);m[k]=(m[k]||0)+1;});
+  return Object.keys(m).sort(function(a,b){return m[b]-m[a]||a.localeCompare(b);})
+    .map(function(k){return '<li>'+esc(k)+' <strong>'+m[k]+'</strong></li>';}).join('');
+}
+
+function render(rows,showProps){
+  var total=data.length;
+  var head='<p><strong>'+rows.length+'</strong> of '+total+' creature'+(total!==1?'s':'')
+    +' match'+(rows.length===1?'es':'')
+    +' <span class="muted">('+(total-rows.length)+' excluded)</span></p>';
+  if(!rows.length){results.innerHTML=head+'<p class="muted">No creatures match.</p>';return;}
+  head+='<details class="search-breakdown"><summary>Breakdown of the '+rows.length+' matches</summary>'
+    +'<div class="breakdown-cols">'
+    +'<div><h4>By race</h4><ul>'+tally(rows,function(c){return c.race||'(unset)';})+'</ul></div>'
+    +'<div><h4>By challenge rating</h4><ul>'+tally(rows,function(c){return crBucket(c.cr);})+'</ul></div>'
+    +'</div></details>';
+
+  var cols='<th>Name</th><th>Count</th><th>Race</th><th>Class</th>'
+    +'<th>CR</th><th>HP</th><th>AC</th>'
+    +(showProps?'<th>Matched</th>':'');
+  var html=head+'<table class="data"><thead><tr>'+cols+'</tr></thead><tbody>';
+  rows.forEach(function(r){
+    var c=r.c;
+    var cls=(c.classes||[]).map(function(x){return esc(x.n)+' '+x.l;}).join('/');
+    var props=r.matched.map(function(p){
+      var label=p.a
+        ?'<a href="../items/properties/index.html#'+esc(p.a)+'">'+esc(p.p)+'</a>'
+        :esc(p.p);
+      var det='';
+      if(p.s&&p.c)det=': '+esc(p.s)+' — '+esc(p.c);
+      else if(p.s)det=': '+esc(p.s);
+      else if(p.c)det=' — '+esc(p.c);
+      var tag=p.src==='race'?' <span class="muted">(racial)</span>':'';
+      return '<span>'+label+det+tag+'</span>';
+    }).join('<br>');
+    var boss=c.boss?' <span class="badge-boss">boss</span>':'';
+    html+='<tr><td><a href="'+esc(c.url)+'">'+esc(c.name)+'</a>'+boss+'</td>'
+      +'<td>'+(c.count?c.count:'—')+'</td>'
+      +'<td>'+esc(c.race||'')+'</td>'
+      +'<td>'+cls+'</td>'
+      +'<td>'+(c.cr===null?'—':c.cr)+'</td>'
+      +'<td>'+(c.hp===null?'—':c.hp.toLocaleString())+'</td>'
+      +'<td>'+(c.ac||'—')+'</td>'
+      +(showProps?'<td>'+props+'</td>':'')
+      +'</tr>';
+  });
+  results.innerHTML=html+'</tbody></table>';
+}
+
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+})();"""
+
+
+def render_creatures_search(db: Db, out: Path) -> None:
+    """creatures/search.html — client-side search over every unique creature.
+
+    Mirrors the item search (render_items_search): a JSON index plus inline JS.
+    Each creature's searchable "abilities" are its equipped-item properties
+    (already resolved by extract_creature_defenses, so the combat rules stay in
+    one place) merged with the immunities its racial type grants. Conditions can
+    be negated, which is what makes "everything that is *not* crit immune"
+    answerable.
+    """
+    global _current_context
+    boss_rrs = {b["resref"] for b in _BOSS_REGISTRY}
+    index: list[dict] = []
+
+    for can_rr in sorted(db.canonical_creatures,
+                         key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        entry = db.canonical_creatures[can_rr]
+        c = entry["c"]
+        bp_rr = entry["bp_rr"]
+        bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+        _current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
+
+        def _f(key, default=None, _c=c, _bp=bp):
+            v = fld(_c, key)
+            if v is None and _bp is not None:
+                v = fld(_bp, key)
+            return default if v is None else v
+
+        D = extract_creature_defenses(db, c, bp)
+
+        classes = (list_items(c.get("ClassList"))
+                   or (list_items(bp.get("ClassList")) if bp else []))
+        cls_list = []
+        for cl in classes:
+            cid = fld(cl, "Class")
+            try:
+                lvl = int(fld(cl, "ClassLevel", 0) or 0)
+            except (TypeError, ValueError):
+                lvl = 0
+            cls_list.append({"n": class_name(cid), "l": lvl})
+
+        # Searchable properties: one row per distinct (property, subtype, cost),
+        # keeping the highest value when several items grant the same thing.
+        props: dict[tuple, dict] = {}
+
+        def _add(p: str, s: str, cost: str, val: int, src: str, anchor: str = "",
+                 _props=props):
+            key = (p, s, cost, src)
+            prev = _props.get(key)
+            if prev is None or val > prev["v"]:
+                row = {"p": p, "s": s, "c": cost, "v": val, "src": src}
+                if anchor:
+                    row["a"] = anchor
+                _props[key] = row
+
+        for _pid, _entries in D["cprop_by_pid"].items():
+            for _pf, _cv in _entries:
+                pname = _pf["property"]
+                if not pname:
+                    continue
+                subtype, cost = _pf["subtype"], _pf["cost"]
+                # Same quirk the item index handles: the spell name lands in the
+                # cost field, which makes the subtype dropdown useless without it.
+                if pname == "Immunity: Specific Spell" and not subtype and cost:
+                    subtype, cost = cost, ""
+                _add(pname, subtype, cost, _prop_value_num(_pf["cost"]) if _pf["cost"] else _cv,
+                     "gear", "pn-" + _prop_slug(pname, ""))
+
+        for _lbl in D["race_immunities"]:
+            _add("Immunity: Miscellaneous", _lbl, "", 0, "race")
+
+        locs = db.canonical_locations.get(can_rr, [])
+        _hp = D["hp"]
+        _cr = _creature_cr_value(db, can_rr)
+
+        index.append({
+            "rr": can_rr,
+            "name": nwn_text(db.canonical_creature_name(can_rr)),
+            "url": f"{can_rr}.html",
+            "race": race_name(_f("Race")),
+            "classes": cls_list,
+            "cr": None if _cr < 0 else _cr,
+            "hp": _hp,
+            "ac": D["ac"],
+            "bab": D["bab"],
+            "fort": D["fort"], "ref": D["ref"], "will": D["will"],
+            "sr": D["sr"],
+            "faction": db.faction_name(_f("FactionID", "")),
+            "count": sum(l["count"] for l in locs),
+            "areas": sorted({db.area_name(l["area"]) for l in locs if l.get("area")}),
+            "boss": can_rr in boss_rrs,
+            "props": sorted(props.values(), key=lambda r: (r["p"], r["s"], r["c"])),
+        })
+
+    _current_context = ""
+    write(out / "creatures" / "search-index.json",
+          json.dumps(index, ensure_ascii=False, separators=(",", ":")))
+
+    def _cond_row(n: int) -> str:
+        return (
+            f'<div class="prop-row">'
+            f'<select id="cm{n}" class="mode-sel">'
+            f'<option value="has">has</option><option value="lacks">lacks</option>'
+            f'</select>'
+            f'<select id="cp{n}" class="prop-sel"><option value="">— any —</option></select>'
+            f'<select id="cs{n}" class="subtype-sel" disabled>'
+            f'<option value="">— any —</option></select>'
+            f'<input id="cv{n}" type="number" min="0" placeholder="min value">'
+            f'</div>'
+        )
+
+    cond_rows = "".join(_cond_row(n) for n in range(1, 5))
+    boss_box = (
+        '<label class="checkbox-label"><input type="checkbox" id="fboss"> Bosses only</label>'
+        if _BOSS_REGISTRY else ""
+    )
+
+    body = (
+        "<h1>Search Creatures</h1>"
+        "<p>All conditions must be satisfied simultaneously. Leave fields blank to skip. "
+        "Set a row to <em>lacks</em> to find creatures <em>without</em> an ability — "
+        "the result header reports how many of the total matched, so a "
+        "<em>has</em>/<em>lacks</em> pair always sums to the full roster.</p>"
+        '<form id="cf" class="item-search-form creature-search-form">'
+        '<div class="search-row">'
+        '<label for="fq">Name</label>'
+        '<input id="fq" type="search" placeholder="substring">'
+        '<label for="frace">Race</label>'
+        '<select id="frace"><option value="">— all —</option></select>'
+        '<label for="fclass">Class</label>'
+        '<select id="fclass"><option value="">— any —</option></select>'
+        '<input id="fclvl" type="number" min="0" placeholder="min level">'
+        '</div>'
+        '<div class="search-row">'
+        '<label for="farea">Area</label>'
+        '<select id="farea"><option value="">— all —</option></select>'
+        '<label for="ffac">Faction</label>'
+        '<select id="ffac"><option value="">— all —</option></select>'
+        '<label class="checkbox-label" title="Only creatures actually placed in the module '
+        '(spawned by an encounter, placed in an area, or created by a script)">'
+        '<input type="checkbox" id="fim"> Placed in module only</label>'
+        f'{boss_box}'
+        '</div>'
+        '<div class="search-row stat-row">'
+        '<label for="fcrmin">CR</label>'
+        '<input id="fcrmin" type="number" step="0.5" placeholder="min">'
+        '<input id="fcrmax" type="number" step="0.5" placeholder="max">'
+        '<label for="fhpmin">HP</label>'
+        '<input id="fhpmin" type="number" placeholder="min">'
+        '<input id="fhpmax" type="number" placeholder="max">'
+        '<label for="facmin">AC</label>'
+        '<input id="facmin" type="number" placeholder="min">'
+        '<label for="fbabmin">BAB</label>'
+        '<input id="fbabmin" type="number" placeholder="min">'
+        '<label for="fsrmin">SR</label>'
+        '<input id="fsrmin" type="number" placeholder="min">'
+        '<label for="fsavemin" title="Every saving throw must be at least this high">Saves</label>'
+        '<input id="fsavemin" type="number" placeholder="min">'
+        '</div>'
+        f'<div class="prop-rows">{cond_rows}</div>'
+        '<div class="search-row">'
+        '<label for="fo">Sort by</label>'
+        '<select id="fo">'
+        '<option value="cr">Challenge Rating</option>'
+        '<option value="name">Name</option>'
+        '<option value="hp">HP</option>'
+        '<option value="ac">AC</option>'
+        '<option value="bab">BAB</option>'
+        '<option value="sr">Spell Resistance</option>'
+        '<option value="count">Count in module</option>'
+        '<option value="value">Matched Property Value</option>'
+        '</select>'
+        '<select id="fd">'
+        '<option value="desc">Descending</option>'
+        '<option value="asc">Ascending</option>'
+        '</select>'
+        '<button type="submit">Search</button>'
+        '</div>'
+        '</form>'
+        '<div id="cr_out"><p class="muted">Loading creature index…</p></div>'
+        '<p class="muted">Abilities come from a creature\'s equipped items plus the '
+        'immunities its racial type grants (marked <em>racial</em>) — see any creature\'s '
+        '<em>Abilities &amp; combat properties</em> table for the full picture.</p>'
+        f"<script>{_CREATURE_SEARCH_JS}</script>"
+    )
+    write(out / "creatures" / "search.html",
+          page("Search Creatures", body, root_rel=".."))
+
+
+def _fmt_cost(raw) -> str:
+    """Format an item Cost value with comma separators; returns '' for missing/zero."""
+    try:
+        v = int(raw)
+        return f"{v:,}" if v else ""
+    except (TypeError, ValueError):
+        return E(str(raw)) if raw not in (None, "") else ""
+
+
+def _items_col_flags(items: list[tuple[str, dict]]) -> tuple[bool, bool]:
+    show_base  = len({baseitem_label(fld(i, "BaseItem"))     for _, i in items}) > 1
+    show_stack = len({str(fld(i, "StackSize", "") or "")     for _, i in items}) > 1
+    return show_base, show_stack
+
+
+def _items_table_head(show_base: bool, show_stack: bool, show_ac: bool = False,
+                      show_reason: bool = False, show_spell_info: bool = False) -> str:
+    cols = ["<th>Name</th>", "<th>ResRef</th>"]
+    if show_base:
+        cols.append("<th>Base item</th>")
+    if show_ac:
+        cols.append("<th>Base AC</th>")
+    if show_spell_info:
+        cols.append("<th>Level</th>")
+        cols.append("<th>Classes</th>")
+    cols.append("<th>GP Value</th>")
+    if show_stack:
+        cols.append("<th>Stack</th>")
+    if show_reason:
+        cols.append("<th>Reason</th>")
+    return '<table class="data"><thead><tr>' + "".join(cols) + "</tr></thead><tbody>"
+
+
+def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
+               prefix: str = "", show_ac: bool = False, reason: str | None = None,
+               show_spell_info: bool = False) -> str:
+    cells = [
+        f"<td>{link(f'{prefix}{rr}.html', db.item_name(rr))}</td>",
+        f"<td>{E(rr)}</td>",
+    ]
+    if show_base:
+        cells.append(f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>")
+    if show_ac:
+        _mac = _torso_base_ac(i)
+        cells.append(f"<td>{_mac if _mac is not None else ''}</td>")
+    if show_spell_info:
+        _lvl, _cls = _spell_level_classes(_scroll_cast_spell_info(i, nwn_text(db.item_name(rr))))
+        cells.append(f"<td>{E(_lvl)}</td>")
+        cells.append(f"<td>{E(_cls)}</td>")
+    cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
+    if show_stack:
+        cells.append(f"<td>{E(fld(i, 'StackSize', ''))}</td>")
+    if reason is not None:
+        cells.append(f"<td>{reason}</td>")
+    return "<tr>" + "".join(cells) + "</tr>"
+
+
+def _inaccessible_reason_html(rr: str, db: "Db") -> str:
+    if db.item_carried_by.get(rr):
+        return '<span class="reason-undroppable">Carried but not droppable</span>'
+    return '<span class="reason-missing">Not found anywhere</span>'
+
+
+def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out: Path) -> None:
+    """Render items/inaccessible/index.html — mirrors the main items index layout."""
+    if not inaccessible:
+        return
+
+    def _item_cost_key(entry: tuple[str, dict]) -> int:
+        return item_gp_value(entry[1])
+
+    buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for rr, i in inaccessible:
+        buckets[_item_category(i, nwn_text(db.item_name(rr)))].append((rr, i))
+
+    for key in buckets:
+        buckets[key].sort(key=_item_cost_key, reverse=True)
+
+    all_weapon_keys = sorted(
+        (k for k in buckets if k.startswith("weapon_")),
+        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
+    )
+    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
+    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
+
+    def _expand(cats: list[str]) -> list[str]:
+        result: list[str] = []
+        for c in cats:
+            if c == "WEAPONS":
+                result.extend(player_weapon_keys)
+            elif c == "CREATURE_WEAPONS":
+                result.extend(creature_weapon_keys)
+            else:
+                result.append(c)
+        return result
+
+    ordered_cats: list[str] = []
+    for _, group_cats in _TOC_GROUPS:
+        ordered_cats.extend(_expand(group_cats))
+    ordered_cats.extend(creature_weapon_keys + ["creature_item"])
+
+    toc_parts: list[str] = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="../index.html">← Accessible Items</a></div>',
+        '<div><a href="../properties/index.html">Browse by Property</a></div>',
+        '<div><a href="../search.html">Search Items</a></div>',
+    ]
+    for group_heading, group_cats_tmpl in _TOC_GROUPS:
+        entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
+        if not entries:
+            continue
+        toc_parts.append(f'<div class="toc-group-heading">{E(group_heading)}</div>')
+        for cat_key, cat_items in entries:
+            slug = cat_key.replace("_", "-")
+            toc_parts.append(
+                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+                f' <span class="muted">({len(cat_items)})</span></a></div>'
+            )
+
+    special_cat_keys = creature_weapon_keys + (["creature_item"] if buckets.get("creature_item") else [])
+    special_entries  = [(ck, buckets[ck]) for ck in special_cat_keys if buckets.get(ck)]
+    if special_entries:
+        toc_parts.append('<div class="toc-group-heading">Special</div>')
+        for cat_key, cat_items in special_entries:
+            slug = cat_key.replace("_", "-")
+            toc_parts.append(
+                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+                f' <span class="muted">({len(cat_items)})</span></a></div>'
+            )
+
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    body = "<h1>Inaccessible Items</h1>"
+    body += (
+        f"<p>{len(inaccessible)} items. "
+        '<small class="muted">These items exist as blueprints in the module but are '
+        "not found in any store, container, or droppable creature inventory — "
+        "there is no normal in-game path for players to obtain them.</small></p>"
+    )
+
+    for cat_key in ordered_cats:
+        items = buckets.get(cat_key, [])
+        if not items:
+            continue
+        slug = cat_key.replace("_", "-")
+        cat_label = _item_category_label(cat_key)
+        show_base, show_stack = _items_col_flags(items)
+        show_ac = cat_key.startswith("armor_")
+        show_spell_info = cat_key == "scroll" and any(
+            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
+        )
+        rows_html = "\n".join(
+            _items_row(rr, i, db, show_base, show_stack, prefix="../", show_ac=show_ac,
+                       reason=_inaccessible_reason_html(rr, db),
+                       show_spell_info=show_spell_info)
+            for rr, i in items
+        )
+        body += (
+            f'<h2 id="{E(slug)}">{E(cat_label)}'
+            f' <small class="muted">({len(items)})</small></h2>'
+            + _items_table_head(show_base, show_stack, show_ac, show_reason=True,
+                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
+        )
+
+    layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
+    write(out / "items" / "inaccessible" / "index.html",
+          page("Inaccessible Items", layout, root_rel="../.."))
+
+
+def render_items_index(db: Db, out: Path) -> None:
+
+    # Classify every item; broken = TLK-only or completely unnamed.
+    buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    broken: list[tuple[str, dict]] = []
+    inaccessible: list[tuple[str, dict]] = []
+
+    for rr in sorted(db.items.keys(), key=lambda r: nwn_text(db.item_name(r)).lower()):
+        i = db.items[rr]
+        name = db.item_name(rr)
+        if name.startswith("[TLK#") or name == rr:
+            broken.append((rr, i))
+        else:
+            accessible = (
+                rr in db.item_sold_at
+                or rr in db.item_in_container
+                or any(e.get("dropable") or e.get("pickpocketable")
+                       for e in db.item_carried_by.get(rr, []))
+                or rr in db.item_from_script
+            )
+            if accessible:
+                buckets[_item_category(i, nwn_text(name))].append((rr, i))
+            else:
+                inaccessible.append((rr, i))
+
+    total = sum(len(v) for v in buckets.values()) + len(broken)
+
+    def _item_cost_key(entry: tuple[str, dict]) -> int:
+        return item_gp_value(entry[1])
+
+    # Split weapon keys into player weapons and creature-only weapons.
+    all_weapon_keys = sorted(
+        (k for k in buckets if k.startswith("weapon_")),
+        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
+    )
+    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
+    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
+
+    def _expand(cats: list[str]) -> list[str]:
+        result: list[str] = []
+        for c in cats:
+            if c == "WEAPONS":
+                result.extend(player_weapon_keys)
+            elif c == "CREATURE_WEAPONS":
+                result.extend(creature_weapon_keys)
+            else:
+                result.append(c)
+        return result
+
+    ordered_cats: list[str] = []
+    for _, group_cats in _TOC_GROUPS:
+        ordered_cats.extend(_expand(group_cats))
+    ordered_cats.extend(creature_weapon_keys + ["creature_item"])
+
+    # Sort each bucket: scrolls by (innate_level, spell_name), others by decreasing GP cost.
+    for key in buckets:
+        if key == "scroll":
+            buckets[key].sort(key=lambda e: _scroll_spell_sort_key(e, db))
+        else:
+            buckets[key].sort(key=_item_cost_key, reverse=True)
+
+    # Table of contents — grouped under headings.
+    toc_parts: list[str] = [
+        '<div class="toc-group-heading">Views</div>',
+        '<div><a href="properties/index.html">Browse by Property</a></div>',
+        '<div><a href="search.html">Search Items</a></div>',
+    ]
+    for group_heading, group_cats_tmpl in _TOC_GROUPS:
+        entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
+        if not entries:
+            continue
+        toc_parts.append(f'<div class="toc-group-heading">{E(group_heading)}</div>')
+        for cat_key, cat_items in entries:
+            slug = cat_key.replace("_", "-")
+            toc_parts.append(
+                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+                f' <span class="muted">({len(cat_items)})</span></a></div>'
+            )
+
+    special_cat_keys = creature_weapon_keys + (["creature_item"] if buckets.get("creature_item") else [])
+    special_entries  = [(ck, buckets[ck]) for ck in special_cat_keys if buckets.get(ck)]
+    if special_entries or inaccessible or broken:
+        toc_parts.append('<div class="toc-group-heading">Special</div>')
+        for cat_key, cat_items in special_entries:
+            slug = cat_key.replace("_", "-")
+            toc_parts.append(
+                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+                f' <span class="muted">({len(cat_items)})</span></a></div>'
+            )
+        if inaccessible:
+            toc_parts.append(
+                f'<div><a href="inaccessible/index.html">Inaccessible'
+                f' <span class="muted">({len(inaccessible)})</span></a></div>'
+            )
+        if broken:
+            toc_parts.append(
+                f'<div><a href="#broken">Potentially Broken'
+                f' <span class="muted">({len(broken)})</span></a></div>'
+            )
+
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    body = "<h1>Accessible Items</h1>"
+    body += (
+        f"<p>{total} items obtainable through normal gameplay — sold in stores, "
+        "found in containers, dropped by creatures, or granted by scripts. "
+        '<small class="muted">Base item names use stock NWN baseitems.2da; '
+        "CEP/HAK overrides are common — the row number shown is authoritative. "
+        "Armor subtypes (Cloth/Light/Medium/Heavy) are based on total AC bonus "
+        "from item properties.</small></p>"
+    )
+
+    for cat_key in ordered_cats:
+        items = buckets.get(cat_key, [])
+        if not items:
+            continue
+        slug = cat_key.replace("_", "-")
+        cat_label = _item_category_label(cat_key)
+        show_base, show_stack = _items_col_flags(items)
+        show_ac = cat_key.startswith("armor_")
+        show_spell_info = cat_key == "scroll" and any(
+            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
+        )
+        rows_html = "\n".join(
+            _items_row(rr, i, db, show_base, show_stack, show_ac=show_ac,
+                       show_spell_info=show_spell_info)
+            for rr, i in items
+        )
+        body += (
+            f'<h2 id="{E(slug)}">{E(cat_label)}'
+            f' <small class="muted">({len(items)})</small></h2>'
+            + _items_table_head(show_base, show_stack, show_ac,
+                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
+        )
+
+    if broken:
+        # Broken items: use the resref as the display name since TLK
+        # placeholders like "[TLK#1550]" are meaningless to readers.
+        broken_sorted = sorted(broken, key=lambda x: x[0].lower())
+        def _broken_row(rr: str, i: dict, show_base: bool, show_stack: bool) -> str:
+            cells = [
+                f"<td>{link(f'{rr}.html', rr)}</td>",
+                f"<td>{E(rr)}</td>",
+            ]
+            if show_base:
+                cells.append(f"<td>{baseitem_label(fld(i, 'BaseItem'))}</td>")
+            cells.append(f"<td>{_fmt_cost(fld(i, 'Cost', ''))}</td>")
+            if show_stack:
+                cells.append(f"<td>{E(fld(i, 'StackSize', ''))}</td>")
+            return "<tr>" + "".join(cells) + "</tr>"
+        show_base, show_stack = _items_col_flags(broken_sorted)
+        rows_html = "\n".join(_broken_row(rr, i, show_base, show_stack) for rr, i in broken_sorted)
+        if BASE_TLK:
+            broken_desc = (
+                "These items have unresolvable names even with the base game TLK loaded "
+                "— their LocalizedName matches their ResRef, their blueprint was not "
+                "found in the NWN install’s BIF archives, or they reference a TLK entry "
+                "that could not be resolved. They may be test items, placeholders, or "
+                "incomplete module entries. The ResRef is shown as the name."
+            )
+        else:
+            broken_desc = (
+                "These items were found only in store inventories and their names "
+                "come from the base game’s TLK file, which is not loaded. "
+                "They are typically stock NWN items (nw_*, x0_*, x2_*) added "
+                "directly to store inventories rather than custom module items. "
+                "Re-run with --dialog-tlk to resolve their names. "
+                "The ResRef is shown as the name since the TLK string is unavailable."
+            )
+        body += (
+            '<h2 id="broken">Potentially Broken'
+            f' <small class="muted">({len(broken)})</small></h2>'
+            f'<p class="muted">{broken_desc}</p>'
+            + _items_table_head(show_base, show_stack) + rows_html + "</tbody></table>"
+        )
+
+    layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
+    write(out / "items" / "index.html", page("Accessible Items", layout, root_rel=".."))
+
+    # Render the inaccessible items on their own page.
+    render_inaccessible_index(db, inaccessible, out)
+
+
+def render_item_page(db: Db, resref: str, out: Path) -> None:
+    i = db.items.get(resref)
+    if not i:
+        return
+    name = db.item_name(resref)
+    # TLK-placeholder names mean the item's name is not available without the
+    # base game TLK file; show the resref as the page title instead.
+    is_tlk_broken    = name.startswith("[TLK#")
+    is_resref_named  = (not is_tlk_broken) and (name == resref)
+    is_broken        = is_tlk_broken or is_resref_named
+    display_name     = resref if is_broken else name
+    accessible = (
+        resref in db.item_sold_at
+        or resref in db.item_in_container
+        or any(e.get("dropable") or e.get("pickpocketable")
+               for e in db.item_carried_by.get(resref, []))
+        or resref in db.item_from_script
+    )
+    is_inaccessible = not is_broken and not accessible
+    props = list_items(i.get("PropertiesList"))
+    is_cursed = bool(int(fld(i, "Cursed", 0) or 0))
+    is_plot   = bool(int(fld(i, "Plot",   0) or 0))
+    _bi_raw = fld(i, "BaseItem", None)
+    _bi = -1 if _bi_raw is None else int(_bi_raw)
+    is_creature_item = _bi in _CREATURE_WEAPON_BASEITEMS or _bi in _CREATURE_ITEM_BASEITEMS
+    _carriers = db.item_carried_by.get(resref, [])
+    _any_droppable = any(e.get("dropable") for e in _carriers)
+    _any_pickpocketable = any(e.get("pickpocketable") for e in _carriers)
+    if is_cursed:
+        _drop_label = "No"
+        _drop_reason = " — cursed"
+        _drop_tt = "title=\"Cursed items are stuck in a creature&#39;s inventory and will not appear as loot.\""
+    elif not _carriers:
+        _drop_label = "—"
+        _drop_reason = ""
+        _drop_tt = "title=\"This item is not carried by any creature in the module.\""
+    elif _any_droppable:
+        _drop_label = "Yes"
+        _drop_reason = ""
+        _drop_tt = "title=\"At least one creature carrying this item has it flagged as droppable (Dropable=1).\""
+    else:
+        _drop_label = "No"
+        _drop_reason = " — not flagged droppable"
+        _drop_tt = "title=\"No creature carrying this item has it flagged as droppable. It will not appear in any loot bag.\""
+    _cat_slug = _item_category(i, nwn_text(display_name)).replace("_", "-")
+    if is_broken:
+        _type_href = f"index.html#broken"
+    elif is_inaccessible:
+        _type_href = f"inaccessible/index.html#{_cat_slug}"
+    else:
+        _type_href = f"index.html#{_cat_slug}"
+    _is_scroll = _bi in _SCROLL_BASEITEMS
+    _scroll_spell_lvl, _scroll_spell_cls = (
+        _spell_level_classes(_scroll_cast_spell_info(i, nwn_text(display_name))) if _is_scroll else ("", "")
+    )
+    sections = [
+        f"<h1>{nwn_html(display_name)}</h1>",
+        '<dl class="meta">',
+        f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
+        f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
+        f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
+        *(
+            [
+                f"<dt>Spell Level</dt><dd>{E(_scroll_spell_lvl)}</dd>",
+                f"<dt>Caster Classes</dt><dd>{E(_scroll_spell_cls)}</dd>",
+            ] if _is_scroll and (_scroll_spell_lvl or _scroll_spell_cls) else []
+        ),
+        f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i, nwn_text(display_name))))}</dd>",
+        *(
+            (lambda _ac: [
+                f"<dt>Base AC</dt><dd>{_ac}</dd>",
+                f"<dt>Material</dt><dd>{'Cloth' if _ac <= 0 else 'Leather' if _ac <= 3 else 'Metal'}</dd>",
+            ])(_torso_base_ac(i))
+            if _bi in _ARMOR_BASEITEMS
+            else [f"<dt>Base AC</dt><dd>{int((WEAPONS.get(_bi) or {}).get('BaseAC', 0) or 0)}</dd>"]
+            if _bi in SHIELD_BASEITEMS
+            else []
+        ),
+        f"<dt>GP Value</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
+        f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
+        *([
+            '<dt title="Plot items cannot be sold to merchants, but can be '
+            'dropped and looted normally.">Plot item</dt><dd>Yes '
+            '<small class="muted">— cannot be sold to merchants; drops/loots '
+            'normally</small></dd>'
+        ] if is_plot else []),
+        f"<dt {_drop_tt}>Drops on death</dt><dd>{_drop_label}"
+        f"{'<small class=\"muted\">' + _drop_reason + '</small>' if _drop_reason else ''}</dd>",
+        '</dl>',
+    ]
+    # Variant notices
+    _base_rr = db.item_is_variant_of.get(resref)
+    if _base_rr:
+        _base_name = nwn_text(db.item_name(_base_rr))
+        sections.append(
+            f'<p class="muted"><em><strong>Property variant</strong> — '
+            f'this is an in-world customised version of '
+            f'{link(f"{_base_rr}.html", _base_name)} ({E(_base_rr)}) '
+            f'with different item properties.</em></p>'
+        )
+    _variants = db.item_variants_of.get(resref, [])
+    if _variants:
+        _vlinks = ", ".join(
+            link(f"{vrr}.html", nwn_text(db.item_name(vrr)) + f" ({E(vrr)})")
+            for vrr in _variants
+        )
+        sections.append(
+            f'<p class="muted"><em><strong>{len(_variants)} property variant(s)</strong> '
+            f'of this item exist in-world with different item properties: {_vlinks}</em></p>'
+        )
+    if is_cursed:
+        sections.append(
+            '<p class="warn-cursed"><strong>Warning: this item is Cursed.</strong> '
+            "If a player acquires this item, it cannot be unequipped, dropped, or sold.</p>"
+        )
+    if is_broken:
+        if is_tlk_broken:
+            if BASE_TLK:
+                _broken_msg = (
+                    "This item references a base game TLK entry that could not be "
+                    "resolved. It may have an out-of-range StrRef or be an incomplete "
+                    "module entry."
+                )
+            else:
+                _broken_msg = (
+                    "Item name not available: this item's name is stored in the base "
+                    "game TLK file which is not loaded. It is typically a stock NWN "
+                    "item (nw_*, x0_*, x2_*) embedded directly in a store inventory."
+                )
+        else:
+            _broken_msg = (
+                "This item's display name matches its ResRef — it may be a test item "
+                "or placeholder."
+            )
+        sections.append(f'<p class="muted"><em>{_broken_msg}</em></p>')
+    if is_creature_item:
+        sections.append(
+            '<p class="warn-creature"><strong>Note: this is a Creature-only item.</strong> '
+            "Items with creature base types cannot be equipped or used by player characters — "
+            "they are intended for use by NPCs and monsters only.</p>"
+        )
+    if _carriers and not _any_droppable and not is_cursed:
+        if _any_pickpocketable:
+            sections.append(
+                '<p class="warn-no-drop"><strong>Note: this item does not drop on death.</strong> '
+                "It is carried by creatures, but none have it flagged as droppable "
+                "(Dropable=1). It will not appear in any loot bag.</p>"
+                '<p class="note-pickpocket"><strong>This item can be pickpocketed.</strong> '
+                "At least one creature carrying it has Pickpocketable set — "
+                "see the Carried by table below.</p>"
+            )
+        else:
+            sections.append(
+                '<p class="warn-no-drop"><strong>Note: this item does not drop on death.</strong> '
+                "It is carried by creatures, but none of them have it flagged as droppable "
+                "(Dropable=1 on the item instance). It will not appear in any loot bag.</p>"
+            )
+
+    # Prefer the identified description (what players see in-game for identified
+    # items, which is nearly all module content); fall back to the unidentified
+    # Description only when there is no DescIdentified.
+    desc = loc(i.get("DescIdentified")) or loc(i.get("Description"))
+    if desc:
+        sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
+
+    # Conversations this item triggers via tag-based scripting (a script
+    # whose resref equals this item's resref or tag, calling
+    # ActionStartConversation with a literal dlg resref).
+    item_tag = (fld(i, "Tag", "") or "").lower()
+    item_dlgs: list[tuple[str, str]] = []  # (script_resref, dlg_resref)
+    for cand in {resref.lower(), item_tag}:
+        if cand and cand in db.script_dialogs:
+            for d in sorted(db.script_dialogs[cand]):
+                item_dlgs.append((cand, d))
+    if item_dlgs:
+        sections.append("<h2>Triggers conversation</h2><ul>")
+        for s, d in item_dlgs:
+            tps = db.dialog_teleports.get(d, [])
+            tp_note = ""
+            if tps:
+                dests = sorted({t["area"] for t in tps if t.get("area")})
+                if dests:
+                    tp_note = " — teleports to " + ", ".join(
+                        link(f"../areas/{a}.html", db.area_name(a))
+                        for a in dests if a in db.areas)
+            sections.append(
+                f"<li>{link(f'../conversations/{d}.html', db.dialog_label(d))} "
+                f"<code>{E(d)}</code> via script <code>{E(s)}</code>{tp_note}</li>"
+            )
+        sections.append("</ul>")
+
+    if props:
+        sections.append("<h2>Properties</h2>")
+        rows = []
+        debug_rows = []
+        for p in props:
+            f = itemprop_format(p)
+            pname, subtype = f["property"], f["subtype"]
+            # Build links into the Browse by Property index/detail pages.
+            # Property cell → index section heading; subtype cell → detail page.
+            # Fall back to plain text when pname is unresolved (e.g. "Property #7").
+            _pname_known = pname and not pname.startswith("Property #")
+            _subtype_real = subtype and not _is_raw_subtype(subtype)
+            cost_str = f["cost"]
+            if _pname_known:
+                _idx_anch = f"properties/index.html#pn-{_prop_slug(pname, '')}"
+                _detail_slug = _prop_slug(pname, subtype if _subtype_real else "")
+                _combined_page = _COMBINED_PROP_PAGES.get(pname)
+                if _combined_page:
+                    _spell_frag = f"#{_detail_slug}" if _subtype_real else ""
+                    _detail_href = f"properties/{_combined_page}.html{_spell_frag}"
+                    # Cost links to the same spell section (no tier-based anchor).
+                    cost_cell = link(_detail_href, cost_str) if cost_str else ""
+                else:
+                    _detail_href = f"properties/{_detail_slug}.html"
+                    if cost_str:
+                        _cost_anch = _cost_anchor(cost_str)
+                        _cost_href = f"{_detail_href}#{_cost_anch}" if _cost_anch else _detail_href
+                        cost_cell = link(_cost_href, cost_str)
+                    else:
+                        cost_cell = ""
+                if _subtype_real:
+                    pname_cell = colorize_damage_words(link(_idx_anch, pname))
+                    subtype_cell = colorize_damage_words(link(_detail_href, subtype))
+                else:
+                    pname_cell = colorize_damage_words(link(_detail_href, pname))
+                    subtype_cell = colorize_damage_words(E(subtype))
+            else:
+                pname_cell = colorize_damage_words(E(pname))
+                subtype_cell = colorize_damage_words(E(subtype))
+                cost_cell = E(cost_str)
+            _param_raw = f["param"]
+            if f["property"] == "Light" and _param_raw:
+                _pcls = f"nwn-light-color nwn-light-{_param_raw.lower()}"
+                param_cell = f'<span class="{_pcls}">{E(_param_raw)}</span>'
+            else:
+                param_cell = E(_param_raw)
+            rows.append(
+                f"<tr><td>{pname_cell}</td>"
+                f"<td>{subtype_cell}</td>"
+                f"<td>{cost_cell}</td>"
+                f"<td>{param_cell}</td>"
+                f"<td>{E(f['chance'])}</td></tr>"
+            )
+            debug_rows.append(
+                f"<tr><td>{E(fld(p, 'PropertyName', ''))}</td>"
+                f"<td>{E(fld(p, 'Subtype', ''))}</td>"
+                f"<td>{E(fld(p, 'CostTable', ''))}</td>"
+                f"<td>{E(fld(p, 'CostValue', ''))}</td>"
+                f"<td>{E(fld(p, 'Param1', ''))}/{E(fld(p, 'Param1Value', ''))}</td>"
+                f"<td>{E(fld(p, 'ChanceAppear', ''))}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Property</th><th>Subtype</th><th>Value</th>"
+            "<th>Param</th><th>Chance %</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+        # Raw values, collapsed by default — handy when the human label is
+        # missing or wrong because of a custom 2DA.
+        sections.append(
+            "<details><summary>Raw values</summary>"
+            '<table class="data"><thead><tr>'
+            "<th>PropertyName</th><th>Subtype</th><th>CostTable</th><th>CostValue</th>"
+            "<th>Param1/Val</th><th>Chance</th>"
+            "</tr></thead><tbody>" + "\n".join(debug_rows) + "</tbody></table>"
+            "</details>"
+        )
+
+    # Where to find this item
+    sold_at = db.item_sold_at.get(resref, [])
+    in_containers = db.item_in_container.get(resref, [])
+    carried_by = db.item_carried_by.get(resref, [])
+    from_script = db.item_from_script.get(resref, [])
+
+    if sold_at or in_containers or carried_by or from_script:
+        sections.append("<h2>Where to find</h2>")
+        if sold_at:
+            rows = []
+            for s in sold_at:
+                area_rr = s["area_rr"]
+                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                             if area_rr in db.areas else E(area_rr))
+                store_cell = link(f"../stores/{s['slug']}.html", s["name"])
+                rows.append(f"<tr><td>{store_cell}</td><td>{area_cell}</td></tr>")
+            sections.append(
+                "<h3>Sold at</h3>"
+                '<table class="data"><thead><tr><th>Store</th><th>Area</th></tr></thead>'
+                "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+        if in_containers:
+            rows = []
+            for c in in_containers:
+                area_rr = c["area_rr"]
+                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                             if area_rr in db.areas else E(area_rr))
+                href = f"../containers/{area_rr}-{c['idx']:03d}.html"
+                lock_note = ""
+                if c["locked"]:
+                    lock_note = f' (locked, DC {c["dc"]})' if c["dc"] else " (locked)"
+                rows.append(
+                    f"<tr><td>{link(href, c['pname'])}{E(lock_note)}</td>"
+                    f"<td>{area_cell}</td></tr>"
+                )
+            sections.append(
+                "<h3>Found in containers</h3>"
+                '<table class="data"><thead><tr><th>Container</th><th>Area</th></tr></thead>'
+                "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+        if carried_by:
+            rows = []
+            for c in carried_by:
+                area_rr = c["area_rr"]
+                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                             if area_rr in db.areas else E(area_rr))
+                crr = c["crr"]
+                creature_cell = (link(f"../creatures/{crr}.html", c["cname"])
+                                 if crr in db.canonical_creatures else E(c["cname"]))
+                drops = c.get("dropable", False)
+                drop_cell = "Yes" if drops else '<span class="muted">No</span>'
+                pp = c.get("pickpocketable", False)
+                pp_cell = "Yes" if pp else '<span class="muted">No</span>'
+                rows.append(
+                    f"<tr><td>{creature_cell}</td><td>{area_cell}</td>"
+                    f"<td>{drop_cell}</td><td>{pp_cell}</td></tr>"
+                )
+            sections.append(
+                "<h3>Carried by</h3>"
+                '<table class="data"><thead><tr>'
+                '<th>Creature</th><th>Area</th>'
+                '<th title="Whether this item appears in the loot bag when the creature is killed (Dropable=1 on the item instance)">Drops on death</th>'
+                '<th title="Whether this item can be stolen via Pickpocket (Pickpocketable=1 on the item instance)">Pickpocketable</th>'
+                "</tr></thead>"
+                "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+        if from_script:
+            rows = []
+            for src in from_script:
+                kind = src["kind"]
+                script_rr = src["script"]
+                areas = src.get("areas") or []
+                area_cells = ", ".join(
+                    link(f"../areas/{a}.html", db.area_name(a))
+                    for a in areas if a in db.areas
+                ) or "—"
+                if kind == "module-event":
+                    source_cell = E(f"Module event ({src['label']})")
+                elif kind == "dialog-action":
+                    dlg = src.get("dlg") or ""
+                    dlg_label = db.dialog_label(dlg) if dlg else script_rr
+                    source_cell = (link(f"../conversations/{dlg}.html", dlg_label)
+                                   if dlg in db.dialogs else E(dlg_label))
+                elif kind == "creature-event":
+                    crr = src.get("crr") or ""
+                    can_crr = db.canonical_for_bp.get(crr, crr) if crr else ""
+                    cname = db.canonical_creature_name(can_crr) if can_crr else script_rr
+                    creature_html = (link(f"../creatures/{can_crr}.html", cname)
+                                     if can_crr in db.canonical_creatures else E(cname))
+                    source_cell = f"{creature_html} <small class=\"muted\">({E(src['label'])})</small>"
+                else:  # placeable-event
+                    prr = src.get("prr") or ""
+                    pname = src.get("label") or prr or script_rr
+                    source_cell = E(pname)
+                rows.append(
+                    f"<tr><td>{source_cell}</td>"
+                    f"<td><code>{E(script_rr)}</code></td>"
+                    f"<td>{area_cells}</td></tr>"
+                )
+            sections.append(
+                "<h3>Quest / script rewards</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Source</th><th>Script</th><th>Area(s)</th>"
+                "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+    elif not is_broken:
+        sections.append(
+            "<h2>Where to find</h2>"
+            '<p class="muted">Not found in any store, container, creature inventory, '
+            "or script reward — this item may be inaccessible to players.</p>"
+        )
+
+    key_for = db.item_is_key_for.get(resref, [])
+    if key_for:
+        has_dst = any(kf.get("dst_area") for kf in key_for)
+        rows = []
+        for kf in key_for:
+            area_rr = kf["area_rr"]
+            area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                         if area_rr in db.areas else E(area_rr))
+            if kf["kind"] == "container":
+                obj_cell = link(
+                    f"../containers/{area_rr}-{kf['idx']:03d}.html", kf["name"]
+                )
+            else:
+                obj_cell = E(kf["name"])
+            required = kf.get("required", True)
+            type_label = kf["kind"].capitalize() + ("" if required else " (optional)")
+            row = (f"<tr><td>{obj_cell}</td>"
+                   f"<td>{E(type_label)}</td>"
+                   f"<td>{area_cell}</td>")
+            if has_dst:
+                dst_rr = kf.get("dst_area")
+                if dst_rr:
+                    dst_cell = (link(f"../areas/{dst_rr}.html", db.area_name(dst_rr))
+                                if dst_rr in db.areas else E(dst_rr))
+                else:
+                    dst_cell = ""
+                row += f"<td>{dst_cell}</td>"
+            row += "</tr>"
+            rows.append(row)
+        headers = "<th>Opens</th><th>Type</th><th>Area</th>"
+        if has_dst:
+            headers += "<th>Leads to</th>"
+        sections.append(
+            "<h2>Key for</h2>"
+            f'<table class="data"><thead><tr>{headers}'
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    script_checks = db.item_script_checks.get(resref, [])
+    if script_checks:
+        rows = []
+        for sc in script_checks:
+            script_rr = sc["script"]
+            script_cell = (link(f"../scripts/{script_rr}.html", script_rr)
+                           if script_rr in db.script_paths else
+                           f"<code>{E(script_rr)}</code>")
+            event_cell = E(sc.get("event", ""))
+            kind = sc.get("kind", "")
+            if kind == "area-event":
+                ctx_cell = "Area event"
+            elif kind in ("dialog-action", "dialog-condition"):
+                dlg = sc.get("dialog", "")
+                label = db.dialog_label(dlg) if dlg else dlg
+                suffix = "" if kind == "dialog-action" else " (condition)"
+                ctx_cell = (link(f"../conversations/{dlg}.html", label + suffix)
+                            if dlg in db.dialogs else E(f"Dialog: {dlg}"))
+            elif kind in ("trigger", "trigger-instance"):
+                tag = sc.get("tag") or sc.get("resref") or ""
+                ctx_cell = E(f"Trigger ({tag})" if tag else "Trigger")
+            elif kind in ("placeable", "placeable-instance"):
+                ctx_cell = E(sc.get("name") or sc.get("resref") or "Placeable")
+            elif kind in ("door", "door-instance"):
+                ctx_cell = E(sc.get("name") or sc.get("resref") or "Door")
+            else:
+                ctx_cell = E(kind)
+            areas = sc.get("areas") or []
+            area_cells = ", ".join(
+                link(f"../areas/{a}.html", db.area_name(a))
+                for a in areas if a in db.areas
+            ) or "—"
+            rows.append(
+                f"<tr><td>{script_cell}</td><td>{event_cell}</td>"
+                f"<td>{ctx_cell}</td><td>{area_cells}</td></tr>"
+            )
+        sections.append(
+            "<h2>Script checks</h2>"
+            '<p class="muted">This item\'s tag is checked via '
+            "<code>GetItemPossessedBy</code> in these scripts:</p>"
+            '<table class="data"><thead><tr>'
+            "<th>Script</th><th>Event</th><th>Context</th><th>Area(s)</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # ---- Related quests ----
+    # Collect quests from every dialog and script that checks this item's tag.
+    item_quest_map: dict[str, set[int]] = defaultdict(set)  # q_tag → entry_ids
+    for sc in db.item_script_checks.get(resref, []):
+        dlg = sc.get("dialog", "")
+        if dlg:
+            for q_tag, eids in db.dialog_quest_grants_rev.get(dlg, {}).items():
+                item_quest_map[q_tag].update(eids)
+        else:
+            script_rr = sc.get("script", "")
+            for q_tag, eid_map in db.quest_grants.items():
+                for eid, script_set in eid_map.items():
+                    if script_rr in script_set:
+                        item_quest_map[q_tag].add(eid)
+    if item_quest_map:
+        rows = []
+        for q_tag in sorted(item_quest_map,
+                            key=lambda t: db.quest_tag_to_info.get(t, (t, ""))[0].lower()):
+            q_name, q_slug = db.quest_tag_to_info.get(q_tag, (q_tag, ""))
+            eids = sorted(item_quest_map[q_tag])
+            step_str = ", ".join(str(e) for e in eids)
+            quest_link = (link(f"../quests/{q_slug}.html", q_name)
+                          if q_slug else E(q_name))
+            rows.append(f"<tr><td>{quest_link}</td><td><code>{E(q_tag)}</code></td>"
+                        f"<td>{E(step_str)}</td></tr>")
+        sections.append(
+            "<h2>Related quests</h2>"
+            '<p class="muted">This item is checked in scripts that grant entries '
+            "in these quests:</p>"
+            '<table class="data"><thead><tr>'
+            "<th>Quest</th><th>Tag</th><th>Step(s)</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    write(out / "items" / f"{resref}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+# ---------------------------------------------------------------------------
+# Browse by property pages
+# ---------------------------------------------------------------------------
+
+_PROP_GROUP_ORDER = [
+    "Resistances & Immunities",
+    "Saving Throws",
+    "Ability & Skill Bonuses",
+    "AC & Combat",
+    "Spell & Magic",
+    "Other",
+]
+
+
+def render_items_by_property(db: "Db", out: Path) -> None:
+    global _current_context
+    # Map from property name → list of subtype prefix groups.
+    # Subtypes matching a prefix (e.g. "Sneak Attack (+1d6)") are grouped under
+    # the prefix key on the index page and shown as sub-sections on the detail page.
+    _pname_subtype_groups: dict[str, list[str]] = {
+        pdef["name"]: pdef["subtype_prefix_groups"]
+        for pdef in IPROP_DEFS.values()
+        if pdef.get("subtype_prefix_groups")
+    }
+
+    def _group_subtype(pname: str, subtype: str) -> str:
+        for prefix in _pname_subtype_groups.get(pname, []):
+            if subtype == prefix or subtype.startswith(prefix + " ("):
+                return prefix
+        return subtype
+
+    # Accumulate per (pname, key_subtype, resref, cost_str) so that an item
+    # granting the same property N times shows up once with qty=N.
+    # Tuple layout: (resref, name, cost_str, value_num, qty)
+    _acc: dict[tuple[str, str, str, str], tuple[str, int, int]] = {}
+    # Separate accumulator for prefix-group variants (tracks actual subtype).
+    _prefix_acc: dict[tuple[str, str, str, str, str], tuple[str, int, int]] = {}
+    # Light property: track param1 color per (resref, cost_str/brightness).
+    _light_param: dict[tuple[str, str], str] = {}
+
+    for resref, i in db.items.items():
+        if not (resref in db.item_sold_at or resref in db.item_in_container
+                or any(e.get("dropable") for e in db.item_carried_by.get(resref, []))
+                or resref in db.item_from_script):
+            continue
+        name = db.item_name(resref)
+        if name.startswith("[TLK#") or name == resref:
+            continue
+        _current_context = f"item:{resref} ({name})"
+        for p in list_items(i.get("PropertiesList")):
+            f = itemprop_format(p)
+            pname, subtype, cost_str = f["property"], f["subtype"], f["cost"]
+            if not pname:
+                continue
+            if pname == "Immunity: Specific Spell" and not subtype and cost_str:
+                subtype, cost_str = cost_str, ""
+            # Merge entries whose subtype is an unresolved numeric fallback
+            # (e.g. "True Seeing: 1", "True Seeing: 2" → all under "True Seeing").
+            key_subtype = "" if _is_raw_subtype(subtype) else _group_subtype(pname, subtype)
+            acc_key = (pname, key_subtype, resref, cost_str)
+            if acc_key in _acc:
+                n, v, c = _acc[acc_key]
+                _acc[acc_key] = (n, v, c + 1)
+            else:
+                _acc[acc_key] = (name, _prop_value_num(cost_str), 1)
+            if pname == "Light" and f["param"]:
+                _light_param[(resref, cost_str)] = f["param"]
+            # When a subtype was grouped under a prefix key, also track the
+            # actual subtype so the detail page can break out sub-sections.
+            if key_subtype and key_subtype != subtype:
+                p_key = (pname, key_subtype, subtype, resref, cost_str)
+                if p_key in _prefix_acc:
+                    n2, v2, c2 = _prefix_acc[p_key]
+                    _prefix_acc[p_key] = (n2, v2, c2 + 1)
+                else:
+                    _prefix_acc[p_key] = (name, _prop_value_num(cost_str), 1)
+
+    prop_index: dict[tuple[str, str], list[tuple[str, str, str, int, int]]] = defaultdict(list)
+    for (pname, key_subtype, resref, cost_str), (name, value_num, qty) in _acc.items():
+        prop_index[(pname, key_subtype)].append((resref, name, cost_str, value_num, qty))
+
+    for key in prop_index:
+        prop_index[key].sort(key=lambda x: (-x[3], nwn_text(x[1]).lower()))
+
+    sorted_keys = sorted(prop_index.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
+
+    groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for pname, subtype in sorted_keys:
+        groups[_prop_group(pname)].append((pname, subtype))
+
+    # Properties that want subtype-only rows on the index (no cost-tier expansion).
+    _index_subtype_only = {
+        pdef["name"]
+        for pdef in IPROP_DEFS.values()
+        if pdef.get("index_by_subtype_only")
+    }
+
+    # Build ordered lists of unique property names per group and their subtypes.
+    # _pname_anchor: stable anchor for each property name (no subtype suffix).
+    def _pname_anchor(pname: str) -> str:
+        return "pn-" + _prop_slug(pname, "")
+
+    # unique_pnames[g] = ordered list of property names, preserving first appearance order
+    unique_pnames: dict[str, list[str]] = {}
+    for g in _PROP_GROUP_ORDER:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for pname, _ in groups.get(g, []):
+            if pname not in seen:
+                seen.add(pname)
+                ordered.append(pname)
+        unique_pnames[g] = ordered
+
+    # subtype_rows[pname] = ordered list of (subtype, slug, cost_tier_list)
+    # cost_tier_list = list of (cost_str, anchor, count) — one row per value tier.
+    subtype_rows: dict[str, list[tuple[str, str, list[tuple[str, str, int]]]]] = defaultdict(list)
+    for pname, subtype in sorted_keys:
+        slug = _prop_slug(pname, subtype)
+        entries = prop_index[(pname, subtype)]
+        tiers = [(c, a, len(items)) for c, a, items in _cost_tiers(entries)]
+        subtype_rows[pname].append((subtype, slug, tiers))
+
+    # Re-sort spell-property subtypes by (innate_level desc, name asc)
+    # instead of the default alphabetical order from sorted_keys.
+    for pname, tbl_name in _SPELL_PROP_TABLES.items():
+        if pname not in subtype_rows:
+            continue
+        def _make_spell_sort_key(tbl: str):
+            def key(row: tuple) -> tuple[int, str]:
+                subtype, slug, tiers = row
+                si = _iprp_name_spell_info(tbl, subtype) if subtype else None
+                lvl = si.get("innate_level") if si else None
+                return (-(lvl) if lvl is not None else 999, subtype.lower())
+            return key
+        subtype_rows[pname].sort(key=_make_spell_sort_key(tbl_name))
+
+    # --- property index page ---
+    # Sidebar: one link per property name (not per subtype).
+    sidebar_parts: list[str] = []
+    for g in _PROP_GROUP_ORDER:
+        if not unique_pnames.get(g):
+            continue
+        sidebar_parts.append(f'<div class="toc-group-heading">{E(g)}</div>')
+        for pname in unique_pnames[g]:
+            total = sum(cnt for _, _, tiers in subtype_rows[pname] for _, _, cnt in tiers)
+            sidebar_parts.append(
+                f'<div><a href="#{E(_pname_anchor(pname))}">{E(pname)}'
+                f' <span class="muted">({total})</span></a></div>'
+            )
+    sidebar = '<aside class="items-toc items-toc--wide">' + "".join(sidebar_parts) + "</aside>"
+
+    total_props = len(prop_index)
+    body = (
+        "<h1>Browse by Property</h1>"
+        f"<p>{total_props} property types across all accessible items.</p>"
+    )
+    for g in _PROP_GROUP_ORDER:
+        if not unique_pnames.get(g):
+            continue
+        anchor = re.sub(r"[^a-z0-9]+", "-", g.lower()).strip("-")
+        body += f'<h2 id="{E(anchor)}">{E(g)}</h2>'
+        for pname in unique_pnames[g]:
+            rows = subtype_rows[pname]
+            total = sum(cnt for _, _, tiers in rows for _, _, cnt in tiers)
+            body += (
+                f'<h3 id="{E(_pname_anchor(pname))}">{E(pname)}'
+                f' <small class="muted">({total})</small></h3>'
+            )
+            has_subtypes = any(st for st, _, _ in rows)
+            # Determine whether any subtype has multiple cost tiers worth showing.
+            any_cost_tiers = any(
+                len(tiers) > 1 or (len(tiers) == 1 and tiers[0][0])
+                for _, _, tiers in rows
+            )
+            # Some properties (e.g. On Hit Properties) want one index row per
+            # subtype only — cost-tier breakdown belongs on the detail page.
+            if has_subtypes and any_cost_tiers and pname not in _index_subtype_only:
+                body += (
+                    '<table class="data"><thead><tr>'
+                    "<th>Subtype</th><th>Value</th><th>Items</th></tr></thead><tbody>"
+                )
+                for subtype, slug, tiers in rows:
+                    label = subtype if subtype else pname
+                    for cost_str, cost_anch, cnt in tiers:
+                        href = f"{slug}.html#{cost_anch}" if cost_anch else f"{slug}.html"
+                        cost_cell = E(cost_str) if cost_str else '<span class="muted">—</span>'
+                        body += (
+                            f'<tr id="{E(slug + ("-" + cost_anch if cost_anch else ""))}">'
+                            f"<td>{link(href, label)}</td>"
+                            f"<td>{cost_cell}</td>"
+                            f"<td>{cnt}</td></tr>"
+                        )
+                body += "</tbody></table>"
+            elif has_subtypes:
+                _spell_tbl = _SPELL_PROP_TABLES.get(pname)
+                _show_spell_cols = _spell_tbl is not None and any(
+                    v for v in SPELL_INFO.get(_spell_tbl, {}).values() if v
+                )
+                _spell_head = "<th>Level</th><th>Classes</th>" if _show_spell_cols else ""
+                body += (
+                    '<table class="data"><thead><tr>'
+                    f"<th>Subtype</th>{_spell_head}<th>Items</th></tr></thead><tbody>"
+                )
+                for subtype, slug, tiers in rows:
+                    label = subtype if subtype else pname
+                    cnt = sum(c for _, _, c in tiers)
+                    _spell_cells = ""
+                    if _show_spell_cols:
+                        _si = _iprp_name_spell_info(_spell_tbl, subtype) if subtype else None
+                        _lvl, _cls = _spell_level_classes(_si)
+                        _spell_cells = f"<td>{E(_lvl)}</td><td>{E(_cls)}</td>"
+                    _comb = _COMBINED_PROP_PAGES.get(pname)
+                    href = f"{_comb}.html#{slug}" if _comb else f"{slug}.html"
+                    body += (
+                        f'<tr id="{E(slug)}"><td>{link(href, label)}</td>'
+                        f"{_spell_cells}<td>{cnt}</td></tr>"
+                    )
+                body += "</tbody></table>"
+            elif any_cost_tiers:
+                # No subtypes but has multiple cost tiers — expand rows.
+                _, slug, tiers = rows[0]
+                body += (
+                    '<table class="data"><thead><tr>'
+                    "<th>Value</th><th>Items</th></tr></thead><tbody>"
+                )
+                for cost_str, cost_anch, cnt in tiers:
+                    href = f"{slug}.html#{cost_anch}" if cost_anch else f"{slug}.html"
+                    label = E(cost_str) if cost_str else E(pname)
+                    body += (
+                        f'<tr id="{E(slug + ("-" + cost_anch if cost_anch else ""))}">'
+                        f"<td>{link(href, label)}</td>"
+                        f"<td>{cnt}</td></tr>"
+                    )
+                body += "</tbody></table>"
+            else:
+                # Single no-subtype, no-value entry — link directly.
+                _, slug, tiers = rows[0]
+                cnt = sum(c for _, _, c in tiers)
+                body += (
+                    '<table class="data"><thead><tr>'
+                    "<th>Property</th><th>Items</th></tr></thead><tbody>"
+                    f'<tr id="{E(slug)}"><td>{link(f"{slug}.html", pname)}</td>'
+                    f"<td>{cnt}</td></tr></tbody></table>"
+                )
+
+    layout = (
+        f'<div class="items-layout">{sidebar}'
+        f'<div class="items-content">{body}</div></div>'
+    )
+    write(out / "items" / "properties" / "index.html",
+          page("Browse by Property", layout, root_rel="../.."))
+
+    # Build prefix-group detail structure:
+    # (pname, group_key) → [(actual_subtype, resref, name, cost_str, value_num, qty)]
+    _prefix_detail: dict[tuple[str, str], list] = defaultdict(list)
+    for (pname, group_key, actual_sub, resref, cost_str), (name, value_num, qty) in _prefix_acc.items():
+        _prefix_detail[(pname, group_key)].append((actual_sub, resref, name, cost_str, value_num, qty))
+    for key in _prefix_detail:
+        _prefix_detail[key].sort(key=lambda x: (x[0], -x[4], nwn_text(x[1]).lower()))
+
+    # --- per-property detail pages ---
+    for (pname, subtype), entries in prop_index.items():
+        if pname in _COMBINED_PROP_PAGES:
+            continue  # rendered as a single combined page below
+        slug = _prop_slug(pname, subtype)
+        label = pname + (f": {subtype}" if subtype else "")
+        tiers = _cost_tiers(entries)
+        body = f"<h1>{E(label)}</h1>"
+
+        # Spell level / class info block for Cast Spell and On Hit Cast Spell pages.
+        _detail_spell_tbl = _SPELL_PROP_TABLES.get(pname)
+        if _detail_spell_tbl and subtype and any(
+            v for v in SPELL_INFO.get(_detail_spell_tbl, {}).values() if v
+        ):
+            _dsi = _iprp_name_spell_info(_detail_spell_tbl, subtype)
+            _dlvl, _dcls = _spell_level_classes(_dsi)
+            if _dlvl or _dcls:
+                body += '<dl class="meta">'
+                if _dlvl:
+                    body += f"<dt>Spell Level</dt><dd>{E(_dlvl)}</dd>"
+                if _dcls:
+                    body += f"<dt>Caster Classes</dt><dd>{E(_dcls)}</dd>"
+                body += "</dl>"
+
+        detail_key = (pname, subtype)
+        if detail_key in _prefix_detail:
+            # Prefix-group page: sub-sections per actual subtype variant.
+            sub_groups: dict[str, list] = defaultdict(list)
+            for actual_sub, resref, name, cost_str, value_num, qty in _prefix_detail[detail_key]:
+                sub_groups[actual_sub].append((resref, name, cost_str, value_num, qty))
+            body += f"<p>{len(entries)} items across {len(sub_groups)} variants.</p>"
+            for actual_sub in sorted(sub_groups.keys()):
+                sub_entries = sub_groups[actual_sub]
+                sub_anchor = _cost_anchor(actual_sub)
+                has_qty = any(e[4] > 1 for e in sub_entries)
+                body += (
+                    f'<h2 id="{E(sub_anchor)}">{E(actual_sub)}'
+                    f' <small class="muted">({len(sub_entries)})</small></h2>'
+                    '<table class="data"><thead><tr>'
+                    "<th>Name</th>"
+                    "<th>Type</th>"
+                    + ("<th>Qty</th>" if has_qty else "")
+                    + "<th>Where to Find</th>"
+                    "</tr></thead><tbody>"
+                )
+                for resref, name, _, _, qty in sub_entries:
+                    _icat = _item_category(db.items[resref], nwn_text(name))
+                    itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
+                    body += (
+                        f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                        f"<td>{itype_link}</td>"
+                        + (f"<td>{qty}</td>" if has_qty else "")
+                        + f"<td>{_where_snippet(db, resref)}</td></tr>"
+                    )
+                body += "</tbody></table>"
+        elif len(tiers) <= 1:
+            # Single tier (or no cost) — keep flat table.
+            body += f"<p>{len(entries)} items.</p>"
+            show_cost = bool(tiers and tiers[0][0])
+            has_qty = any(e[4] > 1 for e in entries)
+            body += (
+                '<table class="data"><thead><tr>'
+                "<th>Name</th>"
+                "<th>Type</th>"
+                + ("<th>Value</th>" if show_cost else "")
+                + ("<th>Qty</th>" if has_qty else "")
+                + "<th>Where to Find</th>"
+                "</tr></thead><tbody>"
+            )
+            for resref, name, cost_str, _, qty in entries:
+                _icat = _item_category(db.items[resref], nwn_text(name))
+                itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
+                body += (
+                    f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                    f"<td>{itype_link}</td>"
+                    + (f"<td>{E(cost_str)}</td>" if show_cost else "")
+                    + (f"<td>{qty}</td>" if has_qty else "")
+                    + f"<td>{_where_snippet(db, resref)}</td></tr>"
+                )
+            body += "</tbody></table>"
+        else:
+            # Multiple tiers — one sub-table per tier with anchors.
+            _is_light = (pname == "Light" and not subtype)
+            body += f"<p>{len(entries)} items across {len(tiers)} value tiers.</p>"
+            for cost_str, cost_anch, tier_entries in tiers:
+                has_qty = any(e[4] > 1 for e in tier_entries)
+                tier_label = E(cost_str) if cost_str else "Other"
+                h_anchor = f' id="{E(cost_anch)}"' if cost_anch else ""
+                body += (
+                    f"<h2{h_anchor}>{tier_label}"
+                    f' <small class="muted">({len(tier_entries)})</small></h2>'
+                    '<table class="data"><thead><tr>'
+                    "<th>Name</th>"
+                    "<th>Type</th>"
+                    + ("<th>Color</th>" if _is_light else "")
+                    + ("<th>Qty</th>" if has_qty else "")
+                    + "<th>Where to Find</th>"
+                    "</tr></thead><tbody>"
+                )
+                for resref, name, _, _, qty in tier_entries:
+                    _icat = _item_category(db.items[resref], nwn_text(name))
+                    itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
+                    _color_cell = ""
+                    if _is_light:
+                        _color = _light_param.get((resref, cost_str), "")
+                        if _color:
+                            _ccls = f"nwn-light-color nwn-light-{_color.lower()}"
+                            _color_cell = f'<td><span class="{_ccls}">{E(_color)}</span></td>'
+                        else:
+                            _color_cell = '<td><span class="muted">—</span></td>'
+                    body += (
+                        f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                        f"<td>{itype_link}</td>"
+                        + _color_cell
+                        + (f"<td>{qty}</td>" if has_qty else "")
+                        + f"<td>{_where_snippet(db, resref)}</td></tr>"
+                    )
+                body += "</tbody></table>"
+
+        # Build floating sidebar for the detail page.
+        sibling_rows = subtype_rows.get(pname, [])
+        toc_parts: list[str] = []
+        if len(sibling_rows) > 1:
+            _sib_spell_tbl = _SPELL_PROP_TABLES.get(pname)
+            _sib_has_spell_info = _sib_spell_tbl and any(
+                v for v in SPELL_INFO.get(_sib_spell_tbl, {}).values() if v
+            )
+            if _sib_has_spell_info:
+                _cur_lvl_heading: object = object()  # sentinel
+                for sib_sub, sib_slug, sib_tiers in sibling_rows:
+                    _ssi = _iprp_name_spell_info(_sib_spell_tbl, sib_sub) if sib_sub else None
+                    _slvl = _ssi.get("innate_level") if _ssi else None
+                    lvl_heading = "Cantrip" if _slvl == 0 else (f"Level {_slvl}" if _slvl is not None else "")
+                    if lvl_heading != _cur_lvl_heading:
+                        _cur_lvl_heading = lvl_heading
+                        if lvl_heading:
+                            toc_parts.append(f'<div class="toc-group-heading">{E(lvl_heading)}</div>')
+                    sib_label = sib_sub if sib_sub else pname
+                    sib_count = sum(c for _, _, c in sib_tiers)
+                    cls = ' class="toc-current"' if sib_slug == slug else ''
+                    toc_parts.append(
+                        f'<div><a href="{sib_slug}.html"{cls}>{E(sib_label)}'
+                        f' <span class="muted">({sib_count})</span></a></div>'
+                    )
+            else:
+                toc_parts.append(f'<div class="toc-group-heading">{E(pname)}</div>')
+                for sib_sub, sib_slug, sib_tiers in sibling_rows:
+                    sib_label = sib_sub if sib_sub else pname
+                    sib_count = sum(c for _, _, c in sib_tiers)
+                    cls = ' class="toc-current"' if sib_slug == slug else ''
+                    toc_parts.append(
+                        f'<div><a href="{sib_slug}.html"{cls}>{E(sib_label)}'
+                        f' <span class="muted">({sib_count})</span></a></div>'
+                    )
+        if detail_key in _prefix_detail:
+            seen_subs: set[str] = set()
+            toc_sub_parts: list[str] = []
+            for actual_sub, *_ in _prefix_detail[detail_key]:
+                if actual_sub not in seen_subs:
+                    seen_subs.add(actual_sub)
+                    toc_sub_parts.append(
+                        f'<div><a href="#{_cost_anchor(actual_sub)}">{E(actual_sub)}</a></div>'
+                    )
+            if toc_sub_parts:
+                toc_parts.append('<div class="toc-group-heading">On This Page</div>')
+                toc_parts.extend(toc_sub_parts)
+        elif len(tiers) > 1:
+            toc_parts.append('<div class="toc-group-heading">On This Page</div>')
+            for cost_str, cost_anch, tier_entries in tiers:
+                tier_label = cost_str if cost_str else "Other"
+                toc_parts.append(
+                    f'<div><a href="#{cost_anch}">{E(tier_label)}'
+                    f' <span class="muted">({len(tier_entries)})</span></a></div>'
+                )
+        back = f'<div><a href="index.html#{E(_pname_anchor(pname))}">← Browse by Property</a></div>'
+        detail_sidebar = '<aside class="items-toc">' + back + "".join(toc_parts) + '</aside>'
+        layout = f'<div class="items-layout">{detail_sidebar}<div class="items-content">{body}</div></div>'
+        write(out / "items" / "properties" / f"{slug}.html",
+              page(label, layout, root_rel="../.."))
+
+    # --- combined property pages (one page per property, all subtypes together) ---
+    for pname, combined_slug in _COMBINED_PROP_PAGES.items():
+        if pname not in subtype_rows:
+            continue
+        _comb_rows = subtype_rows[pname]  # [(subtype, slug, tiers)], sorted level desc
+        _spell_tbl = _SPELL_PROP_TABLES.get(pname)
+        _has_spell_info = bool(_spell_tbl and any(
+            v for v in SPELL_INFO.get(_spell_tbl, {}).values() if v
+        ))
+
+        total_items = sum(sum(c for _, _, c in tiers) for _, _, tiers in _comb_rows)
+
+        # Sidebar ToC: spell level group headings + per-spell anchor links.
+        toc_parts: list[str] = []
+        toc_parts.append(f'<div><a href="index.html#{E(_pname_anchor(pname))}">← Browse by Property</a></div>')
+        _cur_toc_lvl: object = object()
+        for sib_sub, sib_slug, sib_tiers in _comb_rows:
+            _ssi = _iprp_name_spell_info(_spell_tbl, sib_sub) if _has_spell_info and sib_sub else None
+            _slvl = _ssi.get("innate_level") if _ssi else None
+            lvl_heading = "Cantrip" if _slvl == 0 else (f"Level {_slvl}" if _slvl is not None else "")
+            if lvl_heading != _cur_toc_lvl:
+                _cur_toc_lvl = lvl_heading
+                if lvl_heading:
+                    toc_parts.append(f'<div class="toc-group-heading">{E(lvl_heading)}</div>')
+            sib_label = sib_sub if sib_sub else pname
+            sib_count = sum(c for _, _, c in sib_tiers)
+            toc_parts.append(
+                f'<div><a href="#{E(sib_slug)}">{E(sib_label)}'
+                f' <span class="muted">({sib_count})</span></a></div>'
+            )
+
+        # Main content: h2 per spell level, h3 + flat table per spell.
+        body = f"<h1>{E(pname)}</h1>"
+        body += f"<p>{total_items} items across {len(_comb_rows)} spells.</p>"
+        _cur_body_lvl: object = object()
+        for subtype, slug, tiers in _comb_rows:
+            _si = _iprp_name_spell_info(_spell_tbl, subtype) if _has_spell_info and subtype else None
+            _lvl = _si.get("innate_level") if _si else None
+            _dlvl, _dcls = _spell_level_classes(_si)
+
+            lvl_heading = "Cantrip" if _lvl == 0 else (f"Level {_lvl}" if _lvl is not None else "")
+            if lvl_heading != _cur_body_lvl:
+                _cur_body_lvl = lvl_heading
+                if lvl_heading:
+                    lvl_anchor = re.sub(r"[^a-z0-9]+", "-", lvl_heading.lower()).strip("-")
+                    body += f'<h2 id="{E(lvl_anchor)}">{E(lvl_heading)}</h2>'
+
+            entries = prop_index.get((pname, subtype), [])
+            cnt = sum(c for _, _, c in tiers)
+            label = subtype if subtype else pname
+
+            body += f'<h3 id="{E(slug)}">{E(label)} <small class="muted">({cnt})</small></h3>'
+            if _has_spell_info and (_dlvl or _dcls):
+                body += '<dl class="meta">'
+                if _dlvl:
+                    body += f"<dt>Spell Level</dt><dd>{E(_dlvl)}</dd>"
+                if _dcls:
+                    body += f"<dt>Caster Classes</dt><dd>{E(_dcls)}</dd>"
+                body += "</dl>"
+
+            has_qty = any(e[4] > 1 for e in entries)
+            body += (
+                '<table class="data"><thead><tr>'
+                "<th>Name</th><th>Type</th><th>Uses</th>"
+                + ("<th>Qty</th>" if has_qty else "")
+                + "<th>Where to Find</th>"
+                "</tr></thead><tbody>"
+            )
+            for resref, name, cost_str, _, qty in entries:
+                _icat = _item_category(db.items[resref], nwn_text(name))
+                itype_link = link(f"../index.html#{_icat.replace('_', '-')}", _item_category_label(_icat))
+                uses_cell = E(cost_str) if cost_str else '<span class="muted">—</span>'
+                body += (
+                    f"<tr><td>{link(f'../{resref}.html', name)}</td>"
+                    f"<td>{itype_link}</td>"
+                    f"<td>{uses_cell}</td>"
+                    + (f"<td>{qty}</td>" if has_qty else "")
+                    + f"<td>{_where_snippet(db, resref)}</td></tr>"
+                )
+            body += "</tbody></table>"
+
+        combined_sidebar = '<aside class="items-toc">' + "".join(toc_parts) + '</aside>'
+        layout = f'<div class="items-layout">{combined_sidebar}<div class="items-content">{body}</div></div>'
+        write(out / "items" / "properties" / f"{combined_slug}.html",
+              page(pname, layout, root_rel="../.."))
+
+
+# ---------------------------------------------------------------------------
+# Item search page + JSON index
+# ---------------------------------------------------------------------------
+
+_SEARCH_JS = r"""(function(){
+var N=4,data=[],form=document.getElementById('sf'),results=document.getElementById('sr');
+var propSels=[],subSels=[],minVals=[];
+for(var i=1;i<=N;i++){
+  propSels.push(document.getElementById('fp'+i));
+  subSels.push(document.getElementById('fs'+i));
+  minVals.push(document.getElementById('fv'+i));
+}
+
+fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
+  data=d; populateFilters();
+});
+
+var _FIXED_VALS={
+  'Heavy Armor':1,'Medium Armor':1,'Light Armor':1,'Cloth & Robes':1,
+  'Small Shields':1,'Large Shields':1,'Tower Shields':1,
+  'Helmets':1,'Amulets':1,'Belts':1,'Boots':1,'Bracers & Gauntlets':1,'Rings':1,'Cloaks':1,
+  'Ammunition':1,
+  'Wands':1,'Potions':1,'Scrolls':1,'Grenades':1,
+  'Books':1,'Magic Rods':1,'Magic Staves':1,'Gems':1,'Dyes':1,'Poisons & Venoms':1,
+  'Miscellaneous':1,'Creature Items':1
+};
+
+function _addOpts(grp,opts,bisSet){
+  var added=0;
+  opts.forEach(function(o){
+    if(bisSet[o.v]){grp.appendChild(new Option(o.l,o.v));added++;}
+  });
+  return added;
+}
+
+function populateFilters(){
+  var bisSet={},props={},subs={};
+  data.forEach(function(it){
+    bisSet[it.base_item]=1;
+    it.properties.forEach(function(p){
+      props[p.prop]=1;
+      if(p.subtype){if(!subs[p.prop])subs[p.prop]={};subs[p.prop][p.subtype]=1;}
+    });
+  });
+  window._subs=subs;
+  var biSel=document.getElementById('fb');
+
+  var GROUPS=[
+    {label:'Armor',opts:[
+      {l:'Heavy Armor',v:'Heavy Armor'},
+      {l:'Medium Armor',v:'Medium Armor'},
+      {l:'Light Armor',v:'Light Armor'},
+      {l:'Cloth & Robes',v:'Cloth & Robes'},
+      {l:'Small Shields',v:'Small Shields'},
+      {l:'Large Shields',v:'Large Shields'},
+      {l:'Tower Shields',v:'Tower Shields'}
+    ]},
+    {label:'Weapons',dyn:true,extra:[{l:'Ammunition',v:'Ammunition'}]},
+    {label:'Gear',opts:[
+      {l:'Amulets',v:'Amulets'},
+      {l:'Belts',v:'Belts'},
+      {l:'Boots',v:'Boots'},
+      {l:'Bracers & Gauntlets',v:'Bracers & Gauntlets'},
+      {l:'Rings',v:'Rings'},
+      {l:'Cloaks',v:'Cloaks'},
+      {l:'Helmets',v:'Helmets'}
+    ]},
+    {label:'Misc.',opts:[
+      {l:'Wands',v:'Wands'},
+      {l:'Potions',v:'Potions'},
+      {l:'Scrolls',v:'Scrolls'},
+      {l:'Grenades',v:'Grenades'},
+      {l:'Books',v:'Books'},
+      {l:'Magic Rods',v:'Magic Rods'},
+      {l:'Magic Staves',v:'Magic Staves'},
+      {l:'Gems',v:'Gems'},
+      {l:'Dyes',v:'Dyes'},
+      {l:'Poisons & Venoms',v:'Poisons & Venoms'},
+      {l:'Miscellaneous',v:'Miscellaneous'},
+      {l:'Creature Items',v:'Creature Items'}
+    ]}
+  ];
+
+  var dynWeps=Object.keys(bisSet).filter(function(b){return !_FIXED_VALS[b];}).sort();
+
+  GROUPS.forEach(function(g){
+    var grp=document.createElement('optgroup');
+    grp.label=g.label;
+    var added=0;
+    if(g.dyn){
+      dynWeps.forEach(function(v){grp.appendChild(new Option(v,v));added++;});
+      (g.extra||[]).forEach(function(o){if(bisSet[o.v]){grp.appendChild(new Option(o.l,o.v));added++;}});
+    } else {
+      added=_addOpts(grp,g.opts,bisSet);
+    }
+    if(added>0)biSel.appendChild(grp);
+  });
+
+  var propOpts=Object.keys(props).sort();
+  propSels.forEach(function(sel){
+    propOpts.forEach(function(p){sel.appendChild(new Option(p,p));});
+  });
+}
+
+propSels.forEach(function(sel,idx){
+  sel.addEventListener('change',function(){
+    var chosen=sel.value,sub=(window._subs||{})[chosen]||{};
+    subSels[idx].innerHTML='<option value="">— any —</option>';
+    Object.keys(sub).sort().forEach(function(s){subSels[idx].appendChild(new Option(s,s));});
+    subSels[idx].disabled=!chosen||!Object.keys(sub).length;
+  });
+});
+
+form.addEventListener('submit',function(e){
+  e.preventDefault();
+  var bi=document.getElementById('fb').value;
+  var sortBy=document.getElementById('fo').value;
+  var asc=document.getElementById('fd').value==='asc';
+  var inclNonDrop=document.getElementById('fnd').checked;
+  var ppOnly=document.getElementById('fpp').checked;
+  var conds=[];
+  for(var i=0;i<N;i++){
+    var prop=propSels[i].value,sub=subSels[i].value;
+    var minv=parseInt(minVals[i].value,10)||0;
+    if(prop||sub||minv>0)conds.push({prop:prop,sub:sub,minv:minv});
+  }
+  var out=[];
+  data.forEach(function(it){
+    if(!it.accessible&&!inclNonDrop)return;
+    if(ppOnly&&!it.pickpocketable)return;
+    if(bi){
+      if(it.base_item!==bi)return;
+    }
+    var matched=[];
+    var ok=!conds.length||conds.every(function(c){
+      var mp=it.properties.filter(function(p){
+        if(c.prop&&p.prop!==c.prop)return false;
+        if(c.sub&&p.subtype!==c.sub)return false;
+        if(c.minv>0&&p.value_num<c.minv)return false;
+        return true;
+      });
+      if(!mp.length)return false;
+      matched.push(mp[0]);
+      return true;
+    });
+    if(!ok)return;
+    if(!matched.length&&it.properties.length)matched=[it.properties[0]];
+    out.push({it:it,matched:matched});
+  });
+  out.sort(function(a,b){
+    var v;
+    if(sortBy==='cost')v=a.it.cost-b.it.cost;
+    else if(sortBy==='value')v=(a.matched[0]?a.matched[0].value_num:0)-(b.matched[0]?b.matched[0].value_num:0);
+    else v=a.it.name.localeCompare(b.it.name);
+    return asc?v:-v;
+  });
+  render(out,!!conds.length,inclNonDrop);
+});
+
+function render(rows,showProps,showAccess){
+  if(!rows.length){results.innerHTML='<p class="muted">No items match.</p>';return;}
+  var cols='<th>Name</th>'
+    +(showAccess?'<th>Reachable</th>':'')
+    +'<th>Base Item</th>'
+    +(showProps?'<th>Matched Properties</th>':'')
+    +'<th>GP Value</th>';
+  var html='<p><strong>'+rows.length+'</strong> result'+(rows.length!==1?'s':'')+'</p>'
+    +'<table class="data"><thead><tr>'+cols+'</tr></thead><tbody>';
+  rows.forEach(function(r){
+    var props=r.matched.map(function(p){
+      var pIdxHref='properties/index.html#'+p.prop_idx_anchor;
+      var propLink='<a href="'+esc(pIdxHref)+'">'+esc(p.prop)+'</a>';
+      var detail='';
+      if(p.subtype||p.cost){
+        var dHref=p.detail_href?'properties/'+p.detail_href:'properties/'+p.detail_slug+'.html'+(p.cost_anchor?'#'+p.cost_anchor:'');
+        if(p.subtype&&p.cost){
+          detail=': <a href="'+esc(dHref)+'">'+esc(p.subtype)+' \u2014 '+esc(p.cost)+'</a>';
+        }else if(p.subtype){
+          detail=': <a href="'+esc(dHref)+'">'+esc(p.subtype)+'</a>';
+        }else{
+          detail=' \u2014 <a href="'+esc(dHref)+'">'+esc(p.cost)+'</a>';
+        }
+      }
+      if(p.param){
+        var cCls='nwn-light-color nwn-light-'+p.param.toLowerCase();
+        detail+=' \u2014 <span class="'+cCls+'">'+esc(p.param)+'</span>';
+      }
+      return '<span>'+propLink+detail+'</span>';
+    }).join('<br>');
+    var idxBase=r.it.accessible?'index.html':'inaccessible/index.html';
+    var biHref=idxBase+'#'+esc(r.it.base_item_anchor||'');
+    var biCell=r.it.base_item_anchor
+      ?'<a href="'+biHref+'">'+esc(r.it.base_item)+'</a>'
+      :esc(r.it.base_item);
+    var dropBadge=(!showAccess&&!r.it.accessible)?' <span class="badge-no-drop" title="Carried by NPCs but not flagged as droppable \u2014 cannot be looted">no drop</span>':'';
+    var accessCell=showAccess?(r.it.accessible?'<td>Yes</td>':'<td><span class="muted">No</span></td>'):'';
+    html+='<tr><td><a href="'+esc(r.it.url)+'">'+esc(r.it.name)+'</a>'+dropBadge+'</td>'
+         +accessCell
+         +'<td>'+biCell+'</td>'
+         +(showProps?'<td>'+props+'</td>':'')
+         +'<td>'+(r.it.cost?r.it.cost.toLocaleString()+' gp':'\u2014')+'</td></tr>';
+  });
+  results.innerHTML=html+'</tbody></table>';
+}
+
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+})();"""
+
+
+def render_items_search(db: "Db", out: Path) -> None:
+    global _current_context
+    index: list[dict] = []
+    for resref, i in sorted(db.items.items(),
+                            key=lambda kv: nwn_text(db.item_name(kv[0])).lower()):
+        carriers = db.item_carried_by.get(resref, [])
+        pickpocketable = any(e.get("pickpocketable") for e in carriers)
+        accessible = (
+            resref in db.item_sold_at
+            or resref in db.item_in_container
+            or any(e.get("dropable") or e.get("pickpocketable") for e in carriers)
+            or resref in db.item_from_script
+        )
+        if not accessible and not carriers:
+            continue
+        name = db.item_name(resref)
+        if name.startswith("[TLK#") or name == resref:
+            continue
+        _current_context = f"item:{resref} ({name})"
+        _bi_raw = fld(i, "BaseItem", None)
+        bi = -1 if _bi_raw is None else int(_bi_raw)
+        cost_val = item_gp_value(i)
+        props = []
+        for p in list_items(i.get("PropertiesList")):
+            f = itemprop_format(p)
+            pname = f["property"]
+            if not pname:
+                continue
+            subtype = f["subtype"]
+            cost = f["cost"]
+            # detail_slug / cost_anchor use original f values (before any swap)
+            prop_idx_anchor = "pn-" + _prop_slug(pname, "")
+            detail_slug = _prop_slug(pname, f["subtype"])
+            cost_anchor = _cost_anchor(f["cost"]) if f["cost"] else ""
+            _is_raw_sub = _is_raw_subtype(f["subtype"]) if f["subtype"] else False
+            _comb_pg = _COMBINED_PROP_PAGES.get(pname)
+            if _comb_pg and f["subtype"] and not _is_raw_sub:
+                detail_href = f"{_comb_pg}.html#{detail_slug}"
+            else:
+                detail_href = ""
+            if pname == "Immunity: Specific Spell" and not subtype and cost:
+                subtype, cost = cost, ""
+            _srch_param = f["param"] if pname == "Light" else ""
+            props.append({
+                "prop": pname,
+                "subtype": subtype,
+                "cost": cost,
+                **({"param": _srch_param} if _srch_param else {}),
+                "value_num": _prop_value_num(f["cost"]),
+                "prop_idx_anchor": prop_idx_anchor,
+                "detail_slug": detail_slug,
+                "cost_anchor": cost_anchor,
+                "detail_href": detail_href,
+            })
+        _cat = _item_category(i, nwn_text(name))
+        index.append({
+            "resref": resref,
+            "name": nwn_text(name),
+            "base_item": (baseitem_name(bi) or f"BaseItem #{bi}") if _cat.startswith("weapon_") else _item_category_label(_cat),
+            "base_item_id": bi,
+            "base_item_anchor": _cat.replace("_", "-"),
+            "cost": cost_val,
+            "url": f"{resref}.html",
+            "properties": props,
+            "accessible": accessible,
+            "pickpocketable": pickpocketable,
+        })
+
+    write(out / "items" / "search-index.json",
+          json.dumps(index, ensure_ascii=False, separators=(",", ":")))
+
+    def _prop_row(n: int) -> str:
+        return (
+            f'<div class="prop-row">'
+            f'<label>Property {n}</label>'
+            f'<select id="fp{n}" class="prop-sel"><option value="">— any —</option></select>'
+            f'<select id="fs{n}" class="subtype-sel" disabled>'
+            f'<option value="">— any —</option></select>'
+            f'<input id="fv{n}" type="number" min="0" placeholder="min value">'
+            f'</div>'
+        )
+
+    prop_rows = "".join(_prop_row(n) for n in range(1, 5))
+
+    body = (
+        "<h1>Search Items</h1>"
+        "<p>All conditions must be satisfied simultaneously. Leave fields blank to skip.</p>"
+        '<form id="sf" class="item-search-form">'
+        '<div class="search-row">'
+        '<label for="fb">Base item</label>'
+        '<select id="fb"><option value="">— all —</option></select>'
+        '<label for="fo">Sort by</label>'
+        '<select id="fo">'
+        '<option value="cost">Cost</option>'
+        '<option value="value">Property Value</option>'
+        '<option value="name">Name</option>'
+        '</select>'
+        '<select id="fd">'
+        '<option value="desc">Descending</option>'
+        '<option value="asc">Ascending</option>'
+        '</select>'
+        '<label class="checkbox-label" title="Include items carried by NPCs that have no Dropable=1 flag — they exist in the module but cannot be looted">'
+        '<input type="checkbox" id="fnd"> Include non-droppable items'
+        '</label>'
+        '<label class="checkbox-label">'
+        '<input type="checkbox" id="fpp"> Pickpocketable only'
+        '</label>'
+        '<button type="submit">Search</button>'
+        '</div>'
+        f'<div class="prop-rows">{prop_rows}</div>'
+        '</form>'
+        '<div id="sr"><p class="muted">Use the filters above and click Search.</p></div>'
+        f"<script>{_SEARCH_JS}</script>"
+    )
+    write(out / "items" / "search.html",
+          page("Search Items", body, root_rel=".."))
+
+
+def _buy_limit_str(mbp: Any) -> str:
+    if mbp is None:
+        return "—"
+    if mbp == -1:
+        return "No limit"
+    if mbp == 0:
+        return "Won't buy"
+    return f"{mbp:,} gp"
+
+
+def _store_buy_base_types(store: dict, field: str) -> list[int]:
+    """BaseItem rows listed under a store's WillOnlyBuy / WillNotBuy list."""
+    out: list[int] = []
+    for s in list_items(store.get(field)):
+        bi = fld(s, "BaseItem")
+        if bi is not None:
+            out.append(int(bi))
+    return out
+
+
+def _store_buy_summary(store: dict) -> tuple[str, bool]:
+    """Describe which item types a store will buy from the player.
+
+    Returns (html_label, buys_anything). NWN store buy rules:
+      * WillOnlyBuy non-empty → store buys ONLY those base item types.
+      * else WillNotBuy non-empty → buys everything EXCEPT those types.
+      * else → buys all types.
+
+    Builders make a store refuse all sales by pointing WillOnlyBuy at an
+    out-of-range sentinel base item (a row absent from stock baseitems.2da, e.g.
+    309) that no real merchandise uses. When every WillOnlyBuy row is such a
+    sentinel the store buys nothing, so buys_anything is False and callers show
+    N/A for the buy-back rate rather than a misleading percentage."""
+    def _labels(rows: list[int]) -> str:
+        return ", ".join(E(baseitem_name(r) or f"BaseItem #{r}")
+                         for r in sorted(set(rows)))
+
+    only = _store_buy_base_types(store, "WillOnlyBuy")
+    if only:
+        if not any(r in STOCK_BASEITEMS for r in only):
+            return ('<em class="muted">Nothing</em>', False)
+        return (f"Only: {_labels(only)}", True)
+    nope = _store_buy_base_types(store, "WillNotBuy")
+    if nope:
+        return (f"All except: {_labels(nope)}", True)
+    return ("All types", True)
+
+
+_CREATURE_STORES_TABLE_HEAD = (
+    '<table class="data"><thead><tr>'
+    "<th>Name</th><th>Items</th><th>Area</th>"
+    '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+    '<th title="Item types the store will buy from you">Buys</th>'
+    '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
+    '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+    '<th title="Highest base item value in stock (before markup)">Max GP</th>'
+    '<th title="Average base item value in stock (before markup)">Avg GP</th>'
+    "</tr></thead><tbody>"
+)
+
+
+def _creature_store_section(db: "Db", creature_resref: str,
+                             filter_area: str | None, root_rel: str) -> str:
+    """Return an HTML <h2>Stores</h2> + table for stores this creature opens,
+    or empty string if none found. filter_area restricts to one area (instance
+    pages); None returns all areas (blueprint pages)."""
+    rows: list[str] = []
+    seen_slugs: set[str] = set()
+
+    for area_rr, store_list in sorted(
+        db.area_stores.items(),
+        key=lambda kv: nwn_text(db.area_name(kv[0])).lower(),
+    ):
+        if filter_area and area_rr != filter_area:
+            continue
+        if area_rr in db.hidden_areas:
+            continue
+        for inst in store_list:
+            tag = fld(inst, "Tag", "")
+            if not tag:
+                continue
+            openers = db.store_tag_openers.get(tag.lower(), [])
+            matched = any(
+                o.get("resref", "").lower() == creature_resref.lower()
+                and area_rr in (o.get("areas") or (
+                    [o["area"]] if "area" in o else []
+                ))
+                for o in openers
+            )
+            if not matched:
+                continue
+
+            slug = _store_instance_slug(area_rr, inst)
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+
+            rr = fld(inst, "ResRef", "")
+            name = db.store_name(rr) if rr in db.stores else (tag or rr)
+            name_cell = link(f"{root_rel}/stores/{slug}.html", name)
+
+            pages = list_items(inst.get("StoreList"))
+            n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+
+            area_cell = link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
+
+            mu_val = fld(inst, "MarkUp", None)
+            md_val = fld(inst, "MarkDown", None)
+            buy_html, buys_any = _store_buy_summary(inst)
+            mu_str = f"{mu_val}%" if mu_val is not None else "—"
+            md_str = (f"{md_val}%" if md_val is not None else "—") if buys_any else "N/A"
+            mbp_raw = fld(inst, "MaxBuyPrice", None)
+
+            max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
+            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
+            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
+            rows.append(
+                f"<tr>"
+                f"<td>{name_cell}</td>"
+                f"<td>{n_items}</td>"
+                f"<td>{area_cell}</td>"
+                f"<td>{mu_str}</td>"
+                f"<td>{buy_html}</td>"
+                f"<td>{md_str}</td>"
+                f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
+                f"<td>{max_gp_str}</td>"
+                f"<td>{avg_gp_str}</td>"
+                f"</tr>"
+            )
+
+    if not rows:
+        return ""
+    return (
+        "<h2>Stores</h2>"
+        + _CREATURE_STORES_TABLE_HEAD
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+_STORE_TABLE_HEAD = (
+    '<table class="data"><thead><tr>'
+    "<th>Name</th><th>ResRef</th><th>Tag</th><th>Items</th>"
+    "<th>Area</th>"
+    '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+    '<th title="Price store pays you for items (% of base)">Buys At</th>'
+    '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+    "</tr></thead><tbody>"
+)
+
+
+def _store_instance_slug(area_rr: str, inst: dict) -> str:
+    """Stable URL slug for a placed store instance: area + tag (or resref)."""
+    tag = fld(inst, "Tag", "") or fld(inst, "ResRef", "") or "unknown"
+    return f"{area_rr}_{tag.lower()}"
+
+
+def _store_opener_html(db: Db, opener: dict, root_rel: str = "..") -> str:
+    """Compact one-liner describing what opens a store, for table cells."""
+    kind = opener.get("kind", "")
+    rr = opener.get("resref", "")
+    via_dlg = opener.get("via_dialog", "")
+
+    if kind in ("creature", "creature-instance", "creature-event"):
+        if kind == "creature-instance":
+            area_rr = opener.get("area", "")
+            idx = opener.get("idx", 0)
+            can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
+            name = db.canonical_creature_name(can_rr) if can_rr else (rr or "(NPC)")
+            url = f"{root_rel}/creatures/{can_rr}.html" if can_rr else "#"
+            npc_html = f'<a href="{E(url)}">{nwn_html(name)}</a>'
+        else:
+            can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
+            name = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else (rr or "NPC")
+            npc_html = (link(f"{root_rel}/creatures/{can_rr}.html", name)
+                        if can_rr in db.canonical_creatures else nwn_html(name))
+        if via_dlg and via_dlg in db.dialogs:
+            conv = link(f"{root_rel}/conversations/{via_dlg}.html", "conversation")
+            return f"NPC {npc_html} (via {conv})"
+        return f"NPC {npc_html}"
+
+    if kind in ("trigger-event", "trigger-event-instance"):
+        inst_tag = opener.get("tag") or rr or "trigger"
+        areas = opener.get("areas", [])
+        area_html = ""
+        if areas and areas[0] in db.areas:
+            area_html = " in " + link(f"{root_rel}/areas/{areas[0]}.html",
+                                      db.area_name(areas[0]))
+        return f'Trigger <code>{E(inst_tag)}</code>{area_html}'
+
+    if kind in ("placeable-event", "placeable-event-instance"):
+        inst_tag = opener.get("tag") or rr or "placeable"
+        return f'Placeable <code>{E(inst_tag)}</code>'
+
+    # Fall back to full caller html for any other kind.
+    return _caller_html(db, opener, root_rel=root_rel)
+
+
+def _store_inventory_html(db: "Db", pages: list, item_prefix: str = "../items/") -> str:
+    """Render store inventory grouped by item category (same scheme as the items index)."""
+    all_items: list[tuple[str, dict]] = []
+    for p in pages:
+        for it in list_items(p.get("ItemList")):
+            irr = (fld(it, "TemplateResRef", "")
+                   or fld(it, "InventoryRes", "")
+                   or fld(it, "EquippedRes", "") or "").strip()
+            if not irr:
+                continue
+            enriched = db.items.get(irr, it)
+            all_items.append((irr, enriched))
+
+    if not all_items:
+        return '<p class="muted">No items.</p>'
+
+    buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for irr, enriched in all_items:
+        cat_key = _item_category(enriched, nwn_text(db.item_name(irr)))
+        buckets[cat_key].append((irr, enriched))
+
+    def _cost_key(entry: tuple[str, dict]) -> int:
+        return item_gp_value(entry[1])
+
+    for items in buckets.values():
+        items.sort(key=_cost_key, reverse=True)
+
+    all_weapon_keys = sorted(
+        (k for k in buckets if k.startswith("weapon_")),
+        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
+    )
+    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
+    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
+
+    def _expand(cats: list[str]) -> list[str]:
+        result: list[str] = []
+        for c in cats:
+            if c == "WEAPONS":
+                result.extend(player_weapon_keys)
+            elif c == "CREATURE_WEAPONS":
+                result.extend(creature_weapon_keys)
+            else:
+                result.append(c)
+        return result
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _, group_cats in _TOC_GROUPS:
+        for k in _expand(group_cats):
+            if k not in seen:
+                ordered.append(k)
+                seen.add(k)
+    for k in buckets:
+        if k not in seen:
+            ordered.append(k)
+            seen.add(k)
+
+    parts: list[str] = []
+    for cat_key in ordered:
+        items = buckets.get(cat_key)
+        if not items:
+            continue
+        slug = cat_key.replace("_", "-")
+        cat_label = _item_category_label(cat_key)
+        show_base, show_stack = _items_col_flags(items)
+        show_ac = cat_key.startswith("armor_")
+        show_spell_info = cat_key == "scroll" and any(
+            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
+        )
+        rows_html = "\n".join(
+            _items_row(rr, i, db, show_base, show_stack, prefix=item_prefix, show_ac=show_ac,
+                       show_spell_info=show_spell_info)
+            for rr, i in items
+        )
+        parts.append(
+            f'<h3 id="{E(slug)}">{E(cat_label)} <small class="muted">({len(items)})</small></h3>'
+            + _items_table_head(show_base, show_stack, show_ac,
+                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
+        )
+
+    return "\n".join(parts)
+
+
+def _store_inventory_toc_html(db: "Db", pages: list) -> str:
+    """Sidebar TOC for a store instance page. Returns empty string when store has no items."""
+    all_items: list[tuple[str, dict]] = []
+    for p in pages:
+        for it in list_items(p.get("ItemList")):
+            irr = (fld(it, "TemplateResRef", "")
+                   or fld(it, "InventoryRes", "")
+                   or fld(it, "EquippedRes", "") or "").strip()
+            if not irr:
+                continue
+            all_items.append((irr, db.items.get(irr, it)))
+
+    if not all_items:
+        return ""
+
+    buckets: dict[str, list] = defaultdict(list)
+    for irr, enriched in all_items:
+        buckets[_item_category(enriched, nwn_text(db.item_name(irr)))].append(irr)
+
+    all_weapon_keys = sorted(
+        (k for k in buckets if k.startswith("weapon_")),
+        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
+    )
+    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
+    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
+
+    def _expand(cats: list[str]) -> list[str]:
+        result: list[str] = []
+        for c in cats:
+            if c == "WEAPONS":
+                result.extend(player_weapon_keys)
+            elif c == "CREATURE_WEAPONS":
+                result.extend(creature_weapon_keys)
+            else:
+                result.append(c)
+        return result
+
+    toc_parts: list[str] = []
+    for group_heading, group_cats_tmpl in _TOC_GROUPS:
+        entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
+        if not entries:
+            continue
+        toc_parts.append(f'<div class="toc-group-heading">{E(group_heading)}</div>')
+        for cat_key, cat_items in entries:
+            slug = cat_key.replace("_", "-")
+            toc_parts.append(
+                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+                f' <span class="muted">({len(cat_items)})</span></a></div>'
+            )
+
+    special_keys = creature_weapon_keys + (["creature_item"] if buckets.get("creature_item") else [])
+    if special_keys:
+        toc_parts.append('<div class="toc-group-heading">Special</div>')
+        for cat_key in special_keys:
+            if not buckets.get(cat_key):
+                continue
+            slug = cat_key.replace("_", "-")
+            toc_parts.append(
+                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+                f' <span class="muted">({len(buckets[cat_key])})</span></a></div>'
+            )
+
+    if not toc_parts:
+        return ""
+    return '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+
+def _store_item_gp_stats(db: "Db", pages: list) -> tuple[int, str, str, float]:
+    """Scan store inventory pages; return (max_cost, max_irr, max_name, avg_cost).
+    Only items with cost > 0 are counted. avg_cost is 0.0 when none qualify."""
+    max_cost = 0
+    max_irr = ""
+    max_name = ""
+    total = 0
+    count = 0
+    for p in pages:
+        for it in list_items(p.get("ItemList")):
+            cost = item_gp_value(it)
+            if cost <= 0:
+                continue
+            count += 1
+            total += cost
+            if cost > max_cost:
+                max_cost = cost
+                max_irr = (fld(it, "TemplateResRef", "")
+                           or fld(it, "InventoryRes", "")
+                           or fld(it, "EquippedRes", "") or "")
+                max_name = loc(it.get("LocalizedName")) or ""
+                if not max_name and max_irr in db.items:
+                    max_name = db.item_name(max_irr)
+                if not max_name:
+                    max_name = max_irr or "(unknown)"
+    return max_cost, max_irr, max_name, (total / count if count else 0.0)
+
+
+def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> None:
+    """Render a per-placement store page showing the instance's actual inventory."""
+    rr = fld(inst, "ResRef", "") or ""
+    tag = fld(inst, "Tag", "") or rr
+    slug = _store_instance_slug(area_rr, inst)
+
+    bp_name = db.store_name(rr) if rr in db.stores else ""
+    name = bp_name or nwn_text(loc(inst.get("LocName"))) or tag or rr
+
+    sections = [f"<h1>{nwn_html(name)}</h1>"]
+
+    # Location and blueprint metadata
+    area_link = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                 if area_rr in db.areas else E(area_rr))
+    meta = [
+        f"<dt>Area</dt><dd>{area_link}</dd>",
+        f"<dt>Tag</dt><dd><code>{E(tag)}</code></dd>",
+        f"<dt>ResRef (blueprint)</dt><dd>"
+        + (link(f"{rr}.html", rr) if rr in db.stores else E(rr))
+        + "</dd>",
+    ]
+    mu = fld(inst, "MarkUp", None)
+    md = fld(inst, "MarkDown", None)
+    buy_html, buys_any = _store_buy_summary(inst)
+    if mu is not None or md is not None:
+        md_disp = (f'{md}%' if md is not None else '—') if buys_any else "N/A"
+        meta.append(
+            f"<dt>Sells At / Buys At</dt><dd>"
+            f"{f'{mu}%' if mu is not None else '—'} / {md_disp}</dd>"
+        )
+    meta.append(f"<dt>Buys</dt><dd>{buy_html}</dd>")
+    mbp = fld(inst, "MaxBuyPrice", None)
+    if mbp is not None:
+        meta.append(f"<dt>Max Buy Price</dt><dd>{'N/A' if not buys_any else _buy_limit_str(mbp)}</dd>")
+    inst_pages = list_items(inst.get("StoreList"))
+    max_gp, max_irr, max_name, avg_gp = _store_item_gp_stats(db, inst_pages)
+    if max_gp > 0:
+        max_item_html = (link(f"../items/{max_irr}.html", max_name)
+                         if max_irr in db.items else E(max_name))
+        meta.append(f"<dt>Most Valuable Item</dt><dd>{max_item_html} ({max_gp:,} gp)</dd>")
+        meta.append(f"<dt>Avg Item Value</dt><dd>{avg_gp:,.0f} gp</dd>")
+    sections.extend(['<dl class="meta">', *meta, "</dl>"])
+
+    # Opened By
+    openers = db.store_tag_openers.get(tag.lower(), [])
+    # Only show openers whose area matches this store instance. All store-opening
+    # scripts use GetNearestObjectByTag (area-local), so cross-area openers with
+    # the same tag are opening a different instance, not this one.
+    display_openers = [o for o in openers if area_rr in o.get("areas", []) or
+                       o.get("area") == area_rr]
+    if display_openers:
+        sections.append("<h2>Opened by</h2><ul>")
+        seen_html: set[str] = set()
+        for o in display_openers:
+            h = _store_opener_html(db, o, root_rel="..")
+            if h not in seen_html:
+                seen_html.add(h)
+                sections.append(f"<li>{h}</li>")
+        sections.append("</ul>")
+    else:
+        sections.append(
+            "<h2>Opened by</h2>"
+            '<p class="muted">No opener found in static analysis — '
+            "may be opened from a runtime-only code path, or may be inaccessible.</p>"
+        )
+
+    # Instance inventory with floating sidebar TOC
+    inv_toc = _store_inventory_toc_html(db, inst_pages)
+    inv_body = "<h2>Inventory</h2>" + _store_inventory_html(db, inst_pages)
+    if inv_toc:
+        inv_section = (
+            '<div class="items-layout">'
+            + inv_toc
+            + f'<div class="items-content">{inv_body}</div>'
+            + '</div>'
+        )
+    else:
+        inv_section = inv_body
+    sections.append(inv_section)
+
+    write(out / "stores" / f"{slug}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_stores_index(db: Db, out: Path) -> None:
+    # The GIT instance is the authoritative source: each placed store can have
+    # different MarkUp/MarkDown/MaxBuyPrice/inventory from the UTM blueprint.
+    # NWN semantics: MarkUp = % of base the store charges you (Sells At, usually >100)
+    #                MarkDown = % of base the store pays you  (Buys At,  usually <100)
+
+    placed_rows: list[tuple[str, str]] = []      # (sort_key, html_row) — has opener
+    no_opener_rows: list[tuple[str, str]] = []   # (sort_key, html_row) — no opener found
+    placed_resrefs: set[str] = set()
+
+    # Track the single most valuable item across all accessible stores.
+    gm_cost: int = 0          # highest item base cost found so far
+    gm_irr: str = ""          # item resref
+    gm_item_name: str = ""    # item display name
+    gm_store_name: str = ""   # store display name
+    gm_slug: str = ""         # store instance slug (for link)
+    gm_area_rr: str = ""      # area resref (for link)
+
+    _IDX_TABLE_HEAD = (
+        '<table class="data"><thead><tr>'
+        "<th>Name</th>"
+        # "<th>ResRef</th><th>Tag</th>"
+        "<th>Items</th>"
+        "<th>Area</th><th>Opened By</th>"
+        '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+        '<th title="Item types the store will buy from you">Buys</th>'
+        '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
+        '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+        '<th title="Highest base item value in stock (before markup)">Max GP</th>'
+        '<th title="Average base item value in stock (before markup)">Avg GP</th>'
+        "</tr></thead><tbody>"
+    )
+
+    for area_rr in sorted(db.area_stores.keys(),
+                          key=lambda a: nwn_text(db.area_name(a)).lower()):
+        if area_rr in db.hidden_areas:
+            continue
+        for inst in db.area_stores[area_rr]:
+            rr = fld(inst, "ResRef", "")
+            tag = fld(inst, "Tag", "")
+            placed_resrefs.add(rr)
+
+            name = db.store_name(rr) if rr in db.stores else (tag or rr)
+            slug = _store_instance_slug(area_rr, inst)
+            name_cell = link(f"{slug}.html", name)
+
+            pages = list_items(inst.get("StoreList"))
+            n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+
+            mu_val = fld(inst, "MarkUp", None)
+            md_val = fld(inst, "MarkDown", None)
+            buy_html, buys_any = _store_buy_summary(inst)
+            mu_str = f"{mu_val}%" if mu_val is not None else "—"
+            md_str = (f"{md_val}%" if md_val is not None else "—") if buys_any else "N/A"
+
+            area_cell = link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+
+            # Only show openers in the same area. All store-opening scripts use
+            # GetNearestObjectByTag (area-local), so a cross-area NPC with the
+            # same tag is opening a different instance, not this one.
+            all_openers = db.store_tag_openers.get(tag.lower(), [])
+            display_openers = [o for o in all_openers
+                               if area_rr in o.get("areas", []) or o.get("area") == area_rr]
+            if display_openers:
+                seen_html: set[str] = set()
+                opener_parts = []
+                for o in display_openers[:3]:  # cap at 3 in index for readability
+                    h = _store_opener_html(db, o, root_rel="..")
+                    if h not in seen_html:
+                        seen_html.add(h)
+                        opener_parts.append(h)
+                opener_cell = "<br>".join(opener_parts)
+                if len(display_openers) > 3:
+                    opener_cell += f" <em class=\"muted\">(+{len(display_openers)-3} more)</em>"
+            else:
+                opener_cell = '<em class="muted">unknown</em>'
+
+            mbp_raw = fld(inst, 'MaxBuyPrice', None)
+            max_gp, max_irr, max_item_name, avg_gp = _store_item_gp_stats(db, pages)
+            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
+            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
+            row = (
+                f"<tr>"
+                f"<td>{name_cell}</td>"
+                # f"<td>{E(rr)}</td>"
+                # f"<td>{E(tag)}</td>"
+                f"<td>{n_items}</td>"
+                f"<td>{area_cell}</td>"
+                f"<td>{opener_cell}</td>"
+                f"<td>{mu_str}</td>"
+                f"<td>{buy_html}</td>"
+                f"<td>{md_str}</td>"
+                f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
+                f"<td>{max_gp_str}</td>"
+                f"<td>{avg_gp_str}</td>"
+                f"</tr>"
+            )
+            mbp_sort = float('inf') if mbp_raw == -1 else (mbp_raw if mbp_raw is not None else 0)
+            md_sort = md_val if md_val is not None else 0
+            sort_key = (-mbp_sort, -md_sort, nwn_text(name).lower())
+            if display_openers:
+                placed_rows.append((sort_key, row))
+                if max_gp > gm_cost:
+                    gm_cost = max_gp
+                    gm_irr = max_irr
+                    gm_item_name = max_item_name
+                    gm_store_name = name
+                    gm_slug = slug
+                    gm_area_rr = area_rr
+            else:
+                no_opener_rows.append((sort_key, row))
+
+    placed_rows.sort(key=lambda x: x[0])
+    no_opener_rows.sort(key=lambda x: x[0])
+
+    # UTM blueprints that were never placed in any area
+    unplaced_rows: list[tuple] = []
+    for rr in db.stores.keys():
+        if rr in placed_resrefs:
+            continue
+        s = db.stores[rr]
+        pages = list_items(s.get("StoreList"))
+        n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+        mu_val = fld(s, "MarkUp", None)
+        md_val = fld(s, "MarkDown", None)
+        buy_html, buys_any = _store_buy_summary(s)
+        mbp_raw = fld(s, 'MaxBuyPrice', None)
+        mbp_sort = float('inf') if mbp_raw == -1 else (mbp_raw if mbp_raw is not None else 0)
+        md_sort = md_val if md_val is not None else 0
+        u_max_gp, _, _, u_avg_gp = _store_item_gp_stats(db, pages)
+        unplaced_rows.append((
+            (-mbp_sort, -md_sort, nwn_text(db.store_name(rr)).lower()),
+            f"<tr>"
+            f"<td>{link(f'{rr}.html', db.store_name(rr))}</td>"
+            # f"<td>{E(rr)}</td>"
+            # f"<td>{E(fld(s, 'Tag', ''))}</td>"
+            f"<td>{n_items}</td>"
+            f"<td><em>Not placed</em></td>"
+            f"<td>—</td>"
+            f"<td>{f'{mu_val}%' if mu_val is not None else '—'}</td>"
+            f"<td>{buy_html}</td>"
+            f"<td>{(f'{md_val}%' if md_val is not None else '—') if buys_any else 'N/A'}</td>"
+            f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
+            f"<td>{f'{u_max_gp:,}' if u_max_gp > 0 else '—'}</td>"
+            f"<td>{f'{u_avg_gp:,.0f}' if u_avg_gp > 0 else '—'}</td>"
+            f"</tr>"
+        ))
+    unplaced_rows.sort(key=lambda x: x[0])
+
+    n_placed = len(placed_rows) + len(no_opener_rows)
+    body = "<h1>Stores</h1>"
+    body += (
+        f"<p>{n_placed} placed store instance{'s' if n_placed != 1 else ''}"
+        + (f"; {len(no_opener_rows)} with no known opener"
+           if no_opener_rows else "")
+        + (f"; {len(unplaced_rows)} unplaced blueprint"
+           f"{'s' if len(unplaced_rows) != 1 else ''} at bottom"
+           if unplaced_rows else "")
+        + ". Values shown are per-area instance data (may differ from blueprint defaults).</p>"
+    )
+    body += _IDX_TABLE_HEAD + "\n".join(r[1] for r in placed_rows) + "</tbody></table>"
+
+    if gm_cost > 0:
+        item_html = (link(f"../items/{gm_irr}.html", gm_item_name)
+                     if gm_irr in db.items else E(gm_item_name))
+        store_html = link(f"{gm_slug}.html", gm_store_name)
+        area_html = link(f"../areas/{gm_area_rr}.html", db.area_name(gm_area_rr))
+        body += (
+            "<h2>Most Valuable Item for Sale</h2>"
+            f"<p>{item_html} — <strong>{gm_cost:,} gp</strong> base value, "
+            f"sold at {store_html} in {area_html}.</p>"
+        )
+
+    if no_opener_rows:
+        body += (
+            "<h2>Possibly Inaccessible</h2>"
+            "<p>These stores are placed in areas but no NPC conversation or trigger "
+            "was found that opens them. They may be opened by runtime-only code "
+            "(dynamic tag lookup, item scripts) or may be bugged / unreachable.</p>"
+            + _IDX_TABLE_HEAD + "\n".join(r[1] for r in no_opener_rows) + "</tbody></table>"
+        )
+
+    if unplaced_rows:
+        body += (
+            "<h2>Unplaced Blueprints</h2>"
+            "<p>These store blueprints exist in the module files but are not placed "
+            "in any area — they are not accessible to players.</p>"
+            + _IDX_TABLE_HEAD + "\n".join(r[1] for r in unplaced_rows) + "</tbody></table>"
+        )
+
+    write(out / "stores" / "index.html", page("Stores", body, root_rel=".."))
+
+
+def render_store_page(db: Db, resref: str, out: Path) -> None:
+    s = db.stores.get(resref)
+    if not s:
+        return
+    name = db.store_name(resref)
+
+    # Find all placed instances for this blueprint, excluding hidden areas.
+    # If every placement is in a hidden area, suppress the blueprint page entirely.
+    all_instances: list[tuple[str, Any]] = []
+    for area_rr, store_list in db.area_stores.items():
+        for inst in store_list:
+            if fld(inst, "ResRef", "") == resref:
+                all_instances.append((area_rr, inst))
+    instances = [(a, i) for a, i in all_instances if a not in db.hidden_areas]
+    if not instances and all_instances:
+        return  # all placements are in hidden areas
+    instances.sort(key=lambda x: nwn_text(db.area_name(x[0])).lower())
+
+    sections = [f"<h1>{nwn_html(name)}</h1>"]
+
+    if instances:
+        inst_rows = []
+        for area_rr, inst in instances:
+            mu = fld(inst, "MarkUp", None)
+            md = fld(inst, "MarkDown", None)
+            buy_html, buys_any = _store_buy_summary(inst)
+            pages = list_items(inst.get("StoreList"))
+            n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
+            inst_tag = fld(inst, "Tag", "") or ""
+            slug = _store_instance_slug(area_rr, inst)
+            inst_rows.append(
+                f"<tr>"
+                f"<td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                f"<td>{link(f'{slug}.html', inst_tag) if inst_tag else '—'}</td>"
+                f"<td>{n_items}</td>"
+                f"<td>{f'{mu}%' if mu is not None else '—'}</td>"
+                f"<td>{buy_html}</td>"
+                f"<td>{(f'{md}%' if md is not None else '—') if buys_any else 'N/A'}</td>"
+                f"<td>{'N/A' if not buys_any else _buy_limit_str(fld(inst, 'MaxBuyPrice', None))}</td>"
+                f"</tr>"
+            )
+        sections.append(
+            "<h2>Placed Instances</h2>"
+            '<table class="data"><thead><tr>'
+            '<th>Area</th><th>Tag</th><th>Items</th>'
+            '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
+            '<th title="Item types the store will buy from you">Buys</th>'
+            '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
+            '<th title="Maximum the store will pay for any single item">Max Buy</th>'
+            "</tr></thead><tbody>" + "\n".join(inst_rows) + "</tbody></table>"
+        )
+    else:
+        sections.append(
+            '<p><strong>Warning:</strong> This blueprint is not placed in any area '
+            '— it is not accessible to players.</p>'
+        )
+
+    pages = list_items(s.get("StoreList"))
+    bp_max_gp, bp_max_irr, bp_max_name, bp_avg_gp = _store_item_gp_stats(db, pages)
+    bp_max_item_html = ""
+    if bp_max_gp > 0:
+        bp_max_item_html = (link(f"../items/{bp_max_irr}.html", bp_max_name)
+                            if bp_max_irr in db.items else E(bp_max_name))
+    _bp_buy_html, _bp_buys_any = _store_buy_summary(s)
+    bp_meta = [
+        "<h2>Blueprint</h2>",
+        '<dl class="meta">',
+        f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
+        f"<dt>Tag</dt><dd>{E(fld(s, 'Tag', ''))}</dd>",
+        f"<dt>Sells At (MarkUp) / Buys At (MarkDown)</dt>"
+        f"<dd>{E(fld(s, 'MarkUp', ''))} / "
+        f"{E(fld(s, 'MarkDown', '')) if _bp_buys_any else 'N/A'}</dd>",
+        f"<dt>Buys</dt><dd>{_bp_buy_html}</dd>",
+        f"<dt>MaxBuyPrice</dt><dd>"
+        f"{'N/A' if not _bp_buys_any else _buy_limit_str(fld(s, 'MaxBuyPrice', None))}</dd>",
+        f"<dt>StoreGold</dt><dd>{E(fld(s, 'StoreGold', ''))}</dd>",
+        f"<dt>BlackMarket</dt><dd>{E(fld(s, 'BlackMarket', ''))}</dd>",
+    ]
+    if bp_max_gp > 0:
+        bp_meta.append(f"<dt>Most Valuable Item</dt><dd>{bp_max_item_html} ({bp_max_gp:,} gp)</dd>")
+        bp_meta.append(f"<dt>Avg Item Value</dt><dd>{bp_avg_gp:,.0f} gp</dd>")
+    bp_meta.append('</dl>')
+    sections.extend(bp_meta)
+    sections.append("<h2>Blueprint Inventory</h2>" + _store_inventory_html(db, pages))
+
+    write(out / "stores" / f"{resref}.html",
+          page(name, "\n".join(sections), root_rel=".."))
+
+
+def render_factions(db: Db, out: Path) -> None:
+    if not db.fac:
+        write(out / "factions.html", page("Factions", "<h1>Factions</h1><p>(none)</p>"))
+        return
+    flist = list_items(db.fac.get("FactionList"))
+
+    def _int_fid(raw: Any) -> "int | None":
+        if raw is None or raw == "":
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _total_levels(classes: list) -> int:
+        return sum(int(fld(cl, "ClassLevel", 0) or 0) for cl in classes)
+
+    def _faction_anchor(i: int) -> str:
+        raw = db.faction_name(i)
+        slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+        return f"faction-{i}-{slug}" if slug else f"faction-{i}"
+
+    # ---- Collect per-faction entries ----
+    # kind="instance": directly placed GIT creature
+    # kind="spawn":    blueprint slot in an encounter pool
+    faction_entries: dict[int, list[dict]] = defaultdict(list)
+    crr_fids: dict[str, set[int]] = defaultdict(set)
+
+    for area_rr, insts in db.area_creature_instances.items():
+        if area_rr in db.hidden_areas:
+            continue
+        for inst in insts:
+            c = inst["c"]
+            fid = _int_fid(fld(c, "FactionID"))
+            if fid is None:
+                continue
+            crr = fld(c, "TemplateResRef", "") or ""
+            bp = db.creatures.get(crr, {})
+            idx = inst["idx"]
+            name = db.creature_instance_name(area_rr, idx) or db.creature_name(crr) or crr
+            classes = list_items(c.get("ClassList")) or list_items(bp.get("ClassList"))
+            hp = creature_max_hp(c, bp) or 0
+            cr = fld(c, "ChallengeRating") or fld(bp, "ChallengeRating") or ""
+            race = fld(c, "Race") if fld(c, "Race") not in (None, "") else fld(bp, "Race")
+            faction_entries[fid].append({
+                "kind": "instance",
+                "area": area_rr,
+                "crr": crr,
+                "idx": idx,
+                "name": name,
+                "classes": classes,
+                "lvls": _total_levels(classes),
+                "hp": hp,
+                "cr": cr,
+                "race": race,
+            })
+            if crr:
+                crr_fids[crr].add(fid)
+
+    for crr, spawns in db.creature_encounter_spawns.items():
+        bp = db.creatures.get(crr, {})
+        fid = _int_fid(fld(bp, "FactionID"))
+        if fid is None:
+            continue
+        classes = list_items(bp.get("ClassList"))
+        hp = creature_max_hp(bp) or 0
+        cr = fld(bp, "ChallengeRating") or ""
+        name = db.creature_name(crr) or crr
+        lvls = _total_levels(classes)
+        race = fld(bp, "Race")
+        for s in spawns:
+            area_rr = s["area"]
+            if area_rr in db.hidden_areas:
+                continue
+            faction_entries[fid].append({
+                "kind": "spawn",
+                "area": area_rr,
+                "crr": crr,
+                "enc_rr": s["encounter_resref"],
+                "name": name,
+                "classes": classes,
+                "lvls": lvls,
+                "hp": hp,
+                "cr": cr,
+                "race": race,
+            })
+            if crr:
+                crr_fids[crr].add(fid)
+
+    # Blueprints that appear under more than one faction across all placements/pools
+    cross_faction: dict[str, set[int]] = {
+        crr: fids for crr, fids in crr_fids.items() if len(fids) > 1
+    }
+
+    # ---- Sidebar TOC ----
+    toc_parts: list[str] = ['<div class="toc-group-heading">Factions</div>']
+    for i, f in enumerate(flist):
+        fname = nwn_text(fld(f, "FactionName", "")) or f"Faction {i}"
+        n = len(faction_entries.get(i, []))
+        cnt = f' <span class="muted">({n})</span>' if n else ""
+        toc_parts.append(
+            f'<div><a href="#{E(_faction_anchor(i))}">{E(fname)}{cnt}</a></div>'
+        )
+    _none_entries = faction_entries.get(65535, [])
+    if _none_entries:
+        toc_parts.append(
+            f'<div><a href="#{E(_faction_anchor(65535))}">(None)'
+            f' <span class="muted">({len(_none_entries)})</span></a></div>'
+        )
+    if cross_faction:
+        toc_parts.append('<div class="toc-group-heading">Flags</div>')
+        toc_parts.append(
+            f'<div><a href="#cross-faction">&#x26A0; Cross-Faction'
+            f' <span class="muted">({len(cross_faction)})</span></a></div>'
+        )
+    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+
+    # ---- Summary table ----
+    sum_rows: list[str] = []
+    for i, f in enumerate(flist):
+        fname = nwn_text(fld(f, "FactionName", "")) or f"Faction {i}"
+        parent_id = fld(f, "FactionParentID")
+        try:
+            pid = int(parent_id) if parent_id not in (None, "") else -1
+        except (TypeError, ValueError):
+            pid = -1
+        parent_cell = (
+            f'<a href="#{E(_faction_anchor(pid))}">{E(db.faction_name(pid))}</a>'
+            if 0 <= pid < len(flist) and pid != i else "&#x2014;"
+        )
+        glob = fld(f, "FactionGlobal", "")
+        friendly = db.is_friendly(i)
+        entries = faction_entries.get(i, [])
+        n_inst = sum(1 for e in entries if e["kind"] == "instance")
+        n_spawn = sum(1 for e in entries if e["kind"] == "spawn")
+        n_areas = len({e["area"] for e in entries})
+        n_bps = len({e["crr"] for e in entries if e["crr"]})
+        total_lvls = sum(e["lvls"] for e in entries)
+        sum_rows.append(
+            "<tr>"
+            f'<td><a href="#{E(_faction_anchor(i))}">{E(fname)}</a></td>'
+            f"<td>{i}</td>"
+            f"<td>{parent_cell}</td>"
+            f"<td>{'Yes' if glob else 'No'}</td>"
+            f"<td>{'Friendly' if friendly else 'Hostile'}</td>"
+            f"<td>{n_inst:,}</td>"
+            f"<td>{n_spawn:,}</td>"
+            f"<td>{n_bps:,}</td>"
+            f"<td>{n_areas:,}</td>"
+            f"<td>{total_lvls:,}</td>"
+            "</tr>"
+        )
+
+    if faction_entries.get(65535):
+        _ne = faction_entries[65535]
+        sum_rows.append(
+            "<tr>"
+            f'<td><a href="#{E(_faction_anchor(65535))}">(None)</a></td>'
+            f"<td>65535</td>"
+            f"<td>&#x2014;</td>"
+            f"<td>&#x2014;</td>"
+            f"<td>&#x2014;</td>"
+            f"<td>{sum(1 for e in _ne if e['kind'] == 'instance'):,}</td>"
+            f"<td>{sum(1 for e in _ne if e['kind'] == 'spawn'):,}</td>"
+            f"<td>{len({e['crr'] for e in _ne if e['crr']}):,}</td>"
+            f"<td>{len({e['area'] for e in _ne}):,}</td>"
+            f"<td>{sum(e['lvls'] for e in _ne):,}</td>"
+            "</tr>"
+        )
+
+    # ---- Race × Faction matrix ----
+    # Collect (race_id, faction_id) → count across all entries
+    race_faction_counts: dict[tuple, int] = defaultdict(int)
+    for fid, entries in faction_entries.items():
+        for e in entries:
+            rid = e.get("race")
+            if rid is None or rid == "":
+                rid = None
+            race_faction_counts[(rid, fid)] += 1
+
+    all_race_ids = sorted(
+        {k[0] for k in race_faction_counts},
+        key=lambda r: race_name(r).lower() if r is not None else "",
+    )
+    factions_with_creatures = sorted(
+        {k[1] for k in race_faction_counts},
+    )
+
+    rf_header = "<tr><th>Race</th>" + "".join(
+        f'<th><a href="#{E(_faction_anchor(fid))}">{E(db.faction_name(fid))}</a></th>'
+        for fid in factions_with_creatures
+    ) + "<th>Total</th></tr>"
+
+    rf_rows: list[str] = []
+    col_totals: dict[int, int] = {fid: 0 for fid in factions_with_creatures}
+    for rid in all_race_ids:
+        row_total = 0
+        cells = ""
+        for fid in factions_with_creatures:
+            n = race_faction_counts.get((rid, fid), 0)
+            col_totals[fid] += n
+            row_total += n
+            cells += f"<td>{n if n else '&#x2014;'}</td>"
+        rname_cell = _race_link(rid, root_rel=".") if rid is not None else E("(unset)")
+        rf_rows.append(f"<tr><td>{rname_cell}</td>{cells}<td>{row_total}</td></tr>")
+
+    total_cells = "".join(f"<td>{col_totals[fid]}</td>" for fid in factions_with_creatures)
+    grand_total = sum(col_totals.values())
+    rf_rows.append(f"<tr><th>Total</th>{total_cells}<th>{grand_total}</th></tr>")
+
+    sections: list[str] = [
+        "<h1>Factions</h1>",
+        f"<p>{len(flist)} factions defined in repute.fac.</p>",
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>ID</th><th>Parent</th><th>Global</th><th>Friendly?</th>"
+        "<th>Placed</th><th>Enc. Pool</th><th>Blueprints</th><th>Areas</th><th>Total Levels</th>"
+        "</tr></thead><tbody>",
+        "\n".join(sum_rows),
+        "</tbody></table>",
+        "<h2>Race &times; Faction</h2>",
+        '<table class="data"><thead>' + rf_header + "</thead><tbody>",
+        "\n".join(rf_rows),
+        "</tbody></table>",
+    ]
+
+    # ---- Per-faction detail sections ----
+    for i, f in enumerate(flist):
+        fname = nwn_text(fld(f, "FactionName", "")) or f"Faction {i}"
+        friendly = db.is_friendly(i)
+        entries = faction_entries.get(i, [])
+        anchor = _faction_anchor(i)
+
+        sections.append(f'<h2 id="{E(anchor)}">{E(fname)}</h2>')
+
+        if not entries:
+            sections.append(
+                "<p><em>No creatures placed in this faction or in any encounter pool.</em></p>"
+            )
+            continue
+
+        n_inst = sum(1 for e in entries if e["kind"] == "instance")
+        n_spawn = sum(1 for e in entries if e["kind"] == "spawn")
+        areas_sorted = sorted(
+            {e["area"] for e in entries},
+            key=lambda a: db.area_name(a).lower(),
+        )
+        total_lvls = sum(e["lvls"] for e in entries)
+        area_links = ", ".join(
+            link(f"areas/{a}.html", db.area_name(a)) for a in areas_sorted
+        )
+        sections.append(
+            '<dl class="meta">'
+            f"<dt>Attitude</dt><dd>{'Friendly to PC' if friendly else 'Hostile to PC'}</dd>"
+            f"<dt>Direct placements</dt><dd>{n_inst:,}</dd>"
+            f"<dt>Encounter pool slots</dt><dd>{n_spawn:,}</dd>"
+            f"<dt>Total class levels</dt><dd>{total_lvls:,}</dd>"
+            f"<dt>Areas</dt><dd>{area_links}</dd>"
+            "</dl>"
+        )
+
+        by_area: dict[str, list[dict]] = defaultdict(list)
+        for e in entries:
+            by_area[e["area"]].append(e)
+
+        rows: list[str] = []
+        for area_rr in sorted(by_area, key=lambda a: db.area_name(a).lower()):
+            # Collapse identical (crr, kind) pairs within the same area into one row.
+            grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+            for e in by_area[area_rr]:
+                grouped[(e["crr"], e["kind"])].append(e)
+
+            for (crr, kind) in sorted(
+                grouped,
+                key=lambda k: (db.creature_name(k[0]) or k[0]).lower(),
+            ):
+                group = grouped[(crr, kind)]
+                count = len(group)
+                e = group[0]
+                classes = e["classes"]
+                cls_str = "/".join(
+                    f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+                    for cl in classes
+                ) or "&#x2014;"
+
+                can_crr = db.canonical_for_bp.get(crr, crr)
+                disp_name = db.canonical_creature_name(can_crr) or e["name"] or crr
+                name_cell = (
+                    link(f"creatures/{can_crr}.html", disp_name)
+                    if can_crr in db.canonical_creatures else nwn_html(disp_name)
+                )
+                kind_cell = (
+                    '<span class="badge">placed</span>'
+                    if kind == "instance" else
+                    '<span class="badge">encounter pool</span>'
+                )
+                area_cell = link(f"areas/{area_rr}.html", db.area_name(area_rr))
+
+                cross_flag = (
+                    f' <a href="#cross-faction" class="muted"'
+                    f' title="blueprint appears in multiple factions">&#x26A0;</a>'
+                    if crr in cross_faction else ""
+                )
+
+                race_str = E(race_name(e.get("race")))
+                rows.append(
+                    "<tr>"
+                    f"<td>{name_cell}{cross_flag}</td>"
+                    f"<td>{kind_cell}</td>"
+                    f"<td>{count}</td>"
+                    f"<td>{area_cell}</td>"
+                    f"<td>{race_str}</td>"
+                    f"<td>{cls_str}</td>"
+                    f"<td>{_fmt_hp(e['hp'])}</td>"
+                    f"<td>{E(e['cr'])}</td>"
+                    "</tr>"
+                )
+
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Kind</th><th>Count</th><th>Area</th>"
+            "<th>Race</th><th>Classes</th><th>HP</th><th>CR</th>"
+            "</tr></thead><tbody>"
+            + "\n".join(rows)
+            + "</tbody></table>"
+        )
+
+    # ---- (None) faction detail section ----
+    _none_ent = faction_entries.get(65535, [])
+    if _none_ent:
+        _anchor_none = _faction_anchor(65535)
+        sections.append(f'<h2 id="{E(_anchor_none)}">(None)</h2>')
+        _n_inst_n = sum(1 for e in _none_ent if e["kind"] == "instance")
+        _n_spawn_n = sum(1 for e in _none_ent if e["kind"] == "spawn")
+        _areas_n = sorted({e["area"] for e in _none_ent}, key=lambda a: db.area_name(a).lower())
+        _area_links_n = ", ".join(link(f"areas/{a}.html", db.area_name(a)) for a in _areas_n)
+        sections.append(
+            '<dl class="meta">'
+            f"<dt>Direct placements</dt><dd>{_n_inst_n:,}</dd>"
+            f"<dt>Encounter pool slots</dt><dd>{_n_spawn_n:,}</dd>"
+            f"<dt>Total class levels</dt><dd>{sum(e['lvls'] for e in _none_ent):,}</dd>"
+            f"<dt>Areas</dt><dd>{_area_links_n}</dd>"
+            "</dl>"
+        )
+        _by_area_n: dict[str, list[dict]] = defaultdict(list)
+        for _e in _none_ent:
+            _by_area_n[_e["area"]].append(_e)
+        _rows_n: list[str] = []
+        for _area_rr in sorted(_by_area_n, key=lambda a: db.area_name(a).lower()):
+            _grouped_n: dict[tuple, list[dict]] = defaultdict(list)
+            for _e in _by_area_n[_area_rr]:
+                _grouped_n[(_e["crr"], _e["kind"])].append(_e)
+            for (_crr, _kind) in sorted(
+                _grouped_n,
+                key=lambda k: (db.creature_name(k[0]) or k[0]).lower(),
+            ):
+                _grp = _grouped_n[(_crr, _kind)]
+                _e0 = _grp[0]
+                _cls_str = "/".join(
+                    f"{class_name(fld(_cl, 'Class'))} {fld(_cl, 'ClassLevel', '')}"
+                    for _cl in _e0["classes"]
+                ) or "&#x2014;"
+                _can_crr = db.canonical_for_bp.get(_crr, _crr)
+                _disp = db.canonical_creature_name(_can_crr) or _e0["name"] or _crr
+                _name_cell = (
+                    link(f"creatures/{_can_crr}.html", _disp)
+                    if _can_crr in db.canonical_creatures else nwn_html(_disp)
+                )
+                _kind_cell = (
+                    '<span class="badge">placed</span>' if _kind == "instance"
+                    else '<span class="badge">encounter pool</span>'
+                )
+                _cross_flag = (
+                    f' <a href="#cross-faction" class="muted"'
+                    f' title="blueprint appears in multiple factions">&#x26A0;</a>'
+                    if _crr in cross_faction else ""
+                )
+                _rows_n.append(
+                    "<tr>"
+                    f"<td>{_name_cell}{_cross_flag}</td>"
+                    f"<td>{_kind_cell}</td>"
+                    f"<td>{len(_grp)}</td>"
+                    f"<td>{link(f'areas/{_area_rr}.html', db.area_name(_area_rr))}</td>"
+                    f"<td>{E(race_name(_e0.get('race')))}</td>"
+                    f"<td>{_cls_str}</td>"
+                    f"<td>{_fmt_hp(_e0['hp'])}</td>"
+                    f"<td>{E(_e0['cr'])}</td>"
+                    "</tr>"
+                )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Name</th><th>Kind</th><th>Count</th><th>Area</th>"
+            "<th>Race</th><th>Classes</th><th>HP</th><th>CR</th>"
+            "</tr></thead><tbody>"
+            + "\n".join(_rows_n)
+            + "</tbody></table>"
+        )
+
+    # ---- Cross-faction alert section ----
+    if cross_faction:
+        sections.append('<h2 id="cross-faction">&#x26A0; Cross-Faction Creatures</h2>')
+        sections.append(
+            "<p>The following creature blueprints are associated with more than one faction "
+            "across their placements or encounter pool entries. This may indicate that the "
+            "blueprint faction was not overridden consistently on all instances and may need "
+            "review.</p>"
+        )
+        cf_rows: list[str] = []
+        for crr in sorted(cross_faction, key=lambda r: (db.canonical_creature_name(db.canonical_for_bp.get(r, r)) or r).lower()):
+            fids = sorted(cross_faction[crr])
+            can_crr = db.canonical_for_bp.get(crr, crr)
+            bp_cell = (
+                link(f"creatures/{can_crr}.html", db.canonical_creature_name(can_crr))
+                if can_crr in db.canonical_creatures else f"<code>{E(crr)}</code>"
+            )
+            faction_list = ", ".join(
+                f'<a href="#{E(_faction_anchor(fid))}">{E(db.faction_name(fid))}</a>'
+                f' <small class="muted">({fid})</small>'
+                for fid in fids
+            )
+            cf_rows.append(
+                f"<tr><td>{bp_cell}</td><td><code>{E(crr)}</code></td>"
+                f"<td>{faction_list}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Creature</th><th>ResRef</th><th>Factions</th>"
+            "</tr></thead><tbody>"
+            + "\n".join(cf_rows)
+            + "</tbody></table>"
+        )
+
+    body = "\n".join(sections)
+    layout = (
+        f'<div class="items-layout">{sidebar}'
+        f'<div class="items-content">{body}</div></div>'
+    )
+    write(out / "factions.html", page("Factions", layout))
+
+
+def render_journal(db: Db, out: Path) -> None:
+    if not db.jrl:
+        write(out / "journal.html", page("Journal", "<h1>Journal</h1><p>(empty)</p>"))
+        return
+    cats = list_items(db.jrl.get("Categories"))
+    sections = [f"<h1>Journal</h1><p>{len(cats)} quests.</p>"]
+    for c in cats:
+        tag = fld(c, "Tag", "")
+        qname = loc(c.get("Name")) or tag
+        prio = fld(c, "Priority", "")
+        xp = fld(c, "XP", "")
+        sections.append(f"<h2>{nwn_html(qname)} <small>({E(tag)})</small></h2>")
+        sections.append(f"<p>Priority: {E(prio)} · XP: {E(xp)}</p>")
+        entries = list_items(c.get("EntryList"))
+        if entries:
+            rows = []
+            for e in entries:
+                eid = fld(e, "ID", "")
+                end = fld(e, "End", "")
+                txt = loc(e.get("Text"))
+                rows.append(
+                    f"<tr><td>{E(eid)}</td><td>{E('end' if end else '')}</td><td>{nwn_html(txt)}</td></tr>"
+                )
+            sections.append(
+                '<table class="data"><thead><tr><th>ID</th><th>End</th><th>Text</th></tr></thead>'
+                "<tbody>" + "\n".join(rows) + "</tbody></table>"
+            )
+    write(out / "journal.html", page("Journal", "\n".join(sections)))
+
+
+# ---------------------------------------------------------------------------
+# Quests — a browseable, structured view of the module journal: one overview
+# index (table of contents) plus a detail page per quest line.
+# ---------------------------------------------------------------------------
+
+# NWN toolset journal "Priority" dropdown values.
+_QUEST_PRIORITY_LABELS = {0: "Highest", 1: "High", 2: "Medium", 3: "Low", 4: "Lowest"}
+
+
+def _quest_priority_label(prio: Any) -> str:
+    try:
+        p = int(prio)
+    except (TypeError, ValueError):
+        return ""
+    return _QUEST_PRIORITY_LABELS.get(p, str(p))
+
+
+def _quest_slug(tag: str, name: str, used: set[str]) -> str:
+    """Stable, unique, filename-safe slug for a quest line. Prefers the quest
+    Tag (the plot id scripts reference); falls back to the display name.
+    Disambiguates collisions with a numeric suffix."""
+    base = re.sub(r"[^a-z0-9]+", "-", (tag or name or "").lower()).strip("-") or "quest"
+    slug, n = base, 2
+    while slug in used:
+        slug, n = f"{base}-{n}", n + 1
+    used.add(slug)
+    return slug
+
+
+def _quest_categories(db: Db) -> list[dict]:
+    return list_items(db.jrl.get("Categories")) if db.jrl else []
+
+
+def _quest_slugs(cats: list[dict]) -> list[str]:
+    """Slug per category, in category order. Deterministic, so the index and
+    the per-quest pages agree on URLs as long as both iterate in this order."""
+    used: set[str] = set()
+    return [_quest_slug(fld(c, "Tag", ""), loc(c.get("Name")), used) for c in cats]
+
+
+def _quest_entry_id(e: dict) -> int:
+    try:
+        return int(fld(e, "ID", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# Builder-authored directives parsed from a quest category's Comment field —
+# the only per-quest free text the toolset exposes (individual journal entries
+# have no Comment field). All optional and module-agnostic:
+#   @group 'Name'   place this quest under the "Name" heading on the index
+#   @order N        sort position of this quest within its group (integer;
+#                   lower = earlier; ties and ungrouped quests fall back to
+#                   alphabetical order by name)
+#   @group-order N  sort position of this quest's group among all groups
+#                   (set on any quest in the group; first found wins)
+#   @hidden         retired/inactive quest — omit it from the wiki entirely
+#                   (@retired and @inactive are accepted synonyms)
+# The group name may be wrapped in single quotes, double quotes, or left bare.
+_RE_QUEST_GROUP = re.compile(
+    r"@group\s+(?:'([^']*)'|\"([^\"]*)\"|([^\n]+))", re.IGNORECASE)
+_RE_QUEST_ORDER = re.compile(r"@order\s+(\d+)", re.IGNORECASE)
+_RE_QUEST_GROUP_ORDER = re.compile(r"@group-order\s+(\d+)", re.IGNORECASE)
+_RE_QUEST_HIDDEN = re.compile(r"@(?:hidden|retired|inactive)\b", re.IGNORECASE)
+# Whole directive lines, stripped before the Comment is shown to readers.
+_RE_QUEST_DIRECTIVE = re.compile(
+    r"^[ \t]*@(?:group-order|group|order|hidden|retired|inactive)\b[^\n]*$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _quest_hidden(comment: str) -> bool:
+    """True when a quest's Comment marks it retired/inactive via @hidden (or
+    the @retired / @inactive synonyms). Such quests are dropped from all wiki
+    output, mirroring the area-level WIKI_HIDDEN convention."""
+    return bool(_RE_QUEST_HIDDEN.search(comment or ""))
+
+
+def _quest_group(comment: str) -> str:
+    """The @group name declared in a quest's Comment, or '' if none."""
+    m = _RE_QUEST_GROUP.search(comment or "")
+    if not m:
+        return ""
+    return (m.group(1) or m.group(2) or m.group(3) or "").strip()
+
+
+def _quest_sort_order(comment: str) -> int | None:
+    """Sort position of this quest within its group declared via @order N.
+    Returns None when no @order is present (callers fall back to alphabetical)."""
+    m = _RE_QUEST_ORDER.search(comment or "")
+    return int(m.group(1)) if m else None
+
+
+def _quest_group_order(comment: str) -> int | None:
+    """Sort position of this quest's group declared via @group-order N.
+    Returns None when not present (callers fall back to alphabetical)."""
+    m = _RE_QUEST_GROUP_ORDER.search(comment or "")
+    return int(m.group(1)) if m else None
+
+
+def _quest_comment_display(comment: str) -> str:
+    """Builder comment with the @group/@order directive lines removed, so the
+    machine-readable markers don't surface in the human-facing note."""
+    if not comment:
+        return ""
+    cleaned = _RE_QUEST_DIRECTIVE.sub("", comment)
+    return re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", cleaned).strip()
+
+
+
+
+def _quest_group_anchor(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return f"group-{slug}" if slug else "group"
+
+
+def _quest_start_locations(db: Db, c: dict, action_to_dlgs,
+                           script_to_module_event=None,
+                           script_to_placeable_areas=None,
+                           script_to_trigger_areas=None):
+    """Best-effort guess at where a quest begins, for the index overview.
+
+    ``action_to_dlgs`` maps a (lowercased) script resref to the dialogs that run
+    it as an action node (the reverse of ``db.dialog_scripts``). We take the
+    scripts that award the quest's *first known* journal step, find the
+    conversations whose nodes run them, and the NPCs that own those
+    conversations (``db.dialog_callers``). Returns ``(npcs, areas)``:
+
+      npcs  - ``[(canonical_rr, name), ...]`` quest-giver creatures, deduped by
+              blueprint resref. ``canonical_rr`` is "" when the blueprint has no
+              creature page of its own.
+      areas - ``[(area_rr, name), ...]`` areas those NPCs are placed in, deduped
+              by area resref.
+
+    Also detects quests granted by:
+    - Module events (OnClientEnter etc.) → area = module entry area
+    - Placeable events (OnUsed etc.) → area = placeable placement area(s)
+    - Trigger events (OnEnter etc.) → area = trigger placement area(s)
+    - Waypoint-spawned NPCs → area from canonical_locations fallback
+    """
+    tag = fld(c, "Tag", "")
+    tag_lower = (tag or "").lower()
+    grants = db.quest_grants.get(tag_lower, {})
+    dlg_grants = db.quest_dialog_grants.get(tag_lower, {})
+    entries = list_items(c.get("EntryList"))
+    if not entries or (not grants and not dlg_grants):
+        return [], []
+    # Opening step = the first entry, in builder/progression order, that we
+    # actually know a granting script or dialog-native grant for.
+    ordered = sorted(entries, key=_quest_entry_id)
+    scripts: set[str] = set()
+    dlgs_direct: set[str] = set()
+    for e in ordered:
+        step = _quest_entry_id(e)
+        scripts = grants.get(step) or set()
+        dlgs_direct = dlg_grants.get(step) or set()
+        if scripts or dlgs_direct:
+            break
+    if not scripts and not dlgs_direct:
+        return [], []
+    npcs = {}     # bp_rr -> (canonical_rr, name)
+    areas = {}    # area_rr -> area name
+
+    # Priority 1: non-dialog sources fill areas first so they appear
+    # prominently (a shrine or trigger zone is more specific than an NPC area).
+
+    # Module-event grants (OnClientEnter, OnModuleLoad, etc.): area = module entry.
+    if script_to_module_event:
+        entry_area = fld(db.ifo or {}, "Mod_Entry_Area", "") if db.ifo else ""
+        for sref in scripts:
+            if sref.lower() in script_to_module_event and entry_area:
+                areas.setdefault(entry_area, db.area_name(entry_area))
+
+    # Placeable-event grants: quest opened by interacting with a placeable.
+    if script_to_placeable_areas:
+        for sref in scripts:
+            for ar in script_to_placeable_areas.get(sref.lower(), ()):
+                areas.setdefault(ar, db.area_name(ar))
+
+    # Trigger-event grants: quest opened by entering a trigger zone.
+    if script_to_trigger_areas:
+        for sref in scripts:
+            for ar in script_to_trigger_areas.get(sref.lower(), ()):
+                areas.setdefault(ar, db.area_name(ar))
+
+    def _trace_dlg_callers(dlg_resref: str) -> None:
+        """Resolve a dialog resref to NPC quest-givers and their areas."""
+        for caller in db.dialog_callers.get(dlg_resref, ()):
+            if caller.get("kind") not in ("creature", "creature-instance"):
+                continue
+            bp = (caller.get("resref") or "").lower()
+            if bp:
+                can = (bp if bp in db.canonical_creatures
+                       else db.canonical_for_bp.get(bp, ""))
+                name = (db.canonical_creature_name(can) if can
+                        else (db.creature_name(bp) or caller.get("tag") or bp))
+                npcs.setdefault(bp, (can, name))
+            car = caller.get("areas") or (
+                [caller["area"]] if caller.get("area") else [])
+            # Waypoint-spawned NPCs have no placed area in dialog_callers;
+            # fall back to canonical_locations (includes script-spawn areas).
+            if not car and bp:
+                can_for_bp = (bp if bp in db.canonical_creatures
+                              else db.canonical_for_bp.get(bp, ""))
+                if can_for_bp:
+                    car = [loc["area"]
+                           for loc in db.canonical_locations.get(can_for_bp, [])
+                           if loc.get("area")]
+            for ar in car:
+                if ar:
+                    areas.setdefault(ar, db.area_name(ar))
+
+    # Priority 2: dialog-action tracing — scripts that run inside dialog action
+    # nodes → find the owning dialog → resolve NPC callers.
+    for sref in scripts:
+        for dlg in action_to_dlgs.get(sref.lower(), ()):
+            _trace_dlg_callers(dlg)
+
+    # Priority 3: dialog-native quest grants (Quest/QuestEntry fields on dialog
+    # nodes) — the dialog itself is already known, go straight to callers.
+    for dlg in dlgs_direct:
+        _trace_dlg_callers(dlg)
+
+    return list(npcs.values()), list(areas.items())
+
+
+def _quest_loc_cell(items, render):
+    """Render an index "begins at" cell: up to three links via ``render(item)``,
+    an em dash when empty, a muted +N when more than three are known."""
+    if not items:
+        return '<span class="muted">&mdash;</span>'
+    cell = ", ".join(render(it) for it in items[:3])
+    if len(items) > 3:
+        cell += f' <span class="muted">+{len(items) - 3}</span>'
+    return cell
+def render_quests_index(db: Db, out: Path) -> None:
+    """Quests landing page: an overview plus a table of contents of every
+    journal quest, each row linking to that quest's detail page. Quests whose
+    Comment marks them @hidden are omitted entirely. When any visible quest
+    declares `@group 'Name'` in its builder Comment, quests are gathered under
+    those headings; otherwise every quest sits in one table."""
+    cats = _quest_categories(db)
+    visible = [i for i in range(len(cats))
+               if not _quest_hidden(fld(cats[i], "Comment", ""))]
+    if not visible:
+        msg = "(no active quests)" if cats else "(no journal quests)"
+        write(out / "quests" / "index.html",
+              page("Quests", f"<h1>Quests</h1><p>{msg}</p>", root_rel=".."))
+        return
+
+    slugs = _quest_slugs(cats)
+    total_steps = sum(len(list_items(cats[i].get("EntryList"))) for i in visible)
+    quest_comments = {i: fld(cats[i], "Comment", "") for i in visible}
+    quest_groups = {i: _quest_group(quest_comments[i]) for i in visible}
+    quest_orders = {i: _quest_sort_order(quest_comments[i]) for i in visible}
+    has_groups = any(quest_groups.values())
+
+    # script (lowercased) -> dialogs running it as an action node, i.e. the
+    # reverse of db.dialog_scripts. Lets a quest's grant script be traced to
+    # the NPC whose conversation awards it (where the quest is picked up).
+    action_to_dlgs: dict[str, set[str]] = defaultdict(set)
+    for _dlg_rr, _ents in db.dialog_scripts.items():
+        for _e in _ents:
+            if _e.get("kind") == "action":
+                action_to_dlgs[(_e.get("resref") or "").lower()].add(_dlg_rr)
+
+    # Module events: grant script → event label.
+    _ql_module_event: dict[str, str] = {}
+    if db.ifo:
+        for _field, _label in db.MODULE_EVENT_FIELDS.items():
+            _s = (fld(db.ifo, _field, "") or "").lower()
+            if _s:
+                _ql_module_event[_s] = _label
+
+    # Placeable events: grant script → set of area resrefs.
+    _ql_plc_bp_areas: dict[str, set[str]] = defaultdict(set)
+    for _ar, _pls in db.area_placeables.items():
+        for _pl in _pls:
+            _rr = (fld(_pl, "TemplateResRef", "") or "").lower()
+            if _rr:
+                _ql_plc_bp_areas[_rr].add(_ar)
+    _ql_plc_areas: dict[str, set[str]] = defaultdict(set)
+    for _prr, _p in db.placeables.items():
+        for _field in db.PLACEABLE_EVENT_FIELDS:
+            _s = (fld(_p, _field, "") or "").lower()
+            if _s:
+                _ql_plc_areas[_s] |= _ql_plc_bp_areas.get(_prr, set())
+    for _ar, _pls in db.area_placeables.items():
+        for _pl in _pls:
+            for _field in db.PLACEABLE_EVENT_FIELDS:
+                _s = (fld(_pl, _field, "") or "").lower()
+                if _s:
+                    _ql_plc_areas[_s].add(_ar)
+
+    # Trigger events: grant script → set of area resrefs.
+    _ql_trg_bp_areas: dict[str, set[str]] = defaultdict(set)
+    for _ar, _ts in db.area_triggers.items():
+        for _t in _ts:
+            _rr = (fld(_t, "TemplateResRef", "") or "").lower()
+            if _rr:
+                _ql_trg_bp_areas[_rr].add(_ar)
+    _ql_trg_areas: dict[str, set[str]] = defaultdict(set)
+    for _trr, _t in db.triggers.items():
+        for _field in db.TRIGGER_EVENT_FIELDS:
+            _s = (fld(_t, _field, "") or "").lower()
+            if _s:
+                _ql_trg_areas[_s] |= _ql_trg_bp_areas.get(_trr, set())
+    for _ar, _ts in db.area_triggers.items():
+        for _t in _ts:
+            for _field in db.TRIGGER_EVENT_FIELDS:
+                _s = (fld(_t, _field, "") or "").lower()
+                if _s:
+                    _ql_trg_areas[_s].add(_ar)
+
+    def row(i: int) -> str:
+        c = cats[i]
+        tag = fld(c, "Tag", "")
+        qname = loc(c.get("Name")) or tag or "(unnamed quest)"
+        entries = list_items(c.get("EntryList"))
+        has_end = any(fld(e, "End", 0) for e in entries)
+        prio = _quest_priority_label(fld(c, "Priority"))
+        xp = fld(c, "XP", 0) or 0
+        grants = db.quest_grants.get((tag or "").lower(), {})
+        n_grants = sum(1 for e in entries if grants.get(_quest_entry_id(e)))
+        npcs, areas = _quest_start_locations(
+            db, c, action_to_dlgs,
+            script_to_module_event=_ql_module_event,
+            script_to_placeable_areas=_ql_plc_areas,
+            script_to_trigger_areas=_ql_trg_areas,
+        )
+        npc_cell = _quest_loc_cell(
+            npcs,
+            lambda it: (link(f"../creatures/{it[0]}.html", it[1])
+                        if it[0] else nwn_html(it[1])))
+        area_cell = _quest_loc_cell(
+            areas,
+            lambda it: link(f"../areas/{it[0]}.html", it[1]))
+        return (
+            f"<tr><td>{link(f'{slugs[i]}.html', qname)}</td>"
+            f"<td><code>{E(tag)}</code></td>"
+            f"<td>{npc_cell}</td>"
+            f"<td>{area_cell}</td>"
+            f"<td>{E(prio)}</td>"
+            f"<td>{E(xp) if xp else ''}</td>"
+            f"<td>{len(entries)}</td>"
+            f"<td>{'&#10003;' if has_end else ''}</td>"
+            f"<td>{n_grants if n_grants else ''}</td></tr>"
+        )
+
+    def table(indices: list[int]) -> str:
+        def _sort_key(i: int):
+            name = (loc(cats[i].get("Name")) or fld(cats[i], "Tag", "")).lower()
+            order = quest_orders[i]
+            return (order if order is not None else float("inf"), name)
+        ordered = sorted(indices, key=_sort_key)
+        return (
+            '<table class="data"><thead><tr>'
+            "<th>Quest</th><th>Tag</th>"
+            "<th>Begins (NPC)</th><th>Begins (area)</th>"
+            "<th>Priority</th><th>XP</th>"
+            "<th>Steps</th><th>Final step</th><th>Awarded</th>"
+            "</tr></thead><tbody>"
+            + "\n".join(row(i) for i in ordered)
+            + "</tbody></table>"
+        )
+
+    parts = [
+        "<h1>Quests</h1>",
+        f"<p>{len(visible)} quests &middot; {total_steps} journal entries. "
+        '<small class="muted">Quests are the module&rsquo;s journal categories; '
+        "each row links to that quest&rsquo;s entries. &ldquo;Begins&rdquo; is a "
+        "best-effort hint at the NPC and area that grant the opening step, traced "
+        "from the scripts that award it. &ldquo;Final step&rdquo; marks "
+        "a quest with a completion entry. &ldquo;Awarded&rdquo; counts the entries a "
+        "script is known to grant via <code>AddJournalQuestEntry</code>."
+        + (" Quests are grouped by the <code>@group</code> label set in their "
+           "builder Comment." if has_groups else "")
+        + "</small></p>",
+    ]
+
+    if not has_groups:
+        # No quest declares a group — a single flat table, no section headings.
+        parts.append(table(visible))
+    else:
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for i in visible:
+            grouped[quest_groups[i]].append(i)  # "" == no @group declared
+        # Determine group sort order: @group-order N from the first quest in
+        # the group that declares it, then alphabetical for the rest.
+        group_sort_order: dict[str, int | None] = {}
+        for g, idxs in grouped.items():
+            order = None
+            for i in idxs:
+                order = _quest_group_order(quest_comments[i])
+                if order is not None:
+                    break
+            group_sort_order[g] = order
+        def _group_key(g: str):
+            o = group_sort_order[g]
+            return (o if o is not None else float("inf"), g.lower())
+        for g in sorted((g for g in grouped if g), key=_group_key):
+            parts.append(
+                f'<h2 id="{E(_quest_group_anchor(g))}">{nwn_html(g)} '
+                f'<small class="muted">({len(grouped[g])})</small></h2>')
+            parts.append(table(grouped[g]))
+        if grouped.get(""):
+            parts.append(
+                f'<h2 id="{E(_quest_group_anchor("Other"))}">Other '
+                f'<small class="muted">({len(grouped[""])})</small></h2>')
+            parts.append(table(grouped[""]))
+
+    write(out / "quests" / "index.html", page("Quests", "".join(parts), root_rel=".."))
+
+
+def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
+    """Detail page for a single quest line: metadata plus its journal entries
+    in progression order, cross-referenced to the scripts that award each."""
+    tag = fld(c, "Tag", "")
+    qname = loc(c.get("Name")) or tag or "(unnamed quest)"
+    prio = _quest_priority_label(fld(c, "Priority"))
+    xp = fld(c, "XP", 0) or 0
+    raw_comment = fld(c, "Comment", "")
+    group = _quest_group(raw_comment)
+    comment = _quest_comment_display(raw_comment)
+
+    parts = [
+        '<p><a href="index.html">&larr; All quests</a></p>',
+        f"<h1>{nwn_html(qname)}</h1>",
+    ]
+    meta = []
+    if group:
+        meta.append('Group: <a href="index.html#'
+                    f'{E(_quest_group_anchor(group))}">{nwn_html(group)}</a>')
+    if tag:
+        meta.append(f"Tag: <code>{E(tag)}</code>")
+    if prio:
+        meta.append(f"Priority: {E(prio)}")
+    if xp:
+        meta.append(f"XP: {E(xp)}")
+    if meta:
+        parts.append(f"<p>{' &middot; '.join(meta)}</p>")
+    if comment:
+        parts.append('<p class="muted"><strong>Builder comment:</strong> '
+                     f"{nwn_html(comment)}</p>")
+
+    entries = list_items(c.get("EntryList"))
+    grants = db.quest_grants.get((tag or "").lower(), {})
+    dlg_grants = db.quest_dialog_grants.get((tag or "").lower(), {})
+
+    # Build a reverse tag→resref map for items referenced in granting scripts
+    tag_to_item_rr: dict[str, str] = {}
+    for rr, it in db.items.items():
+        t = (fld(it, "Tag", "") or "").strip().lower()
+        if t:
+            tag_to_item_rr.setdefault(t, rr)
+
+    def _item_link(irr: str) -> str:
+        return (link(f"../items/{irr}.html", db.item_name(irr))
+                if irr in db.items else E(db.item_name(irr)))
+
+    def _items_html(item_set: set[str]) -> str:
+        if not item_set:
+            return '<span class="muted">&mdash;</span>'
+        return ", ".join(
+            _item_link(irr)
+            for irr in sorted(item_set, key=lambda r: db.item_name(r).lower())
+        )
+
+    def _collect_entry_items(granters: list[str], granting_dlgs: list[str]
+                             ) -> tuple[set[str], set[str], set[str]]:
+        """Return (required, consumed, granted) item resref sets for a quest entry.
+        required  — checked in condition (Active) scripts of granting dialogs
+        consumed  — checked in action scripts of granting dialogs or granting scripts
+        granted   — created by granting action scripts or granting scripts
+        """
+        required: set[str] = set()
+        consumed: set[str] = set()
+        granted: set[str] = set()
+
+        for dlg_rr in granting_dlgs:
+            for ds in db.dialog_scripts.get(dlg_rr, []):
+                s_rr = ds["resref"]
+                s_kind = ds["kind"]
+                if s_kind == "active":
+                    for itag in db.script_checks_item_tags.get(s_rr, set()):
+                        irr = tag_to_item_rr.get(itag.lower())
+                        if irr:
+                            required.add(irr)
+                elif s_kind == "action":
+                    for itag in db.script_checks_item_tags.get(s_rr, set()):
+                        irr = tag_to_item_rr.get(itag.lower())
+                        if irr:
+                            consumed.add(irr)
+                    for irr in db.script_creates_items.get(s_rr, []):
+                        if irr in db.items:
+                            granted.add(irr)
+
+        for script_rr in granters:
+            for itag in db.script_checks_item_tags.get(script_rr, set()):
+                irr = tag_to_item_rr.get(itag.lower())
+                if irr:
+                    consumed.add(irr)
+            for irr in db.script_creates_items.get(script_rr, []):
+                if irr in db.items:
+                    granted.add(irr)
+
+        # Items that are both required and consumed are consumed (they get taken)
+        required -= consumed
+        return required, consumed, granted
+
+    if not entries:
+        parts.append("<p>(no journal entries)</p>")
+    else:
+        rows = []
+        any_req = any_cons = any_granted = False
+        for e in sorted(entries, key=_quest_entry_id):
+            eid = _quest_entry_id(e)
+            end = fld(e, "End", 0)
+            txt = loc(e.get("Text"))
+            granters = sorted(grants.get(eid, set()))
+            granter_parts = [_script_link(db, s) for s in granters]
+            granting_dlgs = sorted(dlg_grants.get(eid, set()))
+            for dlg_rr in granting_dlgs:
+                dlg_label = db.dialog_label(dlg_rr)
+                granter_parts.append(
+                    link(f"../conversations/{dlg_rr}.html",
+                         f"dialog: {dlg_label}"))
+            grant_html = (", ".join(granter_parts)
+                          if granter_parts else '<span class="muted">&mdash;</span>')
+            req, cons, granted = _collect_entry_items(granters, granting_dlgs)
+            if req:
+                any_req = True
+            if cons:
+                any_cons = True
+            if granted:
+                any_granted = True
+            end_badge = '<span class="badge">final</span>' if end else ""
+            rows.append((eid, end_badge, txt, grant_html, req, cons, granted))
+
+        # Only show item columns that have data in at least one row
+        header = ("<th>ID</th><th></th><th>Journal text</th><th>Awarded by</th>"
+                  + ("<th>Items required</th>" if any_req else "")
+                  + ("<th>Items consumed</th>" if any_cons else "")
+                  + ("<th>Items granted</th>" if any_granted else ""))
+        table_rows = []
+        for eid, end_badge, txt, grant_html, req, cons, granted in rows:
+            r = (f"<tr><td>{eid}</td><td>{end_badge}</td>"
+                 f"<td>{nwn_html(txt)}</td><td>{grant_html}</td>"
+                 + (f"<td>{_items_html(req)}</td>" if any_req else "")
+                 + (f"<td>{_items_html(cons)}</td>" if any_cons else "")
+                 + (f"<td>{_items_html(granted)}</td>" if any_granted else "")
+                 + "</tr>")
+            table_rows.append(r)
+        parts.append(
+            '<table class="data"><thead><tr>'
+            + header +
+            "</tr></thead><tbody>" + "\n".join(table_rows) + "</tbody></table>"
+        )
+
+    write(out / "quests" / f"{slug}.html",
+          page(f"Quest: {qname}", "\n".join(parts), root_rel=".."))
+
+
+# ---------------------------------------------------------------------------
+# Conversations
+# ---------------------------------------------------------------------------
+
+def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
+    """One-line description of a dialog caller, with cross-page links."""
+    kind = c.get("kind")
+    rr = c.get("resref", "")
+    if kind == "creature":
+        can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
+        cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
+        cell = (link(f"{root_rel}/creatures/{can_rr}.html", cname)
+                if can_rr in db.canonical_creatures else nwn_html(rr))
+        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+                          for a in c.get("areas", []) if a in db.areas)
+        return (f'<span class="badge">creature</span> NPC {cell} '
+                f"<code>{E(rr)}</code>" + (f" — in {areas}" if areas else ""))
+    if kind == "creature-instance":
+        area_rr = c.get("area", "")
+        idx = c.get("idx", 0)
+        can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
+        inst_label = db.canonical_creature_name(can_rr) if can_rr else (db.creature_instance_name(area_rr, idx) or rr or "(unnamed)")
+        inst_url = f"{root_rel}/creatures/{can_rr}.html" if can_rr else "#"
+        area_link = (link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
+                     if area_rr in db.areas else nwn_html(area_rr))
+        return (f'<span class="badge">creature</span> NPC '
+                f'<a href="{E(inst_url)}">{nwn_html(inst_label)}</a>'
+                f" — in {area_link}")
+    if kind == "placeable":
+        # Placeables don't have their own page; we'll link to one of their
+        # area pages instead, which is where the placement lives.
+        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+                          for a in c.get("areas", []) if a in db.areas)
+        return (f"Placeable <code>{E(rr)}</code>" +
+                (f" — in {areas}" if areas else ""))
+    if kind == "door":
+        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+                          for a in c.get("areas", []) if a in db.areas)
+        return (f"Door <code>{E(rr)}</code>" +
+                (f" — in {areas}" if areas else ""))
+    if kind in ("placeable-instance", "door-instance"):
+        area_rr = c.get("area", "")
+        tag = c.get("tag") or ""
+        area_link = (link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
+                     if area_rr in db.areas else nwn_html(area_rr))
+        bp = f" <small class=\"muted\">(blueprint <code>{E(rr)}</code>)</small>" if rr else ""
+        label = "Placeable" if kind == "placeable-instance" else "Door"
+        ident = f"<code>{E(tag)}</code>" if tag else "(untagged)"
+        return (f'<span class="badge">instance</span> {label} {ident}'
+                f"{bp} — in {area_link}")
+    if kind in ("creature-event", "placeable-event", "door-event",
+                "trigger-event", "area-event",
+                "placeable-event-instance", "door-event-instance",
+                "trigger-event-instance"):
+        ev = c.get("event", "")
+        s = c.get("script", "")
+        is_instance = kind.endswith("-instance")
+        if kind == "creature-event":
+            can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
+            cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
+            ent = (link(f"{root_rel}/creatures/{can_rr}.html", cname)
+                   if can_rr in db.canonical_creatures else nwn_html(rr))
+            label = f"NPC {ent} <code>{E(rr)}</code>"
+        elif kind == "area-event":
+            ent = (link(f"{root_rel}/areas/{rr}.html", db.area_name(rr))
+                   if rr in db.areas else nwn_html(rr))
+            label = f"Area {ent} <code>{E(rr)}</code>"
+        elif is_instance:
+            tag = c.get("tag") or ""
+            ident = f"<code>{E(tag)}</code>" if tag else "(untagged)"
+            bp = (f" <small class=\"muted\">(blueprint <code>{E(rr)}</code>)</small>"
+                  if rr else "")
+            entity = kind.split("-")[0].title()  # Placeable / Door / Trigger
+            label = (f'<span class="badge">instance</span> {entity} {ident}{bp}')
+        else:
+            label = f"{kind.split('-')[0].title()} <code>{E(rr)}</code>"
+        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+                          for a in c.get("areas", []) if a in db.areas)
+        return (f"{label} via <code>{E(ev)}</code> script {_script_link(db, s, root_rel)}" +
+                (f" — in {areas}" if areas else ""))
+    if kind == "module-event":
+        ev = c.get("event", "")
+        s = c.get("script", "")
+        return (f'<span class="badge global">global</span> '
+                f"Module <code>{E(ev)}</code> via script {_script_link(db, s, root_rel)}")
+    if kind == "item-script":
+        ent = (link(f"{root_rel}/items/{rr}.html", db.item_name(rr))
+               if rr in db.items else nwn_html(rr))
+        s = c.get("script", "")
+        return (f"Item {ent} <code>{E(rr)}</code> via tag-script "
+                f"{_script_link(db, s, root_rel)}")
+    return E(repr(c))
+
+
+def _dialog_node_anchor(kind: str, idx: int) -> str:
+    return f"{kind[0]}{idx}"   # e.g. "e3", "r12"
+
+
+def _dialog_text_preview(node: dict, max_len: int = 80) -> str:
+    """First non-empty line of a dialog node's text, truncated. Strips
+    NWN colour tokens so the preview is plain readable text."""
+    text = nwn_text(loc(node.get("Text"))).strip()
+    if not text:
+        return ""
+    line = text.splitlines()[0].strip()
+    if len(line) > max_len:
+        line = line[:max_len].rstrip() + "…"
+    return line
+
+
+_RE_CUSTOM_TOKEN = re.compile(r"&lt;CUSTOM(\d+)&gt;")
+
+
+def _annotate_custom_tokens(escaped_html: str,
+                             token_setters: dict[int, set[str]],
+                             db: "Db", root_rel: str) -> str:
+    """Replace HTML-escaped <CUSTOMn> tokens with annotated spans that link to
+    the scripts that call SetCustomToken(n, ...). If no setter is found,
+    the token is wrapped in a muted span so it's visually distinct."""
+    def replace(m: re.Match) -> str:
+        n = int(m.group(1))
+        setters = sorted(token_setters.get(n, set()))
+        raw = m.group(0)  # &lt;CUSTOMn&gt;
+        if setters:
+            links = ", ".join(_script_link(db, s, root_rel) for s in setters)
+            return (f'<span class="custom-token" '
+                    f'title="SetCustomToken({n}, ...) called in: '
+                    + ", ".join(setters) + f'">'
+                    f'{raw}'
+                    f'<sup class="token-setters">[{links}]</sup>'
+                    f'</span>')
+        else:
+            return (f'<span class="custom-token custom-token-unknown" '
+                    f'title="SetCustomToken({n}, ...) — no setter found in static analysis">'
+                    f'{raw}</span>')
+    return _RE_CUSTOM_TOKEN.sub(replace, escaped_html)
+
+
+def _render_dialog_node_refs(db: Db, refs_field: list[dict],
+                             tgt_kind: str,
+                             tgt_nodes: list[dict] | None = None) -> str:
+    """Render a node's child-pointer list ("RepliesList" inside an entry,
+    "EntriesList" inside a reply) as inline anchor links to other nodes
+    on the same page. tgt_kind is "reply" or "entry". When tgt_nodes is
+    supplied, append a short text preview of the target so the reader
+    doesn't have to jump to scan each branch."""
+    if not refs_field:
+        return ""
+    cells = []
+    for ref in refs_field:
+        idx = fld(ref, "Index")
+        active = fld(ref, "Active", "")
+        is_child = fld(ref, "IsChild", 0)
+        anchor = _dialog_node_anchor(tgt_kind, int(idx)) if isinstance(idx, int) else "?"
+        label = "→ child" if is_child else f"→ {tgt_kind} #{idx}"
+        bits = [f'<a href="#{E(anchor)}">{E(label)}</a>']
+        if (tgt_nodes is not None and isinstance(idx, int)
+                and 0 <= idx < len(tgt_nodes)):
+            preview = _dialog_text_preview(tgt_nodes[idx])
+            if preview:
+                bits.append(f' <span class="dlg-link-preview">“{nwn_html(preview)}”</span>')
+        if active:
+            bits.append(f' <small class="muted">(if <code>{E(active)}</code>)</small>')
+        cells.append("".join(bits))
+    return '<ul class="dlg-links"><li>' + "</li><li>".join(cells) + "</li></ul>"
+
+
+def _render_dialog_tree(db: Db, entries: list[dict], replies: list[dict],
+                        starts: list[dict]) -> str:
+    """Render the dialog as nested <details> blocks, recursing from each
+    starting entry. Cycles and shared continuations are broken with a
+    backref link to the node's first occurrence so the tree can't
+    explode (NWN dialog graphs frequently cycle)."""
+    if not starts:
+        return ""
+
+    visited_e: set[int] = set()
+    visited_r: set[int] = set()
+    parts: list[str] = []
+    # Recursion depth guard — defensive; visited-sets should already cap it,
+    # but protects against pathological refs (negative indices, etc.).
+    MAX_DEPTH = 200
+
+    def cond_html(active: str) -> str:
+        return (f' <small class="muted">(if <code>{E(active)}</code>)</small>'
+                if active else "")
+
+    def render_entry(idx: int, ref_active: str, depth: int) -> None:
+        if depth > MAX_DEPTH:
+            parts.append('<div class="dlg-tree-broken">⚠ max depth</div>')
+            return
+        if not isinstance(idx, int) or idx < 0 or idx >= len(entries):
+            parts.append(f'<div class="dlg-tree-broken">⚠ entry #{E(idx)} (out of range)</div>')
+            return
+        anchor = _dialog_node_anchor("entry", idx)
+        if idx in visited_e:
+            preview = _dialog_text_preview(entries[idx])
+            parts.append(
+                f'<div class="dlg-tree-ref entry-ref">'
+                f'↩ <a href="#{E(anchor)}">entry #{idx}</a>'
+                + (f' <span class="dlg-link-preview">“{nwn_html(preview)}”</span>'
+                   if preview else "")
+                + cond_html(ref_active) + '</div>'
+            )
+            return
+        visited_e.add(idx)
+        e = entries[idx]
+        speaker = fld(e, "Speaker", "")
+        action = fld(e, "Script", "")
+        text_html = _annotate_custom_tokens(
+            nwn_html(loc(e.get("Text"))), db.token_setters, db, "..") or "<em>(no text)</em>"
+        head = (f'<span class="dlg-id">entry #{idx}</span>'
+                + (f' <span class="dlg-speaker">[{E(speaker)}]</span>' if speaker else "")
+                + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
+                + cond_html(ref_active))
+        parts.append('<details class="dlg-tree-node entry" open>')
+        parts.append(f'<summary>{head} '
+                     f'<a class="dlg-anchor" href="#{E(anchor)}" '
+                     f'title="jump to flat entry #{idx}">¶</a></summary>')
+        parts.append(f'<div class="dlg-text">{text_html}</div>')
+        children = list_items(e.get("RepliesList"))
+        if children:
+            parts.append('<div class="dlg-tree-children">')
+            for ref in children:
+                render_reply(fld(ref, "Index"),
+                             fld(ref, "Active", ""), depth + 1)
+            parts.append('</div>')
+        parts.append('</details>')
+
+    def render_reply(idx: int, ref_active: str, depth: int) -> None:
+        if depth > MAX_DEPTH:
+            parts.append('<div class="dlg-tree-broken">⚠ max depth</div>')
+            return
+        if not isinstance(idx, int) or idx < 0 or idx >= len(replies):
+            parts.append(f'<div class="dlg-tree-broken">⚠ reply #{E(idx)} (out of range)</div>')
+            return
+        anchor = _dialog_node_anchor("reply", idx)
+        if idx in visited_r:
+            preview = _dialog_text_preview(replies[idx])
+            parts.append(
+                f'<div class="dlg-tree-ref reply-ref">'
+                f'↩ <a href="#{E(anchor)}">reply #{idx}</a>'
+                + (f' <span class="dlg-link-preview">“{nwn_html(preview)}”</span>'
+                   if preview else "")
+                + cond_html(ref_active) + '</div>'
+            )
+            return
+        visited_r.add(idx)
+        r = replies[idx]
+        action = fld(r, "Script", "")
+        text_html = _annotate_custom_tokens(
+            nwn_html(loc(r.get("Text"))), db.token_setters, db, "..") or "<em>(no text)</em>"
+        head = (f'<span class="dlg-id">reply #{idx}</span>'
+                + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
+                + cond_html(ref_active))
+        parts.append('<details class="dlg-tree-node reply" open>')
+        parts.append(f'<summary>{head} '
+                     f'<a class="dlg-anchor" href="#{E(anchor)}" '
+                     f'title="jump to flat reply #{idx}">¶</a></summary>')
+        parts.append(f'<div class="dlg-text">{text_html}</div>')
+        children = list_items(r.get("EntriesList"))
+        if children:
+            parts.append('<div class="dlg-tree-children">')
+            for ref in children:
+                render_entry(fld(ref, "Index"),
+                             fld(ref, "Active", ""), depth + 1)
+            parts.append('</div>')
+        parts.append('</details>')
+
+    parts.append('<div class="dlg-tree">')
+    for s in starts:
+        render_entry(fld(s, "Index"), fld(s, "Active", ""), 0)
+    parts.append('</div>')
+    return "\n".join(parts)
+
+
+def render_conversations_index(db: Db, out: Path) -> None:
+    if not db.dialogs:
+        write(out / "conversations" / "index.html",
+              page("Conversations", "<h1>Conversations</h1><p>(none)</p>",
+                   root_rel=".."))
+        return
+    rows = []
+    for rr in sorted(db.dialogs.keys(),
+                     key=lambda r: db.dialog_label(r).lower()):
+        dlg = db.dialogs[rr]
+        n_entries = len(list_items(dlg.get("EntryList")))
+        n_replies = len(list_items(dlg.get("ReplyList")))
+        n_callers = len(db.dialog_callers.get(rr, []))
+        n_teleports = len(db.dialog_teleports.get(rr, []))
+        global_ = any(c["kind"] in ("module-event", "item-script")
+                      for c in db.dialog_callers.get(rr, []))
+        is_zdlg = bool(dlg.get("__zdlg_handler__"))
+        flags = []
+        if is_zdlg:
+            flags.append('<span class="badge">z-dialog</span>')
+        if global_:
+            flags.append('<span class="badge global">global</span>')
+        if n_teleports:
+            flags.append('<span class="badge teleport">teleport</span>')
+        rows.append(
+            f"<tr><td>{link(f'{rr}.html', db.dialog_label(rr))}</td>"
+            f"<td><code>{E(rr)}</code></td>"
+            f"<td>{n_entries}</td>"
+            f"<td>{n_replies}</td>"
+            f"<td>{n_callers}</td>"
+            f"<td>{n_teleports}</td>"
+            f"<td>{' '.join(flags)}</td></tr>"
+        )
+    n_zdlg = sum(1 for d in db.dialogs.values() if d.get("__zdlg_handler__"))
+    body = (
+        "<h1>Conversations</h1>"
+        f"<p>{len(db.dialogs) - n_zdlg} dialog files"
+        + (f", plus {n_zdlg} script-driven z-dialog handlers" if n_zdlg else "")
+        + ". "
+        '<small class="muted">"global" = also reachable from a module-level '
+        "event script (rest, level-up, etc.) or a tag-based item activator. "
+        '"teleport" = at least one entry/reply runs an action script that '
+        "calls JumpToLocation/JumpToObject. "
+        '"z-dialog" = HoMERs script-driven dialog (see zdlg_include_i.nss); '
+        "entry/reply text is generated by NWScript at runtime so isn't "
+        "rendered here.</small></p>"
+        '<table class="data"><thead><tr>'
+        "<th>Opening line</th><th>ResRef</th><th>NPC lines</th><th>PC lines</th>"
+        "<th>Callers</th><th>Teleports</th><th>Flags</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "conversations" / "index.html",
+          page("Conversations", body, root_rel=".."))
+
+
+def render_conversation_page(db: Db, resref: str, out: Path) -> None:
+    """Per-dialog page. Renders the dialog as a flat outline of Entry and
+    Reply nodes with anchor links between them, since real NWN dialog
+    graphs cycle and a tree expansion is impractical (and noisy)."""
+    dlg = db.dialogs.get(resref)
+    if not dlg:
+        return
+    zdlg_handler = dlg.get("__zdlg_handler__")
+    entries = list_items(dlg.get("EntryList"))
+    replies = list_items(dlg.get("ReplyList"))
+    starts = list_items(dlg.get("StartingList"))
+
+    if zdlg_handler:
+        title_html = (f"<h1>Z-dialog: <code>{E(resref)}</code> "
+                      '<span class="badge">z-dialog</span></h1>')
+        meta = [
+            '<dl class="meta">',
+            f"<dt>Handler script</dt><dd>{_script_link(db, zdlg_handler, '..')}</dd>",
+        ]
+        dispatchers = sorted(db.zdlg_handler_dispatchers.get(zdlg_handler, set()))
+        if dispatchers:
+            disp_html = ", ".join(_script_link(db, d, "..") for d in dispatchers)
+            meta.append(f"<dt>Opened from</dt><dd>{disp_html}</dd>")
+        meta.append('</dl>')
+        meta.append(
+            '<p class="muted">This is a HoMERs z-dialog: the conversation is '
+            "generated entirely by NWScript via the <code>StartDlg(...)</code> "
+            "helper in <code>zdlg_include_i.nss</code>. There is no GFF "
+            ".dlg resource for it, so entry/reply text isn't rendered — "
+            "follow the handler script link above to read its logic.</p>"
+        )
+        sections: list[str] = [title_html, "\n".join(meta)]
+    else:
+        sections: list[str] = [
+            f"<h1>Conversation: <code>{E(resref)}</code></h1>",
+            '<dl class="meta">',
+            f"<dt>NPC lines</dt><dd>{len(entries)}</dd>",
+            f"<dt>PC replies</dt><dd>{len(replies)}</dd>",
+            f"<dt>NumWords</dt><dd>{E(fld(dlg, 'NumWords', ''))}</dd>",
+            f"<dt>OnEnd</dt><dd><code>{E(fld(dlg, 'EndConversation', ''))}</code></dd>",
+            f"<dt>OnAbort</dt><dd><code>{E(fld(dlg, 'EndConverAbort', ''))}</code></dd>",
+            '</dl>',
+        ]
+
+    # ---- Triggered by ----
+    callers = db.dialog_callers.get(resref, [])
+    if callers:
+        sections.append("<h2>Triggered by</h2><ul class=\"dlg-callers\">")
+        for c in callers:
+            sections.append("<li>" + _caller_html(db, c, root_rel="..") + "</li>")
+        sections.append("</ul>")
+    else:
+        sections.append("<h2>Triggered by</h2>"
+                        "<p class=\"muted\">No caller found in static analysis. "
+                        "May be invoked from runtime-only code paths "
+                        "(string-built resrefs, etc.).</p>")
+
+    # ---- Teleport destinations ----
+    teleports = db.dialog_teleports.get(resref, [])
+    if teleports:
+        sections.append("<h2>Teleport destinations</h2>")
+        rows = []
+        for t in teleports:
+            anchor = _dialog_node_anchor(t["node_kind"], t["node_index"])
+            dst_area = t.get("area")
+            dst_cell = (link(f"../areas/{dst_area}.html", db.area_name(dst_area))
+                        if dst_area else f'<em class="muted">unresolved</em>')
+            rows.append(
+                f"<tr><td><code>{E(t['tag'])}</code></td>"
+                f"<td>{dst_cell}</td>"
+                f"<td><code>{E(t['via_script'])}</code></td>"
+                f"<td><a href=\"#{E(anchor)}\">{E(t['node_kind'])} #{t['node_index']}</a></td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Waypoint / object tag</th><th>Destination area</th>"
+            "<th>Via script</th><th>From node</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # ---- Action / condition scripts ----
+    scripts = db.dialog_scripts.get(resref, [])
+    if scripts:
+        sections.append("<h2>Scripts referenced</h2>")
+        seen: set[tuple[str, str]] = set()
+        rows = []
+        for s in scripts:
+            key = (s["resref"], s["kind"])
+            if key in seen:
+                continue
+            seen.add(key)
+            existence = "✓" if s["resref"] in db.scripts else "?"
+            extras = []
+            if s["resref"] in db.script_dialogs:
+                outs = sorted(db.script_dialogs[s["resref"]])
+                extras.append("starts: " + ", ".join(
+                    link(f"{o}.html", o) if o in db.dialogs else E(o) for o in outs))
+            if s["resref"] in db.script_teleport_tags:
+                tp_parts = []
+                for t in sorted(db.script_teleport_tags[s["resref"]]):
+                    dst_area = db.tag_to_area.get(t)
+                    if dst_area:
+                        tp_parts.append(
+                            f"<code>{E(t)}</code> ("
+                            + link(f"../areas/{dst_area}.html", db.area_name(dst_area))
+                            + ")"
+                        )
+                    else:
+                        tp_parts.append(f"<code>{E(t)}</code>")
+                extras.append("teleports to: " + ", ".join(tp_parts))
+            rows.append(
+                f"<tr><td><code>{E(s['resref'])}</code></td>"
+                f"<td>{E(s['kind'])}</td>"
+                f"<td>{existence}</td>"
+                f"<td>{' · '.join(extras)}</td></tr>"
+            )
+        sections.append(
+            '<table class="data"><thead><tr>'
+            "<th>Script</th><th>Slot</th><th>In module</th><th>Notes</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # ---- Items checked ----
+    checked_items = db.dialog_item_checks.get(resref, [])
+    if checked_items:
+        item_links = []
+        for item_rr in sorted(checked_items, key=lambda r: db.item_name(r).lower()):
+            name = db.item_name(item_rr)
+            item_links.append(
+                link(f"../items/{item_rr}.html", name)
+                if item_rr in db.items else E(name)
+            )
+        sections.append(
+            "<h2>Items checked</h2>"
+            '<p class="muted">These items\' tags are checked via '
+            "<code>GetItemPossessedBy</code> in this conversation's scripts:</p>"
+            "<ul>" + "".join(f"<li>{h}</li>" for h in item_links) + "</ul>"
+        )
+
+    # ---- Quest entries granted ----
+    dlg_quests = db.dialog_quest_grants_rev.get(resref, {})
+    if dlg_quests:
+        rows = []
+        for q_tag in sorted(dlg_quests, key=lambda t: db.quest_tag_to_info.get(t, (t, ""))[0].lower()):
+            q_name, q_slug = db.quest_tag_to_info.get(q_tag, (q_tag, ""))
+            eids = sorted(dlg_quests[q_tag])
+            step_str = ", ".join(str(e) for e in eids)
+            quest_link = (link(f"../quests/{q_slug}.html", q_name)
+                          if q_slug else E(q_name))
+            rows.append(f"<tr><td>{quest_link}</td><td><code>{E(q_tag)}</code></td>"
+                        f"<td>{E(step_str)}</td></tr>")
+        sections.append(
+            "<h2>Quest entries granted</h2>"
+            '<table class="data"><thead><tr>'
+            "<th>Quest</th><th>Tag</th><th>Step(s)</th>"
+            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+        )
+
+    # ---- Custom tokens summary (non-z-dialog only) ----
+    if not zdlg_handler:
+        all_tokens: set[int] = set()
+        for node in entries + replies:
+            text = loc(node.get("Text"))
+            if text:
+                for m in re.finditer(r'<CUSTOM(\d+)>', text):
+                    all_tokens.add(int(m.group(1)))
+
+        if all_tokens:
+            token_rows = []
+            for n in sorted(all_tokens):
+                setters = sorted(db.token_setters.get(n, set()))
+                setter_html = (", ".join(_script_link(db, s, "..") for s in setters)
+                               if setters else '<em class="muted">not found in static analysis</em>')
+                token_rows.append(
+                    f"<tr><td><code>&lt;CUSTOM{n}&gt;</code></td>"
+                    f"<td>{setter_html}</td></tr>"
+                )
+            sections.append(
+                "<h2>Custom tokens</h2>"
+                '<p class="muted">These runtime tokens are filled by NWScript via '
+                '<code>SetCustomToken(N, text)</code>. The scripts listed set each token; '
+                'the actual value depends on game state at runtime.</p>'
+                '<table class="data"><thead><tr>'
+                "<th>Token</th><th>Set by script(s)</th>"
+                "</tr></thead><tbody>" + "\n".join(token_rows) + "</tbody></table>"
+            )
+
+    # ---- Starting entries ----
+    if starts:
+        sections.append("<h2>Starting entries</h2><ul>")
+        for s in starts:
+            i = fld(s, "Index")
+            active = fld(s, "Active", "")
+            anchor = _dialog_node_anchor("entry", int(i)) if isinstance(i, int) else "?"
+            preview = ""
+            if isinstance(i, int) and 0 <= i < len(entries):
+                preview = nwn_text(loc(entries[i].get("Text"))).strip()
+                preview = preview.splitlines()[0] if preview else ""
+                if len(preview) > 80:
+                    preview = preview[:80] + "…"
+            cond = (f' <small class="muted">(if <code>{E(active)}</code>)</small>'
+                    if active else "")
+            sections.append(
+                f'<li><a href="#{E(anchor)}">entry #{E(i)}</a>{cond}'
+                + (f' — {nwn_html(preview)}' if preview else "") + '</li>'
+            )
+        sections.append("</ul>")
+
+    # ---- Conversation flow (recursive tree from each starting entry) ----
+    tree_html = _render_dialog_tree(db, entries, replies, starts)
+    if tree_html:
+        sections.append("<h2>Conversation flow</h2>")
+        sections.append(
+            '<p class="muted">Each starting entry is expanded recursively. '
+            "Repeated nodes (cycles, shared continuations) appear inline as "
+            "<code>↩ link</code> backrefs to the first occurrence.</p>"
+        )
+        sections.append(tree_html)
+
+    # ---- Flat node index (preserves anchors used by Triggered-by /
+    # Scripts tables; useful for direct lookup by node number).
+    sections.append("<h2>NPC lines (entries) — flat index</h2>")
+    for i, e in enumerate(entries):
+        anchor = _dialog_node_anchor("entry", i)
+        text = loc(e.get("Text"))
+        speaker = fld(e, "Speaker", "")
+        action = fld(e, "Script", "")
+        sections.append(
+            f'<div class="dlg-node entry" id="{E(anchor)}">'
+            f'<div class="dlg-head"><span class="dlg-id">entry #{i}</span>'
+            + (f' <span class="dlg-speaker">[{E(speaker)}]</span>' if speaker else "")
+            + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
+            + '</div>'
+            f'<div class="dlg-text">{_annotate_custom_tokens(nwn_html(text), db.token_setters, db, "..") or "<em>(no text)</em>"}</div>'
+            + _render_dialog_node_refs(db, list_items(e.get("RepliesList")),
+                                       "reply", tgt_nodes=replies)
+            + '</div>'
+        )
+
+    # ---- Replies ----
+    sections.append("<h2>PC replies — flat index</h2>")
+    for i, r in enumerate(replies):
+        anchor = _dialog_node_anchor("reply", i)
+        text = loc(r.get("Text"))
+        action = fld(r, "Script", "")
+        sections.append(
+            f'<div class="dlg-node reply" id="{E(anchor)}">'
+            f'<div class="dlg-head"><span class="dlg-id">reply #{i}</span>'
+            + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
+            + '</div>'
+            f'<div class="dlg-text">{_annotate_custom_tokens(nwn_html(text), db.token_setters, db, "..") or "<em>(no text)</em>"}</div>'
+            + _render_dialog_node_refs(db, list_items(r.get("EntriesList")),
+                                       "entry", tgt_nodes=entries)
+            + '</div>'
+        )
+
+    write(out / "conversations" / f"{resref}.html",
+          page(f"Conversation {resref}", "\n".join(sections), root_rel=".."))
+
+
+# ---------------------------------------------------------------------------
+# Scripts (NWScript source view)
+# ---------------------------------------------------------------------------
+
+def render_script_page(db: Db, resref: str, out: Path) -> None:
+    """One page per shipped .nss script — just the source, syntax-untouched
+    inside a <pre>. Linked from dialog caller / event-script tables so the
+    reader can jump from "this OnUsed opens dialog X" straight to the code."""
+    path = db.script_paths.get(resref)
+    if not path:
+        return
+    try:
+        source = path.read_text(errors="replace")
+    except Exception as e:
+        source = f"(failed to read {path.name}: {e})"
+    starts = sorted(db.script_dialogs.get(resref, set()))
+    zstarts = sorted(db.script_zdialogs.get(resref, set()))
+    teleports = sorted(db.script_teleport_tags.get(resref, set()))
+    meta_rows = []
+    if starts:
+        meta_rows.append("<dt>Starts dialogs</dt><dd>" + ", ".join(
+            _conv_link(db, d, "..") for d in starts) + "</dd>")
+    if zstarts:
+        meta_rows.append("<dt>Opens z-dialogs</dt><dd>" + ", ".join(
+            _conv_link(db, d, "..") for d in zstarts) + "</dd>")
+    if teleports:
+        parts = []
+        for t in teleports:
+            a = db.tag_to_area.get(t)
+            if a and a in db.areas:
+                parts.append(f"<code>{E(t)}</code> ("
+                             + link(f"../areas/{a}.html", db.area_name(a)) + ")")
+            else:
+                parts.append(f"<code>{E(t)}</code>")
+        meta_rows.append("<dt>Teleports to</dt><dd>" + ", ".join(parts) + "</dd>")
+    meta = ('<dl class="meta">' + "\n".join(meta_rows) + "</dl>") if meta_rows else ""
+    body = (
+        f"<h1>Script: <code>{E(resref)}</code></h1>"
+        + meta
+        + f'<pre class="nss-source"><code>{E(source)}</code></pre>'
+    )
+    write(out / "scripts" / f"{resref}.html",
+          page(f"Script {resref}", body, root_rel=".."))
+
+
+def render_scripts_index(db: Db, out: Path) -> None:
+    """Plain listing of every shipped .nss script. Mostly used as a target
+    for cross-page links (caller tables, z-dialog handler pages); not
+    surfaced in the top nav so we don't drown it in 2000+ entries."""
+    if not db.script_paths:
+        return
+    rows = []
+    for rr in sorted(db.script_paths):
+        starts = db.script_dialogs.get(rr, set())
+        zstarts = db.script_zdialogs.get(rr, set())
+        flags = []
+        if starts:
+            flags.append("starts dialog")
+        if zstarts:
+            flags.append("opens z-dialog")
+        if db.script_teleport_tags.get(rr):
+            flags.append("teleports")
+        rows.append(
+            f"<tr><td>{link(f'{rr}.html', rr)}</td>"
+            f"<td>{', '.join(flags)}</td></tr>"
+        )
+    body = (
+        "<h1>Scripts</h1>"
+        f"<p>{len(rows)} NWScript files.</p>"
+        '<table class="data"><thead><tr>'
+        "<th>ResRef</th><th>Notes</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    write(out / "scripts" / "index.html",
+          page("Scripts", body, root_rel=".."))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _html_title(text: str, stem: str) -> str:
+    """Extract title from <title> or first <h1> tag, or derive from filename stem."""
+    m = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    return stem.replace("-", " ").replace("_", " ").title()
+
+
+# Builder-authored directives that override where a docs.manual/ page (or an
+# entire subfolder) lands in the site nav, mirroring the quest @group/@order
+# scheme (see _RE_QUEST_GROUP et al. above). Found by regex search anywhere in
+# the raw file text:
+#   @menu 'Name'     place this page/folder under the "Name" top-level
+#                    dropdown instead of "Documents". 'Documents', 'Activity'
+#                    and 'Quests' fold into those existing built-in nav
+#                    entries; any other name creates a new top-level dropdown.
+#                    ('Quests' is a plain link to the generated quest index
+#                    until at least one page targets it — see _quests_nav.)
+#   @order N         sort position of this entry within its target menu
+#                    (integer; lower = earlier; ties fall back to alphabetical)
+#   @menu-order N    sort position of a custom menu among other custom menus
+#                    in the nav (set on any entry targeting that menu; first
+#                    found wins) — meaningless for 'Documents'/'Activity',
+#                    which keep their fixed nav position.
+# In .md files, write the directive as its own bare line — it is stripped
+# before Markdown conversion (md_to_html HTML-escapes plain text, so an
+# unstripped line would otherwise render as literal visible text). In .html
+# files, wrap it in an HTML comment (e.g. <!-- @menu 'Activity' -->) — the
+# body is inserted verbatim, so a comment is already invisible in the browser
+# and needs no stripping.
+_RE_MANUAL_MENU = re.compile(
+    r"@menu\s+(?:'([^']*)'|\"([^\"]*)\"|([^\n]+))", re.IGNORECASE)
+_RE_MANUAL_ORDER = re.compile(r"@order\s+(\d+)", re.IGNORECASE)
+_RE_MANUAL_MENU_ORDER = re.compile(r"@menu-order\s+(\d+)", re.IGNORECASE)
+# Whole directive lines, stripped from .md source before Markdown conversion.
+_RE_MANUAL_DIRECTIVE = re.compile(
+    r"^[ \t]*@(?:menu-order|menu|order)\b[^\n]*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _manual_menu(text: str) -> str:
+    """The @menu name declared in a manual page's source, or 'Documents' if none."""
+    m = _RE_MANUAL_MENU.search(text or "")
+    if not m:
+        return "Documents"
+    return (m.group(1) or m.group(2) or m.group(3) or "").strip() or "Documents"
+
+
+def _manual_sort_order(text: str) -> int | None:
+    """Sort position of this entry within its target menu, via @order N.
+    Returns None when not present (callers fall back to alphabetical)."""
+    m = _RE_MANUAL_ORDER.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def _manual_menu_order(text: str) -> int | None:
+    """Sort position of this entry's target menu among other custom menus,
+    via @menu-order N. Returns None when not present."""
+    m = _RE_MANUAL_MENU_ORDER.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def _manual_doc_body(path: Path, text: str | None = None) -> tuple[str, str]:
+    """Return (title, body_html) for a .md or .html manual doc."""
+    if text is None:
+        text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".html":
+        # Extract <body> content if present, otherwise use full text as body
+        m = re.search(r"<body[^>]*>(.*?)</body>", text, re.IGNORECASE | re.DOTALL)
+        body = m.group(1) if m else text
+        return _html_title(text, path.stem), body
+    cleaned = _RE_MANUAL_DIRECTIVE.sub("", text)
+    return _md_title(cleaned, path.stem), md_to_html(cleaned)
+
+
+# =============================================================================
+# NWN server log parser
+# =============================================================================
+
+_LOG_JOIN_RE = re.compile(
+    r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\] (.+?) \((\w+)\) Joined as (Player|Game Master) \d+'
+)
+_LOG_LEAVE_RE = re.compile(
+    r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\] (.+?) Left as a (Player|Game Master)'
+)
+_LOG_HEADER_RE = re.compile(
+    r'^Messages for: \w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2} (\d{4})'
+)
+# Anvil ServerLogRedirectorService format (NWNX Anvil):
+# I [2026/06/03 09:15:31.274] [Anvil.Services.ServerLogRedirectorService] Alek Cain (CDKEY) Joined as Player 1
+_ANVIL_JOIN_RE = re.compile(
+    r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (.+?) \((\w+)\) Joined as (Player|Game Master) \d+'
+)
+_ANVIL_LEAVE_RE = re.compile(
+    r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\] \[Anvil\.Services\.ServerLogRedirectorService\] (.+?) Left as a (Player|Game Master)'
+)
+# Written each time the server finishes loading a module (i.e. every restart).
+# Any sessions still open before this line are stale — the server crashed/rebooted
+# without logging leaves.  This line is emitted by the *main* nwserver process, so it
+# normally lands in nwserverLog*.txt, NOT anvil.log; we therefore look for it in every
+# log file (regardless of format) and use it to invalidate stale open sessions across
+# files (e.g. a crashed session dangling in anvil.log, cleared by a restart logged in
+# nwserverLog.txt).  Matched with search() so an optional timestamp prefix is tolerated.
+_RESTART_RE = re.compile(r'Server: Module loaded\b')
+# Timestamp prefixes for the two log formats, used to date a restart marker (and any
+# other line) so restarts can be ordered against session join times across files.
+_ANVIL_TS_RE = re.compile(r'^I \[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\]')
+_NWSERVER_TS_RE = re.compile(r'^\[(\w{3} \w{3} [ \d]\d \d{2}:\d{2}:\d{2})\]')
+
+
+def _log_subdir_sort_key(p: Path) -> list:
+    """Natural sort key so logs.9 < logs.10 (reversed for oldest-first processing)."""
+    parts = re.split(r'(\d+)', p.name)
+    return [int(x) if x.isdigit() else x for x in parts]
+
+
+_LOG_FILE_GLOBS = ("nwserverLog*.txt", "anvil.log")
+
+
+def _collect_log_files(log_dirs: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for d in log_dirs:
+        if not d.is_dir():
+            continue
+        for glob in _LOG_FILE_GLOBS:
+            for f in sorted(d.glob(glob)):
+                if f not in seen:
+                    files.append(f)
+                    seen.add(f)
+        # Sort subdirs in REVERSE numeric order so the oldest rotation (highest
+        # number, e.g. logs.12) is processed before newer ones (logs.0).
+        subdirs = sorted(
+            (p for p in d.iterdir() if p.is_dir()),
+            key=_log_subdir_sort_key,
+            reverse=True,
+        )
+        for sub in subdirs:
+            for glob in _LOG_FILE_GLOBS:
+                for f in sorted(sub.glob(glob)):
+                    if f not in seen:
+                        files.append(f)
+                        seen.add(f)
+    return files
+
+
+def _log_file_fingerprint(path: Path) -> dict | None:
+    try:
+        st = path.stat()
+        return {"mtime": round(st.st_mtime, 3), "size": st.st_size}
+    except OSError:
+        return None
+
+
+_ACTIVITY_CACHE_VERSION = 2  # bump to invalidate stale caches (v2: sessions store cdkey)
+
+
+def _migrate_activity_cache(data: dict) -> dict:
+    """Bring an older-version cache up to the current schema in place.
+
+    Session history is irreplaceable (it preserves hours after the source logs
+    rotate away), so a version mismatch must NEVER discard sessions — every
+    schema bump so far has been purely additive. Default any newly-added fields
+    on existing sessions and carry fingerprints / restart marker forward.
+    """
+    sessions = data.get("sessions")
+    if not isinstance(sessions, list):
+        sessions = []
+    for s in sessions:
+        if isinstance(s, dict):
+            s.setdefault("cdkey", None)      # added in v2
+            s.setdefault("role", "Player")
+    data["sessions"] = sessions
+    if not isinstance(data.get("file_fingerprints"), dict):
+        data["file_fingerprints"] = {}
+    data["version"] = _ACTIVITY_CACHE_VERSION
+    return data
+
+
+def _load_activity_cache(cache_path: Path) -> dict:
+    if cache_path.is_file():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+                if data.get("version") == _ACTIVITY_CACHE_VERSION:
+                    return data
+                # Older (or future-but-compatible) version: migrate, don't wipe.
+                return _migrate_activity_cache(data)
+        except Exception:
+            pass
+    return {"version": _ACTIVITY_CACHE_VERSION, "sessions": [], "file_fingerprints": {}}
+
+
+def _save_activity_cache(cache_path: Path, data: dict) -> None:
+    try:
+        # Keep one recoverable generation in case a write (or a future schema
+        # change) ever loses data; the session history cannot be rebuilt once
+        # the source logs have rotated away.
+        if cache_path.is_file():
+            try:
+                shutil.copy2(cache_path, cache_path.with_suffix(cache_path.suffix + ".bak"))
+            except OSError:
+                pass
+        # Atomic replace so an interrupted write can't truncate the cache.
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(cache_path)
+    except OSError as e:
+        print(f"[nwn-wiki] warn: could not save activity cache: {e}", file=sys.stderr)
+
+
+def _parse_one_log_file(log_path: Path) -> tuple[list[dict], bool, "datetime | None"]:
+    """Parse one NWN server log file (nwserverLog*.txt or Anvil anvil.log).
+
+    Returns (sessions, has_open_sessions, restart_ts). Each session has player,
+    role, join (datetime), leave (datetime|None), duration_min (float|None).
+    restart_ts is the timestamp of the latest server restart seen in this file
+    (or None), used to invalidate stale open sessions across files.
+    """
+    is_anvil = log_path.name == "anvil.log"
+    join_re = _ANVIL_JOIN_RE if is_anvil else _LOG_JOIN_RE
+    leave_re = _ANVIL_LEAVE_RE if is_anvil else _LOG_LEAVE_RE
+    year = datetime.now().year
+    sessions: list[dict] = []
+    open_sessions: dict[str, dict] = {}
+    last_ts: datetime | None = None     # most recent timestamp seen on any line
+    restart_ts: datetime | None = None  # timestamp of the latest restart marker
+
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [], False, None
+
+    for line in text.splitlines():
+        # Track the most recent timestamp so a restart marker can be dated even
+        # when its own line carries no timestamp (e.g. bare "Server: Module loaded").
+        am = _ANVIL_TS_RE.match(line)
+        if am:
+            try:
+                last_ts = datetime.strptime(am.group(1), "%Y/%m/%d %H:%M:%S")
+            except ValueError:
+                pass
+        else:
+            nm = _NWSERVER_TS_RE.match(line)
+            if nm:
+                try:
+                    norm = re.sub(r' +', ' ', nm.group(1).strip())
+                    last_ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+                except ValueError:
+                    pass
+
+        if _RESTART_RE.search(line):
+            # Server restarted; sessions open before this point never logged a
+            # leave (crash/reboot), so discard them rather than reporting online.
+            open_sessions.clear()
+            if last_ts is not None:
+                restart_ts = last_ts
+            continue
+        if not is_anvil:
+            m = _LOG_HEADER_RE.match(line)
+            if m:
+                year = int(m.group(1))
+                continue
+        m = join_re.match(line)
+        if m:
+            ts_str, player, cdkey, role = m.group(1), m.group(2), m.group(3), m.group(4)
+            try:
+                if is_anvil:
+                    ts = datetime.strptime(ts_str, "%Y/%m/%d %H:%M:%S")
+                else:
+                    norm = re.sub(r' +', ' ', ts_str.strip())
+                    ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+            except ValueError:
+                continue
+            if player in open_sessions:
+                prev = open_sessions.pop(player)
+                dur = (ts - prev["join"]).total_seconds() / 60
+                sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
+            open_sessions[player] = {"player": player, "cdkey": cdkey, "role": role, "join": ts}
+            continue
+        m = leave_re.match(line)
+        if m:
+            ts_str, player = m.group(1), m.group(2)
+            try:
+                if is_anvil:
+                    ts = datetime.strptime(ts_str, "%Y/%m/%d %H:%M:%S")
+                else:
+                    norm = re.sub(r' +', ' ', ts_str.strip())
+                    ts = datetime.strptime(f"{norm} {year}", "%a %b %d %H:%M:%S %Y")
+            except ValueError:
+                continue
+            if player in open_sessions:
+                prev = open_sessions.pop(player)
+                dur = (ts - prev["join"]).total_seconds() / 60
+                sessions.append({**prev, "leave": ts, "duration_min": max(0.0, dur)})
+
+    has_open = bool(open_sessions)
+    for player, data in open_sessions.items():
+        sessions.append({**data, "leave": None, "duration_min": None})
+
+    return sessions, has_open, restart_ts
+
+
+def parse_nwserver_logs(
+    log_dirs: list[Path],
+    cache_path: Path | None = None,
+    online_floor: "datetime | None" = None,
+) -> dict:
+    """Parse NWN server log files; return {"sessions": [...], "file_count": N}.
+
+    Each session dict has: player (str), role ("Player"|"Game Master"),
+    join (datetime), leave (datetime|None), duration_min (float|None).
+
+    If cache_path is given, closed sessions are persisted to a JSON file so
+    that hours never decrease even when old log rotations are deleted.
+
+    If online_floor is given, any session still open whose join precedes it is
+    dropped from the "currently online" set — it is a leftover from a previous
+    server run that was killed without logging a leave. Callers that restart the
+    server alongside the monitor (nwn-manager serve) pass their own start time.
+    """
+    log_files = _collect_log_files(log_dirs)
+
+    cache = _load_activity_cache(cache_path) if cache_path else {
+        "version": _ACTIVITY_CACHE_VERSION, "sessions": [], "file_fingerprints": {},
+    }
+    cached_sessions: list[dict] = cache.setdefault("sessions", [])
+    cached_fps: dict = cache.setdefault("file_fingerprints", {})
+
+    # Index of sessions already stored: (player, join_isoformat) → True
+    seen_keys: set[tuple] = {
+        (s["player"], s["join"])
+        for s in cached_sessions
+        if s.get("join") and s.get("duration_min") is not None
+    }
+
+    cache_updated = False
+    # Track open sessions per file so we can discard stale ones after the loop.
+    # Key: str(log_path), Value: (file_mtime_float, [session, ...])
+    _open_by_file: dict[str, tuple[float, list[dict]]] = {}
+    # Latest server-restart timestamp across all files. A restart invalidates any
+    # session left open (un-left) before it, even when the restart is logged in a
+    # different file (nwserverLog.txt) than the dangling session (anvil.log).
+    # Persisted in the cache so it survives once the restart's log file stops
+    # changing and gets fingerprint-skipped on later polls.
+    latest_restart_ts: datetime | None = None
+    _cached_restart = cache.get("latest_restart_ts")
+    if _cached_restart:
+        try:
+            latest_restart_ts = datetime.fromisoformat(_cached_restart)
+        except (ValueError, TypeError):
+            latest_restart_ts = None
+
+    for log_path in log_files:
+        path_key = str(log_path)
+        fp = _log_file_fingerprint(log_path)
+
+        # Skip files whose content hasn't changed since last parse
+        if fp is not None and cached_fps.get(path_key) == fp:
+            continue
+
+        file_sessions, has_open, restart_ts = _parse_one_log_file(log_path)
+        if restart_ts is not None and (
+            latest_restart_ts is None or restart_ts > latest_restart_ts
+        ):
+            latest_restart_ts = restart_ts
+
+        # Persist all newly closed sessions
+        file_opens: list[dict] = []
+        for s in file_sessions:
+            if s.get("duration_min") is None:
+                file_opens.append(s)
+                continue
+            join_key = (s["player"], s["join"].isoformat())
+            if join_key in seen_keys:
+                continue
+            seen_keys.add(join_key)
+            cached_sessions.append({
+                "player": s["player"],
+                "cdkey": s.get("cdkey"),
+                "role": s.get("role", "Player"),
+                "join": s["join"].isoformat(),
+                "leave": s["leave"].isoformat() if s.get("leave") else None,
+                "duration_min": s["duration_min"],
+            })
+            cache_updated = True
+
+        if file_opens:
+            file_mtime = fp["mtime"] if fp else 0.0
+            _open_by_file[path_key] = (file_mtime, file_opens)
+
+        # Only fingerprint files that are fully closed (no players still online)
+        if not has_open and fp is not None:
+            cached_fps[path_key] = fp
+            cache_updated = True
+
+    if latest_restart_ts is not None:
+        restart_iso = latest_restart_ts.isoformat()
+        if cache.get("latest_restart_ts") != restart_iso:
+            cache["latest_restart_ts"] = restart_iso
+            cache_updated = True
+
+    if cache_path is not None and cache_updated:
+        _save_activity_cache(cache_path, cache)
+
+    # Only include open sessions from the most recently modified log file.
+    # If a newer file exists (e.g. server restarted after a crash), sessions left
+    # open in an older file are stale — those players are no longer connected.
+    max_log_mtime = 0.0
+    for lp in log_files:
+        try:
+            mt = lp.stat().st_mtime
+            if mt > max_log_mtime:
+                max_log_mtime = mt
+        except OSError:
+            pass
+
+    open_sessions_out: list[dict] = []
+    for file_mtime, file_opens in _open_by_file.values():
+        # Allow up to 60 s of clock skew / filesystem resolution
+        if max_log_mtime - file_mtime <= 60:
+            for s in file_opens:
+                # Drop sessions that began before the last server restart: the
+                # player was disconnected by the reboot and never logged a leave.
+                if latest_restart_ts is not None and s["join"] < latest_restart_ts:
+                    continue
+                # Drop sessions predating the caller's online floor (e.g. the
+                # monitor's own start time): leftovers from a previous run whose
+                # new "Module loaded" marker may not have been logged yet.
+                if online_floor is not None and s["join"] < online_floor:
+                    continue
+                open_sessions_out.append(s)
+
+    # Convert cached sessions back to datetime objects for rendering
+    sessions_out: list[dict] = []
+    for s in cached_sessions:
+        try:
+            join_dt = datetime.fromisoformat(s["join"])
+            leave_dt = datetime.fromisoformat(s["leave"]) if s.get("leave") else None
+        except (ValueError, KeyError):
+            continue
+        sessions_out.append({
+            "player": s["player"],
+            "cdkey": s.get("cdkey"),
+            "role": s.get("role", "Player"),
+            "join": join_dt,
+            "leave": leave_dt,
+            "duration_min": s.get("duration_min"),
+            # Preserve provenance so the renderer can exclude recovered sessions
+            # (fabricated join times) from the timing-based charts.
+            "synthetic": s.get("synthetic", False),
+        })
+
+    sessions_out.extend(open_sessions_out)
+    return {"sessions": sessions_out, "file_count": len(log_files)}
+
+
+# =============================================================================
+# SVG chart helpers (pure stdlib — no third-party deps)
+# =============================================================================
+
+def _nice_upper(val: float) -> float:
+    """Round val up to a visually nice axis maximum."""
+    if val <= 0:
+        return 1.0
+    exp = 10 ** math.floor(math.log10(val))
+    norm = val / exp
+    for nice in (1, 2, 2.5, 5, 10):
+        if nice >= norm:
+            return nice * exp
+    return float(val)
+
+
+def _fmt_num(val: float) -> str:
+    if val == int(val):
+        return str(int(val))
+    return f"{val:.1f}" if val < 10 else str(int(round(val)))
+
+
+def _se(s: Any) -> str:
+    """html.escape shorthand for SVG text content."""
+    return html.escape(str(s))
+
+
+def svg_vbar_chart(
+    labels: list[str], values: list[float], title: str,
+    ylabel: str = "", bar_color: str = "#6b3a1c",
+    width: int = 700, height: int = 270,
+    rotate_labels: bool = False,
+) -> str:
+    """Vertical bar chart returned as an inline SVG string."""
+    mt, mb = 32, (72 if rotate_labels else 50)
+    ml, mr = 55, 20
+    pw, ph = width - ml - mr, height - mt - mb
+    n = len(labels)
+    if n == 0:
+        return f'<svg width="{width}" height="{height}"><text x="10" y="20">No data</text></svg>'
+    y_max = _nice_upper(max(values) if values else 1)
+    bar_w = max(2.0, pw / n * 0.65)
+    bar_gap = pw / n
+    out: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'style="font-family:Georgia,serif;background:#fff;'
+        f'border:1px solid #d6d2c4;border-radius:4px;display:block;">'
+    ]
+    out.append(
+        f'<text x="{width/2:.1f}" y="22" text-anchor="middle" '
+        f'font-size="13" fill="#6b3a1c">{_se(title)}</text>'
+    )
+    if ylabel:
+        cy = mt + ph / 2
+        out.append(
+            f'<text x="13" y="{cy:.1f}" text-anchor="middle" font-size="11" fill="#6b6b6b" '
+            f'transform="rotate(-90 13 {cy:.1f})">{_se(ylabel)}</text>'
+        )
+    for i in range(6):
+        tv = y_max * i / 5
+        y = mt + ph - (tv / y_max) * ph
+        out.append(
+            f'<line x1="{ml}" y1="{y:.1f}" x2="{ml+pw}" y2="{y:.1f}" '
+            f'stroke="#d6d2c4" stroke-width="1" stroke-dasharray="3,3"/>'
+        )
+        out.append(
+            f'<text x="{ml-6}" y="{y+4:.1f}" text-anchor="end" '
+            f'font-size="10" fill="#6b6b6b">{_fmt_num(tv)}</text>'
+        )
+    out.append(
+        f'<line x1="{ml}" y1="{mt}" x2="{ml}" y2="{mt+ph}" '
+        f'stroke="#9a9a9a" stroke-width="1.5"/>'
+    )
+    out.append(
+        f'<line x1="{ml}" y1="{mt+ph}" x2="{ml+pw}" y2="{mt+ph}" '
+        f'stroke="#9a9a9a" stroke-width="1.5"/>'
+    )
+    for i, (lbl, val) in enumerate(zip(labels, values)):
+        bx = ml + i * bar_gap + (bar_gap - bar_w) / 2
+        bh = (val / y_max) * ph
+        by = mt + ph - bh
+        out.append(
+            f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bar_w:.1f}" height="{bh:.1f}" '
+            f'fill="{bar_color}" opacity="0.82"/>'
+        )
+        if val > 0:
+            out.append(
+                f'<text x="{bx+bar_w/2:.1f}" y="{by-3:.1f}" text-anchor="middle" '
+                f'font-size="10" fill="{bar_color}">{_fmt_num(val)}</text>'
+            )
+        cx = bx + bar_w / 2
+        if rotate_labels:
+            out.append(
+                f'<text x="{cx:.1f}" y="{mt+ph+10}" text-anchor="end" font-size="10" '
+                f'fill="#6b6b6b" transform="rotate(-45 {cx:.1f} {mt+ph+10})">'
+                f'{_se(lbl)}</text>'
+            )
+        else:
+            out.append(
+                f'<text x="{cx:.1f}" y="{mt+ph+16}" text-anchor="middle" '
+                f'font-size="11" fill="#6b6b6b">{_se(lbl)}</text>'
+            )
+    out.append('</svg>')
+    return "\n".join(out)
+
+
+def svg_hbar_chart(
+    labels: list[str], values: list[float], title: str,
+    xlabel: str = "", bar_color: str = "#6b3a1c",
+) -> str:
+    """Horizontal bar chart returned as an inline SVG string."""
+    bar_h, bar_gap = 22, 30
+    n = len(labels)
+    width = 700
+    ml, mr, mt, mb = 130, 65, 34, 38
+    height = mt + n * bar_gap + mb
+    pw = width - ml - mr
+    x_max = _nice_upper(max(values) if values else 1)
+    y_bot = mt + n * bar_gap
+    out: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'style="font-family:Georgia,serif;background:#fff;'
+        f'border:1px solid #d6d2c4;border-radius:4px;display:block;">'
+    ]
+    out.append(
+        f'<text x="{width/2:.1f}" y="24" text-anchor="middle" '
+        f'font-size="13" fill="#6b3a1c">{_se(title)}</text>'
+    )
+    for i in range(6):
+        tv = x_max * i / 5
+        x = ml + (tv / x_max) * pw
+        out.append(
+            f'<line x1="{x:.1f}" y1="{mt}" x2="{x:.1f}" y2="{y_bot}" '
+            f'stroke="#d6d2c4" stroke-width="1" stroke-dasharray="3,3"/>'
+        )
+        out.append(
+            f'<text x="{x:.1f}" y="{y_bot+14}" text-anchor="middle" '
+            f'font-size="10" fill="#6b6b6b">{_fmt_num(tv)}</text>'
+        )
+    if xlabel:
+        out.append(
+            f'<text x="{ml+pw/2:.1f}" y="{y_bot+30}" text-anchor="middle" '
+            f'font-size="11" fill="#6b6b6b">{_se(xlabel)}</text>'
+        )
+    out.append(
+        f'<line x1="{ml}" y1="{mt}" x2="{ml}" y2="{y_bot}" '
+        f'stroke="#9a9a9a" stroke-width="1.5"/>'
+    )
+    out.append(
+        f'<line x1="{ml}" y1="{y_bot}" x2="{ml+pw}" y2="{y_bot}" '
+        f'stroke="#9a9a9a" stroke-width="1.5"/>'
+    )
+    for i, (lbl, val) in enumerate(zip(labels, values)):
+        by = mt + i * bar_gap + (bar_gap - bar_h) / 2
+        bw = (val / x_max) * pw
+        out.append(
+            f'<rect x="{ml}" y="{by:.1f}" width="{bw:.1f}" height="{bar_h}" '
+            f'fill="{bar_color}" opacity="0.82"/>'
+        )
+        if val > 0:
+            out.append(
+                f'<text x="{ml+bw+5:.1f}" y="{by+bar_h/2+4:.1f}" '
+                f'font-size="10" fill="{bar_color}">{_fmt_num(val)}</text>'
+            )
+        out.append(
+            f'<text x="{ml-8}" y="{by+bar_h/2+4:.1f}" text-anchor="end" '
+            f'font-size="11" fill="#1f1f1f">{_se(lbl)}</text>'
+        )
+    out.append('</svg>')
+    return "\n".join(out)
+
+
+# =============================================================================
+# Activity page renderer
+# =============================================================================
+
+def _tz_label_from_env() -> str:
+    """Derive a GMT±N label from the TZ environment variable.
+
+    Uses the zoneinfo module (Python 3.9+) so DST is handled correctly
+    (e.g. America/Chicago → 'GMT-5' in winter, 'GMT-4' in summer).
+    Falls back to 'GMT+0' when TZ is unset or the name is unrecognised.
+    """
+    tz_name = os.environ.get("TZ", "")
+    if not tz_name:
+        return "GMT+0"
+    try:
+        from zoneinfo import ZoneInfo
+        zi = ZoneInfo(tz_name)
+        offset = datetime.now(zi).utcoffset()
+        total_sec = int(offset.total_seconds())
+        h, m = divmod(abs(total_sec) // 60, 60)
+        sign = "+" if total_sec >= 0 else "-"
+        return f"GMT{sign}{h}" if m == 0 else f"GMT{sign}{h}:{m:02d}"
+    except Exception:
+        return tz_name
+
+
+def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> None:
+    """Write activity.html with player-activity charts derived from server logs."""
+    sessions = activity.get("sessions", [])
+    file_count = activity.get("file_count", 0)
+
+    ps = [s for s in sessions if s.get("join") is not None and s.get("role") == "Player"]
+    if not ps:
+        return
+
+    sess_by_player: Counter = Counter(s["player"] for s in ps)
+    time_by_player: dict[str, float] = {}
+    for s in ps:
+        if s.get("duration_min") is not None:
+            time_by_player[s["player"]] = (
+                time_by_player.get(s["player"], 0.0) + s["duration_min"]
+            )
+
+    all_dates = sorted({s["join"].date() for s in ps})
+    if all_dates:
+        min_date, max_date = all_dates[0], all_dates[-1]
+        date_range = [
+            min_date + timedelta(days=i)
+            for i in range((max_date - min_date).days + 1)
+        ]
+    else:
+        date_range = []
+    date_hours: dict = {}
+    hour_hours: dict[int, float] = {}
+    dow_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    dow_hours: dict[str, float] = {}
+    for s in ps:
+        if s.get("duration_min") is not None:
+            d = s["join"].date()
+            day = s["join"].strftime("%a")
+            hrs = s["duration_min"] / 60.0
+            date_hours[d] = date_hours.get(d, 0.0) + hrs
+            dow_hours[day] = dow_hours.get(day, 0.0) + hrs
+            # Distribute play-hours across every clock hour the session spans,
+            # correctly handling sessions that cross midnight. Synthetic sessions
+            # (recovered from old chart snapshots — see bin/recover-activity-gap)
+            # carry a faithful daily total but a fabricated join time, so they are
+            # excluded here to keep the hour-of-day chart honest.
+            if not s.get("synthetic"):
+                cur = s["join"]
+                end = cur + timedelta(hours=hrs)
+                while cur < end:
+                    next_hour = cur.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                    seg_end = min(next_hour, end)
+                    hour_hours[cur.hour] = hour_hours.get(cur.hour, 0.0) + (seg_end - cur).total_seconds() / 3600.0
+                    cur = seg_end
+
+    # Sweep-line: peak concurrent players per day and overall.
+    # Leaves are sorted before joins at identical timestamps so a player
+    # departing and another arriving at the same instant don't inflate the peak.
+    _now = datetime.now()
+    conc_events: list[tuple] = []
+    for s in ps:
+        if s.get("join") is None or s.get("synthetic"):
+            # Synthetic recovery sessions share a single fabricated join time, so
+            # they would inflate the peak; the gap window is dropped from this chart.
+            continue
+        conc_events.append((s["join"], 1))
+        conc_events.append((s.get("leave") or _now, -1))
+    conc_events.sort(key=lambda e: (e[0], e[1]))
+    daily_peak_conc: dict = {}
+    peak_conc = 0
+    peak_conc_date = None
+    _cur = 0
+    for _t, _delta in conc_events:
+        _cur += _delta
+        _d = _t.date()
+        if _cur > daily_peak_conc.get(_d, 0):
+            daily_peak_conc[_d] = _cur
+        if _cur > peak_conc:
+            peak_conc = _cur
+            peak_conc_date = _d
+
+    first_seen: dict[str, object] = {}
+    for s in ps:
+        p, j = s["player"], s["join"]
+        if p not in first_seen or j < first_seen[p]:
+            first_seen[p] = j
+    newest_players = sorted(first_seen.items(), key=lambda x: x[1], reverse=True)[:3]
+
+    n_players = len(sess_by_player)
+    n_sessions = len(ps)
+    total_hours = sum(time_by_player.values()) / 60
+    top_player = max(time_by_player, key=time_by_player.get) if time_by_player else "—"
+    top_day = max(date_hours, key=date_hours.get) if date_hours else None
+    top_day_str = top_day.strftime("%b %d, %Y") if top_day else "—"
+    top_day_hours = date_hours[top_day] if top_day else 0.0
+    peak_conc_str = (
+        f"{peak_conc} player{'s' if peak_conc != 1 else ''}"
+        f" ({peak_conc_date.strftime('%b %d, %Y')})"
+        if peak_conc_date else "—"
+    )
+
+    top_players = sorted(time_by_player, key=time_by_player.get, reverse=True)[:15]
+    chart_time = svg_hbar_chart(
+        list(reversed(top_players)),
+        [round(time_by_player.get(p, 0.0) / 60, 2) for p in reversed(top_players)],
+        "Play-hours per player",
+        xlabel="hours",
+        bar_color="#5a2b78",
+    )
+    _daily_cutoff = date(2026, 5, 17)
+    _conc_cutoff = date(2026, 6, 1)
+
+    # Daily charts show at most the most recent DAILY_WINDOW days. Once the data
+    # runs longer than that, the days that fall off the daily chart aren't lost:
+    # a weekly roll-up of the *whole* range is rendered underneath it.
+    DAILY_WINDOW = 35
+
+    def _weekly(days: list, value_of, combine) -> tuple[list[str], list]:
+        """Roll a per-day series up into Mon-anchored weeks.
+
+        `value_of(day)` yields that day's value; `combine(list)` reduces a week's
+        worth of values (sum for hours, max for a peak). Returns (labels, values).
+        """
+        buckets: dict = {}
+        for d in days:
+            wk = d - timedelta(days=d.weekday())
+            buckets.setdefault(wk, []).append(value_of(d))
+        weeks = sorted(buckets)
+        return (
+            [w.strftime("%b %-d") for w in weeks],
+            [combine(buckets[w]) for w in weeks],
+        )
+
+    date_range_daily_all = [d for d in date_range if d > _daily_cutoff]
+    date_range_daily = date_range_daily_all[-DAILY_WINDOW:]
+    daily_labels = [d.strftime("%b %-d") for d in date_range_daily]
+    date_hour_values = [round(date_hours.get(d, 0.0), 2) for d in date_range_daily]
+    chart_daily_hours = svg_vbar_chart(
+        daily_labels, date_hour_values,
+        "Daily play-hours",
+        ylabel="hours",
+        width=max(700, len(date_range_daily) * 20 + 80),
+        height=270,
+        rotate_labels=True,
+        bar_color="#5a2b78",
+    )
+    chart_weekly_hours = ""
+    if len(date_range_daily_all) > DAILY_WINDOW:
+        wk_labels, wk_values = _weekly(
+            date_range_daily_all,
+            lambda d: date_hours.get(d, 0.0),
+            lambda vs: round(sum(vs), 2),
+        )
+        chart_weekly_hours = svg_vbar_chart(
+            wk_labels, wk_values,
+            "Weekly play-hours (week beginning)",
+            ylabel="hours",
+            width=max(700, len(wk_labels) * 20 + 80),
+            height=270,
+            rotate_labels=True,
+            bar_color="#5a2b78",
+        )
+
+    date_range_conc_all = [d for d in date_range if d > _conc_cutoff]
+    date_range_conc = date_range_conc_all[-DAILY_WINDOW:]
+    conc_labels = [d.strftime("%b %-d") for d in date_range_conc]
+    conc_values = [daily_peak_conc.get(d, 0) for d in date_range_conc]
+    chart_concurrent = svg_vbar_chart(
+        conc_labels, conc_values,
+        "Peak concurrent players per day",
+        ylabel="players",
+        width=max(700, len(date_range_conc) * 20 + 80),
+        height=270,
+        rotate_labels=True,
+    )
+    chart_weekly_conc = ""
+    if len(date_range_conc_all) > DAILY_WINDOW:
+        wk_labels, wk_values = _weekly(
+            date_range_conc_all,
+            lambda d: daily_peak_conc.get(d, 0),
+            max,
+        )
+        chart_weekly_conc = svg_vbar_chart(
+            wk_labels, wk_values,
+            "Peak concurrent players per week (week beginning)",
+            ylabel="players",
+            width=max(700, len(wk_labels) * 20 + 80),
+            height=270,
+            rotate_labels=True,
+        )
+    chart_hour = svg_vbar_chart(
+        [str(h) for h in range(24)],
+        [round(hour_hours.get(h, 0.0), 2) for h in range(24)],
+        f"Play-hours by hour of day ({tz_label})",
+        ylabel="hours",
+        width=700, height=260,
+    )
+    chart_dow = svg_vbar_chart(
+        dow_order,
+        [round(dow_hours.get(d, 0.0), 2) for d in dow_order],
+        "Play-hours by day of week",
+        ylabel="hours",
+        width=500, height=240,
+        bar_color="#5a2b78",
+    )
+
+    range_str = (
+        f"{all_dates[0].strftime('%b %d, %Y')} – {all_dates[-1].strftime('%b %d, %Y')}"
+        if all_dates else ""
+    )
+    body = (
+        "<h1>Player Activity</h1>\n"
+        f'<p class="muted">Parsed from {file_count} server log file'
+        f'{"s" if file_count != 1 else ""}'
+        f'{f" &mdash; {E(range_str)}" if range_str else ""}</p>\n'
+        + (
+            "<h2>Welcome, new adventurers!</h2>\n"
+            "<p>Our most recently seen players:</p>\n"
+            "<ul>\n"
+            + "".join(
+                f"  <li><strong>{E(p)}</strong> &mdash; first joined"
+                f" {j.strftime('%b %d, %Y')}</li>\n"
+                for p, j in newest_players
+            )
+            + "</ul>\n"
+            if newest_players else ""
+        )
+        + "<h2>Summary</h2>\n"
+        '<dl class="meta">\n'
+        f"  <dt>Unique players</dt><dd>{n_players}</dd>\n"
+        f"  <dt>Total sessions</dt><dd>{n_sessions}</dd>\n"
+        f"  <dt>Combined play-hours</dt><dd>{total_hours:.1f} h</dd>\n"
+        f"  <dt>Most active player</dt><dd>{E(top_player)}</dd>\n"
+        f"  <dt>Busiest day</dt><dd>{E(top_day_str)}"
+        f" ({top_day_hours:.1f} h)</dd>\n"
+        f"  <dt>Peak concurrent players</dt><dd>{E(peak_conc_str)}</dd>\n"
+        "</dl>\n"
+        "<h2>Play-hours per player</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_time}</div>\n'
+        "<h2>Play-hours per period</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_daily_hours}</div>\n'
+        + (
+            f'<p style="overflow-x:auto;">{chart_weekly_hours}</p>\n'
+            if chart_weekly_hours else ""
+        )
+        + "<h2>Concurrent players</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_concurrent}</div>\n'
+        + (
+            f'<p style="overflow-x:auto;">{chart_weekly_conc}</p>\n'
+            if chart_weekly_conc else ""
+        )
+        +
+        "<h2>Active time of day</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_hour}</div>\n'
+        "<h2>Day of week</h2>\n"
+        f'<div style="overflow-x:auto;">{chart_dow}</div>\n'
+    )
+    now_str = datetime.now().strftime("%b %-d, %Y %H:%M")
+    write(out / "activity.html", page("Player Activity", body, page_updated_at=now_str))
+    print(f"[nwn-wiki] rendered activity page ({n_sessions} sessions, {n_players} players)")
+
+
+# ---------------------------------------------------------------------------
+# Bestiary kill stats (read from / seeded into the live NWNX:EE campaign DB)
+# ---------------------------------------------------------------------------
+
+def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
+    """Write the creature catalogue (resref, name, CR) into the bestiary DB
+    (<db_dir>/bestiarydb.sqlite3 — must match BST_DB in bst_db.nss, the file the
+    in-game scripts use) so the in-game book can list creatures killed or not.
+
+    Seeds only PLAYER-ACCESSIBLE creatures — the same "present" set the creatures
+    index uses (has >=1 placement or encounter, i.e. canonical_locations count
+    > 0), including stock NWN/CEP creatures registered from encounter pools.
+    Blueprint-only creatures (e.g. DM avatars) are excluded. Rows are keyed by the
+    runtime resref (the base blueprint, what GetResRef returns in-game), never the
+    synthetic __v2/__orphan ids, so kills JOIN. The table is rebuilt each run so
+    creatures that become inaccessible are pruned. Tolerant of the server holding
+    the DB."""
+    import sqlite3
+    # The dir is normally the live server's database/ (already present). Create
+    # it only when genuinely absent — mkdir(exist_ok) still raises on a symlink
+    # whose target doesn't resolve on this host (e.g. a container mount).
+    if not db_dir.exists():
+        try:
+            db_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"[nwn-wiki] bestiary: cannot create {db_dir}: {e}", file=sys.stderr)
+            return
+    db_file = db_dir / "bestiarydb.sqlite3"
+    try:
+        con = sqlite3.connect(str(db_file), timeout=5.0)
+    except sqlite3.Error as e:
+        print(f"[nwn-wiki] bestiary: cannot open {db_file}: {e}", file=sys.stderr)
+        return
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("CREATE TABLE IF NOT EXISTS catalogue "
+                    "(resref TEXT PRIMARY KEY, name TEXT, cr REAL)")
+        # Accessible = the base blueprint of any canonical that has a location
+        # (placement or encounter). A base counts if it OR any of its variants
+        # is placed/encountered.
+        accessible_bases = set()
+        for c_rr in db.canonical_creatures:
+            if sum(l["count"] for l in db.canonical_locations.get(c_rr, [])) > 0:
+                accessible_bases.add(db.canonical_bp_of.get(c_rr, c_rr))
+        rows = []
+        for can_rr, entry in db.canonical_creatures.items():
+            if db.canonical_bp_of.get(can_rr) != can_rr:
+                continue  # variant; never appears in-game by ResRef
+            if can_rr.startswith("__orphan_"):
+                continue  # synthetic id with no runtime resref — can't be killed by it
+            if can_rr not in accessible_bases:
+                continue  # blueprint-only / un-encounterable
+            c = entry["c"]
+            bp_rr = entry["bp_rr"]
+            bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+            cr_raw = fld(c, "ChallengeRating")
+            if cr_raw is None and bp is not None:
+                cr_raw = fld(bp, "ChallengeRating")
+            try:
+                cr = float(cr_raw or 0)
+            except (TypeError, ValueError):
+                cr = 0.0
+            rows.append((can_rr, nwn_text(db.canonical_creature_name(can_rr)), cr))
+        # Rebuild so newly-inaccessible creatures are pruned (catalogue is derived
+        # data; kills / server_first are separate tables and untouched).
+        con.execute("DELETE FROM catalogue")
+        con.executemany(
+            "INSERT INTO catalogue(resref,name,cr) VALUES(?,?,?)", rows)
+        con.commit()
+        print(f"[nwn-wiki] bestiary: seeded {len(rows)} accessible catalogue rows "
+              f"into {db_file}")
+    except sqlite3.Error as e:
+        print(f"[nwn-wiki] bestiary: catalogue seed failed: {e}", file=sys.stderr)
+    finally:
+        con.close()
+
+
+def load_bestiary_stats(db_dir: Path, sessions: list | None = None) -> None:
+    """Populate the bestiary globals from the live DB (read-only). Missing DB or
+    missing tables (no kills yet) leave the stats empty but mark the system active
+    so the Server-First page still renders. `sessions` (parsed log sessions, if
+    available) supplies a cdkey->player-name mapping for the Top Killers table's
+    Player column; kills only store cdkey, not the account/player name."""
+    global _BESTIARY_KILLS, _BESTIARY_TOP, _SERVER_FIRSTS, _BESTIARY_ACTIVE
+    import sqlite3
+    cdkey_to_name: dict = {}
+    for s in (sessions or []):
+        if s.get("cdkey") and s.get("player"):
+            cdkey_to_name[s["cdkey"]] = s["player"]
+    _BESTIARY_KILLS = {}
+    _BESTIARY_TOP = {}
+    _SERVER_FIRSTS = []
+    db_file = db_dir / "bestiarydb.sqlite3"
+    if not db_file.is_file():
+        return
+    _BESTIARY_ACTIVE = True
+    try:
+        con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as e:
+        print(f"[nwn-wiki] bestiary: cannot read {db_file}: {e}", file=sys.stderr)
+        return
+    try:
+        for resref, total, solo, party in con.execute(
+            "SELECT resref, SUM(solo_kills+party_kills), SUM(solo_kills), "
+            "SUM(party_kills) FROM kills GROUP BY resref"
+        ).fetchall():
+            _BESTIARY_KILLS[resref] = {"total": int(total or 0),
+                                       "solo": int(solo or 0),
+                                       "party": int(party or 0)}
+    except sqlite3.Error:
+        pass  # kills table not created yet (no kills recorded)
+    # Per-character rows for the "Top Killers" tables on creature pages.
+    # Loaded once here (never per-page SQL). Fold variant resrefs through the
+    # DB's resref_alias table so a character's kills of a variant blueprint
+    # count toward the canonical creature (kills are normally written already
+    # canonical by Bst_Canonical, so this is a safety net).
+    try:
+        try:
+            alias = dict(con.execute(
+                "SELECT resref, canonical FROM resref_alias").fetchall())
+        except sqlite3.Error:
+            alias = {}
+        per_char: dict[tuple[str, str], dict] = {}
+        for resref, uuid, cdkey, name, solo, party, last in con.execute(
+            "SELECT resref, uuid, cdkey, char_name, solo_kills, party_kills, "
+            "last_kill FROM kills"
+        ).fetchall():
+            rr = alias.get(resref, resref)
+            row = per_char.setdefault((rr, uuid), {
+                "uuid": uuid, "name": name or "", "player": "", "solo": 0,
+                "party": 0, "last": ""})
+            row["solo"] += int(solo or 0)
+            row["party"] += int(party or 0)
+            if (last or "") >= row["last"]:
+                row["last"] = last or ""
+                if name:  # most recent char_name wins (renames)
+                    row["name"] = name
+                if cdkey and cdkey_to_name.get(cdkey):
+                    row["player"] = cdkey_to_name[cdkey]
+        for (rr, _uuid), row in per_char.items():
+            row["total"] = row["solo"] + row["party"]
+            _BESTIARY_TOP.setdefault(rr, []).append(row)
+        for rows_ in _BESTIARY_TOP.values():
+            rows_.sort(key=lambda r: (-r["total"], r["name"].lower()))
+    except sqlite3.Error:
+        pass  # kills table not created yet
+    try:
+        try:
+            rows = con.execute(
+                "SELECT s.resref, s.cr, s.first_name, s.first_at, "
+                "COALESCE(c.name, s.resref), s.first_player_name FROM server_first s "
+                "LEFT JOIN catalogue c ON c.resref = s.resref "
+                "ORDER BY s.cr DESC, s.first_at ASC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # first_player_name column absent (pre-migration DB); fall back without it
+            rows = [
+                (rr, cr, nm, at, cn, "")
+                for rr, cr, nm, at, cn in con.execute(
+                    "SELECT s.resref, s.cr, s.first_name, s.first_at, "
+                    "COALESCE(c.name, s.resref) FROM server_first s "
+                    "LEFT JOIN catalogue c ON c.resref = s.resref "
+                    "ORDER BY s.cr DESC, s.first_at ASC"
+                ).fetchall()
+            ]
+        for resref, cr, name, at, cname, player_name in rows:
+            _SERVER_FIRSTS.append({"resref": resref, "cr": cr or 0,
+                                   "name": name or "", "cname": cname or resref,
+                                   "at": at or "", "player_name": player_name or ""})
+    except sqlite3.Error:
+        pass  # server_first table not created yet
+    con.close()
+    print(f"[nwn-wiki] bestiary: {len(_BESTIARY_KILLS)} creatures with kills, "
+          f"{len(_SERVER_FIRSTS)} server-first record(s)")
+
+
+def backfill_server_first_player_names(db_dir: Path, sessions: list) -> None:
+    """Update server_first rows where first_player_name is NULL using a
+    cdkey→player_name mapping derived from parsed log sessions (most recently
+    seen name for each CD key wins)."""
+    import sqlite3
+    cdkey_to_name: dict = {}
+    for s in sessions:
+        if s.get("cdkey") and s.get("player"):
+            cdkey_to_name[s["cdkey"]] = s["player"]
+    db_file = db_dir / "bestiarydb.sqlite3"
+    if not db_file.is_file():
+        return
+    try:
+        con = sqlite3.connect(str(db_file), timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            con.execute("ALTER TABLE server_first ADD COLUMN first_player_name TEXT")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        if cdkey_to_name:
+            con.executemany(
+                "UPDATE server_first SET first_player_name = ? "
+                "WHERE first_cdkey = ? AND first_player_name IS NULL",
+                [(name, cdkey) for cdkey, name in cdkey_to_name.items()]
+            )
+            updated = con.total_changes
+            con.commit()
+            if updated:
+                print(f"[nwn-wiki] bestiary: back-filled player name for {updated} server-first record(s)")
+        con.close()
+    except sqlite3.Error as e:
+        print(f"[nwn-wiki] bestiary: back-fill player names failed: {e}", file=sys.stderr)
+
+
+def _utc_to_local(ts_str: str) -> str:
+    """Convert a 'YYYY-MM-DD HH:MM:SS' UTC string to server local time using TZ env."""
+    if not ts_str:
+        return ts_str
+    tz_name = os.environ.get("TZ", "")
+    if not tz_name:
+        return ts_str
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import timezone
+        dt_utc = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone(ZoneInfo(tz_name))
+        return dt_local.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ts_str
+
+
+def _render_server_first_body() -> str:
+    """Inner HTML for the generated Server-First leaderboard manual page."""
+    tz_label = _tz_label_from_env()
+    parts = [
+        "<h1>Server First Kills</h1>",
+        f"<p>The first adventurer (or party) to slay each fearsome creature of "
+        f"Challenge Rating {BST_SF_CR} or higher, recorded server-wide.</p>",
+        "<p class=\"note\"><strong>How the credited player is chosen:</strong> "
+        "the server-first record goes to the player who landed the "
+        "<em>killing blow</em>. When a creature is slain by a party, only that "
+        "finisher is named here — every contributing party member still gets "
+        "the kill counted on the creature's own page (under Party). The "
+        "<strong>Player</strong> column is the player’s account name and the "
+        "<strong>Character</strong> column the character they were playing at the "
+        "time.</p>",
+    ]
+    if not _SERVER_FIRSTS:
+        parts.append("<p><em>No server-first kills have been recorded yet — "
+                     "the legends are still unwritten.</em></p>")
+        return "\n".join(parts)
+    rows = []
+    for sf in _SERVER_FIRSTS:
+        rr = sf["resref"]
+        cname = link(f"../creatures/{rr}.html", sf["cname"])
+        cr = int(round(sf["cr"]))
+        player_display = sf["player_name"] or sf["name"]
+        rows.append(
+            f"<tr><td>{cname}</td><td>{cr}</td>"
+            f"<td>{E(player_display)}</td><td>{E(sf['name'])}</td>"
+            f"<td>{E(_utc_to_local(sf['at']))}</td></tr>"
+        )
+    parts.append(
+        '<table class="data"><thead><tr>'
+        f"<th>Creature</th><th>CR</th><th>Player</th><th>Character</th><th>When ({tz_label})</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    return "\n".join(parts)
+
+
+def render_manual_pages(project_root: Path, out: Path) -> None:
+    """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each."""
+    global _MANUAL_MENUS, _MANUAL_MENU_ORDER, _HAS_SERVER_FIRSTS
+    _MANUAL_MENUS = {}
+    _MANUAL_MENU_ORDER = {}
+    manual_dir = project_root / "docs.manual"
+    if not manual_dir.is_dir():
+        return
+
+    # Pass 1: collect all page metadata and content so _MANUAL_MENUS is complete
+    # before any page HTML is written (the dropdowns on every page must list all docs).
+    # (out_path, title, body, root_rel, page_updated_at)
+    pages_to_write: list[tuple[Path, str, str, str, str]] = []
+
+    def note_menu_order(menu_name: str, menu_order: int | None) -> None:
+        if menu_order is not None and menu_name not in _MANUAL_MENU_ORDER:
+            _MANUAL_MENU_ORDER[menu_name] = menu_order
+
+    top_files = sorted(
+        p for p in manual_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".md", ".html")
+    )
+    for doc_path in top_files:
+        raw_text = doc_path.read_text(encoding="utf-8")
+        menu_name = _manual_menu(raw_text)
+        order = _manual_sort_order(raw_text)
+        note_menu_order(menu_name, _manual_menu_order(raw_text))
+        title, body = _manual_doc_body(doc_path, text=raw_text)
+        stem = doc_path.stem
+        _MANUAL_MENUS.setdefault(menu_name, []).append(
+            {"kind": "file", "title": title, "stem": stem, "_order": order})
+        pages_to_write.append((out / "manual" / f"{stem}.html", title, body, "..", ""))
+
+    # Generated (data-driven) page: Server-First kill leaderboard. Surfaced via the
+    # Activity nav dropdown (see _activity_dropdown), not Documents. Its content is
+    # (re)generated only when the bestiary DB was loaded this run; otherwise, if a
+    # prior full build already produced the page, keep it in the nav without
+    # rewriting it — this keeps the nav consistent when nwn-wiki-activity re-renders
+    # manual pages without DB access.
+    sf_path = out / "manual" / "ServerFirsts.html"
+    if _BESTIARY_ACTIVE:
+        sf_now = datetime.now().strftime("%b %-d, %Y %H:%M")
+        _HAS_SERVER_FIRSTS = True
+        pages_to_write.append((sf_path, "Server Firsts",
+                               _render_server_first_body(), "..", sf_now))
+    elif sf_path.exists():
+        _HAS_SERVER_FIRSTS = True
+
+    for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
+        doc_files = sorted(
+            p for p in sub_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".md", ".html")
+        )
+        if not doc_files:
+            continue
+        dirname = sub_dir.name
+        folder_title = dirname.replace("-", " ").replace("_", " ")
+        items: list[dict] = []
+        # Folder-level @menu/@order/@menu-order are taken from the first file
+        # (in sorted order) that declares them — first found wins, mirroring
+        # the quest @group-order rule.
+        folder_menu: str | None = None
+        folder_order: int | None = None
+        for doc_path in doc_files:
+            raw_text = doc_path.read_text(encoding="utf-8")
+            if folder_menu is None and _RE_MANUAL_MENU.search(raw_text):
+                folder_menu = _manual_menu(raw_text)
+            if folder_order is None:
+                folder_order = _manual_sort_order(raw_text)
+            note_menu_order(_manual_menu(raw_text), _manual_menu_order(raw_text))
+            title, body = _manual_doc_body(doc_path, text=raw_text)
+            stem = doc_path.stem
+            items.append({"title": title, "stem": stem})
+            pages_to_write.append((
+                out / "manual" / dirname / f"{stem}.html", title, body, "../..", "",
+            ))
+        _MANUAL_MENUS.setdefault(folder_menu or "Documents", []).append(
+            {"kind": "dir", "title": folder_title, "dirname": dirname,
+             "items": items, "_order": folder_order})
+
+    # Sort each menu's entries by @order (list.sort is stable, so entries
+    # without @order keep their original alphabetical/insertion order,
+    # trailing after any explicitly-ordered ones).
+    for entries in _MANUAL_MENUS.values():
+        entries.sort(key=lambda e: e["_order"] if e["_order"] is not None else 10**9)
+
+    # Pass 2: write all pages now that _MANUAL_MENUS is fully populated.
+    for out_path, title, body, root_rel, page_ts in pages_to_write:
+        write(out_path, page(title, body, root_rel=root_rel, page_updated_at=page_ts))
+
+    total = len(pages_to_write)
+    if total:
+        print(f"[nwn-wiki] rendered {total} manual page(s) from {manual_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Tag-conflict report
+# ---------------------------------------------------------------------------
+
+def generate_tag_conflict_report(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    wiki_out: Path,
+    base_url: str,
+) -> None:
+    """Scan all item blueprints for shared TAG values with differing properties.
+
+    Writes item_tag_conflicts.json to module_index_dir.  Items whose TAG is empty
+    or identical to their resref are skipped.  Groups where every variant has
+    exactly the same property set are also skipped — only genuine differences are
+    reported.
+
+    Each variant includes a wiki_url field:
+      - Fully-qualified URL when base_url is set (e.g. https://…/items/foo.html)
+      - Relative path from project_root when base_url is empty (e.g. docs/items/foo.html)
+    """
+
+    project_root = module_index_dir.parent
+
+    # Build a URL or relative path for a single item resref.
+    if base_url:
+        _url_prefix = base_url.rstrip("/") + "/items/"
+        def _item_url(resref: str) -> str:
+            return _url_prefix + resref + ".html"
+    else:
+        try:
+            rel_wiki = wiki_out.relative_to(project_root)
+        except ValueError:
+            rel_wiki = wiki_out  # wiki is outside project root; use absolute path
+        _rel_prefix = str(rel_wiki).rstrip("/") + "/items/"
+        def _item_url(resref: str) -> str:
+            return _rel_prefix + resref + ".html"
+
+    # Group resrefs by their in-game TAG value (case-insensitive).
+    # Items with no explicit Tag field use their resref as the implicit tag —
+    # this catches conflicts where a plain InventoryRes reference (no inline Tag)
+    # shares a tag with a custom inline item that explicitly sets the same tag.
+    tag_groups: dict[str, list[str]] = defaultdict(list)
+    for resref, item in db.items.items():
+        tag = (fld(item, "Tag") or resref).strip()
+        tag_groups[tag.lower()].append(resref)
+
+    def _prop_sig(item: dict) -> frozenset[str]:
+        return frozenset(itemprop_oneliner(p) for p in list_items(item.get("PropertiesList")))
+
+    def _item_sources(resref: str) -> list[str]:
+        sources: list[str] = []
+        for s in db.item_sold_at.get(resref, []):
+            area = db.area_name(s["area_rr"]) if "area_rr" in s else ""
+            label = nwn_text(s["name"])
+            sources.append("Sold at: " + label + (f" ({area})" if area else ""))
+        for c in db.item_in_container.get(resref, []):
+            area = db.area_name(c["area_rr"]) if "area_rr" in c else ""
+            pname = nwn_text(c.get("pname", ""))
+            sources.append("In container: " + pname + (f" ({area})" if area else ""))
+        for c in db.item_carried_by.get(resref, []):
+            area = db.area_name(c["area_rr"]) if "area_rr" in c else ""
+            cname = nwn_text(c.get("cname", ""))
+            sources.append("Carried by: " + cname + (f" ({area})" if area else ""))
+        for s in db.item_from_script.get(resref, []):
+            sources.append("Script: " + (s.get("label") or s.get("script", "")))
+        return sources
+
+    conflicts: list[dict] = []
+    for _tag_lower, resrefs in sorted(tag_groups.items()):
+        if len(resrefs) < 2:
+            continue
+        sigs = {rr: _prop_sig(db.items[rr]) for rr in resrefs}
+        unique_sigs = set(frozenset(s) for s in sigs.values())
+        if len(unique_sigs) == 1:
+            continue  # all variants identical — not a conflict
+
+        # Canonical tag: prefer an explicit Tag field; fall back to the group key.
+        canonical_tag = next(
+            (
+                (fld(db.items[rr], "Tag") or "").strip()
+                for rr in sorted(resrefs)
+                if (fld(db.items[rr], "Tag") or "").strip()
+            ),
+            _tag_lower,  # group key (the implicit shared tag)
+        )
+
+        variants: list[dict] = []
+        for rr in sorted(resrefs):
+            item = db.items[rr]
+            name = nwn_text(db.item_name(rr))
+            bi = fld(item, "BaseItem")
+            base_name = baseitem_name(bi) if bi is not None else ""
+            cost = item_gp_value(item)
+            props = sorted(sigs[rr])
+            variants.append({
+                "resref": rr,
+                "name": name,
+                "base_item": base_name,
+                "cost_gp": cost,
+                "wiki_url": _item_url(rr),
+                "properties": props,
+                "found_at": _item_sources(rr),
+            })
+
+        conflicts.append({
+            "shared_tag": canonical_tag,
+            "item_count": len(resrefs),
+            "variants": variants,
+            "recommendation": (
+                "Give each variant a unique tag (and consider a matching unique resref) "
+                "so scripts, players, and the wiki can unambiguously identify each item."
+            ),
+        })
+
+    report = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "module": module_title,
+        "conflict_count": len(conflicts),
+        "summary": (
+            f"{len(conflicts)} item tag conflict(s) found across "
+            f"{sum(c['item_count'] for c in conflicts)} item variants."
+            if conflicts else "No item tag conflicts found."
+        ),
+        "conflicts": conflicts,
+    }
+
+    out_path = module_index_dir / "item_tag_conflicts.json"
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    if conflicts:
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: item_tag_conflicts.json ({len(conflicts)} conflict(s)) — {out_path}"))
+    else:
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: item_tag_conflicts.json (none) — {out_path}"))
+
+
+def generate_store_tag_conflict_report(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    wiki_out: Path,
+    base_url: str,
+) -> None:
+    """Scan all store blueprints for shared Tag values with differing inventories.
+
+    Writes store_tag_conflicts.json to module_index_dir.  Stores whose Tag
+    is empty or identical to their resref are still included — any Tag clash
+    on a UTM blueprint makes OpenStore("tag") calls ambiguous.  Groups where
+    every variant has the exact same inventory and pricing are also reported
+    (they are pure file-level duplicates).
+    """
+    project_root = module_index_dir.parent
+    if base_url:
+        _url_prefix = base_url.rstrip("/") + "/stores/"
+        def _store_url(rr: str) -> str:
+            return _url_prefix + rr + ".html"
+    else:
+        try:
+            rel_wiki = wiki_out.relative_to(project_root)
+        except ValueError:
+            rel_wiki = wiki_out
+        _rel_prefix = str(rel_wiki).rstrip("/") + "/stores/"
+        def _store_url(rr: str) -> str:
+            return _rel_prefix + rr + ".html"
+
+    def _store_areas(rr: str) -> list[str]:
+        areas: list[str] = []
+        for area_rr, inst_list in db.area_stores.items():
+            for inst in inst_list:
+                inst_rr = (fld(inst, "ResRef", "") or fld(inst, "TemplateResRef", "") or "").lower()
+                if inst_rr == rr:
+                    areas.append(db.area_name(area_rr))
+        return sorted(set(areas))
+
+    conflicts: list[dict] = []
+    for tag_lower, resrefs in sorted(db.store_tag_groups.items()):
+        if len(resrefs) < 2:
+            continue
+        canonical_tag = next(
+            ((fld(db.stores[rr], "Tag") or "").strip() for rr in sorted(resrefs)
+             if (fld(db.stores[rr], "Tag") or "").strip()),
+            tag_lower,
+        )
+        sigs = {rr: _store_inv_key(db.stores[rr]) for rr in resrefs}
+        unique_sigs = set(sigs.values())
+        is_identical = len(unique_sigs) == 1
+        variants: list[dict] = []
+        for rr in sorted(resrefs):
+            store = db.stores[rr]
+            name = nwn_text(db.store_name(rr))
+            item_count = sum(
+                len(list_items(p.get("ItemList")))
+                for p in list_items(store.get("StoreList"))
+            )
+            variants.append({
+                "resref": rr,
+                "name": name,
+                "wiki_url": _store_url(rr),
+                "item_count": item_count,
+                "markup_pct": fld(store, "MarkUp", 0),
+                "markdown_pct": fld(store, "MarkDown", 0),
+                "store_gold": fld(store, "StoreGold", -1),
+                "found_in_areas": _store_areas(rr),
+            })
+        conflicts.append({
+            "shared_tag": canonical_tag,
+            "store_count": len(resrefs),
+            "inventories_identical": is_identical,
+            "variants": variants,
+            "recommendation": (
+                "These stores share a Tag, making OpenStore(\"" + canonical_tag + "\") "
+                "ambiguous — the engine opens whichever it finds first. "
+                + ("The inventories are identical; consider merging into one blueprint. "
+                   if is_identical else
+                   "Give each store a unique Tag so scripts can target the correct one. ")
+            ),
+        })
+
+    out_path = module_index_dir / "store_tag_conflicts.json"
+    out_path.write_text(json.dumps({
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "module": module_title,
+        "conflict_count": len(conflicts),
+        "summary": (
+            f"{len(conflicts)} store tag conflict(s) found across "
+            f"{sum(c['store_count'] for c in conflicts)} store variants."
+            if conflicts else "No store tag conflicts found."
+        ),
+        "conflicts": conflicts,
+    }, indent=2, ensure_ascii=False) + "\n")
+    if conflicts:
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: store_tag_conflicts.json ({len(conflicts)} conflict(s)) — {out_path}"))
+    else:
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: store_tag_conflicts.json (none) — {out_path}"))
+
+
+def generate_conversation_conflict_report(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    wiki_out: Path,
+    base_url: str,
+) -> None:
+    """Detect dialog files with identical conversation trees (content duplicates).
+
+    Walks every DLG file's entry/reply tree and computes a content fingerprint
+    via _conversation_key().  Files with the same fingerprint have identical
+    content — one is redundant and both blueprint Conversation fields should
+    point to a single canonical resref.
+
+    Writes duplicate_conversations.json to module_index_dir.
+    """
+    project_root = module_index_dir.parent
+    if base_url:
+        _url_prefix = base_url.rstrip("/") + "/conversations/"
+        def _conv_url(rr: str) -> str:
+            return _url_prefix + rr + ".html"
+    else:
+        try:
+            rel_wiki = wiki_out.relative_to(project_root)
+        except ValueError:
+            rel_wiki = wiki_out
+        _rel_prefix = str(rel_wiki).rstrip("/") + "/conversations/"
+        def _conv_url(rr: str) -> str:
+            return _rel_prefix + rr + ".html"
+
+    def _caller_summary(resref: str) -> list[str]:
+        summaries: list[str] = []
+        for caller in db.dialog_callers.get(resref, []):
+            kind = caller.get("kind", "")
+            if kind in ("creature", "placeable", "door"):
+                summaries.append(f"{kind}: {caller.get('resref', '')}")
+            elif kind == "module-event":
+                summaries.append(f"module event: {caller.get('event', '')}")
+            else:
+                summaries.append(kind)
+        return summaries
+
+    duplicates: list[dict] = []
+    for key, resrefs in db._dialog_key_registry.items():
+        # Skip synthesized z-dialog pseudo-entries (no real DLG file)
+        real = [rr for rr in resrefs if not db.dialogs.get(rr, {}).get("__zdlg_handler__")]
+        if len(real) < 2:
+            continue
+        entries_count = len(list_items(db.dialogs[real[0]].get("EntryList")))
+        replies_count = len(list_items(db.dialogs[real[0]].get("ReplyList")))
+        variants: list[dict] = []
+        for rr in sorted(real):
+            callers = _caller_summary(rr)
+            variants.append({
+                "resref": rr,
+                "wiki_url": _conv_url(rr),
+                "caller_count": len(callers),
+                "callers": callers,
+            })
+        duplicates.append({
+            "entry_count": entries_count,
+            "reply_count": replies_count,
+            "file_count": len(real),
+            "files": variants,
+            "recommendation": (
+                "These dialog files have identical conversation trees. "
+                "Keep one canonical resref and update all blueprint Conversation "
+                "fields to point to it; then remove the redundant .dlg file(s)."
+            ),
+        })
+    duplicates.sort(key=lambda d: sorted(v["resref"] for v in d["files"])[0])
+
+    out_path = module_index_dir / "duplicate_conversations.json"
+    out_path.write_text(json.dumps({
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "module": module_title,
+        "duplicate_group_count": len(duplicates),
+        "summary": (
+            f"{len(duplicates)} group(s) of dialog files with identical conversation trees."
+            if duplicates else "No duplicate conversation trees found."
+        ),
+        "duplicates": duplicates,
+    }, indent=2, ensure_ascii=False) + "\n")
+    if duplicates:
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: duplicate_conversations.json ({len(duplicates)} group(s)) — {out_path}"))
+    else:
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: duplicate_conversations.json (none) — {out_path}"))
+
+
+# ---------------------------------------------------------------------------
+# Module-index: LLM-friendly JSON exports
+# ---------------------------------------------------------------------------
+
+def _module_index_url_helpers(
+    module_index_dir: Path,
+    wiki_out: Path,
+    base_url: str,
+) -> "tuple[Any, Any, Any, Any]":
+    """Return (creature_url, item_url, area_url, store_url) callables."""
+    project_root = module_index_dir.parent
+    if base_url:
+        _b = base_url.rstrip("/")
+        def _cu(rr: str) -> str: return f"{_b}/creatures/{rr}.html"
+        def _iu(rr: str) -> str: return f"{_b}/items/{rr}.html"
+        def _au(rr: str) -> str: return f"{_b}/areas/{rr}.html"
+        def _su(rr: str) -> str: return f"{_b}/stores/{rr}.html"
+    else:
+        try:
+            rel_wiki = wiki_out.relative_to(project_root)
+        except ValueError:
+            rel_wiki = wiki_out
+        _wp = str(rel_wiki).rstrip("/")
+        def _cu(rr: str) -> str: return f"{_wp}/creatures/{rr}.html"
+        def _iu(rr: str) -> str: return f"{_wp}/items/{rr}.html"
+        def _au(rr: str) -> str: return f"{_wp}/areas/{rr}.html"
+        def _su(rr: str) -> str: return f"{_wp}/stores/{rr}.html"
+    return _cu, _iu, _au, _su
+
+
+
+# Challenge-Rating buckets for the progression ladder. [lo, hi) half-open; the
+# last bucket's hi is open-ended. The bands past the player level cap exist to
+# separate "hard" from "not intended to be soloed at cap" — every creature in
+# them faces the same level-capped reference PC, which is the point.
+_CR_TIERS: list[tuple[float, float, str]] = [
+    (0, 5, "CR 0–5"),
+    (5, 10, "CR 5–10"),
+    (10, 20, "CR 10–20"),
+    (20, 40, "CR 20–40"),
+    (40, 80, "CR 40–80"),
+    (80, 200, "CR 80–200"),
+    (200, float("inf"), "CR 200+"),
+]
+
+# Bumped by hand whenever the simulation, the reference PC or the kit solver
+# changes in a way that would move the numbers. Part of the staleness
+# fingerprint, so an algorithm change makes existing reports report themselves
+# as out of date without anyone having to remember to delete them.
+_COUNTER_GEAR_ALGO_VERSION = 4
+
+# Past this many rounds a "win" is really a war of attrition (100 rounds is ten
+# minutes of unbroken melee), so the report labels it instead of just ticking it.
+_ATTRITION_ROUNDS = 100
+
+
+def _parse_cr(cr_raw: object) -> float:
+    """Numeric Challenge Rating, or 0.0 when unparseable."""
+    try:
+        return float(cr_raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fmt_gp(cost: int) -> str:
+    """Compact gold display: 1234 → '1.2k gp', 1500000 → '1.5M gp'."""
+    if cost >= 1_000_000_000:
+        return f"{cost / 1_000_000_000:.1f}B gp"
+    if cost >= 1_000_000:
+        return f"{cost / 1_000_000:.1f}M gp"
+    if cost >= 1_000:
+        return f"{cost / 1_000:.1f}k gp"
+    return f"{cost} gp"
+
+
+def devcrit_mode(db: "Db") -> dict:
+    """Which Devastating Critical rule is in force, detected from the 2DAs.
+
+    The engine only rolls a devastating critical for a weapon whose baseitems.2da
+    row names a feat in EpicWeaponDevastatingCriticalFeat. A module that blanks
+    that column across the board (as nwn_homers_lotr does, via
+    bin/gen-devcrit-map.py) has disabled the save-or-die at source, for players
+    and NPCs alike — so no configuration is needed to notice, and any module that
+    left it alone keeps stock behaviour automatically.
+    """
+    col = "EpicWeaponDevastatingCriticalFeat"
+    armed = sum(1 for bi in WEAPONS if weapon_feat_id(bi, col))
+    if armed:
+        return {"mode": "stock", "weapons_armed": armed, "bonus_dice": 0,
+                "label": f"save-or-die (stock; {armed} base items armed)"}
+    if col not in BASEITEM_COLUMNS_SEEN:
+        # No baseitems.2da carried the column, so we never saw the evidence
+        # either way. Assume the engine default rather than silently reporting
+        # a mechanic as disabled — run with --2da-dir to detect it properly.
+        return {"mode": "unknown", "weapons_armed": 0, "bonus_dice": 0,
+                "label": ("assumed stock save-or-die — no baseitems.2da was "
+                          "available to check; pass --2da-dir to detect it")}
+    if db.devcrit_bonus_dice > 0:
+        return {"mode": "bonus-dice", "weapons_armed": 0,
+                "bonus_dice": db.devcrit_bonus_dice,
+                "label": ("disabled at source; replaced by "
+                          f"+{db.devcrit_bonus_dice} damage dice on a critical")}
+    return {"mode": "disabled", "weapons_armed": 0, "bonus_dice": 0,
+            "label": "disabled at source, with no replacement configured"}
+
+
+def _pc_level_for_cr(cr: float, db: "Db") -> int:
+    """Reference-PC level for a creature of this Challenge Rating: CR, clamped
+    to the server's player cap. Everything above the cap gets a capped PC — so a
+    boss the cap cannot beat is reported as unwinnable rather than quietly
+    matched against a character who could never exist."""
+    return max(1, min(int(round(cr)) or 1, db.max_player_level or 40))
+
+
+# ---------------------------------------------------------------------------
+# Staleness fingerprint.
+#
+# The simulation is far too slow to run on every wiki refresh, but a stale
+# report is worse than no report. Both problems go away with a cheap hash of
+# everything the analysis actually reads: if it matches, the report on disk is
+# still correct; if it does not, a normal run says so and you re-run with
+# --counter-gear. Module-agnostic — nothing here knows about any one module.
+# ---------------------------------------------------------------------------
+
+def _counter_gear_fingerprint(db: "Db") -> str:
+    """Hash of every input the counter-gear analysis depends on."""
+    h = hashlib.sha256()
+    h.update(f"algo={_COUNTER_GEAR_ALGO_VERSION}\n".encode())
+    h.update(f"dials={db.max_character_level},{db.max_ability_bonus},"
+             f"{db.max_player_level},{db.devcrit_bonus_dice}\n".encode())
+
+    # 2DA overrides change base item stats, slots and property tables.
+    if db.twoda_dir and Path(db.twoda_dir).is_dir():
+        for p in sorted(Path(db.twoda_dir).glob("*.2da")):
+            st = p.stat()
+            h.update(f"2da:{p.name}:{st.st_size}:{int(st.st_mtime)}\n".encode())
+
+    # Items: what they are, what they cost, what they do, and whether a player
+    # can get one (an item becoming reachable changes every kit).
+    h.update(b"--items--\n")
+    for rr in sorted(db.items):
+        it = db.items[rr]
+        h.update(f"{rr}|{fld(it, 'BaseItem', '')}|{item_gp_value(it)}|"
+                 f"{int(_item_accessible(db, rr))}|".encode())
+        for p in list_items(it.get("PropertiesList")):
+            h.update(f"{fld(p, 'PropertyName', '')},{fld(p, 'Subtype', '')},"
+                     f"{fld(p, 'CostValue', '')},{fld(p, 'Param1Value', '')};".encode())
+        h.update(b"\n")
+
+    # Creatures: the canonical set and the fields the sim reads off them.
+    h.update(b"--creatures--\n")
+    for rr in sorted(db.canonical_creatures):
+        entry = db.canonical_creatures[rr]
+        c = entry["c"]
+        h.update(f"{rr}|{fld(c, 'ChallengeRating', '')}|{fld(c, 'MaxHitPoints', '')}|"
+                 f"{fld(c, 'NaturalAC', '')}|{fld(c, 'ScriptDamaged', '')}|".encode())
+        for key in ("Equip_ItemList", "ClassList", "FeatList", "SpecAbilityList",
+                    "PropertiesList"):
+            for e in list_items(c.get(key)):
+                h.update(repr(sorted(
+                    (k, v) for k, v in e.items() if isinstance(v, (int, str))
+                )).encode())
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def check_counter_gear_freshness(db: "Db", module_index_dir: Path) -> bool:
+    """Compare the on-disk counter_gear.json against the current inputs.
+
+    Returns True when the report is present and current. Called on every wiki
+    run; pushes a warning onto the module-index summary when the report is
+    missing or stale so the staleness surfaces without paying for the sim.
+    """
+    path = module_index_dir / "counter_gear.json"
+    if not path.is_file():
+        _module_index_summary.append(("warn",
+            "[nwn-wiki] module-index: counter_gear.json absent — "
+            "run with --counter-gear to build it"))
+        return False
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8")).get("input_fingerprint")
+    except (OSError, ValueError):
+        stored = None
+    if stored and stored == _counter_gear_fingerprint(db):
+        _module_index_summary.append(("info",
+            "[nwn-wiki] module-index: counter_gear.json current (inputs unchanged)"))
+        return True
+    _module_index_summary.append(("warn",
+        "[nwn-wiki] module-index: counter_gear.json is STALE — items, creatures, "
+        "2DAs or combat dials changed since it was built. Re-run with "
+        "--counter-gear."))
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Report data + rendering
+# ---------------------------------------------------------------------------
+
+def _top_value_by_slot(db: "Db", _iu, limit: int = 5) -> list[dict]:
+    """The most valuable player-attainable items in each equipment slot.
+
+    A blunt but effective best-in-slot proxy: builders price power, so sorting
+    a slot by gold piece value surfaces its strongest items without simulating
+    anything. Attainability is the same rule the items index uses. Items that
+    fit several slots appear under each of them.
+    """
+    buckets: dict[str, list[dict]] = {key: [] for key, _, _, _ in PLAYER_SLOTS}
+    for rr in sorted(db.items):
+        if not _item_accessible(db, rr):
+            continue
+        item = db.items[rr]
+        slots = item_equip_slots(item) & PLAYER_SLOT_MASK
+        if not slots:
+            continue
+        name = nwn_text(db.item_name(rr))
+        if name.startswith("[TLK#") or name == rr:
+            continue                              # broken/unnamed blueprint
+        entry = {
+            "resref": rr, "name": name,
+            "gp_value": item_gp_value(item),
+            "base_item": baseitem_name(_try_int(fld(item, "BaseItem", -1), -1)),
+            "wiki_url": _iu(rr),
+        }
+        for key, _label, mask, _n in PLAYER_SLOTS:
+            if slots & mask:
+                buckets[key].append(entry)
+
+    out: list[dict] = []
+    for key, label, _mask, wearable in PLAYER_SLOTS:
+        items = sorted(buckets[key],
+                       key=lambda e: (-e["gp_value"], e["name"].lower()))[:limit]
+        if items:
+            out.append({"slot": key, "label": label,
+                        "wearable": wearable, "items": items})
+    return out
+
+
+def _kit_entries(kit: dict, _iu) -> list[dict]:
+    """Serialise a solved kit to slot-ordered JSON entries."""
+    entries: list[dict] = []
+    for key, label, _mask, _n in PLAYER_SLOTS:
+        held = kit.get(key)
+        if not held:
+            continue
+        for piece in (held if isinstance(held, list) else [held]):
+            entries.append({
+                "slot": key, "label": label,
+                "resref": piece["resref"], "name": piece["name"],
+                "gp_value": piece["cost"], "wiki_url": _iu(piece["resref"]),
+            })
+    return entries
+
+
+def _fmt_rounds(sim: dict) -> str:
+    """One-line verdict for a simulated fight."""
+    kill = sim["rounds_to_kill"]
+    die = sim["rounds_to_die"]
+    kill_s = f"{kill} rds" if kill is not None else "never"
+    if sim.get("outlasts_heal_cooldown"):
+        # Survives longer than the heal cooldown, so the heal keeps it standing.
+        die_s = f"outlasts heal ({die} rds/heal)" if die is not None else "never"
+    else:
+        die_s = f"dies in {die} rds" if die is not None else "never dies"
+    verdict = "✅" if sim["wins"] else "❌"
+    out = f"kills in {kill_s}, {die_s} {verdict}"
+    # A win measured in thousands of rounds is a win on paper only — that is
+    # hours of real time, and it usually means the kit only just out-paces the
+    # creature's regeneration. Say so rather than let ✅ imply "go fight this".
+    if kill is not None and kill > _ATTRITION_ROUNDS:
+        out += f" ⏳ attrition ({kill * 6 / 60:.0f} min)"
+    if sim["save_fail"] > 0:
+        out += f" (save-fail {sim['save_fail'] * 100:.0f}%/rd)"
+    return out
+
+
+def _kit_lines(entries: list[dict]) -> list[str]:
+    """Markdown table rows for a kit, or a single 'nothing needed' line."""
+    if not entries:
+        return ["  - _(nothing — the fight is won bare-handed)_"]
+    return [f"  - {e['label']}: {e['name']} (`{e['resref']}`, {_fmt_gp(e['gp_value'])})"
+            for e in entries]
+
+
+def _counter_gear_markdown(data: dict) -> str:
+    """Render the counter_gear.json payload as a human-readable report."""
+    L: list[str] = []
+    L.append(f"# Counter-gear analysis — {data['module']}")
+    L.append("")
+    L.append(f"_Generated {data['generated_at']}. Every creature is fought by a "
+             f"synthetic reference PC — a single-class fighter at level "
+             f"min(CR, {data['max_player_level']}), every level-up point and all "
+             "ten tiers of Great Strength (Great Dexterity behind a finesse or "
+             "ranged weapon) in its attacking stat, specced into whatever weapon "
+             "it is holding, with a free full heal every 150s — using only items "
+             "players can actually obtain. Ability bonuses stack across items up "
+             f"to this module's +{data['max_ability_bonus']} cap. Rounds are "
+             "expected values, not rolls. No spells, potions or summons are "
+             "modelled, so **\"unwinnable\" means unwinnable on gear alone**, and "
+             "save DCs are estimates (innate spell level isn't in the data)._")
+    L.append("")
+    L.append(f"_Critical hits: threat range and multiplier come from each "
+             "weapon's own `baseitems.2da` row, and a critical needs a "
+             "threatening roll that hits followed by a confirmation roll. The PC "
+             "takes Improved Critical (doubling the threat range) and, where the "
+             "weapon allows it and Strength reaches 25, Overwhelming and "
+             "Devastating Critical; creatures get only the critical feats their "
+             "blueprint actually carries. Devastating Critical in this module: "
+             f"**{data['devastating_critical']['label']}**. Creatures immune to "
+             "critical hits take none of it. Legendary feats are not simulated._")
+    L.append("")
+    creatures = data["creatures"]
+    won = [c for c in creatures if c["sim"]["wins"]]
+    L.append("## Summary")
+    L.append("")
+    L.append(f"- Creatures analysed: **{len(creatures)}**")
+    L.append(f"- Beatable with obtainable gear: **{len(won)}**")
+    L.append(f"- Unwinnable at the level cap: **{len(data['unbeatable'])}**")
+    L.append(f"- Needs manual review: **{len(data['manual_review'])}**")
+    L.append(f"- Damage types dealt by obtainable weapons: "
+             f"{', '.join(data['damage_types']) or '(none found)'}")
+    L.append("")
+
+    # ---- best in slot by GP ------------------------------------------------
+    L.append("## Best in slot (by GP value)")
+    L.append("")
+    L.append("_The most valuable items a player can actually get hold of, per "
+             "equipment slot. Gold is a proxy for power, not a measure of it — "
+             "use the per-creature kits below for what actually wins fights._")
+    L.append("")
+    for grp in data.get("top_value_by_slot", []):
+        heading = grp["label"]
+        if grp["wearable"] > 1:
+            heading += f" (×{grp['wearable']} wearable)"
+        L.append(f"### {heading}")
+        L.append("")
+        L.append("| # | Item | ResRef | GP Value |")
+        L.append("|--:|------|--------|---------:|")
+        for i, e in enumerate(grp["items"], 1):
+            L.append(f"| {i} | {e['name']} | `{e['resref']}` | {e['gp_value']:,} |")
+        L.append("")
+
+    if data["unbeatable"]:
+        L.append("## ⛔ Unwinnable at the level cap")
+        L.append("")
+        for u in data["unbeatable"]:
+            L.append(f"- **{u['name']}** (`{u['canonical_resref']}`) — "
+                     + "; ".join(u["reasons"]))
+        L.append("")
+
+    if data["manual_review"]:
+        L.append("## ⚠️ Needs manual review")
+        L.append("")
+        for u in data["manual_review"]:
+            L.append(f"- **{u['name']}** (`{u['canonical_resref']}`) — "
+                     + "; ".join(u["notes"]))
+        L.append("")
+
+    # ---- progression ladder ------------------------------------------------
+    L.append("## Progression ladder (by Challenge Rating)")
+    L.append("")
+    L.append("_Each tier's kit is the minimum kit of the band's most gear-hungry "
+             "winnable fight — the band's worst equipment requirement, not an "
+             "average. The hardest fight is listed separately: it is usually a "
+             "different creature, one that needs skill rather than shopping._")
+    L.append("")
+    for t in data.get("progression_tiers", []):
+        prof = t["defeat_profile"]
+        lo, hi = prof["ac_target_range"]
+        L.append(f"### {t['label']} — {t['creature_count']} creatures "
+                 f"(reference PC level {t['pc_level']})")
+        bits = []
+        if prof["min_enhancement_to_bypass_dr"]:
+            bits.append(f"weapon ≥ +{prof['min_enhancement_to_bypass_dr']} (DR)")
+        bits.append(f"AC target {lo}–{hi}")
+        if prof["resist_priority"]:
+            bits.append("resist " + "/".join(prof["resist_priority"]))
+        if prof["has_special_attacks"]:
+            bits.append("save gear (special attacks)")
+        L.append(f"- Profile: {' · '.join(bits)}")
+        if t.get("hardest"):
+            L.append(f"- Hardest fight: **{t['hardest']['name']}** "
+                     f"(CR {t['hardest']['cr']}) in the module's best gear — "
+                     f"{_fmt_rounds(t['hardest']['sim'])}")
+        if t.get("benchmark"):
+            L.append(f"- Most gear-hungry fight: **{t['benchmark']['name']}** "
+                     f"(CR {t['benchmark']['cr']}) — {_fmt_rounds(t['benchmark']['sim'])}; "
+                     "its minimum kit is the tier kit below")
+        L.append(f"- Kit ({_fmt_gp(t['kit_cost'])} total):")
+        L.extend(_kit_lines(t["recommended_kit"]))
+        if t["unwinnable"]:
+            L.append(f"- ⛔ Unwinnable in this band: "
+                     + ", ".join(u["name"] for u in t["unwinnable"][:10])
+                     + (f" (+{len(t['unwinnable']) - 10} more)"
+                        if len(t["unwinnable"]) > 10 else ""))
+        L.append("")
+
+    L.append("## Per-creature counter-gear")
+    L.append("")
+    for c in creatures:
+        sim = c["sim"]
+        flag = ""
+        if c["unbeatable"]:
+            flag = " ⛔ UNWINNABLE"
+        elif c["needs_manual_review"]:
+            flag = " ⚠️ review"
+        L.append(f"### {c['name']} (CR {c['cr']}){flag}")
+        d = c["defenses"]
+        dr = d.get("dr")
+        dr_txt = (f"{dr.get('soak') or ''} {('bypass ' + dr['bypass']) if dr.get('bypass') else ''}".strip()
+                  if dr else "—")
+        L.append(f"- HP {c['hp'] if c['hp'] is not None else '?'} · AC {d['ac']} · "
+                 f"Fort {d['fort']:+d}/Ref {d['ref']:+d}/Will {d['will']:+d}"
+                 f" · SR {d['sr']} · DR {dr_txt or '—'}")
+        sv = c["survival"]
+        off_bits = [f"attacks +{sv['attack_bonus']}"]
+        if sv.get("damage_types_dealt"):
+            off_bits.append("deals " + "/".join(sv["damage_types_dealt"]))
+        if sv.get("save_threats"):
+            st = sv["save_threats"][0]
+            off_bits.append(
+                f"special DC ~{st['dc_est']} est. ({len(sv['save_threats'])} abilities)")
+        L.append(f"- Offense: {' · '.join(off_bits)}")
+        req = c["defeat_requirements"]
+        if d.get("crit_immune"):
+            L.append("- **Immune to critical hits** — no multiplier, no "
+                     "Overwhelming or Devastating Critical damage")
+        if req["immune_types"]:
+            L.append(f"- Immune to: {', '.join(req['immune_types'])}")
+        if req["mandatory_weapon_tags"]:
+            L.append(f"- **Requires weapon tag:** {', '.join(req['mandatory_weapon_tags'])}")
+        if req["min_enhancement_to_bypass_dr"]:
+            L.append(f"- Needs +{req['min_enhancement_to_bypass_dr']} enhancement to bypass DR")
+        for u in c["unbeatable_reasons"]:
+            L.append(f"- ⛔ {u}")
+        for n in c["review_notes"]:
+            L.append(f"- ⚠️ {n}")
+        L.append(f"- Simulated (L{c['pc_level']} PC, best gear): {_fmt_rounds(c['best_sim'])}")
+        if c["minimum_kit"] is not None:
+            L.append(f"- Minimum kit that wins ({_fmt_gp(c['minimum_kit_cost'])}) — "
+                     f"{_fmt_rounds(sim)}:")
+            L.extend(_kit_lines(c["minimum_kit"]))
+        L.append("- Best obtainable kit:")
+        L.extend(_kit_lines(c["best_kit"]))
+        L.append("")
+    return "\n".join(L)
+
+
+def generate_counter_gear_index(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+    _iu,
+) -> None:
+    """Simulate every canonical creature against a level-appropriate reference PC
+    and report the gear needed to beat it.
+
+    For each creature this derives its objective defences and offensive threat
+    (via extract_creature_defenses / extract_creature_offense, shared with the
+    creature pages so the combat maths never forks), then solves for two kits
+    out of the player-attainable item pool: the strongest one available, and the
+    cheapest one that still wins. Creatures are bucketed by Challenge Rating into
+    a progression ladder, and the report opens with the highest-GP attainable
+    item in every slot. Writes counter_gear.json + counter_gear.md.
+    """
+    t0 = time.time()
+    pool = _prune_pool(build_gear_pool(db))
+    print("[nwn-wiki] counter-gear: gear pool "
+          + ", ".join(f"{k}={len(v)}" for k, v in pool.items() if v))
+
+    # Damage types any obtainable weapon can deal — used to spot creatures that
+    # nothing in the module can hurt.
+    module_weapon_dtypes: set[str] = set()
+    for pieces in pool.values():
+        for p in pieces:
+            if p["is_weapon"]:
+                module_weapon_dtypes.update(p["off"]["damage_dtypes"])
+
+    def _tag_has_obtainable(tag: str) -> bool:
+        return any(_item_accessible(db, irr)
+                   for irr in db.item_tag_groups.get(tag.lower(), []))
+
+    creatures_out: list[dict] = []
+    unbeatable_out: list[dict] = []
+    review_out: list[dict] = []
+
+    ordered = [r for r in sorted(
+        db.canonical_creatures,
+        key=lambda r: nwn_text(db.canonical_creature_name(r)).lower())
+        if not r.startswith("__orphan_")]
+
+    for n, can_rr in enumerate(ordered, 1):
+        if n % 100 == 0:
+            print(f"[nwn-wiki] counter-gear: {n}/{len(ordered)} creatures "
+                  f"({time.time() - t0:.0f}s)")
+        entry = db.canonical_creatures[can_rr]
+        c = entry["c"]
+        bp_rr = entry["bp_rr"]
+        bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+        name = nwn_text(db.canonical_creature_name(can_rr))
+        cr_raw = fld(c, "ChallengeRating") or (fld(bp, "ChallengeRating") if bp else "") or ""
+        D = extract_creature_defenses(db, c, bp)
+        O = extract_creature_offense(db, c, bp, D)
+
+        immune_types = sorted(t for t, pct in D["immunities"].items() if pct >= 100)
+        dr = D["dr"]
+        min_enh = _prop_value_num(dr["bypass"]) if dr and dr.get("bypass") else 0
+        mandatory_tags = sorted({t.lower() for t in D["hard_required_tags"]})
+
+        # ---- the creature as a simulation opponent -------------------------
+        # Its best weapon is the one that hits hardest; with none, the profile
+        # list is empty and it can only be worn down by the PC.
+        profiles = O["attack_profiles"]
+        creature_att = (max(profiles, key=lambda p: p["schedule"][0] if p["schedule"] else -99)
+                        if profiles else
+                        attack_profile([], num_dice=0, die=0, flat=0, crit_threat=1,
+                                       crit_mult=2, phys_types=[], elem={}, enhancement=0))
+        crit_immune = CRIT_IMMUNITY_LABEL in D["misc_immunities"]
+        creature_sim = {
+            "attack": creature_att,
+            "defense": defense_profile(
+                ac=D["ac"], hp=D["hp"] or 1,
+                dr_soak=_prop_value_num(dr["soak"]) if dr and dr.get("soak") else 0,
+                dr_bypass=min_enh,
+                resist=D["resistances"], immune=D["immunities"],
+                regen=D["regen"], fort=D["fort"], ref=D["ref"], will=D["will"],
+                crit_immune=crit_immune),
+            "save_threats": O["save_threats"],
+        }
+
+        cr = _parse_cr(cr_raw)
+        pc_level = _pc_level_for_cr(cr, db)
+        best_kit, best_sim = best_in_slot_kit(pc_level, creature_sim, pool, db)
+        min_kit, min_sim = minimum_viable_kit(pc_level, creature_sim, pool, db, best_kit)
+
+        best_entries = _kit_entries(best_kit, _iu)
+        min_entries = _kit_entries(min_kit, _iu) if best_sim["wins"] else None
+
+        # ---- unwinnable / review detection ---------------------------------
+        unbeatable_reasons: list[str] = []
+        if mandatory_tags and not any(_tag_has_obtainable(t) for t in mandatory_tags):
+            unbeatable_reasons.append(
+                "requires a weapon tagged "
+                + " or ".join(f"'{t}'" for t in mandatory_tags)
+                + " but no obtainable item has that tag")
+        if module_weapon_dtypes and not (module_weapon_dtypes - set(immune_types)):
+            unbeatable_reasons.append(
+                "immune to every damage type any obtainable weapon deals ("
+                + ", ".join(sorted(module_weapon_dtypes)) + ")")
+        if not best_sim["wins"]:
+            if best_sim["no_damage"]:
+                unbeatable_reasons.append(
+                    f"takes no damage from a level-{pc_level} PC in the best "
+                    "obtainable gear — its immunities, resistances and damage "
+                    "reduction absorb every attack")
+            elif best_sim["rounds_to_kill"] is None:
+                unbeatable_reasons.append(
+                    f"regenerates faster than a level-{pc_level} PC in the best "
+                    "obtainable gear can deal damage")
+            else:
+                unbeatable_reasons.append(
+                    f"kills a level-{pc_level} PC in the best obtainable gear "
+                    f"({best_sim['rounds_to_die']} rounds) before it can be killed "
+                    f"({best_sim['rounds_to_kill']} rounds)")
+        if best_sim["save_fail"] > 0.5:
+            review_notes_save = (
+                f"special-attack save DC ~{O['save_threats'][0]['dc_est']} beats even "
+                f"the best obtainable save gear ({best_sim['save_fail'] * 100:.0f}% "
+                "failure per round) — survivable only if those abilities are not "
+                "save-or-die, which the blueprint data cannot tell us")
+        else:
+            review_notes_save = ""
+
+        review_notes: list[str] = []
+        if review_notes_save:
+            review_notes.append(review_notes_save)
+        if D["mitigates_damage"]:
+            review_notes.append(
+                f"OnDamaged handler '{D['dmg_script']}' self-heals or grants itself "
+                "damage immunity — the simulation cannot see that, so verify the "
+                "result by hand")
+
+        rec = {
+            "canonical_resref": can_rr,
+            "blueprint_resref": bp_rr,
+            "name": name,
+            "wiki_url": _cu(can_rr),
+            "cr": str(cr_raw),
+            "hp": D["hp"],
+            "pc_level": pc_level,
+            "defenses": {
+                "ac": D["ac"], "fort": D["fort"], "ref": D["ref"], "will": D["will"],
+                "sr": D["sr"], "dr": dr,
+                "resistances": D["resistances"], "immunities": D["immunities"],
+                "spell_immunities": D["spell_immunities"],
+                "regen": D["regen"], "vampiric": D["vampiric"],
+                "crit_immune": crit_immune,
+            },
+            "defeat_requirements": {
+                "damageable_types": sorted(module_weapon_dtypes - set(immune_types)),
+                "immune_types": immune_types,
+                "min_enhancement_to_bypass_dr": min_enh,
+                "mandatory_weapon_tags": mandatory_tags,
+                "hard_gate": bool(mandatory_tags),
+            },
+            "survival": {
+                "attack_bonus": O["attack_bonus"],
+                "ac_target": O["ac_target"],
+                "damage_types_dealt": O["damage_types_dealt"],
+                "save_threats": O["save_threats"],
+            },
+            "sim": min_sim if min_entries is not None else best_sim,
+            "best_sim": best_sim,
+            "best_kit": best_entries,
+            "best_kit_cost": sum(e["gp_value"] for e in best_entries),
+            "minimum_kit": min_entries,
+            "minimum_kit_cost": (sum(e["gp_value"] for e in min_entries)
+                                 if min_entries else 0),
+            "unbeatable": bool(unbeatable_reasons),
+            "unbeatable_reasons": unbeatable_reasons,
+            "needs_manual_review": bool(review_notes),
+            "review_notes": review_notes,
+        }
+        creatures_out.append(rec)
+        if unbeatable_reasons:
+            unbeatable_out.append({"canonical_resref": can_rr, "name": name,
+                                   "reasons": unbeatable_reasons})
+        if review_notes:
+            review_out.append({"canonical_resref": can_rr, "name": name,
+                               "notes": review_notes})
+
+    # ---- progression ladder ------------------------------------------------
+    # A tier's kit has to beat the *hardest* creature in the band, not a typical
+    # one — a kit that clears the average and dies to the boss is not a kit.
+    progression_tiers: list[dict] = []
+    by_resref = {r["canonical_resref"]: r for r in creatures_out}
+    for lo, hi, label in _CR_TIERS:
+        members = [r for r in creatures_out if lo <= _parse_cr(r["cr"]) < hi]
+        if not members:
+            continue
+        winnable = [r for r in members if not r["unbeatable"]]
+        ac_targets = [r["survival"]["ac_target"] for r in members]
+        resist_counter: dict[str, int] = defaultdict(int)
+        for r in members:
+            for dt in r["survival"]["damage_types_dealt"]:
+                resist_counter[dt] += 1
+        top_resist = [dt for dt, _ in sorted(
+            resist_counter.items(), key=lambda kv: (-kv[1], kv[0]))[:3]]
+
+        # Two different questions, two different answers — conflating them is
+        # what made the draft report useless.
+        #
+        # "Most demanding" is the fight in the band that needs the most gear, so
+        # its minimum kit is the one to publish for the tier: buy that and you
+        # have covered the band's worst equipment requirement.
+        #
+        # "Hardest" is the closest-run fight in the module's best gear. It is a
+        # separate creature more often than not, and it cannot be found from the
+        # minimum kits: those are shrunk until they only just win, so every
+        # creature's margin there sits at ~1.0 by construction.
+        benchmark = hardest = None
+        kit_entries: list[dict] = []
+        if winnable:
+            demanding = max(winnable, key=lambda r: (r["minimum_kit_cost"],
+                                                     r["canonical_resref"]))
+            kit_entries = demanding["minimum_kit"] or []
+            benchmark = {
+                "canonical_resref": demanding["canonical_resref"],
+                "name": demanding["name"], "cr": demanding["cr"],
+                "sim": demanding["sim"],
+            }
+            tightest = min(winnable, key=lambda r: (r["best_sim"]["margin"],
+                                                    -(r["best_sim"]["rounds_to_kill"] or 0)))
+            hardest = {
+                "canonical_resref": tightest["canonical_resref"],
+                "name": tightest["name"], "cr": tightest["cr"],
+                "sim": tightest["best_sim"],
+            }
+        progression_tiers.append({
+            "label": label,
+            "creature_count": len(members),
+            "pc_level": _pc_level_for_cr(max(_parse_cr(r["cr"]) for r in members), db),
+            "defeat_profile": {
+                "min_enhancement_to_bypass_dr": max(
+                    (r["defeat_requirements"]["min_enhancement_to_bypass_dr"]
+                     for r in members), default=0),
+                "ac_target_range": [min(ac_targets), max(ac_targets)],
+                "resist_priority": top_resist,
+                "has_special_attacks": any(r["survival"]["save_threats"] for r in members),
+            },
+            "benchmark": benchmark,
+            "hardest": hardest,
+            "recommended_kit": kit_entries,
+            "kit_cost": sum(e["gp_value"] for e in kit_entries),
+            "unwinnable": [{"canonical_resref": r["canonical_resref"], "name": r["name"]}
+                           for r in members if r["unbeatable"]],
+        })
+
+    payload = {
+        "generated_at": now,
+        "module": module_title,
+        "input_fingerprint": _counter_gear_fingerprint(db),
+        "algo_version": _COUNTER_GEAR_ALGO_VERSION,
+        "max_player_level": db.max_player_level,
+        "max_ability_bonus": db.max_ability_bonus,
+        "devastating_critical": devcrit_mode(db),
+        "damage_types": sorted(module_weapon_dtypes),
+        "top_value_by_slot": _top_value_by_slot(db, _iu),
+        "creatures": creatures_out,
+        "unbeatable": unbeatable_out,
+        "manual_review": review_out,
+        "progression_tiers": progression_tiers,
+    }
+    _write_json(module_index_dir / "counter_gear.json", payload)
+    (module_index_dir / "counter_gear.md").write_text(
+        _counter_gear_markdown(payload), encoding="utf-8")
+    sev = "warn" if unbeatable_out else "info"
+    _module_index_summary.append((sev,
+        f"[nwn-wiki] module-index: counter_gear.json "
+        f"({len(creatures_out)} creatures, {len(unbeatable_out)} unwinnable, "
+        f"{len(review_out)} review, {time.time() - t0:.0f}s)"))
+
+
+
+
+def generate_module_index(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    graph: "dict[str, list]",
+    area_paths: "dict[str, list | None] | None",
+    path_from_resref: str,
+    path_from_name: str,
+    wiki_out: Path,
+    base_url: str,
+) -> None:
+    """Write LLM-friendly JSON indexes to module_index_dir.
+
+    Files written:
+      area_graph.json                    — directed area transition graph with names
+      area_paths.json                    — BFS shortest paths (only when path_from_resref given)
+      area_index.json                    — all areas with names, stats, and connections
+      duplicate_destination_tags.json    — transitions whose LinkedTo tag matches multiple objects
+      creature_index.json                — all canonical creatures with stats and locations
+      creature_tag_conflicts.json        — creature blueprints that produced variant resrefs
+      item_index.json                    — all items with names, costs, and sources
+      cross_faction_creatures.json       — blueprints appearing in multiple factions
+      faction_bp_instance_discrepancies.json — placed instances whose FactionID differs from their blueprint
+      inaccessible_items.json            — items not reachable by players
+      unspawned_creatures.json           — creature blueprints never placed or in an encounter
+      instance_only_conversations.json   — creature instances with Conversation overrides not on the blueprint
+    """
+    module_index_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().isoformat(timespec="seconds")
+    _cu, _iu, _au, _su = _module_index_url_helpers(module_index_dir, wiki_out, base_url)
+
+    # ------------------------------------------------------------------ helpers
+    def _int_fid(raw: Any) -> "int | None":
+        if raw is None or raw == "":
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    # ------------------------------------------------------------------ area_graph.json
+    area_graph_data: dict[str, Any] = {}
+    for rr in sorted(db.areas):
+        area_name = db.area_name(rr)
+        edges = []
+        for dst, kind, label, is_fallback, is_dup_tag in graph.get(rr, []):
+            edge: dict[str, Any] = {
+                "to": dst,
+                "to_name": db.area_name(dst),
+                "kind": kind,
+                "label": label,
+            }
+            if is_fallback:
+                edge["is_fallback"] = True
+            if is_dup_tag:
+                edge["is_dup_tag"] = True
+            edges.append(edge)
+        area_graph_data[rr] = {
+            "name": area_name,
+            "hidden": rr in db.hidden_areas,
+            "wiki_url": _au(rr),
+            "transitions": edges,
+        }
+    _write_json(module_index_dir / "area_graph.json", {
+        "generated_at": now,
+        "module": module_title,
+        "area_count": len(area_graph_data),
+        "areas": area_graph_data,
+    })
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_graph.json ({len(area_graph_data)} areas)"))
+
+    # ------------------------------------------------------------------ area_paths.json
+    if path_from_resref and area_paths is not None:
+        paths_out: dict[str, Any] = {}
+        unreachable: list[str] = []
+        for rr, steps in area_paths.items():
+            if steps is None:
+                unreachable.append(rr)
+            else:
+                paths_out[rr] = {
+                    "dest_name": db.area_name(rr),
+                    "steps": [
+                        {
+                            "from": frm,
+                            "from_name": db.area_name(frm),
+                            "to": to,
+                            "to_name": db.area_name(to),
+                            "kind": kind,
+                            "label": label,
+                            **({"is_fallback": True} if is_fb else {}),
+                            **({"is_dup_tag": True} if is_dup else {}),
+                        }
+                        for frm, to, kind, label, is_fb, is_dup in steps
+                    ],
+                }
+        _write_json(module_index_dir / "area_paths.json", {
+            "generated_at": now,
+            "module": module_title,
+            "from_resref": path_from_resref,
+            "from_name": path_from_name,
+            "reachable_count": len(paths_out),
+            "unreachable_count": len(unreachable),
+            "paths": paths_out,
+            "unreachable": sorted(unreachable),
+        })
+        _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_paths.json ({len(paths_out)} reachable, {len(unreachable)} unreachable)"))
+
+    # -------------------------------------------------------- duplicate_destination_tags.json
+    dup_tag_entries: list[dict] = []
+    for tag in sorted(db.dup_dest_tags, key=str.lower):
+        objects = db.dup_dest_tags[tag]
+        matching = [
+            {
+                "kind": obj["kind"],
+                "area": obj["area"],
+                "area_name": db.area_name(obj["area"]),
+                "wiki_url": _au(obj["area"]),
+            }
+            for obj in objects
+            if obj["area"] in db.areas
+        ]
+        transitions_using = [
+            {
+                "src_area": tr["src_area"],
+                "src_area_name": db.area_name(tr["src_area"]),
+                "src_wiki_url": _au(tr["src_area"]),
+                "kind": tr["kind"],
+                "label": tr["label"],
+                "primary_dst": tr["dst_area"] or "",
+                "primary_dst_name": db.area_name(tr["dst_area"]) if tr["dst_area"] else "",
+                "alt_dsts": [
+                    {"area": a, "area_name": db.area_name(a)}
+                    for a in tr.get("dst_area_alts", [])
+                ],
+            }
+            for tr in db.transitions
+            if tr.get("dst_tag") == tag
+        ]
+        dup_tag_entries.append({
+            "tag": tag,
+            "matching_object_count": len(matching),
+            "matching_objects": matching,
+            "transition_count": len(transitions_using),
+            "transitions_using_tag": transitions_using,
+        })
+    _write_json(module_index_dir / "duplicate_destination_tags.json", {
+        "_description": (
+            "Transitions whose LinkedTo tag matches multiple objects (waypoints, doors, "
+            "or triggers) across the module. The NWN engine resolves ambiguous tags to "
+            "whichever matching object it finds first, so these routes may send the "
+            "player to an unexpected area. Each entry lists all objects carrying the "
+            "tag and every transition that references it."
+        ),
+        "generated_at": now,
+        "module": module_title,
+        "count": len(dup_tag_entries),
+        "duplicate_tags": dup_tag_entries,
+    })
+    if dup_tag_entries:
+        _module_index_summary.append(("issue", f"[nwn-wiki] module-index: duplicate_destination_tags.json ({len(dup_tag_entries)} duplicate tag(s)) — {module_index_dir / 'duplicate_destination_tags.json'}"))
+    else:
+        _module_index_summary.append(("issue", "[nwn-wiki] module-index: duplicate_destination_tags.json (none)"))
+
+    # -------------------------------------------------------- area_tag_conflicts.json
+    area_tag_conflicts: list[dict] = []
+    for tag_lower, resrefs in sorted(db.area_tag_groups.items()):
+        if len(resrefs) < 2:
+            continue
+        canonical_tag = next(
+            ((fld(db.areas[rr], "Tag") or "").strip() for rr in sorted(resrefs)
+             if (fld(db.areas[rr], "Tag") or "").strip()),
+            tag_lower,
+        )
+        transition_counts = {
+            rr: sum(1 for tr in db.transitions if tr.get("src_area") == rr or tr.get("dst_area") == rr)
+            for rr in resrefs
+        }
+        area_tag_conflicts.append({
+            "shared_tag": canonical_tag,
+            "area_count": len(resrefs),
+            "areas": [
+                {
+                    "resref": rr,
+                    "name": db.area_name(rr),
+                    "hidden": rr in db.hidden_areas,
+                    "wiki_url": _au(rr),
+                    "transition_count": transition_counts[rr],
+                }
+                for rr in sorted(resrefs, key=lambda r: db.area_name(r).lower())
+            ],
+            "recommendation": (
+                f"Multiple areas share the Tag \"{canonical_tag}\". Scripts using "
+                f"GetObjectByTag(\"{canonical_tag}\") will find whichever area the "
+                "engine resolves first. Give each area a unique Tag."
+            ),
+        })
+    _write_json(module_index_dir / "area_tag_conflicts.json", {
+        "generated_at": now,
+        "module": module_title,
+        "conflict_count": len(area_tag_conflicts),
+        "summary": (
+            f"{len(area_tag_conflicts)} area tag conflict(s) found across "
+            f"{sum(c['area_count'] for c in area_tag_conflicts)} areas."
+            if area_tag_conflicts else "No area tag conflicts found."
+        ),
+        "conflicts": area_tag_conflicts,
+    })
+    if area_tag_conflicts:
+        _module_index_summary.append(("issue", f"[nwn-wiki] module-index: area_tag_conflicts.json ({len(area_tag_conflicts)} conflict(s)) — {module_index_dir / 'area_tag_conflicts.json'}"))
+    else:
+        _module_index_summary.append(("issue", "[nwn-wiki] module-index: area_tag_conflicts.json (none)"))
+
+    # ------------------------------------------------------------------ area_index.json
+    area_index: list[dict] = []
+    for rr in sorted(db.areas, key=lambda r: db.area_name(r).lower()):
+        n_creatures = len(db.area_creature_instances.get(rr, []))
+        n_encounters = len(db.area_encounters.get(rr, []))
+        n_stores = len(db.area_stores.get(rr, []))
+        n_containers = len(db.area_containers.get(rr, []))
+        connections = sorted({
+            dst for dst, _kind, _label, _fb, _dup in graph.get(rr, [])
+        })
+        area_index.append({
+            "resref": rr,
+            "name": db.area_name(rr),
+            "hidden": rr in db.hidden_areas,
+            "wiki_url": _au(rr),
+            "creature_count": n_creatures,
+            "encounter_count": n_encounters,
+            "store_count": n_stores,
+            "container_count": n_containers,
+            "connections": connections,
+        })
+    _write_json(module_index_dir / "area_index.json", {
+        "generated_at": now,
+        "module": module_title,
+        "area_count": len(area_index),
+        "areas": area_index,
+    })
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_index.json ({len(area_index)} areas)"))
+
+    # ------------------------------------------------------------------ creature_index.json
+    creature_index: list[dict] = []
+    for can_rr in sorted(db.canonical_creatures,
+                         key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        if can_rr.startswith("__orphan_"):
+            continue
+        entry = db.canonical_creatures[can_rr]
+        c = entry["c"]
+        bp_rr = entry["bp_rr"]
+        bp = db.creatures.get(bp_rr, c)
+        name = nwn_text(db.canonical_creature_name(can_rr))
+        cr_raw = fld(c, "ChallengeRating") or fld(bp, "ChallengeRating") or ""
+        hp = creature_max_hp(c, bp if bp is not c else None) or 0
+        race_raw = fld(c, "Race") if fld(c, "Race") not in (None, "") else fld(bp, "Race")
+        fid = _int_fid(fld(c, "FactionID") if fld(c, "FactionID") not in (None, "")
+                       else fld(bp, "FactionID"))
+        app_raw = fld(c, "Appearance_Type") if fld(c, "Appearance_Type") not in (None, "") \
+            else fld(bp, "Appearance_Type")
+        app_id = _try_int(app_raw, -1) if app_raw not in (None, "") else -1
+        is_variant = bp_rr != can_rr
+        locs = db.canonical_locations.get(can_rr, [])
+        loc_list = [
+            {
+                "area_resref": l["area"],
+                "area_name": db.area_name(l["area"]),
+                "kind": l["kind"],
+                "count": l["count"],
+                **({"encounter_resref": l["enc_rr"]} if l.get("enc_rr") else {}),
+            }
+            for l in locs
+        ]
+        rec: dict[str, Any] = {
+            "canonical_resref": can_rr,
+            "blueprint_resref": bp_rr,
+            "name": name,
+            "cr": str(cr_raw),
+            "hp": hp,
+            "race_id": _try_int(race_raw, -1) if race_raw not in (None, "") else -1,
+            "race": race_name(race_raw),
+            "appearance_id": app_id,
+            "appearance_name": appearance_name(app_id) if app_id >= 0 else "",
+            "faction_id": fid,
+            "faction_name": db.faction_name(fid) if fid is not None else "",
+            "wiki_url": _cu(can_rr),
+            "locations": loc_list,
+        }
+        if is_variant:
+            rec["is_variant_of"] = bp_rr
+        dmg_script = (fld(c, "ScriptDamaged") if fld(c, "ScriptDamaged") not in (None, "")
+                      else fld(bp, "ScriptDamaged")) or ""
+        dmg_script = dmg_script.strip()
+        if db.is_custom_damage_script(dmg_script) and (
+            dmg_script in db.script_mitigates_damage
+            or db.script_damage_req_tags.get(dmg_script)
+        ):
+            rec["custom_damage_script"] = dmg_script
+            reqs = []
+            for tag in sorted(db.script_damage_req_tags.get(dmg_script, set())):
+                for irr in db.item_tag_groups.get(tag.lower(), []):
+                    reqs.append({"tag": tag, "resref": irr, "name": db.item_name(irr)})
+                if not db.item_tag_groups.get(tag.lower()):
+                    reqs.append({"tag": tag, "resref": None, "name": None})
+            if reqs:
+                rec["damage_requirements"] = reqs
+        ret_info = db.script_retaliation.get(dmg_script) if dmg_script else None
+        if db.is_custom_damage_script(dmg_script) and ret_info:
+            rec["retaliation_script"] = dmg_script
+            rec["retaliation_summary"] = _retaliation_sentence(ret_info)
+        creature_index.append(rec)
+    _write_json(module_index_dir / "creature_index.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(creature_index),
+        "creatures": creature_index,
+    })
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: creature_index.json ({len(creature_index)} canonical creatures)"))
+
+    # ------------------------------------------------------------------ counter_gear.json
+    # Opt-in: the simulation runs every creature against the whole attainable
+    # item pool, which is far too slow for a routine wiki refresh. A normal run
+    # only fingerprints the inputs and warns when the report on disk no longer
+    # matches them.
+    if db.run_counter_gear or not (module_index_dir / "counter_gear.json").is_file():
+        generate_counter_gear_index(db, module_index_dir, module_title, now, _cu, _iu)
+    else:
+        check_counter_gear_freshness(db, module_index_dir)
+
+    # ------------------------------------------------------------------ appearance_faction_report.json
+    # Group canonical creatures by (appearance_id, faction_id) so that LLMs can
+    # quickly spot appearances that span multiple factions — a common cause of
+    # NPC confusion (two guards that look identical but one is hostile).
+    # appearance_id → faction_id → list of creature entries
+    app_faction: dict[int, dict[int, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    _NO_FACTION = -1  # sentinel for creatures with fid=None
+    for crec in creature_index:
+        aid = crec["appearance_id"]
+        if aid < 0:
+            continue
+        fid_key = crec["faction_id"] if crec["faction_id"] is not None else _NO_FACTION
+        app_faction[aid][fid_key].append({
+            "canonical_resref": crec["canonical_resref"],
+            "name": crec["name"],
+            "race": crec["race"],
+            "race_id": crec["race_id"],
+            "cr": crec["cr"],
+            "wiki_url": crec["wiki_url"],
+        })
+
+    app_report: list[dict] = []
+    for aid in sorted(app_faction):
+        factions_map = app_faction[aid]
+        real_fids = [f for f in factions_map if f != _NO_FACTION]
+        cross = len(real_fids) > 1
+        races_in_app: set[int] = {
+            crec["race_id"]
+            for entries in factions_map.values()
+            for crec in entries
+            if crec["race_id"] >= 0
+        }
+        faction_entries: list[dict] = []
+        for fid_key in sorted(factions_map):
+            fname = db.faction_name(fid_key) if fid_key != _NO_FACTION else "(none)"
+            faction_entries.append({
+                "faction_id": fid_key if fid_key != _NO_FACTION else None,
+                "faction_name": fname,
+                "creature_count": len(factions_map[fid_key]),
+                "creatures": sorted(factions_map[fid_key],
+                                    key=lambda r: r["name"].lower()),
+            })
+        app_report.append({
+            "appearance_id": aid,
+            "appearance_name": appearance_name(aid),
+            "race_ids": sorted(races_in_app),
+            "races": sorted({race_name(r) for r in races_in_app}),
+            "faction_count": len(real_fids),
+            "cross_faction": cross,
+            "total_creatures": sum(len(v) for v in factions_map.values()),
+            "factions": faction_entries,
+        })
+
+    # Sort: cross-faction appearances first (most interesting), then by name.
+    app_report.sort(key=lambda e: (not e["cross_faction"], e["appearance_name"].lower()))
+    cross_count = sum(1 for e in app_report if e["cross_faction"])
+
+    _write_json(module_index_dir / "appearance_faction_report.json", {
+        "generated_at": now,
+        "module": module_title,
+        "appearance_count": len(app_report),
+        "cross_faction_appearance_count": cross_count,
+        "summary": (
+            f"{cross_count} appearance(s) used by creatures in more than one faction."
+            if cross_count else "No appearances span multiple factions."
+        ),
+        "appearances": app_report,
+    })
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: appearance_faction_report.json ({len(app_report)} appearances, {cross_count} cross-faction)"))
+
+    # ------------------------------------------------------------------ creature_tag_conflicts.json
+    # Canonical entries whose resref was synthesised as bp__v2, bp__v3, …
+    # indicate that the same blueprint was placed with differing overrides, giving
+    # it a new synthetic canonical resref.  These are potential content issues:
+    # two placed instances of the same .utc file that look different in-game.
+    ct_conflicts: list[dict] = []
+    for bp_rr in sorted(db.creatures,
+                        key=lambda r: nwn_text(db.creature_name(r)).lower()):
+        variants = [
+            can_rr for can_rr, meta in db.canonical_creatures.items()
+            if meta["bp_rr"] == bp_rr and can_rr != bp_rr
+            and not can_rr.startswith("__orphan_")
+        ]
+        if not variants:
+            continue
+        all_can = [bp_rr] + sorted(variants)
+        variant_rows: list[dict] = []
+        for can_rr in all_can:
+            locs = db.canonical_locations.get(can_rr, [])
+            loc_summary = [
+                {
+                    "area_resref": l["area"],
+                    "area_name": db.area_name(l["area"]),
+                    "kind": l["kind"],
+                    "count": l["count"],
+                    **({"encounter_resref": l["enc_rr"]} if l.get("enc_rr") else {}),
+                }
+                for l in locs
+            ]
+            variant_rows.append({
+                "canonical_resref": can_rr,
+                "is_base": can_rr == bp_rr,
+                "wiki_url": _cu(can_rr),
+                "location_count": sum(l["count"] for l in locs),
+                "locations": loc_summary,
+            })
+        ct_conflicts.append({
+            "blueprint_resref": bp_rr,
+            "name": nwn_text(db.creature_name(bp_rr)),
+            "variant_count": len(variants),
+            "variants": variant_rows,
+            "recommendation": (
+                "Instances of this blueprint diverge from each other or from the "
+                "blueprint. Consider whether the differences are intentional; if so, "
+                "promote each variant to its own blueprint with a unique resref."
+            ),
+        })
+    _write_json(module_index_dir / "creature_tag_conflicts.json", {
+        "generated_at": now,
+        "module": module_title,
+        "conflict_count": len(ct_conflicts),
+        "summary": (
+            f"{len(ct_conflicts)} blueprint(s) have placed instances that differ "
+            f"from each other or from the source blueprint."
+            if ct_conflicts else "No creature blueprint conflicts found."
+        ),
+        "conflicts": ct_conflicts,
+    })
+    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: creature_tag_conflicts.json ({len(ct_conflicts)} blueprint(s) with variants)"))
+
+    # ------------------------------------------------------------------ item_index.json
+    def _item_sources(rr: str) -> list[str]:
+        sources: list[str] = []
+        for s in db.item_sold_at.get(rr, []):
+            area = db.area_name(s["area_rr"]) if "area_rr" in s else ""
+            label = nwn_text(s["name"])
+            sources.append("Sold at: " + label + (f" ({area})" if area else ""))
+        for c in db.item_in_container.get(rr, []):
+            area = db.area_name(c["area_rr"]) if "area_rr" in c else ""
+            pname = nwn_text(c.get("pname", ""))
+            sources.append("In container: " + pname + (f" ({area})" if area else ""))
+        for c in db.item_carried_by.get(rr, []):
+            area = db.area_name(c["area_rr"]) if "area_rr" in c else ""
+            cname = nwn_text(c.get("cname", ""))
+            sources.append("Carried by: " + cname + (f" ({area})" if area else ""))
+        for s in db.item_from_script.get(rr, []):
+            sources.append("Script: " + (s.get("label") or s.get("script", "")))
+        return sources
+
+    item_index: list[dict] = []
+    for rr in sorted(db.items, key=lambda r: nwn_text(db.item_name(r)).lower()):
+        i = db.items[rr]
+        name = nwn_text(db.item_name(rr))
+        if name.startswith("[TLK#") or name == rr:
+            continue  # broken/unnamed items; skip
+        bi_raw = fld(i, "BaseItem", None)
+        bi = -1 if bi_raw is None else _try_int(bi_raw, -1)
+        cost = item_gp_value(i)
+        carriers = db.item_carried_by.get(rr, [])
+        accessible = (
+            rr in db.item_sold_at
+            or rr in db.item_in_container
+            or any(e.get("dropable") or e.get("pickpocketable") for e in carriers)
+            or rr in db.item_from_script
+        )
+        item_index.append({
+            "resref": rr,
+            "name": name,
+            "base_item": baseitem_name(bi) if bi >= 0 else "",
+            "cost_gp": cost,
+            "accessible": accessible,
+            "wiki_url": _iu(rr),
+            "sources": _item_sources(rr),
+        })
+    _write_json(module_index_dir / "item_index.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(item_index),
+        "items": item_index,
+    })
+    _module_index_summary.append(("info", f"[nwn-wiki] module-index: item_index.json ({len(item_index)} items)"))
+
+    # ------------------------------------------------------------------ cross_faction_creatures.json
+    crr_fids: dict[str, set[int]] = defaultdict(set)
+    for area_rr, insts in db.area_creature_instances.items():
+        if area_rr in db.hidden_areas:
+            continue
+        for inst in insts:
+            c = inst["c"]
+            fid = _int_fid(fld(c, "FactionID"))
+            if fid is None:
+                continue
+            crr = fld(c, "TemplateResRef", "") or ""
+            if crr:
+                crr_fids[crr].add(fid)
+    for crr, spawns in db.creature_encounter_spawns.items():
+        bp = db.creatures.get(crr, {})
+        fid = _int_fid(fld(bp, "FactionID"))
+        if fid is None:
+            continue
+        for s in spawns:
+            area_rr = s["area"]
+            if area_rr in db.hidden_areas:
+                continue
+            if crr:
+                crr_fids[crr].add(fid)
+    cross_faction = {crr: fids for crr, fids in crr_fids.items() if len(fids) > 1}
+    cf_creatures: list[dict] = []
+    for crr in sorted(cross_faction,
+                      key=lambda r: (nwn_text(db.canonical_creature_name(
+                          db.canonical_for_bp.get(r, r))) or r).lower()):
+        can_crr = db.canonical_for_bp.get(crr, crr)
+        fids_sorted = sorted(cross_faction[crr])
+        cf_creatures.append({
+            "blueprint_resref": crr,
+            "canonical_resref": can_crr,
+            "name": nwn_text(db.canonical_creature_name(can_crr)),
+            "wiki_url": _cu(can_crr) if can_crr in db.canonical_creatures else "",
+            "factions": [
+                {"id": fid, "name": db.faction_name(fid)}
+                for fid in fids_sorted
+            ],
+            "recommendation": (
+                "Blueprint appears in multiple factions. Verify the faction override "
+                "on each placed instance or encounter pool slot is intentional."
+            ),
+        })
+    _write_json(module_index_dir / "cross_faction_creatures.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(cf_creatures),
+        "summary": (
+            f"{len(cf_creatures)} blueprint(s) appear in more than one faction."
+            if cf_creatures else "No cross-faction creatures found."
+        ),
+        "creatures": cf_creatures,
+    })
+    _module_index_summary.append(("issue", f"[nwn-wiki] module-index: cross_faction_creatures.json ({len(cf_creatures)} blueprint(s))"))
+
+    # ------------------------------------------------------------------ faction_bp_instance_discrepancies.json
+    # Each entry: a placed GIT instance whose FactionID differs from its blueprint's FactionID.
+    discrepancies: list[dict] = []
+    for area_rr, insts in db.area_creature_instances.items():
+        if area_rr in db.hidden_areas:
+            continue
+        for inst in insts:
+            c = inst["c"]
+            bp_rr = fld(c, "TemplateResRef", "") or ""
+            if not bp_rr:
+                continue
+            bp = db.creatures.get(bp_rr)
+            if bp is None:
+                continue
+            inst_fid = _int_fid(fld(c, "FactionID"))
+            bp_fid = _int_fid(fld(bp, "FactionID"))
+            if inst_fid is None or bp_fid is None or inst_fid == bp_fid:
+                continue
+            can_rr = db.canonical_for_inst.get((area_rr, inst["idx"]), bp_rr)
+            discrepancies.append({
+                "blueprint_resref": bp_rr,
+                "canonical_resref": can_rr,
+                "name": nwn_text(db.canonical_creature_name(can_rr)),
+                "wiki_url": _cu(can_rr) if can_rr in db.canonical_creatures else "",
+                "area_resref": area_rr,
+                "area_name": nwn_text(db.area_name(area_rr)),
+                "area_url": _au(area_rr),
+                "instance_index": inst["idx"],
+                "blueprint_faction": {"id": bp_fid, "name": db.faction_name(bp_fid)},
+                "instance_faction": {"id": inst_fid, "name": db.faction_name(inst_fid)},
+            })
+    discrepancies.sort(key=lambda d: (
+        (nwn_text(db.canonical_creature_name(d["canonical_resref"])) or d["blueprint_resref"]).lower(),
+        d["area_resref"],
+        d["instance_index"],
+    ))
+    _write_json(module_index_dir / "faction_bp_instance_discrepancies.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(discrepancies),
+        "summary": (
+            f"{len(discrepancies)} placed instance(s) have a FactionID that differs from their blueprint."
+            if discrepancies else "No blueprint/instance faction discrepancies found."
+        ),
+        "discrepancies": discrepancies,
+    })
+    _module_index_summary.append(("issue", f"[nwn-wiki] module-index: faction_bp_instance_discrepancies.json ({len(discrepancies)} instance(s))"))
+
+    # ------------------------------------------------------------------ inaccessible_items.json
+    inac_items: list[dict] = []
+    for rr in sorted(db.items, key=lambda r: nwn_text(db.item_name(r)).lower()):
+        i = db.items[rr]
+        name = nwn_text(db.item_name(rr))
+        if name.startswith("[TLK#") or name == rr:
+            continue
+        carriers = db.item_carried_by.get(rr, [])
+        accessible = (
+            rr in db.item_sold_at
+            or rr in db.item_in_container
+            or any(e.get("dropable") or e.get("pickpocketable") for e in carriers)
+            or rr in db.item_from_script
+        )
+        if accessible:
+            continue
+        bi_raw = fld(i, "BaseItem", None)
+        bi = -1 if bi_raw is None else _try_int(bi_raw, -1)
+        reason = "undroppable_carried" if carriers else "not_found_anywhere"
+        carrier_list = []
+        for ce in carriers:
+            crr = ce.get("crr", "")
+            can_crr = db.canonical_for_bp.get(crr, crr)
+            carrier_list.append({
+                "creature_resref": crr,
+                "canonical_resref": can_crr,
+                "creature_name": nwn_text(db.canonical_creature_name(can_crr)) if crr else "",
+                "wiki_url": _cu(can_crr) if can_crr in db.canonical_creatures else "",
+            })
+        inac_items.append({
+            "resref": rr,
+            "name": name,
+            "base_item": baseitem_name(bi) if bi >= 0 else "",
+            "cost_gp": item_gp_value(i),
+            "wiki_url": _iu(rr),
+            "reason": reason,
+            "carriers": carrier_list,
+        })
+    _write_json(module_index_dir / "inaccessible_items.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(inac_items),
+        "summary": (
+            f"{len(inac_items)} item(s) that players cannot obtain "
+            f"(carried but not droppable, or not found anywhere)."
+            if inac_items else "No inaccessible items found."
+        ),
+        "items": inac_items,
+    })
+    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: inaccessible_items.json ({len(inac_items)} item(s))"))
+
+    # ------------------------------------------------------------------ unspawned_creatures.json
+    placed_bps: set[str] = {
+        fld(inst["c"], "TemplateResRef", "") or ""
+        for insts in db.area_creature_instances.values()
+        for inst in insts
+    } - {""}
+    encounter_bps: set[str] = set(db.creature_encounter_spawns.keys())
+    script_bps: set[str] = {
+        sp["bp_rr"]
+        for spawns in db.area_script_spawns.values()
+        for sp in spawns
+    }
+    used_bps = placed_bps | encounter_bps | script_bps
+    unspawned: list[dict] = []
+    for bp_rr in sorted(db.creatures,
+                        key=lambda r: nwn_text(db.creature_name(r)).lower()):
+        if bp_rr in used_bps:
+            continue
+        can_rr = db.canonical_for_bp.get(bp_rr, bp_rr)
+        name = nwn_text(db.creature_name(bp_rr))
+        bp = db.creatures[bp_rr]
+        cr_raw = fld(bp, "ChallengeRating") or ""
+        race_raw = fld(bp, "Race")
+        unspawned.append({
+            "resref": bp_rr,
+            "canonical_resref": can_rr,
+            "name": name,
+            "cr": str(cr_raw),
+            "race": race_name(race_raw),
+            "wiki_url": _cu(can_rr) if can_rr in db.canonical_creatures else "",
+        })
+    _write_json(module_index_dir / "unspawned_creatures.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(unspawned),
+        "summary": (
+            f"{len(unspawned)} creature blueprint(s) never placed in any area, "
+            f"referenced in any encounter pool, or spawned by script."
+            if unspawned else
+            "All creature blueprints are placed, in an encounter pool, or spawned by script."
+        ),
+        "creatures": unspawned,
+    })
+    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: unspawned_creatures.json ({len(unspawned)} blueprint(s))"))
+
+    # -------------------------------------------------------- instance_only_conversations.json
+    # Creature instances whose Conversation field is set in the GIT placement but
+    # either missing or empty on the blueprint.  The wiki reads Conversation from
+    # the blueprint canonical, so these NPCs appear to have no conversation on
+    # their creature detail page while showing one on the area page.
+    # Fix: move the conversation value to the blueprint (.utc.json).
+    inst_conv_mismatches: list[dict] = []
+    seen_inst_conv: set[tuple] = set()  # (area_rr, idx) dedup
+    for area_rr, insts in db.area_creature_instances.items():
+        if area_rr in db.hidden_areas:
+            continue
+        for idx, inst in enumerate(insts):
+            key_inst = (area_rr, idx)
+            if key_inst in seen_inst_conv:
+                continue
+            seen_inst_conv.add(key_inst)
+            c_git = inst["c"]
+            inst_conv = (fld(c_git, "Conversation", "") or "").strip()
+            if not inst_conv:
+                continue
+            bp_rr = (fld(c_git, "TemplateResRef", "") or "").lower()
+            bp = db.creatures.get(bp_rr)
+            bp_conv = (fld(bp, "Conversation", "") or "").strip() if bp else ""
+            if inst_conv == bp_conv:
+                continue  # Blueprint already carries the same value — no mismatch
+            can_rr = db.canonical_for_inst.get((area_rr, idx), bp_rr)
+            npc_name = nwn_text(
+                db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures
+                else (db.creature_name(bp_rr) if bp_rr else "")
+            )
+            inst_conv_mismatches.append({
+                "blueprint_resref": bp_rr,
+                "canonical_resref": can_rr,
+                "npc_name": npc_name,
+                "area_resref": area_rr,
+                "area_name": db.area_name(area_rr),
+                "instance_conversation": inst_conv,
+                "blueprint_conversation": bp_conv,
+                "wiki_url": _cu(can_rr) if can_rr in db.canonical_creatures else "",
+                "area_url": _au(area_rr) if area_rr in db.areas else "",
+            })
+    inst_conv_mismatches.sort(key=lambda e: (e["area_name"].lower(), e["npc_name"].lower()))
+    _write_json(module_index_dir / "instance_only_conversations.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(inst_conv_mismatches),
+        "summary": (
+            f"{len(inst_conv_mismatches)} creature instance(s) whose Conversation field is set "
+            f"on the GIT placement but not (or differently) on the blueprint. "
+            f"Fix: copy the value to the blueprint .utc.json and clear the instance override."
+            if inst_conv_mismatches else
+            "All creature conversations are consistently set on blueprints."
+        ),
+        "instances": inst_conv_mismatches,
+    })
+    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: instance_only_conversations.json ({len(inst_conv_mismatches)} instance(s))"))
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def main() -> int:
+    global _current_context
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--src", required=True, help="path to unpacked/ tree")
+    ap.add_argument("--out", required=True, help="path to output wiki/ dir")
+    ap.add_argument("--module-name", default=None,
+                    help="override module title (default: from module.ifo)")
+    ap.add_argument("--seed", type=int, default=1, help="layout RNG seed")
+    ap.add_argument("--2da-dir", dest="twoda_dir", default=None,
+                    help="directory of extracted 2DA files (e.g. baseitems.2da, "
+                         "iprp_feats.2da) to override the bundled stock lookups. "
+                         "Use this when the module relies on CEP / custom HAKs.")
+    ap.add_argument("--dialog-tlk", default=None,
+                    help="path to base-game dialog.tlk for resolving "
+                         "StrRef references (id < 16777216).")
+    ap.add_argument("--nwn-install", default=None,
+                    help="(ignored — stock item names are now pre-cached in "
+                         "wiki_data/stock_item_names.json; see bin/refresh-nwn-stock-items)")
+    ap.add_argument("--custom-tlk", default=None,
+                    help="path to the module's custom TLK (named in module.ifo "
+                         "Mod_CustomTlk) for resolving StrRefs >= 16777216.")
+    ap.add_argument("--base-url", default="",
+                    help="public URL the wiki is served from (e.g. "
+                         "https://user.github.io/project/). When set, the area "
+                         "map SVG uses absolute URLs for node links so a "
+                         "downloaded standalone SVG keeps clickable links.")
+    ap.add_argument("--exclude-conv-option", action="append", default=[],
+                    metavar="TEXT",
+                    help="Player-option label (exact match, after stripping "
+                         "NWN colour tokens and surrounding whitespace) whose "
+                         "dialog subtree should NOT contribute teleport edges "
+                         "to the area map. Repeat the flag for multiple "
+                         "labels (e.g. --exclude-conv-option '[Admin Options]' "
+                         "--exclude-conv-option '[DM Options]'). Use this to "
+                         "hide admin/DM teleport menus from cluttering the map "
+                         "— the teleports still appear on the conversation "
+                         "page, only the map edges are suppressed.")
+    ap.add_argument("--log-dir", action="append", default=[], dest="log_dirs",
+                    metavar="DIR",
+                    help="Directory containing NWN server logs (nwserverLog*.txt) "
+                         "or a parent directory whose subdirectories contain them "
+                         "(e.g. ~/.local/state/nwnxee-mygame/ whose logs.0/, "
+                         "logs.1/, … hold nwserverLog1.txt). Repeat for multiple "
+                         "log roots. When provided, an Activity page with "
+                         "player-activity charts is generated and added to the wiki.")
+    ap.add_argument("--db-dir", default=None, dest="db_dir", metavar="DIR",
+                    help="Directory holding the live NWN:EE campaign SQLite "
+                         "databases (where bestiary.sqlite3 lives). Used to seed "
+                         "the bestiary creature catalogue and read kill stats. "
+                         "On containerized servers this is the host path bound to "
+                         "the server's database/ dir, which usually differs from "
+                         "--log-dir. If omitted, falls back to <log-dir>/database "
+                         "when that is a real directory.")
+    ap.add_argument("--activity-cache", default=None, dest="activity_cache",
+                    metavar="PATH",
+                    help="JSON file for persisting player-session data across log "
+                         "rotations. Defaults to activity-sessions.json inside the "
+                         "first --log-dir. Keeps historical hours from being lost "
+                         "when old log rotations are deleted by the server.")
+    ap.add_argument("--path-from", default=None, metavar="RESREF",
+                    help="Area resref to compute shortest paths FROM. When given, "
+                         "every area page (except the source itself) shows the "
+                         "shortest path back to this area via door/trigger/conversation "
+                         "transitions. Omit to suppress the section entirely.")
+    ap.add_argument("--cr-bucket-size", type=int, default=10, metavar="N",
+                    dest="cr_bucket_size",
+                    help="Width of each Challenge Rating range bucket on the "
+                         "Creatures → By Challenge Rating page (default: 10, "
+                         "producing CR 0–9, CR 10–19, …).")
+    ap.add_argument("--max-character-level", type=int, default=40, metavar="N",
+                    dest="max_character_level",
+                    help="Server level cap used when deriving a creature's base "
+                         "attack bonus: its total class levels are clamped to N "
+                         "(in ClassList order) so an over-HD boss doesn't get "
+                         "unbounded BAB. 0 = no cap. Default: 40 (NWN default).")
+    ap.add_argument("--max-ability-bonus", type=int, default=12, metavar="N",
+                    dest="max_ability_bonus",
+                    help="Cap on the ability-score bonus a single item may grant, "
+                         "applied when folding equipped-item ability bonuses into "
+                         "a creature's effective scores. Default: 12 (NWN default; "
+                         "some modules raise it, e.g. 24).")
+    ap.add_argument("--max-player-level", type=int, default=0, metavar="N",
+                    dest="max_player_level",
+                    help="Level cap a player character can actually reach, used "
+                         "for the counter-gear report's reference PC. Separate "
+                         "from --max-character-level (which clamps creature BAB): "
+                         "a server running NWNX MaxLevel can let players past 40 "
+                         "while creature stats still want the engine cap. "
+                         "0 (default) = follow --max-character-level.")
+    ap.add_argument("--devcrit-bonus-dice", type=int, default=0, metavar="N",
+                    dest="devcrit_bonus_dice",
+                    help="Bonus damage dice a critical hit deals when the module "
+                         "has replaced the engine's save-or-die Devastating "
+                         "Critical with flat damage. Whether the engine's version "
+                         "is still active is DETECTED from baseitems.2da's "
+                         "EpicWeaponDevastatingCriticalFeat column, not "
+                         "configured; this only supplies the replacement, whose "
+                         "die size follows WeaponSize (1-2 d6, 3 d8, 4+ d10). "
+                         "Default: 0 (stock behaviour).")
+    ap.add_argument("--counter-gear", action="store_true", dest="counter_gear",
+                    help="Run the counter-gear combat simulation and rewrite "
+                         "module-index/counter_gear.{json,md}. Off by default "
+                         "because it simulates every creature against every "
+                         "attainable item; normal runs instead compare an input "
+                         "fingerprint and warn when the existing report is stale.")
+    args = ap.parse_args()
+
+    global _GENERATED_AT
+    _GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
+
+    src = Path(args.src).resolve()
+    out = Path(args.out).resolve()
+    if not src.is_dir():
+        print(f"error: --src not a directory: {src}", file=sys.stderr)
+        return 1
+
+    if args.dialog_tlk:
+        p = Path(args.dialog_tlk).resolve()
+        if p.is_file():
+            BASE_TLK.update(read_tlk(p))
+            print(f"[nwn-wiki] loaded base TLK ({len(BASE_TLK)} entries) from {p}")
+        else:
+            print(f"warn: --dialog-tlk {p} not found; StrRefs will show as [TLK#N]",
+                  file=sys.stderr)
+    if args.custom_tlk:
+        p = Path(args.custom_tlk).resolve()
+        if p.is_file():
+            CUSTOM_TLK.update(read_tlk(p))
+            print(f"[nwn-wiki] loaded custom TLK ({len(CUSTOM_TLK)} entries) from {p}")
+        else:
+            print(f"warn: --custom-tlk {p} not found; custom StrRefs will show as [TLK#N]",
+                  file=sys.stderr)
+
+    if args.nwn_install:
+        print("[nwn-wiki] --nwn-install is ignored; stock item names are pre-cached in "
+              "wiki_data/stock_item_names.json (run bin/refresh-nwn-stock-items to rebuild)",
+              file=sys.stderr)
+
+    # --- wiki_data pre-flight: confirm all data files are present ---
+    _DATA_AUDIT: list[tuple[str, Any, str]] = [
+        ("baseitems.json",        lambda: len(BASEITEMS),                              "bin/wiki_data/_build_stock.py"),
+        ("classes.json",          lambda: len(CLASSES),                               "bin/wiki_data/_build_stock.py"),
+        ("racialtypes.json",      lambda: len(RACES),                                 "bin/wiki_data/_build_stock.py"),
+        ("appearance.json",       lambda: len(APPEARANCE),                            "bin/wiki_data/_build_stock.py"),
+        ("feat.json",             lambda: len(FEATS),                                 "bin/wiki_data/_build_stock.py"),
+        ("iprp_feats.json",       lambda: len(IPRP_FEATS),                            "bin/wiki_data/_build_stock.py"),
+        ("skills.json",           lambda: len(SKILLS),                                "bin/wiki_data/_build_stock.py"),
+        ("spells.json",           lambda: len(SPELLS),                                "bin/wiki_data/_build_stock.py"),
+        ("weapons.json",          lambda: len(WEAPONS),                               "bin/wiki_data/_build_stock.py"),
+        ("itemprops.json",        lambda: len(IPROP_DEFS),                            "committed — restore from git"),
+        ("parts_chest.2da",       lambda: len(PARTS_CHEST_AC),                        "committed — restore from git"),
+        ("stock_item_names.json", lambda: len(STOCK_ITEM_NAMES),                      "bin/refresh-nwn-stock-items"),
+        ("spell_info.json",       lambda: sum(len(v) for v in SPELL_INFO.values()),   "bin/refresh-nwn-spell-info"),
+    ]
+    _missing_data: list[tuple[str, str]] = []
+    for _fname, _count_fn, _refresh in _DATA_AUDIT:
+        _p = DATA_DIR / _fname
+        if _p.exists():
+            print(f"[nwn-wiki] data: {_fname:<25} ok ({_count_fn()})")
+        else:
+            print(f"[nwn-wiki] data: {_fname:<25} MISSING", file=sys.stderr)
+            _missing_data.append((_fname, _refresh))
+    if _missing_data:
+        _by_cmd: dict[str, list[str]] = {}
+        for _fname, _refresh in _missing_data:
+            _by_cmd.setdefault(_refresh, []).append(_fname)
+        print("error: required wiki_data files are missing:", file=sys.stderr)
+        for _cmd, _files in _by_cmd.items():
+            print(f"  {_cmd}  ({', '.join(_files)})", file=sys.stderr)
+        return 1
+
+    print(f"[nwn-wiki] reading {src}")
+    db = Db(src)
+    db.exclude_option_texts = list(args.exclude_conv_option or [])
+    if db.exclude_option_texts:
+        print(f"[nwn-wiki] excluding map edges from dialog subtrees under: "
+              + ", ".join(repr(t) for t in db.exclude_option_texts))
+    db.max_character_level = args.max_character_level
+    db.max_ability_bonus = args.max_ability_bonus
+    db.max_player_level = args.max_player_level or args.max_character_level or 40
+    print(f"[nwn-wiki] combat dials: max-character-level="
+          f"{db.max_character_level or 'uncapped'}, "
+          f"max-ability-bonus=+{db.max_ability_bonus}, "
+          f"max-player-level={db.max_player_level}")
+    db.load()
+    db.index()
+    db.index_dialogs()
+
+    # Area graph is always built (used for module-index and, conditionally, shortest paths).
+    graph = build_area_graph(db)
+
+    # Shortest-path data keyed by area resref (only populated when --path-from given).
+    area_paths: dict[str, list | None] = {}
+    path_from_name: str = ""
+    if args.path_from:
+        src_rr = args.path_from
+        if src_rr not in db.areas:
+            print(f"warn: --path-from {src_rr!r} not found in module areas; "
+                  "skipping shortest-path sections", file=sys.stderr)
+        else:
+            path_from_name = db.area_name(src_rr)
+            print(f"[nwn-wiki] computing shortest paths from {src_rr!r} ({path_from_name})")
+            for rr in db.areas:
+                if rr == src_rr:
+                    continue
+                area_paths[rr] = bfs_shortest_path(graph, src_rr, rr)
+
+    # Apply 2DA-derived label overrides on top of the bundled stock JSON.
+    # The lookup dicts (BASEITEMS, RACES, …) are module-level and only
+    # consulted during rendering, so it's safe to mutate them after db.load().
+    # Order matters — later writers win:
+    #   1. stock         (baked into wiki_data/*.json on import)
+    #   2. CEP overlay   (auto-loaded when the IFO references any cep* hak)
+    #   3. --2da-dir     (or auto-picked <src>/../hak_2da, <src>/2da)
+    cep_haks = detect_cep_haks(db.ifo)
+    if cep_haks:
+        cep_overlay = DATA_DIR / "cep"
+        if cep_overlay.is_dir():
+            print(f"[nwn-wiki] applying CEP overlay (haks: {', '.join(cep_haks)})")
+            load_json_overlay(cep_overlay, label="cep")
+        else:
+            print(f"warn: CEP haks present but {cep_overlay} not bundled; "
+                  f"run wiki_data/cep/_build.py to regenerate",
+                  file=sys.stderr)
+
+    twoda_dir: Path | None = None
+    if args.twoda_dir:
+        twoda_dir = Path(args.twoda_dir).resolve()
+    else:
+        for candidate in (src.parent / "hak_2da", src / "2da"):
+            if candidate.is_dir():
+                twoda_dir = candidate
+                break
+    db.twoda_dir = twoda_dir
+    db.run_counter_gear = bool(args.counter_gear)
+    db.devcrit_bonus_dice = max(0, args.devcrit_bonus_dice)
+    if twoda_dir is not None:
+        if twoda_dir.is_dir():
+            print(f"[nwn-wiki] applying 2DA overrides from {twoda_dir}")
+            load_2da_overrides(twoda_dir)
+        else:
+            print(f"warn: --2da-dir {twoda_dir} is not a directory; ignoring",
+                  file=sys.stderr)
+
+    # Wipe stale generated content so deleted resources don't linger in the
+    # wiki. We only nuke the contents — keeping the directory itself preserves
+    # any user-created tooling (CNAME, custom workflow files) co-located in
+    # docs/. CNAME is the one well-known file we explicitly preserve.
+    if out.is_dir():
+        cname = out / "CNAME"
+        keep_cname = cname.read_bytes() if cname.is_file() else None
+        for child in out.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        if keep_cname is not None:
+            cname.write_bytes(keep_cname)
+
+    out.mkdir(parents=True, exist_ok=True)
+    # Disable Jekyll on GitHub Pages so files starting with _ etc. are served verbatim.
+    (out / ".nojekyll").touch()
+    # Copy bundled stylesheet (idempotent)
+    if ASSETS_DIR.is_dir():
+        (out / "assets").mkdir(parents=True, exist_ok=True)
+        for f in ASSETS_DIR.iterdir():
+            if f.is_file():
+                shutil.copy2(f, out / "assets" / f.name)
+    (out / "assets" / "meta.json").write_text(
+        json.dumps({"generated_at": _GENERATED_AT}, ensure_ascii=False)
+    )
+
+    # Load per-module theme from wiki-theme/ next to the unpacked/ directory.
+    load_wiki_theme(src.parent, out)
+
+    # Index creature artwork from creature-pics/ and copy the files into the
+    # output tree (creatures/pics/). Done after db is built so names resolve.
+    scan_creature_pics(src.parent, db)
+    if _CREATURE_PIC_GROUPS:
+        pics_src = src.parent / "creature-pics"
+        pics_out = out / "creatures" / "pics"
+        pics_out.mkdir(parents=True, exist_ok=True)
+        wanted = {fn for grp in _CREATURE_PIC_GROUPS for fn in grp["images"]}
+        for f in pics_src.iterdir():
+            if f.is_file() and f.name in wanted:
+                shutil.copy2(f, pics_out / f.name)
+
+    # Module title
+    title = args.module_name
+    if not title and db.ifo:
+        title = loc(db.ifo.get("Mod_Name")) or "NWN Module"
+    title = title or "NWN Module"
+
+    module_index_dir = src.parent / "module-index"
+    # Wipe stale content so removed resources don't linger across refreshes.
+    # The counter-gear report is exempt: it is rebuilt only on demand
+    # (--counter-gear), so deleting it here would destroy the previous run's
+    # analysis and silently force the slow rebuild on every refresh.
+    _KEEP = {"counter_gear.json", "counter_gear.md"}
+    if module_index_dir.is_dir():
+        for _child in module_index_dir.iterdir():
+            if _child.name in _KEEP:
+                continue
+            if _child.is_dir():
+                shutil.rmtree(_child)
+            else:
+                _child.unlink()
+    module_index_dir.mkdir(parents=True, exist_ok=True)
+
+    # Tag-conflict burndown list + all module-index JSON exports
+    generate_tag_conflict_report(db, module_index_dir, title, out, args.base_url or "")
+    generate_store_tag_conflict_report(db, module_index_dir, title, out, args.base_url or "")
+    generate_conversation_conflict_report(db, module_index_dir, title, out, args.base_url or "")
+    generate_module_index(
+        db, module_index_dir, title,
+        graph, area_paths if args.path_from else None,
+        args.path_from or "", path_from_name,
+        out, args.base_url or "",
+    )
+
+    # Layout
+    print("[nwn-wiki] computing area layout")
+    t0 = time.time()
+    visible_areas = {r for r in db.areas if r not in db.hidden_areas}
+    edges = []
+    for tr in db.transitions:
+        a, b = tr["src_area"], tr["dst_area"]
+        if a in visible_areas and b in visible_areas:
+            edges.append((a, b))
+        # Include alt destinations for dup-tag transitions so they appear on the map.
+        if tr.get("is_dup_tag"):
+            for alt in tr.get("dst_area_alts", []):
+                if a in visible_areas and alt in visible_areas:
+                    edges.append((a, alt))
+    for tr in db.script_transitions:
+        a, b = tr["src_area"], tr["dst_area"]
+        if a in visible_areas and b and b in visible_areas:
+            edges.append((a, b))
+    # Conversation-teleport edges and the pseudo-nodes that sit at the
+    # source of "global" trigger conversations (rest menu, item activators).
+    pseudo_nodes = sorted(db.global_convo_pseudo.keys())
+    for tr in db.conv_transitions:
+        s = tr["src"]
+        d = tr["dst_area"]
+        # Either both endpoints are visible areas, or src is a pseudo-node we'll
+        # add to node_ids below.
+        if d not in visible_areas:
+            continue
+        if s in visible_areas or s in db.global_convo_pseudo:
+            edges.append((s, d))
+    positions, sizes = layout_areas(
+        sorted(visible_areas) + pseudo_nodes,
+        edges,
+        db=db,
+        seed=args.seed,
+    )
+    print(f"  layout in {time.time() - t0:.1f}s")
+
+    # Parse server logs and set the activity-page flag BEFORE any page() calls
+    # so the Activity nav link appears on every rendered page.
+    global _HAS_ACTIVITY_PAGE
+    activity: dict | None = None
+    if args.log_dirs:
+        log_dir_paths = [Path(d).resolve() for d in args.log_dirs]
+        if args.activity_cache:
+            cache_path = Path(args.activity_cache).resolve()
+        else:
+            cache_path = log_dir_paths[0] / "activity-sessions.json"
+        activity = parse_nwserver_logs(log_dir_paths, cache_path=cache_path)
+        player_sessions = [
+            s for s in activity["sessions"]
+            if s.get("join") is not None and s.get("role") == "Player"
+        ]
+        if player_sessions:
+            _HAS_ACTIVITY_PAGE = True
+            print(f"[nwn-wiki] found {len(player_sessions)} player sessions "
+                  f"across {activity['file_count']} log file(s) "
+                  f"(cache: {cache_path})")
+        else:
+            print("[nwn-wiki] log-dir specified but no player sessions found; "
+                  "skipping activity page", file=sys.stderr)
+
+    # Bestiary kill stats: only when this module ships the bestiary system
+    # (detected by the book item). Locate the live campaign-DB dir from --db-dir,
+    # falling back to <log-dir>/database when that is a real directory (it is a
+    # dangling container symlink on this server, hence the explicit --db-dir).
+    if "bestiarybook" in db.items:
+        _bestiary_db_dir: Path | None = None
+        if args.db_dir:
+            _bestiary_db_dir = Path(args.db_dir).expanduser()
+        elif args.log_dirs:
+            _cand = Path(args.log_dirs[0]).expanduser() / "database"
+            if _cand.is_dir():
+                _bestiary_db_dir = _cand
+        if _bestiary_db_dir is not None:
+            seed_bestiary_catalogue(db, _bestiary_db_dir)
+            # Migrate/back-fill server-first player names from log cdkeys BEFORE
+            # reading stats, so the Player column is populated in this same build.
+            if activity is not None:
+                backfill_server_first_player_names(
+                    _bestiary_db_dir, activity["sessions"])
+            load_bestiary_stats(
+                _bestiary_db_dir,
+                activity["sessions"] if activity is not None else None)
+        else:
+            print("[nwn-wiki] bestiary: no reachable database dir "
+                  "(set --db-dir); skipping kill stats", file=sys.stderr)
+
+    # Boss respawn tracker registry — must load before ANY page renders (manual
+    # pages here, the activity subprocess below, and the main pages) so the
+    # conditional "Bosses" nav link appears consistently on every page.
+    load_boss_registry(db)
+
+    render_manual_pages(src.parent, out)
+
+    if _HAS_ACTIVITY_PAGE:
+        _act_cmd = [sys.executable, str(SCRIPT_DIR / "nwn-wiki-activity"),
+                    "--src", str(src), "--out", str(out)]
+        for _d in args.log_dirs:
+            _act_cmd += ["--log-dir", str(_d)]
+        if args.activity_cache:
+            _act_cmd += ["--activity-cache", str(args.activity_cache)]
+        if "bestiarybook" in db.items and args.db_dir:
+            _act_cmd += ["--db-dir", str(Path(args.db_dir).expanduser())]
+        subprocess.run(_act_cmd, check=True)
+
+    print("[nwn-wiki] rendering pages")
+    t0 = time.time()
+    render_index(db, out, title, positions, sizes, base_url=args.base_url,
+                 project_root=src.parent)
+    render_map_page(db, out, positions, sizes, base_url=args.base_url)
+    render_areas_index(db, out,
+                       area_paths=area_paths if args.path_from else None,
+                       path_from_resref=args.path_from or "",
+                       path_from_name=path_from_name)
+    for resref in db.areas:
+        if resref in db.hidden_areas:
+            continue
+        render_area_page(db, resref, out,
+                         path_from_name=path_from_name,
+                         path_steps=area_paths.get(resref, _OMIT))
+    for resref, conts in db.area_containers.items():
+        if resref in db.hidden_areas:
+            continue
+        for c in conts:
+            render_container_page(db, resref, c, out)
+    render_creatures_index(db, out)
+    render_bosses_index(db, out)
+    render_creature_pictures(db, out)
+    render_creatures_by_area(db, out)
+    render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
+    render_creatures_by_race(db, out)
+    render_creatures_search(db, out)
+    _current_context = ""
+    for can_rr in db.canonical_creatures:
+        _current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
+        render_creature_page(db, can_rr, out)
+    _current_context = ""
+    render_items_index(db, out)
+    for resref in db.items:
+        _current_context = f"item:{resref} ({db.item_name(resref)})"
+        render_item_page(db, resref, out)
+    _current_context = ""
+    render_items_by_property(db, out)
+    _current_context = ""
+    render_items_search(db, out)
+    _current_context = ""
+    render_stores_index(db, out)
+    for area_rr, inst_list in db.area_stores.items():
+        if area_rr in db.hidden_areas:
+            continue
+        for inst in inst_list:
+            render_store_instance_page(db, area_rr, inst, out)
+    for resref in db.stores:
+        render_store_page(db, resref, out)
+    render_conversations_index(db, out)
+    for resref in db.dialogs:
+        render_conversation_page(db, resref, out)
+    render_scripts_index(db, out)
+    for resref in db.script_paths:
+        render_script_page(db, resref, out)
+    render_factions(db, out)
+    qcats = _quest_categories(db)
+    qslugs = _quest_slugs(qcats)
+    render_quests_index(db, out)
+    for qcat, qslug in zip(qcats, qslugs):
+        if _quest_hidden(fld(qcat, "Comment", "")):
+            continue  # retired/inactive quest — no detail page
+        render_quest_page(db, qcat, qslug, out)
+    print(f"  rendered in {time.time() - t0:.1f}s")
+
+    # Write lookup warnings to module-index so they're visible outside the build log.
+    warnings_path = module_index_dir / "lookup_warnings.json"
+    sorted_warnings = sorted(_warned.keys())
+    warnings_out = [
+        {"message": msg, "referenced_by": sorted(_warned[msg])}
+        for msg in sorted_warnings
+    ]
+    _write_json(warnings_path, {
+        "_description": "Lookup failures encountered during wiki generation. "
+                        "Integers or [TLK#N] placeholders may appear on wiki pages "
+                        "for each entry below. Re-run with --dialog-tlk / --custom-tlk "
+                        "and/or --2da-dir to resolve.",
+        "count": len(warnings_out),
+        "warnings": warnings_out,
+    })
+
+    # Boss respawn tracker registry (parsed from brd_db.nss BRD_SeedBoss rows —
+    # the same list the game seeds into respawndb, and the creatures/bosses.html
+    # page renders). Written for LLM-assist consumers.
+    if _BOSS_REGISTRY:
+        _write_json(module_index_dir / "bosses.json", {
+            "_description": "Bosses tracked by the in-game 'Roll of the Fallen' "
+                            "respawn board, parsed from the BRD_SeedBoss rows in "
+                            "unpacked/brd_db.nss (single source of truth shared "
+                            "with the game). See creatures/bosses.html.",
+            "count": len(_BOSS_REGISTRY),
+            "aliases": _BOSS_ALIASES,
+            "bosses": [
+                {
+                    "resref": b["resref"],
+                    "name": b["name"],
+                    "tag": b["tag"],
+                    "area_resref": b["area"],
+                    "area_name": b["area_name"],
+                    "cr": b["cr"],
+                    "has_creature_page": b["resref"] in db.canonical_creatures,
+                    "kills": _BESTIARY_KILLS.get(b["resref"]),
+                }
+                for b in sorted(_BOSS_REGISTRY, key=lambda b: -b["cr"])
+            ],
+        })
+    if warnings_out:
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json ({len(warnings_out)} lookup failure(s)) — {warnings_path}"))
+    else:
+        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json (no lookup failures)"))
+
+    if _module_index_summary:
+        print()
+        print("[nwn-wiki] module-index summary:")
+        for label, color, sev in [
+            ("Informational", _C_INFO,  "info"),
+            ("Warnings",      _C_WARN,  "warn"),
+            ("Issues",        _C_ISSUE, "issue"),
+        ]:
+            msgs = [m for s, m in _module_index_summary if s == sev]
+            if msgs:
+                print(f"  {color}{label}:{_C_RESET}")
+                for m in msgs:
+                    print(f"    {color}{m}{_C_RESET}")
+    
+    
+    print(f"[nwn-wiki] done — {out}/index.html")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

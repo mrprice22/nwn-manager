@@ -35,8 +35,6 @@ hour-of-day charts for the gap window are NOT reliably restored.
 from __future__ import annotations
 
 import argparse
-import importlib.machinery
-import importlib.util
 import re
 import subprocess
 import sys
@@ -56,13 +54,10 @@ _MONTHS = {m: i for i, m in enumerate(
 
 
 def _load_nwn_wiki():
-    """Load nwn-wiki as a module to reuse its cache load/save helpers."""
-    path = Path(__file__).resolve().parent / "nwn-wiki"
-    loader = importlib.machinery.SourceFileLoader("nwn_wiki", str(path))
-    spec = importlib.util.spec_from_loader("nwn_wiki", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    """Import the wiki generator to reuse its cache load/save helpers."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from nwn_wiki import cli
+    return cli
 
 
 def _read_source_html(args) -> str:

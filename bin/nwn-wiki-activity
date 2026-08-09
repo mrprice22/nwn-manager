@@ -11,21 +11,21 @@ Exit codes for check modes:
 from __future__ import annotations
 
 import argparse
-import importlib.machinery
-import importlib.util
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 
 def _load_nwn_wiki():
-    """Load nwn-wiki as a Python module via importlib."""
-    path = Path(__file__).resolve().parent / "nwn-wiki"
-    loader = importlib.machinery.SourceFileLoader("nwn_wiki", str(path))
-    spec = importlib.util.spec_from_loader("nwn_wiki", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    """Import the module that owns the wiki generator's globals.
+
+    Returns nwn_wiki.cli, not the nwn_wiki package: this script sets module
+    attributes on the result (see main()), and those writes are only visible to
+    the code that reads them if they land on the module that defines them.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from nwn_wiki import cli
+    return cli
 
 
 def _should_refresh(activity: dict, within_seconds: int) -> bool:
