@@ -590,8 +590,38 @@ items:
 - id: util-module
   phase: 1
   title: Give the homeless generic helpers and crit-feat maths a module
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 9acef57
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (142s), lotr2008 IDENTICAL (88s), lotr2009 IDENTICAL (110s)"
+  impl_notes: >
+    util.py 20 lines holding _try_int alone — a true leaf that imports nothing from
+    the package, so any module may take it.  The crit/finesse block went to
+    combat.py (150 -> 286): WEAPON_FINESSE_FEAT, EPIC_TOUGHNESS_BASE,
+    epic_toughness_hp, FINESSE_BASEITEMS, the "Critical-hit feats" banner,
+    _OVERWHELMING_DIE, _DEVCRIT_DIE_BY_SIZE, _DEVCRIT_DIE_LARGE,
+    _IMPROVED_CRIT_MIN_BAB, _EPIC_CRIT_MIN_STR, _devcrit_die, weapon_feat_id,
+    crit_feat_effects — chosen because crit_feat_effects calls ability_mod, which
+    already lives there, so it needed only WEAPONS/BASEITEM_COLUMNS_SEEN from
+    lookups plus util; items.py would have gained a new combat edge.  _CWEAP_SLOTS
+    went to items.py instead (505 -> 506): it is built from items.py's own
+    SLOT_CWEAP_* bitmasks and so needed no new imports at all.  cli.py 15,380 ->
+    15,251; line multiset shows only 8 added import lines.  WEAPONS and
+    BASEITEM_COLUMNS_SEEN stay safe as plain from-imports — twoda.py mutates them in
+    place and never rebinds.
+  found:
+    - "combat.py's module docstring still says 'Depends only on stdlib, gff and
+       lookups'; it now also imports nwn_wiki.util and reads baseitem data."
+    - "cli.py still holds 21 inlined try/int/except duplicates of _try_int (e.g.
+       creature_max_hp) — left alone, they are phase-3 dedup-formatting."
+    - "_CWEAP_SLOTS is underscore-private yet imported across modules by cli.py, as
+       are several of the crit-feat privates now in combat.py.  A phase-3 naming
+       pass should unprefix the cross-module ones."
+    - "TUMBLE_SKILL_ID, ARMOR_SKIN_FEAT and MONK_CLASS_ID are pure combat-stat 2da
+       row ids still in cli.py that would sit naturally beside WEAPON_FINESSE_FEAT;
+       their shared banner comment is now split across two files in spirit."
+
   after: [sim-combat]
   plan: >
     A handful of small symbols have no backlog home and are now the sole blockers
