@@ -295,8 +295,38 @@ items:
 - id: items-module
   phase: 1
   title: Extract item slot/damage/AC derivation into items.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 98d9374
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (135s), lotr2008 IDENTICAL (86s), lotr2009 IDENTICAL (107s)"
+  impl_notes: >
+    items.py 505 lines; cli.py 17,464 -> 17,020.  Moved: the whole SLOT_* constant
+    block (SLOT_HEAD..SLOT_CHIDE, SLOT_NAMES, WEAPON_SLOTS, ARMOR_SLOTS,
+    SHIELD_BASEITEMS, CRIT_IMMUNITY_LABEL, _STOCK_BASEITEM_SLOTS + its build loop,
+    BASEITEM_SLOTS, _AMMO_SLOTS, PLAYER_SLOT_MASK, PLAYER_SLOTS), baseitem_slots,
+    item_equip_slots, slot_label, the category data block (_ARMOR_BASEITEMS
+    .._TOC_GROUPS) with _item_category/_item_category_label/is_ranged_weapon, and
+    weapon_damage_string, weapon_crit_string, item_ac_bonus, item_attack_bonus,
+    item_damage_bonus, weapon_enhancement, item_gp_value, _item_accessible.
+    SCOPE REDUCED: extract_item_offense, extract_item_defense, weapon_damage_props
+    and _weapon_extra_damage_types stayed in cli.py — they need nwn_text (owned by
+    htmlgen-escape-links), avg_roll (sim-combat) and _DAMAGE_TYPE_LABELS, so moving
+    them now would force a cycle.  New item item-extractors-module picks them up
+    once both homes exist.  Snapshot ordering preserved: items.py is imported from
+    cli.py's header, so BASEITEM_SLOTS = dict(_STOCK_BASEITEM_SLOTS) still evaluates
+    before load_2da_overrides runs from main(); verified at runtime that
+    items.BASEITEM_SLOTS is cli.BASEITEM_SLOTS and that a write through the cli
+    binding is visible to items.baseitem_slots().  Line multiset: 34 lines added
+    (the import block only), 478 removed and all present verbatim in items.py.
+  found:
+    - "_PHYSICAL_DAMAGE_TYPES (cli.py) is defined and referenced nowhere in bin/ —
+       dead."
+    - "WEAPON_SLOTS and ARMOR_SLOTS (now items.py) are likewise referenced nowhere;
+       dead constants that travelled with the block."
+    - "_ABIL_NAME_KEY sits ~5,500 lines below extract_item_defense, its first user —
+       relocate it with item-extractors-module."
+
   after: [combat-module]
   ranges: "1736-2430"
   plan: >
@@ -380,6 +410,24 @@ items:
     attack_profile, defense_profile, _mitigate, _hit_damage, dpr,
     crit_chance_per_round, _rounds_to_drop, _devcrit_rounds, save_fail_chance,
     simulate.
+
+- id: item-extractors-module
+  phase: 1
+  title: Move the item offence/defence extractors into items.py
+  status: pending
+  gate: zero-diff
+  after: [htmlgen-escape-links, sim-combat]
+  plan: >
+    items-module had to leave four functions behind: extract_item_offense,
+    extract_item_defense (nesting depth 8 — move as-is, do not flatten),
+    weapon_damage_props and _weapon_extra_damage_types.  They need nwn_text
+    (htmlgen/escape.py), avg_roll (sim/combat.py) and _DAMAGE_TYPE_LABELS, none of
+    which had a home when items.py was carved out.  Once both dependencies have
+    landed, move all four into items.py, together with _ABIL_NAME_KEY, which is
+    only used by extract_item_defense and currently sits ~5,500 lines away from it.
+  notes: >
+    Decide where _DAMAGE_TYPE_LABELS lives before moving _weapon_extra_damage_types
+    — it is shared with the retaliation analysis that render-creature-page owns.
 
 - id: sim-pc-gear
   phase: 1
