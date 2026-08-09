@@ -1055,8 +1055,37 @@ items:
 - id: db-names
   phase: 1
   title: Split name lookups into db/names.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: f95fa04
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (135s), lotr2008 IDENTICAL (88s), lotr2009 IDENTICAL (103s)"
+  impl_notes: >
+    db/names.py 139 lines; cli.py 11,977 -> 11,863.  All nine methods moved, nothing
+    dragged along or left behind — the module imports only gff and
+    htmlgen.escape.nwn_text.  class Db(DbNamesMixin, DbDerivedMixin, DbDialogsMixin,
+    DbScriptsMixin, DbIndexMixin, DbCore).  A diff of HEAD's cli.py range against
+    names.py's body is byte-identical.  dir(Db) identical to HEAD (91 entries).
+    END OF THE db-* SERIES: what remains of Db in cli.py is six class-level constant
+    dicts and nothing else — no methods, no __init__ (MODULE_/CREATURE_/PLACEABLE_/
+    DOOR_/TRIGGER_/AREA_EVENT_FIELDS, ~65 lines), which the dialogs and derived
+    mixins resolve through self at runtime.
+  found:
+    - "PHASE 3: four sites write the same 'FirstName/LastName -> full -> fallback'
+       longhand — names.py's creature_name, creature_instance_name and
+       canonical_creature_name, plus a variant in db/core.py's canonical
+       registration and a fifth near-copy in cli.py.  A shared _display_name(c, bp)
+       would collapse all of them.  Deliberately NOT collapsed here."
+    - "STOCK_CREATURE_NAMES is now unused in cli.py.  With ~25 other imports the
+       extractions have left dead, this wants one dead-import sweep rather than
+       dribbling across moves — cli-module already owns that."
+    - "faction_name has three different fallback shapes in one function (empty
+       string, None and non-int junk all land differently) and an unnamed magic
+       65535 -> '(None)'."
+    - "dialog_label duplicates its truncation logic in both loops, and the 60/63
+       asymmetry (txt[:60] + '…' when len(txt) > 63) looks unintentional.  Any change
+       is output-visible, so it needs an expected-diff item."
+
   after: [db-derived]
   ranges: "4823-4936"
   plan: >
