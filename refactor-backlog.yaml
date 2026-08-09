@@ -925,8 +925,42 @@ items:
 - id: db-scripts
   phase: 1
   title: Split script parsing into db/scripts.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 097f098
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (136s), lotr2008 IDENTICAL (84s), lotr2009 IDENTICAL (107s)"
+  impl_notes: >
+    db/scripts.py 652 lines; cli.py 13,515 -> 12,895.  All ten planned methods moved
+    verbatim plus _extract_func_body, and — verified used only by them — the whole
+    _RE_* scrape-regex block and _STOCK_DAMAGE_SCRIPTS class attributes.
+    class Db(DbScriptsMixin, DbIndexMixin, DbCore); mixin name sets are disjoint.
+    DRAGGED ALONG: _parse_scripts calls _analyze_retaliation, so the retaliation
+    block (_strip_nss_comments, _ret_dice_to_text, _analyze_retaliation and the
+    _RE_STRIP_*/_RE_RET_* regexes) had to come too — db/ may not import cli.
+    _strip_nss_comments still has one cli.py caller (_load_boss_registry_from_path),
+    so cli.py imports it back, the same pattern db/index.py uses for
+    _store_instance_slug.  render-creature-page's plan updated accordingly: only
+    _retaliation_sentence is left there.  Left behind: _retaliation_sentence (a pure
+    renderer with no moved deps) and the six *_EVENT_FIELDS class dicts, still read
+    by index_dialogs and several cli.py renderers.  dir(Db) identical to HEAD; the
+    only removed cli.py line is the old bases line, every other change is
+    scaffolding.  The moved code touches no state.
+  found:
+    - "cli.py's typing.Iterable import is now unused (its only user was
+       _walk_dialog_nodes), as is _DAMAGE_TYPE_LABELS from the lookups import block
+       (only _analyze_retaliation used it).  Add both to the cli-module prune list."
+    - "_retaliation_sentence now lives in a different module from
+       _analyze_retaliation, its natural companion.  A later phase may want a
+       retaliation concern module so the two rejoin."
+    - "The '# --- Retaliation (OnDamaged strike-back) analysis ---' banner now
+       appears in both files; the cli.py copy labels only _retaliation_sentence and
+       should be retitled."
+    - "The *_EVENT_FIELDS dicts are pure static tables read by both Db methods and
+       free renderer functions — candidates for the db-dialogs mixin or lookups."
+    - "_parse_scripts reads every .nss into _include_text_cache and never releases
+       it — a sizeable transient allocation on large modules."
+
   after: [db-index]
   ranges: "3486-3919"
   plan: >
@@ -1012,8 +1046,11 @@ items:
   after: [render-creature-index]
   ranges: "7768-8190, 9061-10051"
   plan: >
-    The retaliation analysis (_strip_nss_comments, _ret_dice_to_text,
-    _analyze_retaliation, _retaliation_sentence), extract_creature_defenses (324),
+    _retaliation_sentence — the rest of the retaliation analysis
+    (_strip_nss_comments, _ret_dice_to_text, _analyze_retaliation) already went to
+    db/scripts.py with db-scripts, because _parse_scripts calls it and db/ may not
+    import cli; decide whether the sentence renderer joins it there or the analysis
+    follows it here.  Then extract_creature_defenses (324),
     _creature_detail_sections (619 — second-longest function in the program) and
     render_creature_page.
 
