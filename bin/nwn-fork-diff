@@ -1592,17 +1592,41 @@ def chips(rec: dict) -> str:
         else:
             out.append(f'<span class="fd-chip fd-chip-off" '
                        f'title="not in this module">{esc(l["label"])}</span>')
-    return "".join(out)
+    # nowrap: the labels are tiny and always the same three, so letting them
+    # wrap only ever costs row height
+    return f'<span class="fd-chips">{"".join(out)}</span>'
 
 
 def code(s: Any) -> str:
     return f"<code>{esc(s)}</code>" if s else "—"
 
 
+def cell_list(items: list[str], noun: str, *, inline_max: int = 2,
+              sep: str = ", ") -> str:
+    """A list cell that stays one line tall until you ask for it.
+
+    One long cell sets the height of its whole row, so a lost area carrying 21
+    creatures — or an item with a paragraph of loot sources — used to stretch
+    that row over a dozen lines while every other cell in it sat empty.  Short
+    lists stay inline; longer ones collapse behind a count you can click.
+    """
+    items = [i for i in items if i]
+    if not items:
+        return "—"
+    if len(items) <= inline_max:
+        return sep.join(items)
+    return (f'<details class="fd-cell"><summary>{len(items)} {esc(noun)}</summary>'
+            '<ul class="fd-lines">'
+            + "".join(f"<li>{i}</li>" for i in items) + "</ul></details>")
+
+
 class Page:
     """Accumulates HTML plus the table of contents it needs."""
 
-    OPEN_LIMIT = 50  # rows below which a block starts expanded
+    # Every block starts collapsed, on every load.  <details> keeps no state of
+    # its own, and none is added on purpose: the page opens as a scannable
+    # index of counts, identical for everyone, rather than restoring whatever
+    # the last visitor happened to leave open.
 
     def __init__(self) -> None:
         self.parts: list[str] = []
@@ -1630,17 +1654,14 @@ class Page:
     def note(self, html: str, cls: str = "tip-box") -> None:
         self.w(f'<div class="{cls}"><p>{html}</p></div>')
 
-    def block(self, title: str, count: int, body: str, *, sub: str = "",
-              open_: bool | None = None) -> None:
-        """A collapsible subsection carrying its own row count."""
-        if open_ is None:
-            open_ = 0 < count <= self.OPEN_LIMIT
+    def block(self, title: str, count: int, body: str, *, sub: str = "") -> None:
+        """A collapsible subsection carrying its own row count, always closed."""
         if not count:
             self.w(f'<details class="fd-block"><summary>{esc(title)} '
                    f'<span class="fd-count">0</span></summary>'
                    f'<p class="muted">None.</p></details>')
             return
-        self.w(f'<details class="fd-block"{" open" if open_ else ""}>'
+        self.w('<details class="fd-block">'
                f'<summary>{esc(title)} <span class="fd-count">{count}</span></summary>'
                + (f'<p class="muted">{sub}</p>' if sub else "") + body + "</details>")
 
@@ -1714,16 +1735,24 @@ FD_STYLE = """
     .fd-scroll { overflow-x: auto; margin-bottom: 0.9em; }
     .fd-scroll table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
     .fd-scroll th, .fd-scroll td { border-bottom: 1px solid var(--border);
-                                   padding: 0.35em 0.6em; text-align: left;
-                                   vertical-align: top; }
+                                   padding: 0.3em 0.6em; text-align: left;
+                                   vertical-align: top; line-height: 1.35; }
     .fd-scroll th { color: var(--muted); font-weight: 600; white-space: nowrap; }
     .fd-scroll td.num, .fd-scroll th.num { text-align: right; white-space: nowrap; }
     .fd-scroll tr:hover td { background: rgba(107,58,28,0.04); }
     .fd-filter { width: 100%; max-width: 26em; margin: 0.5em 0 0.6em;
                  padding: 0.35em 0.6em; border: 1px solid var(--border);
                  border-radius: 3px; background: var(--bg); color: var(--fg); }
+    /* A single tall cell sets the height of its whole row, so long lists
+       collapse behind a count and the always-identical wiki chips never wrap. */
+    .fd-cell > summary { cursor: pointer; color: var(--link); white-space: nowrap;
+                         font-size: 0.95em; }
+    .fd-cell > summary:hover { color: var(--link-hover); }
+    .fd-cell[open] > summary { margin-bottom: 0.2em; color: var(--muted); }
+    .fd-cell .fd-lines { margin-left: 1em; }
+    .fd-chips { white-space: nowrap; }
     .fd-chip { display: inline-block; font-size: 0.78em; line-height: 1.5;
-               padding: 0 0.5em; margin: 0 0.22em 0.15em 0; border-radius: 9px;
+               padding: 0 0.5em; margin: 0 0.22em 0 0; border-radius: 9px;
                border: 1px solid var(--accent-soft); white-space: nowrap; }
     a.fd-chip { background: rgba(200,165,119,0.18); }
     .fd-chip-off { color: var(--muted); border-style: dashed; opacity: 0.6;
@@ -1762,8 +1791,8 @@ def _changes_html(changes: dict) -> str:
     out = []
     for f, v in sorted(changes.items()):
         if isinstance(v, dict) and "fork" in v:
-            out.append(f"<li><b>{esc(f)}</b>: {esc(_val(v['fork']))} → "
-                       f"{esc(_val(v['baseline']))}</li>")
+            out.append(f"<b>{esc(f)}</b>: {esc(_val(v['fork']))} → "
+                       f"{esc(_val(v['baseline']))}")
         elif isinstance(v, dict):
             bits = []
             for lbl, key in (("removed since", "removed"), ("added since", "added")):
@@ -1771,9 +1800,9 @@ def _changes_html(changes: dict) -> str:
                 if vals:
                     bits.append(f'<li>{lbl}: ' + ", ".join(
                         f"<code>{esc(x)}</code>" for x in vals) + "</li>")
-            out.append(f"<li><b>{esc(f)}</b><ul class=\"fd-lines\">"
-                       + "".join(bits) + "</ul></li>")
-    return f'<ul class="fd-lines">{"".join(out)}</ul>'
+            out.append(f"<b>{esc(f)}</b><ul class=\"fd-lines\">"
+                       + "".join(bits) + "</ul>")
+    return cell_list(out, "fields changed", inline_max=1, sep="; ")
 
 
 def _diff_html(diff: list[str], truncated: bool) -> str:
@@ -1871,10 +1900,10 @@ def render_html(payload: dict) -> str:
     rows = []
     for a in lost["areas"]:
         contained = a.get("contains", {}).get("creatures") or []
-        manifest = ", ".join(
-            f'{linked(c, c["name"])} <span class="muted">(CR {c["cr"]:g}'
-            + (f' ×{c["count"]}' if c["count"] > 1 else "") + ")</span>"
-            for c in contained) or '<span class="muted">—</span>'
+        manifest = cell_list(
+            [f'{linked(c, c["name"])} <span class="muted">(CR {c["cr"]:g}'
+             + (f' ×{c["count"]}' if c["count"] > 1 else "") + ")</span>"
+             for c in contained], "creatures", inline_max=1)
         rows.append([linked(a, a["name"]), code(a["resref"]), chips(a),
                      esc(_forks(a)), str(a["creature_count"]),
                      str(a["encounter_count"]), str(a["store_count"]),
@@ -1890,7 +1919,8 @@ def render_html(payload: dict) -> str:
          "Placed in"],
         [[linked(c, c["name"]), code(c["resref"]), chips(c), esc(_forks(c)),
           f'{c["cr"]:g}', esc(c["hp"]), esc(c["race"]), esc(c["faction"]),
-          esc(", ".join(a for a in c["areas"] if a)) or "<i>blueprint only</i>"]
+          (cell_list([esc(a) for a in c["areas"] if a], "areas")
+           if any(c["areas"]) else "<i>blueprint only</i>")]
          for c in lost["creatures"]], nums={4, 5}))
 
     p.block("Items", len(lost["items"]), p.table(
@@ -1899,7 +1929,8 @@ def render_html(payload: dict) -> str:
         [[linked(i, i["name"]), code(i["resref"]), chips(i), esc(_forks(i)),
           esc(i["base_item"]), _fmt_gp(i["cost_gp"]),
           "yes" if i["accessible_in_fork"] else "no",
-          esc("; ".join(i.get("sources") or [])) or "—"]
+          cell_list([esc(s) for s in (i.get("sources") or [])], "sources",
+                    inline_max=1)]
          for i in lost["items"]], nums={5}))
 
     # -- accessibility ---------------------------------------------------
@@ -1915,7 +1946,8 @@ def render_html(payload: dict) -> str:
         [[linked(i, i["name"]), code(i["resref"]), chips(i), esc(_forks(i)),
           esc(_match_kinds(i)), _fmt_gp(i["cost_gp"]),
           esc(i["reason_now"]) or "—",
-          esc("; ".join(i["sources_in_fork"])) or "—"]
+          cell_list([esc(s) for s in i["sources_in_fork"]], "sources",
+                    inline_max=1)]
          for i in reg], nums={5}),
         sub=f"Per fork: {esc(per)}. Counter-check: {acc['items_improved_count']} "
             f"item(s) moved the other way (unreachable in a fork, reachable now).")
@@ -1937,8 +1969,9 @@ def render_html(payload: dict) -> str:
          "Was placed in", "Baseline blueprints of this name"],
         [[linked(c, c["name"]), code(c["resref"]), chips(c), esc(_forks(c)),
           esc(_match_kinds(c)), f'{c["cr"]:g}',
-          esc(", ".join(c["areas_in_fork"])) or "—",
-          ", ".join(f'<code>{esc(s["resref"])}</code>' for s in c["siblings"]) or "—"]
+          cell_list([esc(a) for a in c["areas_in_fork"]], "areas"),
+          cell_list([f'<code>{esc(s["resref"])}</code>' for s in c["siblings"]],
+                    "blueprints", inline_max=3)]
          for c in spawn], nums={5}),
         sub="No blueprint of this name is placed anywhere in the baseline, so the "
             "creature really is absent from the live world. The last column lists "
@@ -1950,14 +1983,15 @@ def render_html(payload: dict) -> str:
             len(dup), p.table(
         ["Kind", "Name", "Matched blueprint", "Live under", "Wiki"],
         [[r["kind"], linked(r, r["name"]), code(r["resref"]),
-          ", ".join(f'<code>{esc(s["resref"])}</code>'
-                    for s in r["siblings"] if s["ok"]) or "—",
+          cell_list([f'<code>{esc(s["resref"])}</code>'
+                     for s in r["siblings"] if s["ok"]], "blueprints",
+                    inline_max=3),
           chips(r)] for r in dup]),
         sub="These matched an unplaced/unreachable baseline blueprint, but another "
             "blueprint of the <b>same name</b> is placed or reachable — identity "
             "resolution consumes each baseline entity once, so it can land on the "
             "dead twin of a name that is perfectly alive. Listed so you can see why "
-            "an entry you expected above is not there.", open_=False)
+            "an entry you expected above is not there.")
 
     # -- content by name -------------------------------------------------
     div = payload["divergence"]
@@ -1977,7 +2011,8 @@ def render_html(payload: dict) -> str:
             ["Name", "In fork", "Fork resref", "Baseline resref(s)", "Wiki",
              "Autonumbered"],
             [[linked(r, r["name"]), esc(r["fork"]), code(r["fork_resref"]),
-              ", ".join(f'<code>{esc(x)}</code>' for x in r["baseline_resrefs"]),
+              cell_list([f'<code>{esc(x)}</code>' for x in r["baseline_resrefs"]],
+                        "resrefs", inline_max=3),
               chips(r), "yes" if r["autonumbered"] else ""]
              for r in nd["renamed"]]),
             sub="Same name on both sides, different resref — the content survived, "
@@ -1985,15 +2020,17 @@ def render_html(payload: dict) -> str:
         p.block(f"{kind.title()}s only a fork has (by name)", len(nd["only_in_fork"]),
                 p.table(["Name", "In fork(s)", "Fork resref(s)", "Wiki"],
                         [[linked(r, r["name"]), esc(_forks(r)),
-                          ", ".join(f'<code>{esc(v)}</code>'
-                                    for v in r["fork_resrefs"].values()),
+                          cell_list([f'<code>{esc(v)}</code>'
+                                     for v in r["fork_resrefs"].values()],
+                                    "resrefs", inline_max=3),
                           chips(r)] for r in nd["only_in_fork"]]))
         p.block(f"{kind.title()}s only the baseline has (by name)",
                 len(nd["only_in_baseline"]),
                 p.table(["Name", "Baseline resref(s)", "Wiki"],
                         [[linked(r, r["name"]),
-                          ", ".join(f'<code>{esc(x)}</code>'
-                                    for x in r["baseline_resrefs"]),
+                          cell_list([f'<code>{esc(x)}</code>'
+                                     for x in r["baseline_resrefs"]],
+                                    "resrefs", inline_max=3),
                           chips(r)] for r in nd["only_in_baseline"]]),
                 sub="Added since the fork.")
 
@@ -2018,7 +2055,7 @@ def render_html(payload: dict) -> str:
                       linked(r, r["baseline_name"]), chips(r)] for r in auto]),
             sub="The toolset assigns these resrefs, so two modules landing on the same "
                 "one means nothing was deliberately repurposed. Separated out so they "
-                "do not drown the list above.", open_=False)
+                "do not drown the list above.")
 
     p.h3("Rebalanced")
     p.w('<p class="muted">Matched on both sides, same content, different numbers. '
@@ -2032,7 +2069,7 @@ def render_html(payload: dict) -> str:
                  if r.get("fork_name") else ""),
               code(r["resref"]), chips(r), esc(r["fork"]), esc(r["match_kind"]),
               _changes_html(r["changes"])]
-             for r in rows]), open_=False)
+             for r in rows]))
 
     # -- dialogs ---------------------------------------------------------
     dlg = payload["dialogs"]
@@ -2057,7 +2094,8 @@ def render_html(payload: dict) -> str:
          "Wiki"],
         [[code(r["resref"]), code(r["baseline_resref"]), esc(_forks(r)),
           str(r["nodes"]),
-          esc(_owner_summary(r["owners_in_fork"])) or "—", chips(r)]
+          cell_list([esc(o["name"]) for o in r["owners_in_fork"]], "NPCs"),
+          chips(r)]
          for r in ren], nums={3}),
         sub="Identical text under a different resref — not lost, just moved.")
 
@@ -2078,7 +2116,7 @@ def render_html(payload: dict) -> str:
     p.block("Dropped conversations", len(drop), "".join(body),
             sub="Gone from the baseline entirely. Each expands to its full transcript "
                 "— including the scripts each node fired — so the writing can be "
-                "reclaimed straight off this page.", open_=False)
+                "reclaimed straight off this page.")
 
     chg = dlg["changed"]
     body = []
@@ -2106,16 +2144,15 @@ def render_html(payload: dict) -> str:
                 "<span class=\"fd-diff\" style=\"padding:0 .3em\">"
                 "<span class=\"del\">-</span></span> is a line the fork had and "
                 "<span class=\"fd-diff\" style=\"padding:0 .3em\">"
-                "<span class=\"add\">+</span></span> is what replaced it.",
-            open_=False)
+                "<span class=\"add\">+</span></span> is what replaced it.")
 
     own = dlg["owner_changed"]
     p.block("Conversations whose speaker changed", len(own), p.table(
         ["resref", "In fork(s)", "Spoken by in the fork", "Spoken by now", "Wiki"],
         [[code(r["resref"]), esc(_forks(r)),
-          esc(", ".join(r["owners_in_fork"])) or "—",
-          esc(", ".join(r["owners_in_baseline"]))
-          or "<b>nobody — orphaned</b>", chips(r)]
+          cell_list([esc(o) for o in r["owners_in_fork"]], "NPCs"),
+          (cell_list([esc(o) for o in r["owners_in_baseline"]], "NPCs")
+           if r["owners_in_baseline"] else "<b>nobody — orphaned</b>"), chips(r)]
          for r in own]),
         sub="The conversation still exists, but a different NPC speaks it — or none "
             "does, which means players can no longer hear it.")
