@@ -587,6 +587,32 @@ items:
     crit_chance_per_round, _rounds_to_drop, _devcrit_rounds, save_fail_chance,
     simulate.
 
+- id: util-module
+  phase: 1
+  title: Give the homeless generic helpers and crit-feat maths a module
+  status: pending
+  gate: zero-diff
+  after: [sim-combat]
+  plan: >
+    A handful of small symbols have no backlog home and are now the sole blockers
+    for three later items.  (1) _try_int — a 6-line int-coerce-with-default with 20
+    cli.py call sites; it blocks _kit_conflicts, _weapon_raw_damage, reference_pc
+    and the crit-feat block.  Give it a leaf home (util.py) that anything may
+    import.  (2) The 2DA-driven crit/finesse maths whose own dependencies are all
+    already extracted, and which sim-combat had to leave behind along with the
+    "Critical-hit feats" banner and _OVERWHELMING_DIE, _DEVCRIT_DIE_BY_SIZE,
+    _DEVCRIT_DIE_LARGE, _IMPROVED_CRIT_MIN_BAB, _EPIC_CRIT_MIN_STR:
+    weapon_feat_id, _devcrit_die, crit_feat_effects (need
+    lookups.BASEITEM_COLUMNS_SEEN, lookups.WEAPONS, combat.ability_mod),
+    WEAPON_FINESSE_FEAT, FINESSE_BASEITEMS, EPIC_TOUGHNESS_BASE, epic_toughness_hp
+    and _CWEAP_SLOTS.  combat.py and items.py are the natural homes; pick per
+    symbol and leave no cycle.
+  notes: >
+    Do NOT also collapse the inlined try/int/except duplicates of _try_int — that
+    is phase-3 dedup-formatting.  This item only gives the existing symbols a home.
+    Landing it makes sim-crit-feats trivial and unblocks the gear half of
+    sim-pc-gear.
+
 - id: item-extractors-module
   phase: 1
   title: Move the item offence/defence extractors into items.py
@@ -610,13 +636,36 @@ items:
   title: Extract the reference PC and gear-kit search into sim/pc.py + sim/gear.py
   status: pending
   gate: zero-diff
-  after: [sim-combat]
+  after: [sim-combat, util-module, item-extractors-module]
   ranges: "8592-9060"
   plan: >
     pc.py: the feat-budget helpers (_general_feat_slots, _fighter_bonus_slots,
     _great_ability_tiers, _epic_toughness_tiers, _kit_pieces) and reference_pc.
     gear.py: build_gear_pool, _prune_pool, _weapon_raw_damage, _kit_conflicts,
     best_in_slot_kit, minimum_viable_kit, extract_creature_offense.
+  notes: >
+    2026-08-09 (commit 87ea1ff): PARTIAL.  Only the feat-budget half landed —
+    sim/pc.py, 77 lines, pure stdlib: _GREAT_ABILITY_TIERS, _EPIC_TOUGHNESS_TIERS,
+    _FIRST_EPIC_LEVEL and the five helpers, gate --all IDENTICAL.  Everything else
+    is blocked on symbols still resident in cli.py, and no submodule may import cli:
+    reference_pc needs _try_int, FINESSE_BASEITEMS, weapon_feat_id,
+    crit_feat_effects, weapon_damage_props, epic_toughness_hp, EPIC_TOUGHNESS_BASE;
+    build_gear_pool needs extract_item_offense/extract_item_defense;
+    _weapon_raw_damage and _kit_conflicts need _try_int (and weapon_damage_props);
+    _prune_pool, best_in_slot_kit and minimum_viable_kit chain off those;
+    extract_creature_offense needs extract_item_offense, crit_feat_effects,
+    _try_int, _CWEAP_SLOTS, WEAPON_FINESSE_FEAT, FINESSE_BASEITEMS.  sim/gear.py was
+    deliberately NOT created — an empty module is worse than none.  Deps corrected
+    to require util-module (homes _try_int and the crit/finesse maths) and
+    item-extractors-module (homes the extract_item_* pair); resume when both land.
+    OPEN QUESTION for the resume, not blocking: extract_creature_offense is creature
+    extraction, not gear, and its sibling extract_creature_defenses stays in cli.py
+    for render-creature-page — putting one in sim/gear.py and the other in cli.py
+    splits a deliberately-paired API.  Decide before moving it.
+  found:
+    - "best_in_slot_kit and minimum_viable_kit each define a byte-identical inner
+       `def _sim(k): return simulate(reference_pc(level, k, db), creature)` — a
+       dedup candidate for phase 3."
 
 - id: bestiary-module
   phase: 1
@@ -1077,22 +1126,6 @@ items:
     _parse_cr rather than calling it.  Those sentinels sort differently.  Resolve
     it deliberately — if which one is correct isn't obvious, take the
     design-question hatch.  Do NOT silently unify them.
-
-- id: sim-crit-feats
-  phase: 3
-  title: Move the crit-feat block into sim/ once _try_int has a home
-  status: pending
-  gate: zero-diff
-  after: [dedup-formatting]
-  plan: >
-    sim-combat had to leave _devcrit_die, weapon_feat_id, crit_feat_effects and
-    their constants (_OVERWHELMING_DIE, _DEVCRIT_DIE_BY_SIZE, _DEVCRIT_DIE_LARGE,
-    _IMPROVED_CRIT_MIN_BAB, _EPIC_CRIT_MIN_STR) plus the "Critical-hit feats"
-    banner in cli.py: the last two call _try_int, which has 20 cli.py call sites,
-    so importing it back into sim/combat.py would be a cycle.  dedup-formatting
-    gives _try_int a home; afterwards move the block into sim/combat.py (or a
-    sim/crit.py).  Its other needs — lookups.WEAPONS,
-    lookups.BASEITEM_COLUMNS_SEEN, combat.ability_mod — are already cycle-free.
 
 - id: dedup-map-js
   phase: 3
