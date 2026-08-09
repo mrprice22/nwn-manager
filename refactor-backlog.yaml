@@ -696,8 +696,53 @@ items:
 - id: sim-pc-gear
   phase: 1
   title: Extract the reference PC and gear-kit search into sim/pc.py + sim/gear.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: da02a31
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (142s), lotr2008 IDENTICAL (92s), lotr2009 IDENTICAL (105s)"
+  impl_notes: >
+    Shipped in two commits.  87ea1ff took the feat-budget half into sim/pc.py (77
+    lines) while reference_pc and the whole gear side were still blocked on cli.py
+    residents; da02a31 finished it once util-module and item-extractors-module had
+    homed those.  pc.py 77 -> 292 (the reference-PC banner, REFERENCE_PC_CLASS,
+    _PC_HIT_DIE, _PRE_EPIC_CAP, _FIGHTER_CORE_FEATS, _EPIC_PROWESS_FEATS,
+    _FULL_HEAL_ROUNDS, reference_pc); new gear.py 235 lines (build_gear_pool,
+    _prune_pool, _weapon_raw_damage, _kit_conflicts, best_in_slot_kit,
+    minimum_viable_kit).  cli.py 15,041 -> 14,643, gaining one 6-line import block.
+    Graph stays acyclic: sim.gear -> sim.pc -> items -> sim.combat.
+    DECISION on the open question: extract_creature_offense STAYS in cli.py.  No
+    gear code calls it, so moving it buys no import simplification and would drag
+    gff.fld/list_items, lookups.spell_name, htmlgen.escape.nwn_text,
+    combat.feat_attack_bonus and the SLOT_CWEAP_*/_CWEAP_SLOTS constants into
+    gear.py; and its D argument is an undocumented dict contract produced by
+    extract_creature_defenses, so splitting producer from consumer across files
+    would make that contract unreviewable.  Move the pair together in
+    render-creature-page, ideally into a nwn_wiki/creatures.py rather than sim/.
+    Line multiset: 6 added lines (the import block), every removed line verbatim
+    downstream, both moved blocks verified as contiguous substrings of their
+    destinations.
+  found:
+    - "best_in_slot_kit and minimum_viable_kit each define a byte-identical inner
+       `def _sim(k): return simulate(reference_pc(level, k, db), creature)` — a
+       dedup candidate for phase 3."
+    - "sim/pc.py's docstring is stale twice over: it still says reference_pc 'still
+       lives in nwn_wiki.cli'.  sim/__init__.py omits gear, and sim/combat.py's
+       docstring says the weapon-side inputs are built by the caller in cli."
+    - "cli.py has accumulated ~20 now-unused imports across phase 1 (CLASS_BAB,
+       STOCK_FEAT_NAMES, Callable, _CEP_WEAPON_BASEITEMS, _brand_html,
+       _custom_manual_dropdowns, _docs_dropdown, _faction_dd, _img_pixel_size,
+       _manual_menu_rows, avg_roll, baseitem_slots, weapon_enhancement,
+       EPIC_TOUGHNESS_BASE, _class_bab, _FIRST_EPIC_LEVEL, _epic_toughness_tiers,
+       _great_ability_tiers, _kit_pieces, extract_item_defense, simulate).  Prune
+       them in cli-module, which already owns the end-of-phase-1 tidy."
+    - "_prune_pool, _kit_pieces, _item_accessible and _CWEAP_SLOTS are underscore-
+       private yet imported across module boundaries — a naming pass should promote
+       the ones that are genuinely package API."
+    - "reference_pc is rebuilt from scratch for every candidate piece in both solver
+       loops, though the ability-score/feat portion is invariant across most trials.
+       Memoising or splitting out the invariant part is a performance opportunity."
+
   after: [sim-combat, util-module, item-extractors-module]
   ranges: "8592-9060"
   plan: >
@@ -997,6 +1042,11 @@ items:
     imports.  Verify nothing is left behind, confirm bin/nwn-wiki is still a thin
     shim, and check the module count and per-module line counts look sane
     (target: no module over ~900 lines except the ones phase 4 addresses).
+    ALSO: prune the ~20 imports the extractions left dead in cli.py (list in
+    sim-pc-gear's found:), and fix the module docstrings that went stale as code
+    moved on past them — twoda.py, lookups.py, items.py, combat.py, sim/pc.py,
+    sim/combat.py and sim/__init__.py all describe a layout that no longer holds.
+    Both are no-ops for output, so the zero-diff gate covers them cheaply.
 
 # ---------------------------------------------------------------------------
 # Phase 2 — page chrome and the nav-desync bugs.  Output changes on purpose.
