@@ -973,8 +973,39 @@ items:
 - id: db-dialogs
   phase: 1
   title: Split dialog indexing into db/dialogs.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: d01b291
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (136s), lotr2008 IDENTICAL (83s), lotr2009 IDENTICAL (107s)"
+  impl_notes: >
+    db/dialogs.py 351 lines (25 scaffolding + the 326-line body verbatim); cli.py
+    12,895 -> 12,569.  class Db(DbDialogsMixin, DbScriptsMixin, DbIndexMixin,
+    DbCore).  The body needed only time, defaultdict and gff.fld/list_items — a free-
+    name scan confirmed everything else is a local or self.  DECISION: the six
+    *_EVENT_FIELDS class dicts STAY in cli.py's Db body.  index_dialogs is nowhere
+    near their dominant consumer — ~20 further read sites across the remaining Db
+    methods (_index_script_item_sources, _index_script_item_checks,
+    _build_store_openers, _build_direct_teleport_transitions) plus free renderers
+    reaching in as db.MODULE_EVENT_FIELDS etc.  Moving them would have made most of
+    the monolith's Db body depend on the dialogs mixin for its own class attributes;
+    they resolve through self. from the assembled class either way.  Nothing else
+    dragged along or left behind.  dir(Db) byte-identical to HEAD; MRO linear.
+  found:
+    - "The six *_EVENT_FIELDS dicts are pure constant tables with no self dependency,
+       shared between the dialogs mixin, ~10 other Db methods and free renderers.
+       They want a plain module (events.py or lookups.py) imported by both sides —
+       but that would change dir(Db), so it needs its own item with a declared
+       surface change, not a zero-diff move."
+    - "TRIGGER_EVENT_FIELDS carries both the bare (OnEnter) and Script-prefixed
+       (ScriptOnEnter) GFF spellings mapping to the same labels while
+       CREATURE_EVENT_FIELDS uses only Script*.  Looks deliberate (blueprint vs
+       instance naming) but is a latent double-counting source that _add_caller's
+       dedupe currently masks."
+    - "index_dialogs ends by chaining seven dependent passes whose ordering
+       constraints are documented only in prose docstrings ('Must run after ...').
+       Worth an explicit pipeline in a later phase."
+
   after: [db-scripts]
   ranges: "3921-4246 (index_dialogs, 326 lines)"
 
