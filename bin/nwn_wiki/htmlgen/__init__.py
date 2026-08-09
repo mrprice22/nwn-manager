@@ -9,6 +9,8 @@ just the piece they need:
   conversations, factions, races and tilesets.
 * :mod:`nwn_wiki.htmlgen.markdown` -- the minimal Markdown-to-HTML
   converter used for the module's manual pages (stdlib only).
+* :mod:`nwn_wiki.htmlgen.chrome` -- the page shell, nav dropdowns, theme
+  asset loader and creature-picture index.
 
 This package deliberately re-exports nothing; import from the submodules.
 """
