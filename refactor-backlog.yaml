@@ -1137,8 +1137,39 @@ items:
 - id: render-areas
   phase: 1
   title: Extract area index/page/container renderers into render/areas.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 2961eb8
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (131s), lotr2008 IDENTICAL (85s), lotr2009 IDENTICAL (100s)"
+  impl_notes: >
+    render/areas.py 418 lines; cli.py 11,481 -> 11,081.  Moved build_area_graph,
+    bfs_shortest_path, render_areas_index and render_container_page.  SCOPE REDUCED:
+    render_area_page (515 lines) and its _OMIT sentinel stayed — it calls
+    creature_max_hp plus the store-instance block (_store_buy_summary,
+    _buy_limit_str, _store_item_gp_stats, _store_opener_html), all still in cli.py,
+    and the drag-along is not contained: _store_opener_html falls through to
+    _caller_html (~90 lines of dialog/caller rendering) and _store_buy_summary pulls
+    _store_buy_base_types, so ~200 lines of store and conversation code would land in
+    render/areas.py and pre-empt render-stores and render-conversations.  New item
+    render-area-page picks it up after those land.  STATE AUDIT: zero — none of the
+    four moved functions reads or writes any state symbol (AST free-name analysis
+    plus a state. grep), and neither does render_area_page; everything flows through
+    the db argument read-only.  Line multiset: 6 added lines, all import-block
+    entries; every removed line present verbatim in areas.py.
+  found:
+    - "creature_max_hp is pure combat maths with no cli dependency, sitting beside
+       creature_feat_ids/TUMBLE_SKILL_ID/ARMOR_SKIN_FEAT/MONK_CLASS_ID.  Moving it
+       to combat.py would cheaply remove one of render_area_page's five blockers."
+    - "cli.py gained three more dead imports: tileset_name and placeable_name from
+       lookups, and deque — whose import line is shared with Counter and defaultdict,
+       so the sweep must edit rather than delete that line."
+    - "render/areas.py annotates db: Db / db: \"Db\" with no Db in scope — harmless
+       under PEP 563 and identical to render/map.py's precedent, but the render/
+       package will want a TYPE_CHECKING import or a Protocol."
+    - "Carried over verbatim: build_area_graph quotes the Db annotation while
+       render_areas_index and render_container_page leave it bare."
+
   after: [render-map]
   ranges: "6528-7444"
   plan: >
@@ -1230,6 +1261,26 @@ items:
   gate: zero-diff
   after: [render-quests]
   ranges: "14290-14878"
+
+- id: render-area-page
+  phase: 1
+  title: Move render_area_page into render/areas.py
+  status: pending
+  gate: zero-diff
+  after: [render-stores, render-conversations]
+  plan: >
+    render-areas had to leave render_area_page (515 lines, nesting depth 6) and its
+    _OMIT sentinel in cli.py: it calls creature_max_hp and the store-instance block
+    (_store_buy_summary, _buy_limit_str, _store_item_gp_stats, _store_opener_html ->
+    _caller_html -> _store_buy_base_types), which would have dragged ~200 lines of
+    store and conversation rendering into render/areas.py.  Once render-stores and
+    render-conversations have homed those, move it into render/areas.py AS-IS — do
+    not flatten the nesting, that is phase-4 render-page-split.  _OMIT is also read
+    by main(), so it will need an import-back.
+  notes: >
+    creature_max_hp is the cheap blocker: it is pure combat maths with no cli
+    dependency and belongs in combat.py.  Move it there as part of this item (or
+    earlier, if another item passes through that code).
 
 - id: render-scripts-manual
   phase: 1
