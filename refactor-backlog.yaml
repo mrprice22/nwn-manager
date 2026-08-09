@@ -513,8 +513,35 @@ items:
 - id: layout-module
   phase: 1
   title: Extract area force-directed layout into layout.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: bc042d0
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (134s), lotr2008 IDENTICAL (86s), lotr2009 IDENTICAL (107s)"
+  impl_notes: >
+    layout.py 342 lines; cli.py 16,047 -> 15,723.  Moved the "# Directional area
+    layout" banner, _transition_dir and layout_areas (with its nested ideal_len and
+    _bfs_place_comp).  Nothing left behind and no cycle: Db appears only in the
+    quoted annotation db: "Db | None", so layout.py needs neither a Db import nor a
+    TYPE_CHECKING block; deps are math, random, defaultdict and gff.fld, with zero
+    state access.  Only layout_areas is called from outside the block —
+    _transition_dir had no other callers.  Iteration order, sorts and RNG use were
+    left byte-identical, so the PYTHONHASHSEED-sensitive map output is unchanged.
+    Line multiset: exactly one line added (the import), every removed non-blank line
+    present in layout.py.
+  found:
+    - "`import random` in cli.py is now unused — layout_areas was its only consumer.
+       Drop it in a later cleanup pass."
+    - "layout_areas unpacks main_h from comp_positioned[0] and never uses it;
+       _transition_dir unpacks `name` from the sorted edges triple and never uses it."
+    - "layout_areas's db parameter defaults to None and the whole edge_dirs pass plus
+       sizes[] lookups are guarded on `db is not None`, so the db=None path silently
+       degrades to a plain force layout — at odds with what the docstring implies."
+    - "In the force loop, `sign` is unpacked and unused, and the loop variable t_id
+       sits confusingly next to the temperature variable t."
+    - "The repulsion pass is O(n^2) per iteration across 600 iterations with no
+       spatial index — the dominant cost of map generation on large modules."
+
   after: [htmlgen-chrome]
   ranges: "4938-5261 (_transition_dir, layout_areas)"
 
