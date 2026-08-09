@@ -8,3 +8,8 @@ __pycache__/
 # Nimble/Atlas dependency source checkouts (e.g. neverwinter.nim and its
 # transitive deps), vendored in-place at build time — not project source.
 /githubcom_*/
+
+# golden-diff gate baselines (wiki-golden)
+/.golden/
+# autopilot WIP marker (local machine state)
+/autopilot-wip.md

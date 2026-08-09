@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/var/home/james/GIT/nwn_manager-refactor/bin/autopilot-safety-commit PreCompact",
+            "timeout": 60,
+            "statusMessage": "Autopilot safety-net commit"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/var/home/james/GIT/nwn_manager-refactor/bin/autopilot-safety-commit SessionEnd",
+            "timeout": 60,
+            "statusMessage": "Autopilot safety-net commit"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""wiki-golden — golden-output gate for nwn-wiki refactoring.
+
+Regenerates the static wiki from one or more frozen module corpora and diffs the
+result against a recorded baseline.  This is the mechanical pass/fail gate the
+refactor autopilot runs after every backlog item: a pure code move must produce
+byte-identical output, and an item that deliberately changes output must declare
+in advance which paths (and optionally which lines) are allowed to move.
+
+  wiki-golden baseline [--corpus NAME | --all]     record the baseline
+  wiki-golden check    [--corpus NAME | --all] [--expect FILE]
+  wiki-golden rebaseline [--corpus NAME | --all]   promote the last check
+  wiki-golden corpora                              list configured corpora
+
+Why the scratch tree: nwn-wiki derives its module-index output directory from
+``--src`` (``src.parent / "module-index"``), *not* from ``--out``.  Pointing
+--src straight at a live project would rewrite that project's module-index on
+every gate run.  So each corpus is reflink-copied into .golden/work/<corpus>/
+first (near-free on btrfs) and the build runs entirely inside it.
+
+Determinism.  Three things have to be pinned:
+
+  --seed 1            the area-layout RNG (random.Random(seed))
+  PYTHONHASHSEED=0    nwn-wiki iterates plain sets in several places, so string
+                      hash randomisation reorders the area-map SVG nodes, the
+                      faction rows and some conversation tables between runs.
+                      This is a real pre-existing quirk -- it makes every
+                      published docs/ rebuild churn spuriously -- and there is a
+                      backlog item to sort those iterations properly.  Until
+                      then the gate pins the seed so the diff means something.
+  no --log-dir/--db-dir   keeps the activity and bestiary paths (wall-clock time
+                      and a live SQLite DB) out of the build entirely.
+
+What is left is normalised away: the build timestamp in docs/assets/meta.json,
+the "generated_at" key in every module-index JSON, and the _Generated line in
+module-index/counter_gear.md.
+
+Pure stdlib.  No third-party deps.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import fnmatch
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BIN_DIR = Path(__file__).resolve().parent
+REPO = BIN_DIR.parent
+GOLDEN = REPO / ".golden"
+GIT_ROOT = Path("/var/home/james/GIT")
+
+# Corpora are frozen module checkouts.  The primary one is the live module; the
+# two archives are deliberately never-changing CEP2 modules that exercise
+# different code paths (no custom TLK, no hak_2da overrides, no docs.manual).
+CORPORA: dict[str, dict] = {
+    "homers_lotr": {
+        "root": GIT_ROOT / "nwn_homers_lotr",
+        "args": [
+            "--base-url", "https://homerslotr.com/",
+            "--exclude-conv-option", "[Admin Options]",
+            "--exclude-conv-option", "[Options of the Homeless]",
+            "--max-character-level", "40",
+            "--max-ability-bonus", "24",
+            "--max-player-level", "60",
+            "--devcrit-bonus-dice", "3",
+            "--path-from", "thewelloferu",
+        ],
+        # relative to the corpus root; passed as an absolute path
+        "twoda_dir": "hak_2da",
+    },
+    "lotr2008": {
+        "root": GIT_ROOT / "nwn_lordoftherings",
+        "args": [
+            "--base-url", "https://lotr.homerslotr.com/",
+            "--module-name", "Lord of the Rings (2008)",
+            "--path-from", "welloferu",
+        ],
+    },
+    "lotr2009": {
+        "root": GIT_ROOT / "nwn_homers_lotr_2009",
+        "args": [
+            "--base-url", "https://2009.homerslotr.com/",
+            "--module-name", "Homer's LotR (2009)",
+        ],
+    },
+}
+
+# Project-root siblings of unpacked/ that nwn-wiki reads (never writes).
+# Symlinked into the scratch tree so theme, creature pics and the manual pages
+# are all exercised — the manual pages especially, since that is where the nav
+# desync bugs live.
+PROJECT_INPUTS = ["wiki-theme", "creature-pics", "docs.manual",
+                  "index.html", "index.md"]
+
+
+# --------------------------------------------------------------------------
+# scratch tree + build
+# --------------------------------------------------------------------------
+
+def _corpus_names(args: argparse.Namespace) -> list[str]:
+    if args.all:
+        return list(CORPORA)
+    if args.corpus:
+        if args.corpus not in CORPORA:
+            sys.exit(f"error: unknown corpus {args.corpus!r} "
+                     f"(known: {', '.join(CORPORA)})")
+        return [args.corpus]
+    return ["homers_lotr"]
+
+
+def _tlk_args(root: Path) -> list[str]:
+    """Mirror nwn-manager's TLK detection: dialog.tlk + first custom tlk."""
+    out: list[str] = []
+    tlk_dir = root / "tlk"
+    dialog = tlk_dir / "dialog.tlk"
+    if dialog.is_file():
+        out += ["--dialog-tlk", str(dialog)]
+    if tlk_dir.is_dir():
+        for f in sorted(tlk_dir.glob("*.tlk")):
+            if f.name != "dialog.tlk":
+                out += ["--custom-tlk", str(f)]
+                break
+    return out
+
+
+def _prepare_scratch(name: str) -> Path:
+    """Reflink-copy the corpus into .golden/work/<name>/ and return that dir."""
+    cfg = CORPORA[name]
+    root: Path = cfg["root"]
+    src = root / "unpacked"
+    if not src.is_dir():
+        sys.exit(f"error: corpus {name}: missing {src}")
+
+    work = GOLDEN / "work" / name
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+
+    # --reflink=auto: CoW clone on btrfs (near-instant, no extra space), and a
+    # plain copy elsewhere.  Deliberately NOT hardlinks -- a hardlink farm would
+    # share inodes with the live repo.
+    subprocess.run(["cp", "-a", "--reflink=auto", str(src), str(work / "unpacked")],
+                   check=True)
+
+    for entry in PROJECT_INPUTS:
+        real = root / entry
+        if real.exists():
+            (work / entry).symlink_to(real)
+
+    return work
+
+
+def build(name: str, dest: Path) -> float:
+    """Build the wiki for one corpus into dest/{docs,module-index}.
+
+    Returns wall-clock seconds.
+    """
+    cfg = CORPORA[name]
+    root: Path = cfg["root"]
+    work = _prepare_scratch(name)
+
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+
+    cmd = [str(BIN_DIR / "nwn-wiki"),
+           "--src", str(work / "unpacked"),
+           "--out", str(dest / "docs"),
+           "--seed", "1"]
+    cmd += _tlk_args(root)
+    if cfg.get("twoda_dir"):
+        cmd += ["--2da-dir", str(root / cfg["twoda_dir"])]
+    cmd += cfg["args"]
+
+    env = dict(os.environ, PYTHONHASHSEED="0")
+    t0 = time.time()
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    elapsed = time.time() - t0
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout[-4000:])
+        sys.stderr.write(proc.stderr[-4000:])
+        sys.exit(f"error: corpus {name}: nwn-wiki exited {proc.returncode}")
+
+    mi = work / "module-index"
+    if mi.is_dir():
+        shutil.move(str(mi), str(dest / "module-index"))
+
+    shutil.rmtree(work, ignore_errors=True)
+    _normalise(dest)
+    return elapsed
+
+
+def _normalise(dest: Path) -> None:
+    """Strip the known time-dependent outputs.
+
+    docs/assets/meta.json holds the build timestamp (site.js fetches it at view
+    time, so it is never baked into a page).  Every module-index JSON carries a
+    generated_at key, and counter_gear.md repeats it in prose.  Both sides of a
+    comparison go through this same pass, so the rewritten JSON formatting is
+    consistent.
+    """
+    meta = dest / "docs" / "assets" / "meta.json"
+    if meta.is_file():
+        meta.unlink()
+
+    mi = dest / "module-index"
+    if not mi.is_dir():
+        return
+
+    cg = mi / "counter_gear.md"
+    if cg.is_file():
+        text = cg.read_text(encoding="utf-8")
+        cg.write_text(re.sub(r"^_Generated [0-9T:-]+\.", "_Generated <normalised>.",
+                             text, count=1, flags=re.M), encoding="utf-8")
+
+    for f in sorted(mi.rglob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if isinstance(data, dict):
+            data.pop("generated_at", None)
+        f.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True,
+                                indent=2) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# comparison
+# --------------------------------------------------------------------------
+
+def _files(root: Path) -> dict[str, Path]:
+    return {str(p.relative_to(root)): p
+            for p in root.rglob("*") if p.is_file()}
+
+
+def _is_text(p: Path) -> bool:
+    return p.suffix.lower() in (".html", ".json", ".css", ".js", ".svg",
+                                ".txt", ".md", ".xml")
+
+
+class Expect:
+    """A declared allowance for output that is *meant* to change."""
+
+    def __init__(self, data: dict):
+        self.paths: list[str] = data.get("paths", [])
+        self.line_patterns = [re.compile(p) for p in data.get("line_patterns", [])]
+        self.reason: str = data.get("reason", "")
+
+    def path_ok(self, rel: str) -> bool:
+        return any(fnmatch.fnmatch(rel, pat) for pat in self.paths)
+
+    def line_ok(self, line: str) -> bool:
+        if not self.line_patterns:
+            return True
+        return any(p.search(line) for p in self.line_patterns)
+
+
+def compare(golden: Path, new: Path, expect: Expect | None) -> tuple[bool, list[str]]:
+    """Return (ok, report-lines)."""
+    g, n = _files(golden), _files(new)
+    report: list[str] = []
+    ok = True
+
+    added = sorted(set(n) - set(g))
+    removed = sorted(set(g) - set(n))
+    common = sorted(set(g) & set(n))
+
+    def flag(kind: str, rel: str) -> None:
+        nonlocal ok
+        allowed = expect.path_ok(rel) if expect else False
+        mark = "ok " if allowed else "!! "
+        if not allowed:
+            ok = False
+        report.append(f"  {mark}{kind}: {rel}")
+
+    for rel in added:
+        flag("added  ", rel)
+    for rel in removed:
+        flag("removed", rel)
+
+    for rel in common:
+        gb, nb = g[rel].read_bytes(), n[rel].read_bytes()
+        if gb == nb:
+            continue
+        allowed_path = expect.path_ok(rel) if expect else False
+        if not allowed_path:
+            ok = False
+            report.append(f"  !! changed: {rel}")
+            report += _hunk_preview(gb, nb, g[rel])
+            continue
+
+        # Path is allowed; if line_patterns were declared, every moved line
+        # must match one of them.
+        bad = _offending_lines(gb, nb, g[rel], expect)
+        if bad:
+            ok = False
+            report.append(f"  !! changed: {rel} (unexpected lines)")
+            report += [f"       {b}" for b in bad[:10]]
+        else:
+            report.append(f"  ok  changed: {rel}")
+
+    return ok, report
+
+
+def _decode(b: bytes) -> list[str]:
+    return b.decode("utf-8", errors="replace").splitlines()
+
+
+def _hunk_preview(gb: bytes, nb: bytes, path: Path, limit: int = 8) -> list[str]:
+    if not _is_text(path):
+        return [f"       (binary, {len(gb)} -> {len(nb)} bytes)"]
+    diff = difflib.unified_diff(_decode(gb), _decode(nb),
+                                "golden", "new", lineterm="", n=1)
+    lines = [ln for ln in diff if ln.startswith(("+", "-"))
+             and not ln.startswith(("+++", "---"))]
+    out = [f"       {ln[:160]}" for ln in lines[:limit]]
+    if len(lines) > limit:
+        out.append(f"       … {len(lines) - limit} more changed line(s)")
+    return out
+
+
+def _offending_lines(gb: bytes, nb: bytes, path: Path,
+                     expect: Expect) -> list[str]:
+    if not expect.line_patterns:
+        return []
+    if not _is_text(path):
+        return ["(binary file, line_patterns cannot apply)"]
+    diff = difflib.unified_diff(_decode(gb), _decode(nb), lineterm="", n=0)
+    bad = []
+    for ln in diff:
+        if ln.startswith(("+++", "---", "@@")) or not ln.startswith(("+", "-")):
+            continue
+        if not expect.line_ok(ln[1:]):
+            bad.append(ln[:160])
+    return bad
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_baseline(names: list[str]) -> int:
+    for name in names:
+        dest = GOLDEN / "golden" / name
+        print(f"[wiki-golden] baseline {name} …")
+        secs = build(name, dest)
+        n = len(_files(dest))
+        print(f"[wiki-golden] baseline {name}: {n} files in {secs:.0f}s -> {dest}")
+    return 0
+
+
+def cmd_check(names: list[str], expect_path: Path | None) -> int:
+    expect = None
+    if expect_path:
+        expect = Expect(json.loads(expect_path.read_text(encoding="utf-8")))
+        if expect.reason:
+            print(f"[wiki-golden] expecting: {expect.reason}")
+
+    failed = []
+    for name in names:
+        golden = GOLDEN / "golden" / name
+        if not golden.is_dir():
+            sys.exit(f"error: no baseline for {name}; run: wiki-golden baseline "
+                     f"--corpus {name}")
+        dest = GOLDEN / "last" / name
+        print(f"[wiki-golden] check {name} …")
+        secs = build(name, dest)
+        ok, report = compare(golden, dest, expect)
+        if ok and not report:
+            print(f"[wiki-golden] check {name}: IDENTICAL ({secs:.0f}s)")
+        elif ok:
+            print(f"[wiki-golden] check {name}: OK — all diffs declared ({secs:.0f}s)")
+            print("\n".join(report))
+        else:
+            failed.append(name)
+            print(f"[wiki-golden] check {name}: FAILED ({secs:.0f}s)")
+            print("\n".join(report))
+
+    if failed:
+        print(f"\n[wiki-golden] FAIL: {', '.join(failed)}")
+        return 1
+    print("\n[wiki-golden] PASS")
+    return 0
+
+
+def cmd_rebaseline(names: list[str]) -> int:
+    for name in names:
+        last = GOLDEN / "last" / name
+        if not last.is_dir():
+            sys.exit(f"error: no check build for {name}; run wiki-golden check first")
+        golden = GOLDEN / "golden" / name
+        if golden.exists():
+            shutil.rmtree(golden)
+        shutil.move(str(last), str(golden))
+        print(f"[wiki-golden] rebaselined {name}")
+    return 0
+
+
+def cmd_corpora() -> int:
+    for name, cfg in CORPORA.items():
+        root: Path = cfg["root"]
+        state = "ok" if (root / "unpacked").is_dir() else "MISSING"
+        base = "baselined" if (GOLDEN / "golden" / name).is_dir() else "-"
+        print(f"  {name:14s} {state:8s} {base:10s} {root}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("mode", choices=["baseline", "check", "rebaseline", "corpora"])
+    ap.add_argument("--corpus", default=None, help="corpus name (default: homers_lotr)")
+    ap.add_argument("--all", action="store_true", help="every configured corpus")
+    ap.add_argument("--expect", default=None, metavar="FILE",
+                    help="JSON file declaring which output changes are intended: "
+                         '{"reason": str, "paths": [glob], "line_patterns": [regex]}')
+    args = ap.parse_args()
+
+    if args.mode == "corpora":
+        return cmd_corpora()
+
+    names = _corpus_names(args)
+    GOLDEN.mkdir(exist_ok=True)
+
+    if args.mode == "baseline":
+        return cmd_baseline(names)
+    if args.mode == "check":
+        return cmd_check(names, Path(args.expect) if args.expect else None)
+    return cmd_rebaseline(names)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

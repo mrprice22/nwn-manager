@@ -1,0 +1,775 @@
+# Refactor backlog — bin/nwn-wiki (18,618 lines) -> bin/nwn_wiki/ package.
+#
+# Sole loop state for the refactor autopilot (with git).  See
+# CLAUDE-refactor-autopilot.md for the loop, the gate and the hard rules.
+#
+# Item schema:
+#   id            kebab-case, unique.  Also names gates/<id>.json.
+#   phase         1 split | 2 chrome bugs | 3 dedup | 4 giants
+#   title         one line
+#   status        pending | design | done
+#   gate          zero-diff | expected-diff
+#   after         [ids] that must be done first (must appear earlier in the file)
+#   ranges        line ranges in the ORIGINAL bin/nwn-wiki, for orientation only
+#   plan          what to do
+#   # set when shipped:
+#   commit / date / gate_result / impl_notes / found / design_questions
+#
+# Line ranges are against the pre-refactor monolith and go stale as items land.
+# Locate code by symbol name (grep), not by line number.
+
+meta:
+  monolith: bin/nwn-wiki
+  monolith_lines: 18618
+  package: bin/nwn_wiki
+  branch: refactor/nwn-wiki-modules
+  gate_cost: "homers_lotr ~150s / 10897 files; lotr2008 ~90s; lotr2009 ~90s"
+
+items:
+
+# ---------------------------------------------------------------------------
+# Phase 1 — split.  Moves only.  Every item gate: zero-diff.
+# ---------------------------------------------------------------------------
+
+- id: pkg-skeleton
+  phase: 1
+  title: Package skeleton, CLI shim, paths module, importer fixups
+  status: pending
+  gate: zero-diff
+  ranges: "1-108 (header/imports), 33-35 (SCRIPT_DIR/DATA_DIR/ASSETS_DIR)"
+  plan: >
+    Create bin/nwn_wiki/ with __init__.py and paths.py.  Move the whole monolith
+    body to bin/nwn_wiki/cli.py verbatim; bin/nwn-wiki becomes a ~10-line shim
+    that inserts bin/ on sys.path and calls nwn_wiki.cli.main().  paths.py must
+    resolve DATA_DIR/ASSETS_DIR to bin/wiki_data and bin/wiki_assets — one level
+    UP from the package, not beside it.  Then fix the two importers that load the
+    monolith by path: bin/nwn-wiki-activity (_load_nwn_wiki, ~line 22) and
+    bin/recover-activity-gap (_load_nwn_wiki, ~line 58); both should switch to
+    sys.path.insert + `import nwn_wiki`.
+  notes: >
+    Keep bin/nwn-wiki executable and at the same path — nwn-manager (line 672)
+    execs it, and the wiki-publish services rely on it.
+
+- id: state-module
+  phase: 1
+  title: Extract cross-module mutable globals into nwn_wiki/state.py
+  status: pending
+  gate: zero-diff
+  after: [pkg-skeleton]
+  ranges: "44-48, 78-88 (globals); 102, 5923, 5979, 7578, 10625, 15958, 16144, 18168, 18421 (writers)"
+  plan: >
+    Move _MANUAL_MENUS, _MANUAL_MENU_ORDER, _HAS_ACTIVITY_PAGE, _HAS_SERVER_FIRSTS,
+    _GENERATED_AT, _BESTIARY_*, _SERVER_FIRSTS, _BOSS_REGISTRY, _BOSS_ALIASES,
+    _CREATURE_PICS, _CREATURE_PIC_GROUPS, _THEME_*, _current_context, _warned into
+    state.py.  Rewrite every read and write as state.X.  Update the `global`
+    declarations accordingly.  In nwn-wiki-activity, the attribute pokes become
+    nwn_wiki.state.X — and delete the dead `wiki._MANUAL_PAGES = []` line, which
+    targets a global renamed to _MANUAL_MENUS long ago.
+  notes: >
+    HIGHEST-RISK ITEM IN PHASE 1.  Never `from nwn_wiki.state import X` — a
+    from-import snapshots the binding and yields silently wrong output rather
+    than an error.  Always `from nwn_wiki import state` then `state.X`.
+    Worth a human review even though the gate is zero-diff.
+
+- id: gff-module
+  phase: 1
+  title: Extract GFF/TLK accessors into gff.py and warn.py
+  status: pending
+  gate: zero-diff
+  after: [state-module]
+  ranges: "101-107 (_warn_once), 110-242 (gff, fld, read_tlk, loc, list_items, stock name loaders)"
+  plan: >
+    warn.py gets _warn_once.  gff.py gets gff, fld, read_tlk,
+    _load_stock_item_names, _load_stock_creature_names, loc, list_items.
+    These are the deepest leaves — nothing in the program depends on anything
+    else to work.
+
+- id: twoda-module
+  phase: 1
+  title: Extract 2DA parsing and override loading into twoda.py
+  status: pending
+  gate: zero-diff
+  after: [gff-module]
+  ranges: "453-786 (parse_2da, _2da_split, load_json_overlay, detect_cep_haks, load_2da_overrides)"
+  plan: >
+    load_2da_overrides is 196 lines and mutates many of the lookup tables — keep
+    it a move, do not restructure it.  Its writes go through state/lookups module
+    attributes, never from-imports.
+
+- id: lookups-module
+  phase: 1
+  title: Extract JSON caches and id->name lookups into lookups.py
+  status: pending
+  gate: zero-diff
+  after: [twoda-module]
+  ranges: "243-452 (_load_* caches), 787-1066 (baseitem_name .. tileset_label)"
+  plan: >
+    The _load_* functions and the *_name/*_label lookups they back.  Includes the
+    spell-info helpers (_iprp_spell_info, _spell_level_classes,
+    _scroll_cast_spell_info, _scroll_spell_sort_key, _iprp_name_spell_info) and
+    creature_race_immunities.
+
+- id: itemprops-module
+  phase: 1
+  title: Extract item-property formatting and dedup keys into itemprops.py
+  status: pending
+  gate: zero-diff
+  after: [lookups-module]
+  ranges: "1068-1563"
+  plan: >
+    itemprop_format, _table_lookup, the dedup keys (_item_prop_key, _creature_key,
+    _store_inv_key, _conversation_key, _variant_diff_items), itemprop_oneliner,
+    _prop_slug/_prop_value_num/_prop_group, _cost_anchor, _cost_tiers,
+    _where_snippet, _is_raw_subtype, _fmt_hp, _yn.
+
+- id: combat-module
+  phase: 1
+  title: Extract BAB / attack-schedule / ability-mod maths into combat.py
+  status: pending
+  gate: zero-diff
+  after: [itemprops-module]
+  ranges: "1565-1735"
+  plan: >
+    _class_bab, creature_bab, creature_class_bab, attack_schedule,
+    feat_attack_bonus, ability_mod, plus the feat-id constants above them.
+
+- id: items-module
+  phase: 1
+  title: Extract item slot/damage/AC derivation into items.py
+  status: pending
+  gate: zero-diff
+  after: [combat-module]
+  ranges: "1736-2430"
+  plan: >
+    baseitem_slots .. extract_item_defense, including _item_category,
+    weapon_damage_string/crit_string, item_ac_bonus, item_attack_bonus,
+    item_damage_bonus, weapon_enhancement, weapon_damage_props, item_gp_value,
+    _item_accessible, extract_item_offense, extract_item_defense.
+    extract_item_defense has nesting depth 8 — move it as-is, do not flatten.
+
+- id: htmlgen-escape-links
+  phase: 1
+  title: Extract escaping and link helpers into htmlgen/escape.py + links.py
+  status: pending
+  gate: zero-diff
+  after: [items-module]
+  ranges: "5262-5505"
+  plan: >
+    escape.py: E, _colour_byte, nwn_html, colorize_damage_words, nwn_text,
+    nwn_first_color.  links.py: link, _script_link, _conv_link, _faction_dd,
+    _faction_cell, _race_link.  Leave the contradictory root_rel defaults exactly
+    as they are — fixing them is item root-rel-derive in phase 2.
+
+- id: htmlgen-markdown
+  phase: 1
+  title: Extract md_to_html into htmlgen/markdown.py
+  status: pending
+  gate: zero-diff
+  after: [htmlgen-escape-links]
+  ranges: "5506-5631"
+
+- id: htmlgen-chrome
+  phase: 1
+  title: Extract page shell, nav and theme into htmlgen/chrome.py
+  status: pending
+  gate: zero-diff
+  after: [htmlgen-markdown]
+  ranges: "5632-6036"
+  plan: >
+    _manual_menu_rows, _quests_nav, _activity_dropdown, _docs_dropdown,
+    _custom_manual_dropdowns, _md_title, _brand_html, page, write,
+    _img_pixel_size, load_wiki_theme, _creature_cr_value, scan_creature_pics.
+    This is the module every phase-2 item then works in.
+
+- id: layout-module
+  phase: 1
+  title: Extract area force-directed layout into layout.py
+  status: pending
+  gate: zero-diff
+  after: [htmlgen-chrome]
+  ranges: "4938-5261 (_transition_dir, layout_areas)"
+
+- id: sim-combat
+  phase: 1
+  title: Extract the DPR/defence simulation into sim/combat.py
+  status: pending
+  gate: zero-diff
+  after: [layout-module]
+  ranges: "8191-8590"
+  plan: >
+    avg_roll, _devcrit_die, weapon_feat_id, crit_feat_effects, hit_chance,
+    attack_profile, defense_profile, _mitigate, _hit_damage, dpr,
+    crit_chance_per_round, _rounds_to_drop, _devcrit_rounds, save_fail_chance,
+    simulate.
+
+- id: sim-pc-gear
+  phase: 1
+  title: Extract the reference PC and gear-kit search into sim/pc.py + sim/gear.py
+  status: pending
+  gate: zero-diff
+  after: [sim-combat]
+  ranges: "8592-9060"
+  plan: >
+    pc.py: the feat-budget helpers (_general_feat_slots, _fighter_bonus_slots,
+    _great_ability_tiers, _epic_toughness_tiers, _kit_pieces) and reference_pc.
+    gear.py: build_gear_pool, _prune_pool, _weapon_raw_damage, _kit_conflicts,
+    best_in_slot_kit, minimum_viable_kit, extract_creature_offense.
+
+- id: bestiary-module
+  phase: 1
+  title: Extract bestiary/server-firsts DB reads into bestiary.py
+  status: pending
+  gate: zero-diff
+  after: [sim-pc-gear]
+  ranges: "15875-16141"
+  plan: >
+    seed_bestiary_catalogue, load_bestiary_stats, backfill_server_first_player_names,
+    _utc_to_local, _render_server_first_body.
+  notes: >
+    NOT covered by the gate — these only run with --db-dir, which the golden
+    build deliberately omits.  Move with extra care and re-read the diff by eye.
+
+- id: db-core
+  phase: 1
+  title: Split Db construction/loading/interning into db/core.py
+  status: pending
+  gate: zero-diff
+  after: [bestiary-module]
+  ranges: "2457-2885 (__init__ 248 lines, load, _intern_item, _intern_creature)"
+  plan: >
+    Db becomes a class assembled from mixins (or a package module holding the
+    class with the other groups imported as mixin bases) so each concern lives in
+    its own file.  Pick one mechanism here and keep it for db-index .. db-names.
+    __init__ is 248 lines of attribute declarations — MOVE it, do not convert it
+    to dataclass fields yet; that is phase-4 item db-init-schema.
+
+- id: db-index
+  phase: 1
+  title: Split Db.index into db/index.py
+  status: pending
+  gate: zero-diff
+  after: [db-core]
+  ranges: "2887-3485 (index is 436 lines, nesting depth 6)"
+
+- id: db-scripts
+  phase: 1
+  title: Split script parsing into db/scripts.py
+  status: pending
+  gate: zero-diff
+  after: [db-index]
+  ranges: "3486-3919"
+  plan: >
+    is_custom_damage_script, _build_nwstr_dispatch, _parse_scripts (189 lines),
+    _build_tag_to_area, _resolve_script_creature_spawns,
+    _build_direct_teleport_transitions, _walk_dialog_nodes,
+    _excluded_dialog_nodes, _synthesize_zdialogs, _script_dialog_targets.
+    Also _extract_func_body (2435-2452), which only scripts use.
+
+- id: db-dialogs
+  phase: 1
+  title: Split dialog indexing into db/dialogs.py
+  status: pending
+  gate: zero-diff
+  after: [db-scripts]
+  ranges: "3921-4246 (index_dialogs, 326 lines)"
+
+- id: db-derived
+  phase: 1
+  title: Split derived indexes into db/derived.py
+  status: pending
+  gate: zero-diff
+  after: [db-dialogs]
+  ranges: "4248-4819"
+  plan: >
+    _index_script_item_sources (152), _index_random_treasure_containers,
+    _index_key_items, _index_script_item_checks (174), _build_dialog_quest_index,
+    _build_store_openers (143).
+
+- id: db-names
+  phase: 1
+  title: Split name lookups into db/names.py
+  status: pending
+  gate: zero-diff
+  after: [db-derived]
+  ranges: "4823-4936"
+  plan: >
+    area_name, creature_name, item_name, store_name, is_friendly, faction_name,
+    creature_instance_name, canonical_creature_name, dialog_label.
+    Four of these share a "instance name -> blueprint -> resref" shape written
+    out longhand; record that in `found:` for phase 3, do not collapse it now.
+
+- id: render-map
+  phase: 1
+  title: Extract the area map SVG into render/map.py
+  status: pending
+  gate: zero-diff
+  after: [db-names]
+  ranges: "6150-6527 (render_map_page, render_map_svg 358 lines)"
+  notes: >
+    Contains a 37-line inline pan/zoom IIFE (6474-6510).  Moving it to site.js is
+    a phase-3 candidate — record it in `found:`, don't do it here.
+
+- id: render-areas
+  phase: 1
+  title: Extract area index/page/container renderers into render/areas.py
+  status: pending
+  gate: zero-diff
+  after: [render-map]
+  ranges: "6528-7444"
+  plan: >
+    build_area_graph, bfs_shortest_path, render_areas_index (211),
+    render_area_page (515, depth 6), render_container_page.
+
+- id: render-creature-index
+  phase: 1
+  title: Extract creature index/bosses/pictures renderers into render/creatures.py
+  status: pending
+  gate: zero-diff
+  after: [render-areas]
+  ranges: "7445-7767, 10052-10803"
+  plan: >
+    render_creatures_index, the boss registry loaders, render_bosses_index,
+    _pic_src, _pic_figures, render_creature_pictures, render_creatures_by_area,
+    render_creatures_by_cr, render_creatures_by_race, render_creatures_search
+    and _CREATURE_SEARCH_JS.
+
+- id: render-creature-page
+  phase: 1
+  title: Extract creature detail rendering into render/creature_page.py
+  status: pending
+  gate: zero-diff
+  after: [render-creature-index]
+  ranges: "7768-8190, 9061-10051"
+  plan: >
+    The retaliation analysis (_strip_nss_comments, _ret_dice_to_text,
+    _analyze_retaliation, _retaliation_sentence), extract_creature_defenses (324),
+    _creature_detail_sections (619 — second-longest function in the program) and
+    render_creature_page.
+
+- id: render-items
+  phase: 1
+  title: Extract item index/page renderers into render/items.py
+  status: pending
+  gate: zero-diff
+  after: [render-creature-page]
+  ranges: "10804-11657"
+  plan: >
+    _fmt_cost, _items_col_flags, _items_table_head, _items_row,
+    _inaccessible_reason_html, render_inaccessible_index, render_items_index,
+    render_item_page (500, depth 7).
+
+- id: render-itemprops
+  phase: 1
+  title: Extract the by-property pages and item search into render/itemprops_pages.py
+  status: pending
+  gate: zero-diff
+  after: [render-items]
+  ranges: "11658-12514"
+  plan: >
+    render_items_by_property (511, depth 7), _SEARCH_JS, render_items_search.
+
+- id: render-stores
+  phase: 1
+  title: Extract store renderers into render/stores.py
+  status: pending
+  gate: zero-diff
+  after: [render-itemprops]
+  ranges: "12515-13256"
+
+- id: render-factions
+  phase: 1
+  title: Extract render_factions into render/factions.py
+  status: pending
+  gate: zero-diff
+  after: [render-stores]
+  ranges: "13257-13725 (render_factions 437; render_journal 13696 is orphaned)"
+  notes: >
+    render_journal is never called from main().  MOVE it anyway — deciding its
+    fate is phase-2 item journal-decide.
+
+- id: render-quests
+  phase: 1
+  title: Extract quest renderers into render/quests.py
+  status: pending
+  gate: zero-diff
+  after: [render-factions]
+  ranges: "13726-14289"
+
+- id: render-conversations
+  phase: 1
+  title: Extract dialog-tree renderers into render/conversations.py
+  status: pending
+  gate: zero-diff
+  after: [render-quests]
+  ranges: "14290-14878"
+
+- id: render-scripts-manual
+  phase: 1
+  title: Extract script pages and manual-page rendering into render/
+  status: pending
+  gate: zero-diff
+  after: [render-conversations]
+  ranges: "14879-15080, 16142-16236"
+  plan: >
+    render/scripts.py: render_script_page, render_scripts_index.
+    render/manual.py: _html_title, _manual_menu, _manual_sort_order,
+    _manual_menu_order, _manual_doc_body, render_manual_pages.
+  notes: >
+    render_manual_pages holds two of the phase-2 bugs (_HAS_SERVER_FIRSTS never
+    reset; the docs.manual/ early return swallowing ServerFirsts).  Move only.
+
+- id: render-activity
+  phase: 1
+  title: Extract log parsing and the activity page into render/activity.py
+  status: pending
+  gate: zero-diff
+  after: [render-scripts-manual]
+  ranges: "15081-15874"
+  plan: >
+    The log collectors and cache (_collect_log_files .. _save_activity_cache),
+    parse_nwserver_logs, the SVG chart builders (svg_vbar_chart, svg_hbar_chart),
+    _tz_label_from_env, render_activity_page.
+  notes: >
+    NOT covered by the gate — needs --log-dir, which the golden build omits.
+    After this item, run bin/nwn-wiki-activity --check-online by hand against a
+    real log dir to prove the module still imports and parses.
+
+- id: render-index
+  phase: 1
+  title: Extract the site index page into render/index.py
+  status: pending
+  gate: zero-diff
+  after: [render-activity]
+  ranges: "6037-6149"
+
+- id: reports-conflicts
+  phase: 1
+  title: Extract the tag/conversation conflict reports into reports/conflicts.py
+  status: pending
+  gate: zero-diff
+  after: [render-index]
+  ranges: "16237-16561"
+
+- id: reports-counter-gear
+  phase: 1
+  title: Extract the counter-gear report into reports/counter_gear.py
+  status: pending
+  gate: zero-diff
+  after: [reports-conflicts]
+  ranges: "16562-17287"
+  plan: >
+    _module_index_url_helpers, _parse_cr, _fmt_gp, devcrit_mode, _pc_level_for_cr,
+    _counter_gear_fingerprint, check_counter_gear_freshness, _top_value_by_slot,
+    _kit_entries, _fmt_rounds, _kit_lines, _counter_gear_markdown,
+    generate_counter_gear_index.
+
+- id: reports-module-index
+  phase: 1
+  title: Extract generate_module_index into reports/module_index.py
+  status: pending
+  gate: zero-diff
+  after: [reports-counter-gear]
+  ranges: "17288-18059 (767 lines — the longest function in the program)"
+
+- id: cli-module
+  phase: 1
+  title: Reduce cli.py to argument parsing and the build pipeline
+  status: pending
+  gate: zero-diff
+  after: [reports-module-index]
+  ranges: "18061-18618 (main, 554 lines)"
+  plan: >
+    After every extraction above, whatever remains in cli.py is main() plus
+    imports.  Verify nothing is left behind, confirm bin/nwn-wiki is still a thin
+    shim, and check the module count and per-module line counts look sane
+    (target: no module over ~900 lines except the ones phase 4 addresses).
+
+# ---------------------------------------------------------------------------
+# Phase 2 — page chrome and the nav-desync bugs.  Output changes on purpose.
+# ---------------------------------------------------------------------------
+
+- id: site-chrome-object
+  phase: 2
+  title: Replace the nav globals with one SiteChrome object built once
+  status: pending
+  gate: expected-diff
+  after: [cli-module]
+  plan: >
+    Build a SiteChrome in cli.main() AFTER every loader has run, carrying the
+    facts the nav depends on (has_activity, has_server_firsts, boss_registry,
+    manual_menus, theme, and the new has_inaccessible/has_creature_pics).  Pass
+    it into page().  Serialise it to docs/.chrome.json, and make
+    bin/nwn-wiki-activity LOAD that file instead of hand-rebuilding globals.
+    Fixes the one genuine desync mechanism: that subprocess currently re-execs
+    the program in a fresh interpreter, sets _HAS_ACTIVITY_PAGE = True
+    unconditionally, and rewrites activity.html + every manual/**.html — so those
+    pages can carry a different nav bar from the rest of the wiki.  After this,
+    the subprocess computes nothing, so it cannot disagree.
+  expected_diff: "one new file docs/.chrome.json; no page content changes"
+
+- id: nav-gate-conditional
+  phase: 2
+  title: Gate the Pictures and Inaccessible nav entries on those pages existing
+  status: pending
+  gate: expected-diff
+  after: [site-chrome-object]
+  plan: >
+    page() emits items/inaccessible/index.html and creatures/pictures.html
+    unconditionally, but render_inaccessible_index and render_creature_pictures
+    both early-return when their data is empty — so the nav can link to pages
+    that were never written.  bosses.html is already gated correctly on the same
+    global its renderer checks; apply that pattern to the other two, feeding
+    has_inaccessible / has_creature_pics from the same predicates.
+  expected_diff: "nav <li> removed from every page when the target is absent"
+
+- id: root-rel-derive
+  phase: 2
+  title: Derive root_rel from the output path instead of threading it by hand
+  status: pending
+  gate: expected-diff
+  after: [nav-gate-conditional]
+  plan: >
+    root_rel is passed as a "." / ".." / "../.." string through 17 functions, and
+    the helper block holds TWO CONTRADICTORY DEFAULTS — "." on _faction_dd,
+    _faction_cell, _race_link; ".." on _script_link, _conv_link,
+    _store_opener_html, _caller_html, _creature_detail_sections.  Correctness
+    currently rests on an unwritten "only called from depth 1" rule.  All 34
+    page() call sites are correct today, so this is a latent trap, not a live
+    bug — fix it by construction: page() takes the output Path and computes depth
+    from it, helpers take a context carrying that depth.  Fold in the three
+    parallel mechanisms for the same idea: _items_row(prefix=),
+    _store_inventory_html(item_prefix=), _pic_figures(prefix=).
+  expected_diff: "none — this is a mechanical equivalence and the gate proves it"
+
+- id: typed-link-helpers
+  phase: 2
+  title: Add _area_link/_item_link/_creature_link and route hand-built hrefs
+  status: pending
+  gate: expected-diff
+  after: [root-rel-derive]
+  plan: >
+    111 anchors are written as raw f-string <a href=...> against 129 link()
+    calls, so ~46% of anchors bypass link()'s escaping.  The relative prefixes
+    are spelled out by hand at 22 (../areas/), 10 (../items/), 9 (../creatures/),
+    5 (../conversations/), 2 (../stores/) sites.  Add the three missing typed
+    helpers next to the existing _script_link/_conv_link and convert the call
+    sites.  There is already a local _item_link buried inside render_quest_page —
+    hoist it.
+  expected_diff: "escaping-only changes, if any — inspect every hunk by eye"
+
+- id: server-firsts-reset
+  phase: 2
+  title: Reset _HAS_SERVER_FIRSTS and lift it above the docs.manual early return
+  status: pending
+  gate: expected-diff
+  after: [typed-link-helpers]
+  plan: >
+    render_manual_pages resets _MANUAL_MENUS and _MANUAL_MENU_ORDER but not
+    _HAS_SERVER_FIRSTS, which is only ever set True and never back to False.  It
+    also sits below the `if not manual_dir: return` early return, so a module
+    with a bestiary but no docs.manual/ never gets ServerFirsts.html nor its
+    Activity nav entry.  Fix both.
+  expected_diff: "Activity dropdown gains a Server Firsts entry on modules with a bestiary and no docs.manual/"
+
+- id: journal-decide
+  phase: 2
+  title: Wire up or delete the orphaned render_journal
+  status: pending
+  gate: expected-diff
+  after: [server-firsts-reset]
+  plan: >
+    render_journal emits journal.html with a full nav bar but is never called
+    from main().  Either wire it in or delete it.  If the right answer is not
+    obvious from the code and git history, take the design-question escape hatch
+    rather than guessing — deleting a page the admin wanted is not recoverable
+    from the gate.
+  expected_diff: "either one new page docs/journal.html, or nothing"
+
+- id: active-nav
+  phase: 2
+  title: Mark the current page in the nav (aria-current + class)
+  status: pending
+  gate: expected-diff
+  after: [journal-decide]
+  plan: >
+    There is no active-nav state today — no aria-current, no active class.  Now
+    that chrome knows the current output path, add it.  Optional polish; drop the
+    item if the styling turns out to need design input.
+  expected_diff: "one attribute + class on one nav element per page"
+
+# ---------------------------------------------------------------------------
+# Phase 3 — deduplication.  ~500 Python LOC + ~130 JS LOC.
+# ---------------------------------------------------------------------------
+
+- id: dedup-creature-row
+  phase: 3
+  title: One _creature_row() and _bp_field() for the six creature tables
+  status: pending
+  gate: zero-diff
+  after: [active-nav]
+  plan: >
+    The blueprint-fallback closure (_f/_f2/_f3) is re-declared 12 times and the
+    class-string join 9 times; six renderers build the same row from scratch
+    (creatures index, bosses, by-area, by-cr, by-race, search).  Collapse to a
+    shared row builder plus a _bp_field(c, bp) helper.  ~120-150 LOC.
+
+- id: dedup-items-skeleton
+  phase: 3
+  title: One items-index builder for the four copies of that skeleton
+  status: pending
+  gate: zero-diff
+  after: [dedup-creature-row]
+  plan: >
+    render_inaccessible_index, render_items_index, _store_inventory_html and
+    _store_inventory_toc_html are structurally the same function — bucket ->
+    weapon-key split -> _expand() -> TOC walk -> sidebar — differing only in the
+    path prefix, one extra column and the intro text.  ~90-110 LOC.
+
+- id: dedup-layout-wrappers
+  phase: 3
+  title: Add _toc_sidebar / _items_layout / _meta_dl wrappers
+  status: pending
+  gate: zero-diff
+  after: [dedup-items-skeleton]
+  plan: >
+    The sidebar open/close is hand-written at 10 sites, the items-layout div at
+    12, the <dl class="meta"> at 15, and the four-link "Views" sibling nav is
+    copy-pasted at 4.  Also fold the three near-identical store table-head
+    constants (_CREATURE_STORES_TABLE_HEAD, _STORE_TABLE_HEAD, _IDX_TABLE_HEAD
+    and the inline head on the store page) into one.  ~90-110 LOC.
+
+- id: dedup-search-js
+  phase: 3
+  title: Move the shared search engine into wiki_assets/site.js
+  status: pending
+  gate: zero-diff
+  after: [dedup-layout-wrappers]
+  plan: >
+    _CREATURE_SEARCH_JS (188 lines) and _SEARCH_JS (206 lines) are near-copies —
+    the creature one's own docstring says it mirrors the item one, and the
+    subtype-cascade handler is 8 verbatim-identical lines.  Extract the common
+    engine (index fetch, filter population, subtype cascade, condition build,
+    sort, render shell) into site.js as initSearch(cfg), and fold _cond_row /
+    _prop_row into one Python form builder.  ~130 JS + ~40 Py.
+  notes: >
+    The gate compares generated HTML byte-for-byte, so any change to the emitted
+    <script> block shows up as a diff.  Plan for the HTML to shrink to a small
+    config object plus an initSearch call — that IS an intended diff, so this
+    item may need to become expected-diff once the shape is settled.
+
+- id: dedup-formatting
+  phase: 3
+  title: Consolidate the numeric formatting helpers
+  status: pending
+  gate: zero-diff
+  after: [dedup-search-js]
+  plan: >
+    _fmt_hp and _fmt_cost are ~90% identical.  f"{x:,}" is written by hand at 25
+    sites outside them, including the exact idiom
+    `f"{max_gp:,}" if max_gp > 0 else "—"` copy-pasted at three.  _try_int exists
+    but the same try/int/except is inlined elsewhere.
+  notes: >
+    CONTAINS A REAL BEHAVIOURAL FORK: _parse_cr returns 0.0 for an unparseable
+    CR, _creature_cr_value returns -1.0, and _creature_cr_value re-implements
+    _parse_cr rather than calling it.  Those sentinels sort differently.  Resolve
+    it deliberately — if which one is correct isn't obvious, take the
+    design-question hatch.  Do NOT silently unify them.
+
+- id: dedup-map-js
+  phase: 3
+  title: Move the map pan/zoom IIFE into site.js
+  status: pending
+  gate: expected-diff
+  after: [dedup-formatting]
+  plan: >
+    render_map_svg inlines a 37-line pan/zoom IIFE into both index.html and
+    map/index.html.  Move it to site.js like the nav code.
+  expected_diff: "the inline <script> disappears from docs/index.html and docs/map/index.html"
+
+# ---------------------------------------------------------------------------
+# Phase 4 — break up the giants.  Optional; a fine place for the run to end.
+# ---------------------------------------------------------------------------
+
+- id: db-init-schema
+  phase: 4
+  title: Turn Db.__init__ from 248 lines of attributes into a declared schema
+  status: pending
+  gate: zero-diff
+  after: [dedup-map-js]
+  plan: >
+    ~60 index dicts/sets initialised inline with interleaved comment blocks.  It
+    reads as a schema, so make it one — dataclass fields or grouped sub-objects.
+
+- id: db-index-split
+  phase: 4
+  title: Break up Db.index and Db.index_dialogs
+  status: pending
+  gate: zero-diff
+  after: [db-init-schema]
+  plan: >
+    436 and 326 lines, both at nesting depth 6.  With _parse_scripts (189) and
+    _index_script_item_checks (174) these four are 46% of the Db class.
+
+- id: module-index-split
+  phase: 4
+  title: Break up generate_module_index
+  status: pending
+  gate: zero-diff
+  after: [db-index-split]
+  plan: 767 lines — the longest function in the program. One writer per report.
+
+- id: creature-sections-split
+  phase: 4
+  title: Break up _creature_detail_sections
+  status: pending
+  gate: zero-diff
+  after: [module-index-split]
+  plan: 619 lines. One function per section of the creature page.
+
+- id: render-page-split
+  phase: 4
+  title: Break up render_area_page, render_item_page, render_items_by_property
+  status: pending
+  gate: zero-diff
+  after: [creature-sections-split]
+  plan: >
+    515 (depth 6), 500 (depth 7) and 511 (depth 7) lines respectively.  Depth 7
+    is where this program is hardest to read.
+
+- id: main-split
+  phase: 4
+  title: Break up cli.main into argument parsing and named build stages
+  status: pending
+  gate: zero-diff
+  after: [render-page-split]
+  plan: >
+    554 lines.  The loader ordering inside it is load-bearing — three comments in
+    the original call it out — so name the stages explicitly rather than leaving
+    the order implicit in statement sequence.
+
+# ---------------------------------------------------------------------------
+# Deferred / not scheduled
+# ---------------------------------------------------------------------------
+
+- id: sort-set-iteration
+  phase: 4
+  title: Sort the set iterations that make the build non-deterministic
+  status: design
+  gate: expected-diff
+  after: [main-split]
+  plan: >
+    The build is not reproducible run-to-run: with PYTHONHASHSEED unset, string
+    hash randomisation reorders the area-map SVG nodes, the faction table rows
+    and some conversation tables (~1700 changed lines per run on the lotr2008
+    corpus alone).  bin/wiki-golden pins PYTHONHASHSEED=0 to work around it.
+    The real fix is to sort those iterations at the point of emission.
+  design_questions:
+    - question: >
+        This is pre-existing, not caused by the refactor — but it means every
+        published docs/ rebuild churns thousands of lines in git for no semantic
+        reason, which makes `git add -A docs` commits noisy and real changes hard
+        to spot.  Recommend fixing it (sort at emission; one-off large diff, then
+        stable output forever).  Fix it, or leave it and keep the
+        PYTHONHASHSEED=0 pin in the gate?
+      status: open
+      answer: null

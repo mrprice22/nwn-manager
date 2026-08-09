@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Safety-net commit for the refactor autopilot loop, invoked from PreCompact/SessionEnd
+# hooks.  No-ops unless autopilot-wip.md shows an active item with a non-empty files:
+# list -- never fires during ordinary interactive sessions, and never touches files
+# autopilot didn't itself declare as part of the current item (no blanket `git add -A`,
+# which would sweep in unrelated untracked work sitting in the tree).
+#
+# Adapted from nwn_homers_lotr/bin/autopilot-safety-commit.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Refuse to run anywhere but the refactor branch -- the parent checkout serves the live
+# wiki-publish services and must never be committed to by a hook.
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+[ "$branch" = "refactor/nwn-wiki-modules" ] || exit 0
+
+grep -q '^- id: none' autopilot-wip.md 2>/dev/null && exit 0
+
+files_line="$(grep '^- files:' autopilot-wip.md 2>/dev/null | sed 's/^- files: *//')"
+[ -n "$files_line" ] || exit 0
+
+added=0
+for f in $files_line; do
+  if [ -e "$f" ]; then
+    git add -- "$f"
+    added=1
+  fi
+done
+[ "$added" -eq 1 ] || exit 0
+
+git diff --cached --quiet && exit 0
+git commit -q -m "Refactor autopilot safety-net commit (${1:-unknown})"
