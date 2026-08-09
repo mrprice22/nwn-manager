@@ -105,8 +105,31 @@ items:
 - id: gff-module
   phase: 1
   title: Extract GFF/TLK accessors into gff.py and warn.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 19eb745
+  date: 2026-08-09
+  gate_result: "check --all: IDENTICAL on homers_lotr, lotr2008, lotr2009"
+  impl_notes: >
+    warn.py 19 lines, gff.py ~145.  BASE_TLK/CUSTOM_TLK/CUSTOM_TLK_BASE turned out
+    to be shared mutable state (loc reads, main fills) and went to state.py, not
+    gff.py — they are .update()d in place, never rebound.  The STOCK_* caches ARE
+    from-imported into cli.py: built once at import and read-only afterwards, so
+    the snapshot hazard does not apply.  No import cycles: gff -> {state, paths,
+    warn}, warn -> state.
+  found:
+    - "fld()'s first parameter is named `struct`, shadowing the stdlib module —
+       which gff.py now genuinely imports for read_tlk.  Harmless (function-local)
+       but a live landmine in that file.  Rename the parameter in a later phase."
+    - "The module nwn_wiki.gff and the function gff() share a name; any file
+       wanting both must alias one.  Decide a convention before more modules
+       import it."
+    - "The stock-name loaders return {} silently when their JSON cache is absent,
+       while _load_lookup warns on failure.  Inconsistent failure reporting across
+       neighbouring loaders."
+    - "read_tlk is the only reason gff.py needs `struct`.  If TLK parsing later
+       gets its own module, gff.py drops to pure-JSON accessors."
+
   after: [state-module]
   ranges: "101-107 (_warn_once), 110-242 (gff, fld, read_tlk, loc, list_items, stock name loaders)"
   plan: >
