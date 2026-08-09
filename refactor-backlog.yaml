@@ -646,8 +646,40 @@ items:
 - id: item-extractors-module
   phase: 1
   title: Move the item offence/defence extractors into items.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: fe7dfaf
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (143s), lotr2008 IDENTICAL (84s), lotr2009 IDENTICAL (110s)"
+  impl_notes: >
+    All four functions moved, nothing blocked.  items.py 506 -> 718 took
+    _weapon_extra_damage_types, weapon_damage_props, extract_item_offense,
+    extract_item_defense (nesting left at depth 8, not flattened), _ABIL_NAME_KEY,
+    and — forced, since items.py may not import cli — _WEAPONTYPE_TO_PHYS with the
+    dead _PHYSICAL_DAMAGE_TYPES that shares its comment block.  _DAMAGE_TYPE_LABELS
+    went to lookups.py (529 -> 538) rather than items.py: its other consumer is
+    _analyze_retaliation, which render-creature-page will move later, and lookups.py
+    is already the leaf home for label tables imported by both items.py and cli.py,
+    so it adds no graph edge.  New items.py imports: htmlgen.escape.nwn_text,
+    sim.combat.avg_roll, itemprops._prop_value_num/itemprop_format — all leaves, no
+    cycle.  cli.py 15,251 -> 15,041 and does not import _weapon_extra_damage_types,
+    whose only caller moved with it.  Line multiset: 5 added lines, all import-list
+    entries; all 215 removed lines present verbatim downstream.
+  found:
+    - "_PHYSICAL_DAMAGE_TYPES (now items.py) is dead — defined and referenced
+       nowhere in bin/."
+    - "items.py's docstring now lies: 'Depends only on stdlib, gff, lookups and
+       itemprops -- nothing here may touch Db, E() or the renderers.'  It already
+       took a Db param via _item_accessible and now imports htmlgen.escape and
+       sim.combat."
+    - "weapon_damage_props and _weapon_extra_damage_types duplicate the same
+       property-scan loop with DIFFERENT accounting (the latter ignores amounts, the
+       former folds unknown subtypes into flat instead of dropping them).  The
+       difference is behavioural — do not merge them blindly."
+    - "_ABIL_NAME_KEY is imported back into cli.py for extract_creature_defenses
+       alone; it should follow that function to its own module, or join
+       _DAMAGE_TYPE_LABELS in lookups.py."
+
   after: [htmlgen-escape-links, sim-combat]
   plan: >
     items-module had to leave four functions behind: extract_item_offense,
