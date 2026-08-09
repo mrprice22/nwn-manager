@@ -170,8 +170,27 @@ items:
 - id: lookups-module
   phase: 1
   title: Extract JSON caches and id->name lookups into lookups.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: ff94834
+  date: 2026-08-09
+  gate_result: "check --all: IDENTICAL on homers_lotr, lotr2008, lotr2009"
+  impl_notes: >
+    lookups.py 529 lines; cli.py 18,347 -> 17,886.  Snapshot ordering verified:
+    STOCK_BASEITEMS/STOCK_FEAT_NAMES still immediately follow their sources, so
+    they evaluate at import, before load_2da_overrides runs from main().  Move
+    checked for byte purity by comparing the line multiset before and after —
+    zero lines lost, only the import block gained.  Three functions stayed in
+    cli.py rather than forcing a cycle: load_2da_overrides (-> new item
+    twoda-overrides-module), _scroll_spell_sort_key (-> render-items, it needs
+    nwn_text/Db.item_name/_table_lookup) and tileset_label (-> htmlgen-escape-links,
+    it needs E()).
+  found:
+    - "_iprp_spell_info has no callers outside lookups.py — confirm it should stay
+       module-private rather than be re-exported."
+    - "ITEMPROPS is now only read at import time by IPROP_DEFS/IPROP_TABLES and has
+       no other consumer; the module-level binding could go."
+
   after: [twoda-module]
   ranges: "243-452 (_load_* caches), 787-1066 (baseitem_name .. tileset_label)"
   plan: >
@@ -228,6 +247,26 @@ items:
     item_damage_bonus, weapon_enhancement, weapon_damage_props, item_gp_value,
     _item_accessible, extract_item_offense, extract_item_defense.
     extract_item_defense has nesting depth 8 — move it as-is, do not flatten.
+
+- id: twoda-overrides-module
+  phase: 1
+  title: Move load_2da_overrides now that its tables all have homes
+  status: pending
+  gate: zero-diff
+  after: [items-module]
+  plan: >
+    load_2da_overrides could not travel with either twoda-module or
+    lookups-module: it writes BASEITEM_SLOTS, which is derived from the SLOT_*
+    constants that items-module owns, so moving it earlier meant a
+    lookups <-> items cycle.  Once items-module has landed, place it (and the
+    `# 2DA override loader` banner comment that belongs with it) in whichever of
+    twoda.py / lookups.py leaves no cycle.
+  notes: >
+    All 14 tables it writes are mutated in place and never rebound, so plain
+    imports are safe — no state.X rewrite needed.  Its docstring is stale: it
+    lists 7 tables but writes 14 (adds PLACEABLES, SKILLS, SPELLS, BASEITEM_SLOTS,
+    BASEITEM_COLUMNS_SEEN, WEAPONS, RACE_ABILITY_ADJ).  Fixing that is a comment
+    change, so it belongs in a later phase, not in this move.
 
 - id: htmlgen-escape-links
   phase: 1
