@@ -339,8 +339,40 @@ items:
 - id: twoda-overrides-module
   phase: 1
   title: Move load_2da_overrides now that its tables all have homes
-  status: pending
+  status: done
   gate: zero-diff
+  commit: ca74a7c
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (130s), lotr2008 IDENTICAL (83s), lotr2009 IDENTICAL (108s)"
+  impl_notes: >
+    Went to twoda.py, not lookups.py: the loader needs BASEITEM_SLOTS (items.py)
+    plus 13 lookups tables, and items already imports lookups, so hosting it in
+    lookups.py would have made lookups -> items -> lookups.  twoda.py is imported
+    only by cli.py and imports neither, so twoda -> {lookups, items} is acyclic —
+    and parse_2da, the loader's engine, already lives there.  _OVERLAY_TARGETS and
+    load_json_overlay were already in lookups.py from lookups-module, so nothing to
+    do for them.  cli.py 17,020 -> 16,799; twoda.py 92 -> 328.  cli.py dropped four
+    now-unused imports (BASEITEM_SLOTS, IPROP_TABLES, PLACEABLES, _WEAPON_2DA_COLS)
+    and parse_2da; line multiset shows one line added and the block byte-exact as a
+    suffix of twoda.py.  The gate cannot see this item (the golden corpora pass no
+    --2da-dir), so object identity was checked by hand: twoda.BASEITEM_SLOTS is
+    items.BASEITEM_SLOTS, all 13 lookups tables are the same objects in twoda/cli/
+    lookups, writes through the loader's bindings are visible via
+    items.baseitem_slots(), lookups.feat_name() and itemprops._table_lookup(), and
+    combat.STOCK_FEAT_NAMES correctly does NOT see a post-import FEATS write.
+  found:
+    - "twoda.py's module docstring is stale twice over: it says load_2da_overrides
+       and load_json_overlay 'still live in nwn_wiki.cli'.  The first is now in this
+       very file, the second in lookups.py."
+    - "lookups.py's docstring says the tables are patched by load_2da_overrides
+       '(still in cli)' — now twoda."
+    - "cli.py's comment near the module-index writer, 'The lookup dicts (BASEITEMS,
+       RACES, ...) are module-level', is no longer true of cli.py — they live in
+       lookups."
+    - "load_2da_overrides is ~200 lines mixing four unrelated merge passes (labels,
+       baseitem slots/weapons, racial adjusts, iprp tables); a natural split into
+       four helpers for a later phase."
+
   after: [items-module]
   plan: >
     load_2da_overrides could not travel with either twoda-module or
