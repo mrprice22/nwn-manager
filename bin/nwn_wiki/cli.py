@@ -56,6 +56,7 @@ from nwn_wiki.db.core import DbCore
 from nwn_wiki.db.derived import DbDerivedMixin, _quest_hidden, _quest_slug
 from nwn_wiki.db.dialogs import DbDialogsMixin
 from nwn_wiki.db.index import DbIndexMixin, _store_instance_slug
+from nwn_wiki.db.names import DbNamesMixin
 from nwn_wiki.db.scripts import DbScriptsMixin, _strip_nss_comments
 from nwn_wiki.gff import (
     STOCK_CREATURE_NAMES,
@@ -416,7 +417,8 @@ def creature_max_hp(c: dict | None, bp: dict | None = None) -> int | None:
 # Database
 # ---------------------------------------------------------------------------
 
-class Db(DbDerivedMixin, DbDialogsMixin, DbScriptsMixin, DbIndexMixin, DbCore):
+class Db(DbNamesMixin, DbDerivedMixin, DbDialogsMixin, DbScriptsMixin, DbIndexMixin,
+         DbCore):
     # ---- Dialog & script cross-referencing ----
 
     # Module-event field → human label, used when a module-bound event
@@ -481,122 +483,6 @@ class Db(DbDerivedMixin, DbDialogsMixin, DbScriptsMixin, DbIndexMixin, DbCore):
         "OnHeartbeat": "OnHeartbeat",
         "OnUserDefined": "OnUserDefined",
     }
-
-    # ---- Convenience getters ----
-
-    def area_name(self, resref: str) -> str:
-        a = self.areas.get(resref)
-        if not a:
-            return resref
-        return loc(a.get("Name")) or resref
-
-    def creature_name(self, resref: str) -> str:
-        c = self.creatures.get(resref)
-        if not c:
-            return STOCK_CREATURE_NAMES.get(resref, resref)
-        first = loc(c.get("FirstName"))
-        last = loc(c.get("LastName"))
-        full = (first + " " + last).strip()
-        return full or STOCK_CREATURE_NAMES.get(resref, resref)
-
-    def item_name(self, resref: str) -> str:
-        i = self.items.get(resref)
-        if not i:
-            return STOCK_ITEM_NAMES.get(resref, resref)
-        resolved = loc(i.get("LocalizedName"))
-        if not resolved or resolved.startswith("[TLK#"):
-            base = self.item_is_variant_of.get(resref, resref)
-            return (STOCK_ITEM_NAMES.get(base)
-                    or STOCK_ITEM_NAMES.get(resref)
-                    or resolved or resref)
-        return resolved
-
-    def store_name(self, resref: str) -> str:
-        s = self.stores.get(resref)
-        if not s:
-            return resref
-        return loc(s.get("LocName")) or resref
-
-    def is_friendly(self, faction_id: int | None) -> bool:
-        if faction_id is None:
-            return True
-        return self.faction_friendly.get(int(faction_id), True)
-
-    def faction_name(self, faction_id) -> str:
-        """Human-readable faction name from repute.fac.json's FactionList.
-        Falls back to the numeric id if the faction can't be resolved."""
-        if faction_id is None or faction_id == "":
-            return ""
-        try:
-            i = int(faction_id)
-        except (TypeError, ValueError):
-            return str(faction_id)
-        if i == 65535:
-            return "(None)"
-        if not self.fac:
-            return str(i)
-        flist = list_items(self.fac.get("FactionList"))
-        if 0 <= i < len(flist):
-            name = fld(flist[i], "FactionName", "") or ""
-            return nwn_text(name) if name else str(i)
-        return str(i)
-
-    def creature_instance_name(self, area: str, idx: int) -> str:
-        """Display name for a creature INSTANCE (uses overridden FirstName/
-        LastName on the placement, falling back to the blueprint's name)."""
-        insts = self.area_creature_instances.get(area, [])
-        if not (0 <= idx < len(insts)):
-            return ""
-        c = insts[idx]["c"]
-        first = loc(c.get("FirstName"))
-        last = loc(c.get("LastName"))
-        full = (first + " " + last).strip()
-        if full:
-            return full
-        rr = fld(c, "TemplateResRef", "") or ""
-        return self.creature_name(rr) if rr else "(unnamed)"
-
-    def canonical_creature_name(self, canonical_rr: str) -> str:
-        """Display name for a canonical creature entry.
-        Uses FirstName/LastName from the canonical struct (which may be a
-        GIT instance override), falling back to the source blueprint's name.
-        """
-        entry = self.canonical_creatures.get(canonical_rr)
-        if not entry:
-            return canonical_rr
-        c = entry["c"]
-        first = loc(c.get("FirstName"))
-        last = loc(c.get("LastName"))
-        full = (first + " " + last).strip()
-        if full:
-            return full
-        bp_rr = entry["bp_rr"]
-        if bp_rr and bp_rr != canonical_rr and bp_rr in self.creatures:
-            return self.creature_name(bp_rr)
-        return self.creature_name(canonical_rr) or canonical_rr
-
-    def dialog_label(self, resref: str) -> str:
-        """A short human label for a dialog: the first line of its first
-        Starting entry, truncated. Falls back to the resref."""
-        dlg = self.dialogs.get(resref)
-        if not dlg:
-            return resref
-        starts = list_items(dlg.get("StartingList"))
-        entries = list_items(dlg.get("EntryList"))
-        for s in starts:
-            i = fld(s, "Index")
-            if isinstance(i, int) and 0 <= i < len(entries):
-                txt = nwn_text(loc(entries[i].get("Text")))
-                txt = txt.strip().splitlines()[0] if txt else ""
-                if txt:
-                    return (txt[:60] + "…") if len(txt) > 63 else txt
-        # Fall back to the first non-empty entry text.
-        for e in entries:
-            txt = nwn_text(loc(e.get("Text")))
-            txt = txt.strip().splitlines()[0] if txt else ""
-            if txt:
-                return (txt[:60] + "…") if len(txt) > 63 else txt
-        return resref
 
 
 # ---------------------------------------------------------------------------
