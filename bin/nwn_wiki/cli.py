@@ -179,6 +179,12 @@ from nwn_wiki.sim.combat import (
     defense_profile,
     simulate,
 )
+from nwn_wiki.sim.pc import (
+    _FIRST_EPIC_LEVEL,
+    _epic_toughness_tiers,
+    _great_ability_tiers,
+    _kit_pieces,
+)
 from nwn_wiki.twoda import detect_cep_haks, load_2da_overrides
 from nwn_wiki.warn import _warn_once
 
@@ -5440,28 +5446,6 @@ REFERENCE_PC_CLASS = 4      # classes.2da row 4 = Fighter (d10, full BAB)
 _PC_HIT_DIE = 10
 _PRE_EPIC_CAP = 20          # class level past which BAB and saves stop growing
 
-# ---- feat budget ----------------------------------------------------------
-#
-# A pure single-class build draws on TWO pools, and they are not interchangeable:
-# a class bonus feat may only be spent from that class's own list. Great
-# Constitution is not on the Fighter list, so it cannot be bought with one; Epic
-# Toughness is, and is where spare Fighter feats go.
-#
-#   Pool A, Fighter bonus feats — level 1, then every even level, continuing
-#       every 2 levels into epic. Spent on the weapon chain (Focus,
-#       Specialization, Improved Critical, then the epic critical feats), Epic
-#       Prowess, and finally Epic Toughness.
-#   Pool B, general feats — level 1, then every 3 levels. Spent on Great
-#       Strength (Great Dexterity behind a finesse or ranged weapon), then Great
-#       Constitution.
-#
-# Legendary feats are deliberately NOT modelled: they are still in development
-# in nwn_homers_lotr, so simulating them would report power no character has.
-# Do not add them here until that lands.
-_GREAT_ABILITY_TIERS = 10       # Great <Ability> I..X
-_EPIC_TOUGHNESS_TIERS = 10      # Epic Toughness I..X, +20 HP each
-_FIRST_EPIC_LEVEL = 21
-
 # Fighter weapon/combat feats bought out of pool A before anything else. The
 # epic critical feats are counted here too, but only claim a slot when the
 # weapon and the build actually qualify for them (see crit_feat_effects).
@@ -5472,49 +5456,6 @@ _EPIC_PROWESS_FEATS = 1
 # cooldown, which is 25 six-second rounds. Surviving one cooldown therefore
 # means surviving indefinitely.
 _FULL_HEAL_ROUNDS = 150 // 6
-
-
-def _general_feat_slots(level: int) -> int:
-    """General feats: one at level 1, then one every 3 levels."""
-    return 1 + level // 3
-
-
-def _fighter_bonus_slots(level: int) -> int:
-    """Fighter bonus feats: level 1 and every even level, continuing every 2
-    levels past 20."""
-    return 1 + level // 2
-
-
-def _great_ability_tiers(level: int, *, spent: int = 0) -> int:
-    """Tiers of Great <Ability> pool B can afford at `level`.
-
-    Only epic levels can buy them, so the pre-epic general feats are set aside
-    as already spent on the ordinary prerequisites (Weapon Finesse, Toughness
-    and friends) rather than counted here.
-    """
-    if level < _FIRST_EPIC_LEVEL:
-        return 0
-    epic_general = _general_feat_slots(level) - _general_feat_slots(_FIRST_EPIC_LEVEL - 1)
-    return max(0, min(_GREAT_ABILITY_TIERS, epic_general - spent))
-
-
-def _epic_toughness_tiers(level: int, *, spent: int) -> int:
-    """Epic Toughness tiers left over in pool A once the weapon chain, the epic
-    critical feats and Epic Prowess have been paid for."""
-    if level < _FIRST_EPIC_LEVEL:
-        return 0
-    epic_bonus = _fighter_bonus_slots(level) - _fighter_bonus_slots(_FIRST_EPIC_LEVEL - 1)
-    return max(0, min(_EPIC_TOUGHNESS_TIERS, epic_bonus - spent))
-
-
-def _kit_pieces(kit: dict) -> list[dict]:
-    """Flatten a kit (slot key → piece or list of pieces) to a piece list."""
-    out: list[dict] = []
-    for v in kit.values():
-        if not v:
-            continue
-        out.extend(v if isinstance(v, list) else [v])
-    return out
 
 
 def reference_pc(level: int, kit: dict, db: "Db") -> dict:
