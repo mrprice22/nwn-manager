@@ -16,6 +16,13 @@ exception to remember.
 
 from __future__ import annotations
 
+# TLK lookup tables, populated from --dialog-tlk / --custom-tlk if given.
+# StrRefs >= CUSTOM_TLK_BASE are custom-TLK rows (id - CUSTOM_TLK_BASE);
+# anything below resolves against the base game's dialog.tlk.
+CUSTOM_TLK_BASE = 0x01000000  # 16777216
+BASE_TLK: dict[int, str] = {}
+CUSTOM_TLK: dict[int, str] = {}
+
 # Populated by render_manual_pages(); used by page() to build the Documents dropdown.
 # Each entry is one of:
 #   {"kind": "file", "title": str, "stem": str}
