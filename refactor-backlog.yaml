@@ -838,8 +838,44 @@ items:
 - id: db-core
   phase: 1
   title: Split Db construction/loading/interning into db/core.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 357e54a
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (137s), lotr2008 IDENTICAL (86s), lotr2009 IDENTICAL (102s)"
+  impl_notes: >
+    MECHANISM FOR THE WHOLE db-* SERIES — follow it in db-index .. db-names.  New
+    package db/: each concern is one mixin class in its own module, and the concrete
+    class stays declared in cli.py as `class Db(<mixins...>, DbCore)`.  DbCore owns
+    __init__ and must stay LAST in the MRO; every later item adds one module
+    defining a Db<Concern>Mixin and prepends it to the bases list.  Mixins never
+    subclass or import each other, so they stay independently movable and the MRO
+    stays trivial.  The convention is written up in db/__init__.py.  When the last
+    group leaves, `class Db` in cli.py has an empty body and collapses to an import.
+    Moved verbatim: __init__ (248 lines, NOT converted to fields — that is phase-4
+    db-init-schema), load, _intern_item, _intern_creature.  _conversation_key had to
+    travel too: only load and _intern_creature call it, and db/ may not import cli.
+    itemprops-module had left it behind for want of nwn_text, which db/core.py can
+    import from htmlgen.escape without a cycle.  db/core.py 492 lines, db/__init__.py
+    30 (docstring only); cli.py 14,427 -> 13,963.  dir(Db) is byte-identical before
+    and after (91 names), MRO is (cli.Db, db.core.DbCore, object) and Db.__module__
+    is still nwn_wiki.cli, so every existing import and annotation still resolves.
+    Line multiset: the only removed line is `class Db:`; additions are the new class
+    header, the DbCore import and the new module's own header.
+  found:
+    - "_conversation_key now sits in db/core.py though it is conceptually a sibling
+       of _creature_key/_item_prop_key/_store_inv_key in itemprops.py — split off
+       only by its nwn_text dependency.  Phase 3 could reunite the four dedup-key
+       functions once nwn_text's home settles."
+    - "Db.__init__ also sets CLI-configured dials (max_character_level,
+       max_ability_bonus, max_player_level, twoda_dir, run_counter_gear) that main()
+       overwrites afterwards.  Those are config, not state, and want to arrive as
+       constructor arguments — worth folding into phase-4 db-init-schema."
+    - "Db.load prints parse warnings straight to stderr with print() rather than
+       going through nwn_wiki/warn.py; the _intern_* methods emit no diagnostics."
+    - "The deletion incidentally normalised a three-blank-line gap in cli.py; other
+       3-blank gaps likely remain."
+
   after: [bestiary-module]
   ranges: "2457-2885 (__init__ 248 lines, load, _intern_item, _intern_creature)"
   plan: >
