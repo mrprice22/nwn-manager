@@ -391,8 +391,39 @@ items:
 - id: htmlgen-escape-links
   phase: 1
   title: Extract escaping and link helpers into htmlgen/escape.py + links.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: e78c0e1
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (132s), lotr2008 IDENTICAL (87s), lotr2009 IDENTICAL (106s)"
+  impl_notes: >
+    New subpackage htmlgen/: __init__.py 14 lines (deliberately re-exports nothing,
+    so importing the package stays a no-op and cannot create cycles), escape.py 187,
+    links.py 94.  escape.py took E, _colour_byte, nwn_html, colorize_damage_words,
+    nwn_text, nwn_first_color with the data they own (_C_TOKEN_RE, _C_OPEN_RE,
+    NWN_DAMAGE_COLORS, _DMG_WORD_RE) and the colour-token banner; it is stdlib-only.
+    links.py took the six planned helpers plus tileset_label, which lookups-module
+    had left behind for want of E() — it went to links.py rather than back to
+    lookups.py to keep the data-table leaf from depending on htmlgen.  TILESETS lost
+    its last cli.py user and left cli's lookups import.  No moved helper touches
+    state, and none imports Db (they duck-type db.script_paths / db.dialogs /
+    db.faction_name / db.canonical_inst_factions), so there is no cycle.  root_rel
+    defaults left contradictory on purpose — that is root-rel-derive.  cli.py
+    16,799 -> 16,561; line multiset shows only the two new import blocks added.
+  found:
+    - "_script_link/_conv_link quote the Db annotation, _faction_dd/_faction_cell
+       use a bare Db.  Both survive only through `from __future__ import
+       annotations` — Db is now an undefined name inside links.py, so
+       typing.get_type_hints() on them would raise.  Wants a TYPE_CHECKING import."
+    - "nwn_text's _C_TOKEN_RE strips ANY HTML-ish tag (</?[A-Za-z][^>]*>), not just
+       colour tokens, which is broader than its docstring claims."
+    - "_faction_dd hardcodes 65535 as the no-faction id with no named constant."
+    - "md_to_html (still in cli.py) does a function-local `import html as _html`
+       though cli.py already imports html at module top."
+    - "link() is the only helper in links.py without a docstring, and it applies E()
+       to the href but nwn_html() to the text, so link text can carry colour spans.
+       Looks intentional; undocumented."
+
   after: [items-module]
   ranges: "5262-5505"
   plan: >
