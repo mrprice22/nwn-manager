@@ -467,8 +467,41 @@ items:
 - id: htmlgen-chrome
   phase: 1
   title: Extract page shell, nav and theme into htmlgen/chrome.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: dda9971
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (134s), lotr2008 IDENTICAL (85s), lotr2009 IDENTICAL (110s)"
+  impl_notes: >
+    chrome.py 429 lines; cli.py 16,435 -> 16,047.  All 13 planned symbols moved,
+    nothing left behind: _creature_cr_value and scan_creature_pics take a Db but
+    only touch it by attribute, and the bare annotation never evaluates under PEP
+    563, so no cycle.  _brand_html is re-imported into cli.py even though only
+    page() calls it, to keep cli's namespace identical.  No `global` statements
+    existed in any moved function — the writers already assigned state.X directly.
+    State audit (12 symbols): read-only _MANUAL_MENUS, _MANUAL_MENU_ORDER,
+    _HAS_ACTIVITY_PAGE, _HAS_SERVER_FIRSTS, _BOSS_REGISTRY, CREATURE_PIC_EXTS;
+    read+written _THEME_HEADER_IMGS, _THEME_HEADER_DIMS, _THEME_FAVICON,
+    _THEME_EXTRA_CSS, _CREATURE_PICS, _CREATURE_PIC_GROUPS.  Write visibility
+    verified at runtime in both directions: nav globals set on state are observed by
+    chrome's dropdowns and page(), and load_wiki_theme() against a temp theme dir
+    made both chrome.page() and cli.page() emit the theme css/favicon/header with
+    the right pixel dims.  Line multiset: 15 lines added (the import block), 403
+    removed and all present verbatim in chrome.py.
+  found:
+    - "_brand_html's zip(srcs, dims) silently drops banners when
+       _THEME_HEADER_DIMS is non-empty but shorter than _THEME_HEADER_IMGS, while
+       the sibling size_attrs() guards i >= len(dims).  Inconsistent."
+    - "write(path, content) is a filesystem helper with no HTML in it — htmlgen/
+       chrome is not its long-term home; wants an io/util module."
+    - "_md_title (chrome.py) and _html_title (cli.py) are near-duplicates differing
+       only in how they find the title, sharing the same stem-fallback line."
+    - "scan_creature_pics's docstring still says 'module-level globals
+       state._CREATURE_PICS ...' — they are state attributes now."
+    - "Db in _creature_cr_value/scan_creature_pics annotations is unresolvable
+       inside chrome.py and works only because PEP 563 defers evaluation; same
+       TYPE_CHECKING gap as links.py."
+
   after: [htmlgen-markdown]
   ranges: "5632-6036"
   plan: >
