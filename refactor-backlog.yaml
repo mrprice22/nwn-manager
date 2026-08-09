@@ -140,15 +140,32 @@ items:
 
 - id: twoda-module
   phase: 1
-  title: Extract 2DA parsing and override loading into twoda.py
-  status: pending
+  title: Extract 2DA parsing into twoda.py
+  status: done
   gate: zero-diff
   after: [gff-module]
-  ranges: "453-786 (parse_2da, _2da_split, load_json_overlay, detect_cep_haks, load_2da_overrides)"
-  plan: >
-    load_2da_overrides is 196 lines and mutates many of the lookup tables — keep
-    it a move, do not restructure it.  Its writes go through state/lookups module
-    attributes, never from-imports.
+  commit: 3f6dca5
+  date: 2026-08-09
+  gate_result: "check --all: IDENTICAL on homers_lotr, lotr2008, lotr2009"
+  impl_notes: >
+    SCOPE REDUCED to parse_2da, _2da_split, detect_cep_haks.  _OVERLAY_TARGETS,
+    load_json_overlay and load_2da_overrides reference the lookup tables by
+    object, so they cannot move before the tables do — moved to lookups-module's
+    scope rather than leaving loaders and data in different modules.
+    twoda.py depends only on stdlib + gff.
+  found:
+    - "bin/wiki_data/_2da_lib.py carries its own parse_2da/_2da_split (used by
+       _build_stock.py, build_class_bab.py, build_itemprop_tables.py,
+       build_spell_info.py, cep/_build.py) — a near-copy of twoda.py that has
+       DRIFTED.  Collapsing them needs a diff-and-reconcile, not a blind delete."
+    - "load_2da_overrides's docstring lists 7 tables it updates; it actually
+       writes 14 (adds PLACEABLES, SKILLS, SPELLS, BASEITEM_SLOTS,
+       BASEITEM_COLUMNS_SEEN, WEAPONS, RACE_ABILITY_ADJ)."
+    - "load_2da_overrides is nesting depth 6 and defines its _cell closure inside
+       the per-row loop, rebuilding it for every row.  Phase-4 target."
+    - "The `# 2DA override loader` banner comment now sits above _OVERLAY_TARGETS
+       rather than the parser it introduced; it should follow load_2da_overrides
+       into lookups.py." 
 
 - id: lookups-module
   phase: 1
@@ -161,7 +178,18 @@ items:
     The _load_* functions and the *_name/*_label lookups they back.  Includes the
     spell-info helpers (_iprp_spell_info, _spell_level_classes,
     _scroll_cast_spell_info, _scroll_spell_sort_key, _iprp_name_spell_info) and
-    creature_race_immunities.
+    creature_race_immunities.  ALSO TAKES, handed over from twoda-module:
+    _OVERLAY_TARGETS, load_json_overlay and load_2da_overrides, which reference
+    these tables by object and so could not move before them.
+  notes: >
+    Two things established while twoda-module was being done.  (1) All 14 tables
+    load_2da_overrides writes are mutated in place and never rebound, so plain
+    imports are safe for every one of them — no state.X rewrite needed.  (2)
+    BASEITEM_SLOTS is `dict(_STOCK_BASEITEM_SLOTS)` evaluated at IMPORT time and
+    mutated by load_2da_overrides afterwards; STOCK_BASEITEMS and STOCK_FEAT_NAMES
+    are snapshots too.  Preserve snapshot-at-import-then-mutate ordering or the
+    stock-vs-custom row distinction breaks silently, with no gate signal on a
+    corpus that passes no --2da-dir.
 
 - id: itemprops-module
   phase: 1
