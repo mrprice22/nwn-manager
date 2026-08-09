@@ -56,6 +56,7 @@ SLOT_NAMES = {
 }
 
 WEAPON_SLOTS = {SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B}
+_CWEAP_SLOTS = frozenset({SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B})
 ARMOR_SLOTS = {SLOT_CHEST, SLOT_LEFT}  # left can hold a shield
 SHIELD_BASEITEMS = {14, 56, 57}  # Small / Large / Tower shields (stock 2da rows)
 

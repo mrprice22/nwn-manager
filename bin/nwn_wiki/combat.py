@@ -16,7 +16,13 @@ import re
 from typing import Iterable
 
 from nwn_wiki.gff import fld
-from nwn_wiki.lookups import CLASS_BAB, STOCK_FEAT_NAMES
+from nwn_wiki.lookups import (
+    BASEITEM_COLUMNS_SEEN,
+    CLASS_BAB,
+    STOCK_FEAT_NAMES,
+    WEAPONS,
+)
+from nwn_wiki.util import _try_int
 
 
 # ---------------------------------------------------------------------------
@@ -148,3 +154,133 @@ def ability_mod(score: int | None) -> int:
     if score is None:
         return 0
     return (int(score) - 10) // 2
+
+
+WEAPON_FINESSE_FEAT = 42   # feat.2da FEAT_WEAPON_FINESSE → light weapons use Dex
+EPIC_TOUGHNESS_BASE = 754  # feat.2da Epic Toughness I; I..X = 754..763, +20 HP/tier
+
+
+def epic_toughness_hp(feat_ids: Iterable[int]) -> int:
+    """HP NWN:EE adds on spawn from Epic Toughness, on top of the blueprint's
+    stored MaxHitPoints (the toolset's stored value excludes it). Modelled as
+    20 × the highest tier owned (the tiers form a prereq ladder). Returns 0 if
+    none are present."""
+    tiers = [fid - EPIC_TOUGHNESS_BASE + 1 for fid in feat_ids
+             if EPIC_TOUGHNESS_BASE <= fid <= EPIC_TOUGHNESS_BASE + 9]
+    return 20 * max(tiers) if tiers else 0
+
+
+# Stock light/finessable weapon base-item rows (Weapon Finesse uses Dex on
+# these); creature weapons (claw/bite) are also finessable and handled by slot.
+FINESSE_BASEITEMS = frozenset({22, 37, 38, 40, 42, 51, 60, 111})
+# Dagger, Light Hammer, Handaxe, Kama, Kukri, Rapier, Sickle, Whip.
+
+
+# ---------------------------------------------------------------------------
+# Critical-hit feats.
+#
+# The engine resolves these per base item: baseitems.2da names the exact feat id
+# for this weapon's Weapon Focus, Improved Critical, Overwhelming Critical and
+# Devastating Critical. A blank column means the feat does not exist for that
+# weapon and cannot be taken — which is precisely how nwn_homers_lotr disables
+# Devastating Critical server-wide (bin/gen-devcrit-map.py blanks the column, so
+# the engine's own check can never succeed and no save is ever rolled).
+#
+# Reading the columns rather than hardcoding a rule keeps this module-agnostic:
+# a stock module keeps its save-or-die, this one does not, and neither has to be
+# told which it is.
+# ---------------------------------------------------------------------------
+
+# Overwhelming Critical adds damage scaling with the weapon's crit multiplier:
+# +1d6 for a x2 weapon, +2d6 for x3, +3d6 for x4 — i.e. (mult - 1) six-sided
+# dice. Isolated here so it can be corrected in one place if a module's own
+# rules differ.
+_OVERWHELMING_DIE = 6
+
+# Devastating Critical's replacement damage, when a module has disabled the
+# engine's save-or-die and re-implemented it as bonus dice (--devcrit-bonus-dice).
+# Die size follows baseitems.2da WeaponSize, matching this module's
+# unpacked/devcrit_inc.nss: 1-2 small, 3 medium, 4+ large.
+_DEVCRIT_DIE_BY_SIZE = {1: 6, 2: 6, 3: 8}
+_DEVCRIT_DIE_LARGE = 10
+
+# Feat prerequisites the simulation actually enforces. Improved Critical needs
+# BAB +8; the epic critical chain needs Strength 25, which is what stops a
+# Dexterity/finesse build from taking it.
+_IMPROVED_CRIT_MIN_BAB = 8
+_EPIC_CRIT_MIN_STR = 25
+
+
+def _devcrit_die(weapon_size: int) -> int:
+    """Die size for a replacement devastating-critical bonus die."""
+    return _DEVCRIT_DIE_BY_SIZE.get(weapon_size, _DEVCRIT_DIE_LARGE)
+
+
+def weapon_feat_id(bi: int, column: str) -> int:
+    """Feat id this base item names in `column`, or 0 when it names none.
+
+    Zero is the answer that matters: it means the engine has no feat to check,
+    so nobody wielding this weapon can have it.
+    """
+    return _try_int((WEAPONS.get(bi) or {}).get(column), 0)
+
+
+def crit_feat_effects(bi: int, *, bab: int, str_score: int,
+                      has_feat: "Callable[[int], bool] | None" = None,
+                      devcrit_bonus_dice: int = 0) -> dict:
+    """Resolve the critical-hit feats for one weapon in one wielder's hands.
+
+    `has_feat(feat_id) -> bool` decides whether the wielder actually has a given
+    feat; pass None for the reference PC, which is assumed specced into whatever
+    it holds (subject to the real prerequisites below). Creatures pass a lookup
+    over their own FeatList so they only get what they were built with.
+
+    Returns {threat_mult, crit_bonus, devcrit_save_dc, feats} where `feats` names
+    what was granted, for the report.
+    """
+    stats = WEAPONS.get(bi) or {}
+    size = _try_int(stats.get("WeaponSize"), 0)
+    crit_mult = _try_int(stats.get("CritHitMult"), 2) or 2
+
+    def _granted(column: str, *, prereq: bool) -> bool:
+        feat_id = weapon_feat_id(bi, column)
+        if not feat_id or not prereq:
+            return False
+        return has_feat(feat_id) if has_feat is not None else True
+
+    names: list[str] = []
+    threat_mult = 1
+    crit_bonus = 0.0
+    devcrit_dc = 0
+
+    if _granted("WeaponImprovedCriticalFeat", prereq=bab >= _IMPROVED_CRIT_MIN_BAB):
+        threat_mult = 2          # NWN doubles the range: 20 -> 19-20, 19-20 -> 17-20
+        names.append("Improved Critical")
+
+    epic_ok = str_score >= _EPIC_CRIT_MIN_STR and threat_mult > 1
+    overwhelming = _granted("EpicWeaponOverwhelmingCriticalFeat", prereq=epic_ok)
+    if overwhelming:
+        crit_bonus += max(1, crit_mult - 1) * (_OVERWHELMING_DIE + 1) / 2.0
+        names.append("Overwhelming Critical")
+
+    # Devastating Critical requires Overwhelming. Which of its two forms applies
+    # is decided by the 2DA, not by configuration: a named feat means the engine
+    # still rolls its save-or-die, a blank column means the module disabled it
+    # and any replacement damage comes from --devcrit-bonus-dice.
+    if overwhelming:
+        _col = "EpicWeaponDevastatingCriticalFeat"
+        # A blank column means the module disabled the mechanic; a column we
+        # never loaded means we have no evidence, so assume the engine default.
+        if weapon_feat_id(bi, _col) or _col not in BASEITEM_COLUMNS_SEEN:
+            # Stock: Fort save or die. DC 10 + half character level + Str mod;
+            # the caller supplies the level via `bab` for creatures whose level
+            # we do not track separately.
+            devcrit_dc = 10 + bab // 2 + ability_mod(str_score)
+            names.append("Devastating Critical (save-or-die)")
+        elif devcrit_bonus_dice > 0:
+            die = _devcrit_die(size)
+            crit_bonus += devcrit_bonus_dice * (die + 1) / 2.0
+            names.append(f"Devastating Critical ({devcrit_bonus_dice}d{die})")
+
+    return {"threat_mult": threat_mult, "crit_bonus": crit_bonus,
+            "devcrit_save_dc": devcrit_dc, "feats": names}
