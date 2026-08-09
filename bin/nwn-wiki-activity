@@ -155,10 +155,12 @@ def main() -> int:
               file=sys.stderr)
         return 0
 
-    # Set globals required by page() and render_activity_page().
-    wiki._HAS_ACTIVITY_PAGE = True
-    wiki._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
-    wiki._MANUAL_PAGES = []
+    # Set the state required by page() and render_activity_page().  These must
+    # land on nwn_wiki.state, the module that defines them -- setting them on
+    # any other module object would leave the readers seeing the defaults.
+    from nwn_wiki import state
+    state._HAS_ACTIVITY_PAGE = True
+    state._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
     wiki.load_wiki_theme(src.parent, out)
 
     if args.db_dir:

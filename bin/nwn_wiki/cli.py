@@ -34,61 +34,7 @@ from typing import Any, Callable, Iterable
 
 from nwn_wiki.paths import ASSETS_DIR, DATA_DIR, SCRIPT_DIR
 
-# Populated by render_manual_pages(); used by page() to build the Documents dropdown.
-# Each entry is one of:
-#   {"kind": "file", "title": str, "stem": str}
-#   {"kind": "dir",  "title": str, "dirname": str,
-#    "items": [{"title": str, "stem": str}, ...]}
-_MANUAL_MENUS: dict[str, list[dict]] = {}  # menu name -> ordered manual-page entries
-_MANUAL_MENU_ORDER: dict[str, int] = {}  # custom menu name -> first @menu-order seen
-_HAS_ACTIVITY_PAGE: bool = False
-_HAS_SERVER_FIRSTS: bool = False  # set in render_manual_pages(); drives Activity nav
-_GENERATED_AT: str = ""  # set in main(); included in every page footer
-
-# Bestiary kill-tracking stats, read from the live NWNX:EE campaign DB
-# (<db-dir>/bestiarydb.sqlite3) when the module uses the bestiary system. The
-# filename must match the module's campaign DB name (BST_DB="bestiarydb" in
-# bst_db.nss) — that is the file the in-game scripts read and write.
-BST_SF_CR = 60  # Server-First Challenge Rating threshold (mirror bst_db.nss)
-_BESTIARY_ACTIVE: bool = False
-_BESTIARY_KILLS: dict[str, dict] = {}  # canonical resref -> {"total","solo","party"}
-# canonical resref -> per-character kill rows, sorted by total desc:
-#   [{"uuid","name","solo","party","total","last"}]  ("uuid" is internal only —
-#   never rendered into HTML; pages show char_name.)
-_BESTIARY_TOP: dict[str, list[dict]] = {}
-_SERVER_FIRSTS: list[dict] = []        # [{"resref","cr","name","cname","at"}]
-
-# Boss respawn tracker ("Roll of the Fallen") registry, parsed from the module's
-# brd_db.nss BRD_SeedBoss(...) seed rows by load_boss_registry(). Single source
-# of truth shared with the in-game Well of Eru board — the wiki Bosses page is
-# generated from the same rows the game seeds into respawndb on module load, so
-# the two can never drift. Empty for modules without the tracker (no nav link).
-_BOSS_REGISTRY: list[dict] = []   # [{"resref","name","tag","area","area_name","cr"}]
-_BOSS_ALIASES: dict[str, str] = {}  # variant blueprint resref -> canonical resref
-
-# Creature artwork loaded from <project-root>/creature-pics/ by scan_creature_pics().
-# Filenames are matched to creature display names; a trailing "_NN" sets order.
-CREATURE_PIC_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-_CREATURE_PICS: dict[str, list[str]] = {}     # canonical resref -> [image filename, ...]
-_CREATURE_PIC_GROUPS: list[dict] = []         # [{"name","matches","images","cr"}], sorted
-
-# Per-module theme assets loaded from <project-root>/wiki-theme/ by load_wiki_theme().
-_THEME_FAVICON: str = ""           # filename in assets/, e.g. "favicon.png"
-_THEME_HEADER_IMGS: list[str] = [] # filenames in assets/, e.g. ["header.png", "header_02.png"]
-_THEME_HEADER_DIMS: list[tuple[int, int] | None] = []  # intrinsic (w, h) per header image
-_THEME_EXTRA_CSS: str = ""         # filename in assets/, e.g. "theme.css"
-
-# Lookup warning registry: message → sorted list of referencing items/creatures.
-# Populated by _warn_once(); avoids flooding stderr on large modules.
-_warned: dict[str, list[str]] = {}
-# Set by rendering functions before processing each entity so warnings can
-# record which item/creature triggered them.
-_current_context: str = ""
-
-# Module-index summary collector: (severity, message) tuples accumulated during
-# generation and printed as a grouped, colour-coded block at the end of the run.
-# severity ∈ {"info", "warn", "issue"}
-_module_index_summary: list[tuple[str, str]] = []
+from nwn_wiki import state
 
 _C_INFO  = "\033[36m"    # cyan — informational
 _C_WARN  = "\033[33m"    # yellow — warnings
@@ -97,12 +43,11 @@ _C_RESET = "\033[0m"
 
 
 def _warn_once(msg: str) -> None:
-    global _warned, _current_context
-    already = msg in _warned
+    already = msg in state._warned
     if not already:
-        _warned[msg] = []
-    if _current_context and _current_context not in _warned[msg]:
-        _warned[msg].append(_current_context)
+        state._warned[msg] = []
+    if state._current_context and state._current_context not in state._warned[msg]:
+        state._warned[msg].append(state._current_context)
 
 
 # ---------------------------------------------------------------------------
@@ -5660,7 +5605,7 @@ def _quests_nav(root_rel: str) -> str:
     generated index becomes "Journal Entries" inside it.
     """
     index_link = f'{E(root_rel)}/quests/index.html'
-    rows = _manual_menu_rows(_MANUAL_MENUS.get("Quests", []), root_rel)
+    rows = _manual_menu_rows(state._MANUAL_MENUS.get("Quests", []), root_rel)
     if not rows:
         return f'<a href="{index_link}">Quests</a>'
     rows.append(f'<a href="{index_link}">Journal Entries</a>')
@@ -5680,13 +5625,13 @@ def _activity_dropdown(root_rel: str) -> str:
     Player Activity / Server Firsts are refreshed more often than the rest of
     the wiki (via nwn-wiki-activity). Shown only when at least one entry exists.
     """
-    manual_rows = _manual_menu_rows(_MANUAL_MENUS.get("Activity", []), root_rel)
-    if not (_HAS_ACTIVITY_PAGE or _HAS_SERVER_FIRSTS or manual_rows):
+    manual_rows = _manual_menu_rows(state._MANUAL_MENUS.get("Activity", []), root_rel)
+    if not (state._HAS_ACTIVITY_PAGE or state._HAS_SERVER_FIRSTS or manual_rows):
         return ""
     rows: list[str] = list(manual_rows)
-    if _HAS_ACTIVITY_PAGE:
+    if state._HAS_ACTIVITY_PAGE:
         rows.append(f'<a href="{E(root_rel)}/activity.html">Player Activity</a>')
-    if _HAS_SERVER_FIRSTS:
+    if state._HAS_SERVER_FIRSTS:
         rows.append(
             f'<a href="{E(root_rel)}/manual/ServerFirsts.html">Server Firsts</a>'
         )
@@ -5701,7 +5646,7 @@ def _activity_dropdown(root_rel: str) -> str:
 
 def _docs_dropdown(root_rel: str) -> str:
     """Return the Documents nav dropdown HTML, or empty string if none."""
-    entries = _MANUAL_MENUS.get("Documents", [])
+    entries = state._MANUAL_MENUS.get("Documents", [])
     if not entries:
         return ""
     inner = "\n".join(_manual_menu_rows(entries, root_rel))
@@ -5717,13 +5662,13 @@ def _custom_manual_dropdowns(root_rel: str) -> str:
     """Return nav dropdown HTML for any custom @menu names (excluding the
     built-in Documents/Activity/Quests dropdowns), ordered by @menu-order then
     first-seen position."""
-    custom_names = [n for n in _MANUAL_MENUS
+    custom_names = [n for n in state._MANUAL_MENUS
                     if n not in ("Documents", "Activity", "Quests")]
-    custom_names.sort(key=lambda n: (_MANUAL_MENU_ORDER.get(n, 10**9),
-                                      list(_MANUAL_MENUS).index(n)))
+    custom_names.sort(key=lambda n: (state._MANUAL_MENU_ORDER.get(n, 10**9),
+                                      list(state._MANUAL_MENUS).index(n)))
     blocks: list[str] = []
     for name in custom_names:
-        inner = "\n".join(_manual_menu_rows(_MANUAL_MENUS[name], root_rel))
+        inner = "\n".join(_manual_menu_rows(state._MANUAL_MENUS[name], root_rel))
         blocks.append(
             '<div class="nav-dropdown">'
             f'<span class="nav-dropdown-label">{E(name)} &#9660;</span>'
@@ -5754,11 +5699,11 @@ def _brand_html(root_rel: str) -> str:
     ever fetched and the reserved box matches it.
     """
     home = f'{E(root_rel)}/index.html'
-    if not _THEME_HEADER_IMGS:
+    if not state._THEME_HEADER_IMGS:
         return f'<a class="brand" href="{home}">Module Wiki</a>'
 
-    srcs = [f"{root_rel}/assets/{n}" for n in _THEME_HEADER_IMGS]
-    dims = _THEME_HEADER_DIMS or [None] * len(srcs)
+    srcs = [f"{root_rel}/assets/{n}" for n in state._THEME_HEADER_IMGS]
+    dims = state._THEME_HEADER_DIMS or [None] * len(srcs)
 
     def size_attrs(i: int) -> str:
         d = dims[i] if i < len(dims) else None
@@ -5788,10 +5733,10 @@ def _brand_html(root_rel: str) -> str:
 
 def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") -> str:
     """Wrap body in the standard wiki page shell."""
-    extra_css = (f'\n  <link rel="stylesheet" href="{E(root_rel)}/assets/{E(_THEME_EXTRA_CSS)}">'
-                 if _THEME_EXTRA_CSS else "")
-    favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(_THEME_FAVICON)}">'
-               if _THEME_FAVICON else "")
+    extra_css = (f'\n  <link rel="stylesheet" href="{E(root_rel)}/assets/{E(state._THEME_EXTRA_CSS)}">'
+                 if state._THEME_EXTRA_CSS else "")
+    favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(state._THEME_FAVICON)}">'
+               if state._THEME_FAVICON else "")
     brand = _brand_html(root_rel)
     return f"""<!doctype html>
 <html lang="en">
@@ -5816,7 +5761,7 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
           <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
           <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
           <a href="{E(root_rel)}/creatures/search.html">Search</a>
-          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if _BOSS_REGISTRY else ''}
+          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if state._BOSS_REGISTRY else ''}
           <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>
         </div>
       </div>
@@ -5918,7 +5863,6 @@ def _img_pixel_size(path: Path) -> tuple[int, int] | None:
 
 def load_wiki_theme(project_root: Path, out: Path) -> None:
     """Copy files from <project_root>/wiki-theme/ into output assets and set theme globals."""
-    global _THEME_FAVICON, _THEME_HEADER_IMGS, _THEME_HEADER_DIMS, _THEME_EXTRA_CSS
     theme_dir = project_root / "wiki-theme"
     if not theme_dir.is_dir():
         return
@@ -5933,14 +5877,14 @@ def load_wiki_theme(project_root: Path, out: Path) -> None:
         shutil.copy2(f, assets_out / f.name)
         stem, ext = f.stem.lower(), f.suffix.lower()
         if stem == "favicon" and ext in favicon_exts:
-            _THEME_FAVICON = f.name
+            state._THEME_FAVICON = f.name
             loaded.append(f"favicon={f.name}")
         elif stem.startswith("header") and ext in img_exts:
-            _THEME_HEADER_IMGS.append(f.name)
-            _THEME_HEADER_DIMS.append(_img_pixel_size(f))
+            state._THEME_HEADER_IMGS.append(f.name)
+            state._THEME_HEADER_DIMS.append(_img_pixel_size(f))
             loaded.append(f"header={f.name}")
         elif f.name == "theme.css":
-            _THEME_EXTRA_CSS = f.name
+            state._THEME_EXTRA_CSS = f.name
             loaded.append("css=theme.css")
     if loaded:
         print(f"[nwn-wiki] loaded wiki-theme ({', '.join(loaded)}) from {theme_dir}")
@@ -5966,17 +5910,16 @@ def _creature_cr_value(db: Db, can_rr: str) -> float:
 def scan_creature_pics(project_root: Path, db: Db) -> None:
     """Index <project_root>/creature-pics/ artwork against creature names.
 
-    Populates the module-level globals _CREATURE_PICS (canonical resref ->
-    [image filename]) and _CREATURE_PIC_GROUPS (display groups for the Pictures
+    Populates the module-level globals state._CREATURE_PICS (canonical resref ->
+    [image filename]) and state._CREATURE_PIC_GROUPS (display groups for the Pictures
     page, sorted by descending CR with unmatched groups last).
 
     Filename rules: the stem (minus extension) is matched case-insensitively to
     a creature's display name. A trailing "_NN" sets the display order of
     multiple images for the same creature (e.g. "Gimli_01.png", "Gimli_02.png").
     """
-    global _CREATURE_PICS, _CREATURE_PIC_GROUPS
-    _CREATURE_PICS = {}
-    _CREATURE_PIC_GROUPS = []
+    state._CREATURE_PICS = {}
+    state._CREATURE_PIC_GROUPS = []
     pics_dir = project_root / "creature-pics"
     if not pics_dir.is_dir():
         return
@@ -5990,7 +5933,7 @@ def scan_creature_pics(project_root: Path, db: Db) -> None:
     # base_name (original case) -> {"matches": [...], "images": [(order, filename)]}
     groups: dict[str, dict] = {}
     for f in sorted(pics_dir.iterdir(), key=lambda p: p.name.lower()):
-        if not f.is_file() or f.suffix.lower() not in CREATURE_PIC_EXTS:
+        if not f.is_file() or f.suffix.lower() not in state.CREATURE_PIC_EXTS:
             continue
         stem = f.stem
         m = suffix_re.match(stem)
@@ -6014,21 +5957,21 @@ def scan_creature_pics(project_root: Path, db: Db) -> None:
             cr = max(_creature_cr_value(db, rr) for rr in g["matches"])
         else:
             cr = -1.0
-        _CREATURE_PIC_GROUPS.append({
+        state._CREATURE_PIC_GROUPS.append({
             "name": base_name,
             "matches": g["matches"],
             "images": images,
             "cr": cr,
         })
         for rr in g["matches"]:
-            _CREATURE_PICS.setdefault(rr, []).extend(images)
+            state._CREATURE_PICS.setdefault(rr, []).extend(images)
 
     # Descending CR; unmatched (cr < 0) sink to the bottom; tie-break by name.
-    _CREATURE_PIC_GROUPS.sort(
+    state._CREATURE_PIC_GROUPS.sort(
         key=lambda grp: (grp["matches"] == [], -grp["cr"], grp["name"].lower())
     )
-    if _CREATURE_PIC_GROUPS:
-        print(f"[nwn-wiki] indexed creature-pics: {len(_CREATURE_PIC_GROUPS)} "
+    if state._CREATURE_PIC_GROUPS:
+        print(f"[nwn-wiki] indexed creature-pics: {len(state._CREATURE_PIC_GROUPS)} "
               f"group(s) from {pics_dir}")
 
 
@@ -7472,8 +7415,8 @@ def render_creatures_index(db: Db, out: Path) -> None:
             variant_note = ""
         _eff_hp = creature_max_hp(c, bp)
         total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
-        if _BESTIARY_ACTIVE:
-            k = _BESTIARY_KILLS.get(can_rr)
+        if state._BESTIARY_ACTIVE:
+            k = state._BESTIARY_KILLS.get(can_rr)
             kills_cells = (
                 f"<td>{k['total'] if k else '—'}</td>"
                 f"<td>{k['solo'] if k else '—'}</td>"
@@ -7504,7 +7447,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
         if n_variants else ""
     )
     kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
-                  if _BESTIARY_ACTIVE else "")
+                  if state._BESTIARY_ACTIVE else "")
     TABLE_HEAD = (
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>Count</th><th>Race</th><th>Class</th>"
@@ -7570,33 +7513,32 @@ _BOSS_ALIAS_RE = re.compile(
 
 
 def _load_boss_registry_from_path(p: Path | None) -> None:
-    """Populate _BOSS_REGISTRY/_BOSS_ALIASES from a brd_db.nss path.
+    """Populate state._BOSS_REGISTRY/state._BOSS_ALIASES from a brd_db.nss path.
     No-op (empty registry, no Bosses page/nav link) when the path is missing —
     i.e. the module doesn't use the boss respawn tracker."""
-    global _BOSS_REGISTRY, _BOSS_ALIASES
-    _BOSS_REGISTRY = []
-    _BOSS_ALIASES = {}
+    state._BOSS_REGISTRY = []
+    state._BOSS_ALIASES = {}
     if not p or not p.is_file():
         return
     text = _strip_nss_comments(p.read_text())
     for m in _BOSS_SEED_RE.finditer(text):
         d = m.groupdict()
         d["cr"] = float(d["cr"])
-        _BOSS_REGISTRY.append(d)
+        state._BOSS_REGISTRY.append(d)
     for m in _BOSS_ALIAS_RE.finditer(text):
-        _BOSS_ALIASES[m.group("resref")] = m.group("canonical")
-    if _BOSS_REGISTRY:
-        print(f"[nwn-wiki] boss registry: {len(_BOSS_REGISTRY)} bosses"
-              f" ({len(_BOSS_ALIASES)} variant aliases) from brd_db.nss")
+        state._BOSS_ALIASES[m.group("resref")] = m.group("canonical")
+    if state._BOSS_REGISTRY:
+        print(f"[nwn-wiki] boss registry: {len(state._BOSS_REGISTRY)} bosses"
+              f" ({len(state._BOSS_ALIASES)} variant aliases) from brd_db.nss")
 
 
 def load_boss_registry(db: Db) -> None:
-    """Populate _BOSS_REGISTRY/_BOSS_ALIASES from the module's brd_db.nss."""
+    """Populate state._BOSS_REGISTRY/state._BOSS_ALIASES from the module's brd_db.nss."""
     _load_boss_registry_from_path(db.script_paths.get("brd_db"))
 
 
 def load_boss_registry_from_src(src: Path) -> None:
-    """Populate _BOSS_REGISTRY/_BOSS_ALIASES from <src>/brd_db.nss.
+    """Populate state._BOSS_REGISTRY/state._BOSS_ALIASES from <src>/brd_db.nss.
 
     For callers (e.g. nwn-wiki-activity) that render pages without building a
     full Db. Mirrors how Db.load maps the 'brd_db' resref to <src>/brd_db.nss."""
@@ -7606,10 +7548,10 @@ def load_boss_registry_from_src(src: Path) -> None:
 def render_bosses_index(db: Db, out: Path) -> None:
     """creatures/bosses.html — every boss tracked by the in-game Roll of the
     Fallen board, same columns as the creatures index, sorted by CR desc."""
-    if not _BOSS_REGISTRY:
+    if not state._BOSS_REGISTRY:
         return
     rows = []
-    for boss in sorted(_BOSS_REGISTRY, key=lambda b: (-b["cr"], b["name"].lower())):
+    for boss in sorted(state._BOSS_REGISTRY, key=lambda b: (-b["cr"], b["name"].lower())):
         rr = boss["resref"]
         entry = db.canonical_creatures.get(rr)
         if entry:
@@ -7647,12 +7589,12 @@ def render_bosses_index(db: Db, out: Path) -> None:
             lair_cell = link(f"../areas/{area_rr}.html", boss["area_name"])
         else:
             lair_cell = E(boss["area_name"])
-        if _BESTIARY_ACTIVE:
+        if state._BESTIARY_ACTIVE:
             # Sum kills across the boss's variant blueprints (e.g. the five
             # leveled Xanith .utcs all count as one boss on the board).
-            variant_rrs = [rr] + [v for v, canon in _BOSS_ALIASES.items()
+            variant_rrs = [rr] + [v for v, canon in state._BOSS_ALIASES.items()
                                   if canon == rr]
-            ks = [_BESTIARY_KILLS[v] for v in variant_rrs if v in _BESTIARY_KILLS]
+            ks = [state._BESTIARY_KILLS[v] for v in variant_rrs if v in state._BESTIARY_KILLS]
             if ks:
                 kills_cells = (
                     f"<td>{sum(k['total'] for k in ks)}</td>"
@@ -7674,8 +7616,8 @@ def render_bosses_index(db: Db, out: Path) -> None:
             f"{kills_cells}</tr>"
         )
     kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
-                  if _BESTIARY_ACTIVE else "")
-    n = len(_BOSS_REGISTRY)
+                  if state._BESTIARY_ACTIVE else "")
+    n = len(state._BOSS_REGISTRY)
     body = (
         "<h1>Bosses</h1>"
         f"<p>The {n} great powers of Middle-earth tracked by the "
@@ -7710,7 +7652,7 @@ def _pic_figures(images: list[str], alt: str, prefix: str = "pics") -> str:
 def render_creature_pictures(db: Db, out: Path) -> None:
     """Gallery page grouping creature artwork (from creature-pics/) by NPC,
     sorted by descending CR, with a floating left-hand name navigation."""
-    if not _CREATURE_PIC_GROUPS:
+    if not state._CREATURE_PIC_GROUPS:
         return
 
     def _slug(name: str) -> str:
@@ -7719,7 +7661,7 @@ def render_creature_pictures(db: Db, out: Path) -> None:
 
     # Disambiguate any colliding slugs.
     used: dict[str, int] = {}
-    for grp in _CREATURE_PIC_GROUPS:
+    for grp in state._CREATURE_PIC_GROUPS:
         base = _slug(grp["name"])
         n = used.get(base, 0)
         used[base] = n + 1
@@ -7729,17 +7671,17 @@ def render_creature_pictures(db: Db, out: Path) -> None:
         '<div><a href="index.html">All Creatures</a></div>',
         '<div class="toc-group-heading">Pictures</div>',
     ]
-    for grp in _CREATURE_PIC_GROUPS:
+    for grp in state._CREATURE_PIC_GROUPS:
         toc_parts.append(f'<div><a href="#{E(grp["_slug"])}">{nwn_html(grp["name"])}</a></div>')
     sidebar = '<aside class="items-toc items-toc--wide">' + "".join(toc_parts) + "</aside>"
 
     sections = [
         "<h1>Creature Pictures</h1>",
-        f"<p>{len(_CREATURE_PIC_GROUPS)} creature"
-        f"{'s' if len(_CREATURE_PIC_GROUPS) != 1 else ''} with artwork, "
+        f"<p>{len(state._CREATURE_PIC_GROUPS)} creature"
+        f"{'s' if len(state._CREATURE_PIC_GROUPS) != 1 else ''} with artwork, "
         f"sorted by descending Challenge Rating.</p>",
     ]
-    for grp in _CREATURE_PIC_GROUPS:
+    for grp in state._CREATURE_PIC_GROUPS:
         name = grp["name"]
         sections.append(f'<section id="{E(grp["_slug"])}">')
         sections.append(f"<h2>{nwn_html(name)}</h2>")
@@ -9894,14 +9836,14 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     sections.append('</dl>')
 
     # Creature artwork (from creature-pics/), just after the meta box.
-    pics = _CREATURE_PICS.get(canonical_rr)
+    pics = state._CREATURE_PICS.get(canonical_rr)
     if pics:
         sections.append('<div class="creature-pics">'
                         + _pic_figures(pics, name) + "</div>")
 
     # Bestiary kill stats (when the module runs the kill-tracking system).
-    if _BESTIARY_ACTIVE:
-        sf = next((s for s in _SERVER_FIRSTS if s["resref"] == canonical_rr), None)
+    if state._BESTIARY_ACTIVE:
+        sf = next((s for s in state._SERVER_FIRSTS if s["resref"] == canonical_rr), None)
         if sf:
             slayer = E(sf["name"])
             if sf.get("player_name"):
@@ -9911,7 +9853,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
                 f"first slain by {slayer}"
                 + (f" on {E(_utc_to_local(sf['at']))}" if sf["at"] else "") + ".</p>"
             )
-        k = _BESTIARY_KILLS.get(canonical_rr)
+        k = state._BESTIARY_KILLS.get(canonical_rr)
         if k:
             sections.append(
                 "<h2>Kills</h2>"
@@ -9926,11 +9868,11 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
         # creature. Merge boss variant blueprints into their canonical (same
         # summing the Bosses index does) so e.g. the leveled Xanith .utcs
         # don't split a character's count. Omitted when nobody has a kill.
-        variant_rrs = [canonical_rr] + [v for v, canon in _BOSS_ALIASES.items()
+        variant_rrs = [canonical_rr] + [v for v, canon in state._BOSS_ALIASES.items()
                                         if canon == canonical_rr]
         merged: dict[str, dict] = {}
         for v_rr in variant_rrs:
-            for r in _BESTIARY_TOP.get(v_rr, []):
+            for r in state._BESTIARY_TOP.get(v_rr, []):
                 m = merged.get(r["uuid"])
                 if m is None:
                     merged[r["uuid"]] = dict(r)
@@ -10620,8 +10562,7 @@ def render_creatures_search(db: Db, out: Path) -> None:
     be negated, which is what makes "everything that is *not* crit immune"
     answerable.
     """
-    global _current_context
-    boss_rrs = {b["resref"] for b in _BOSS_REGISTRY}
+    boss_rrs = {b["resref"] for b in state._BOSS_REGISTRY}
     index: list[dict] = []
 
     for can_rr in sorted(db.canonical_creatures,
@@ -10630,7 +10571,7 @@ def render_creatures_search(db: Db, out: Path) -> None:
         c = entry["c"]
         bp_rr = entry["bp_rr"]
         bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
-        _current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
+        state._current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
 
         def _f(key, default=None, _c=c, _bp=bp):
             v = fld(_c, key)
@@ -10704,7 +10645,7 @@ def render_creatures_search(db: Db, out: Path) -> None:
             "props": sorted(props.values(), key=lambda r: (r["p"], r["s"], r["c"])),
         })
 
-    _current_context = ""
+    state._current_context = ""
     write(out / "creatures" / "search-index.json",
           json.dumps(index, ensure_ascii=False, separators=(",", ":")))
 
@@ -10724,7 +10665,7 @@ def render_creatures_search(db: Db, out: Path) -> None:
     cond_rows = "".join(_cond_row(n) for n in range(1, 5))
     boss_box = (
         '<label class="checkbox-label"><input type="checkbox" id="fboss"> Bosses only</label>'
-        if _BOSS_REGISTRY else ""
+        if state._BOSS_REGISTRY else ""
     )
 
     body = (
@@ -11668,7 +11609,6 @@ _PROP_GROUP_ORDER = [
 
 
 def render_items_by_property(db: "Db", out: Path) -> None:
-    global _current_context
     # Map from property name → list of subtype prefix groups.
     # Subtypes matching a prefix (e.g. "Sneak Attack (+1d6)") are grouped under
     # the prefix key on the index page and shown as sub-sections on the detail page.
@@ -11701,7 +11641,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         name = db.item_name(resref)
         if name.startswith("[TLK#") or name == resref:
             continue
-        _current_context = f"item:{resref} ({name})"
+        state._current_context = f"item:{resref} ({name})"
         for p in list_items(i.get("PropertiesList")):
             f = itemprop_format(p)
             pname, subtype, cost_str = f["property"], f["subtype"], f["cost"]
@@ -12393,7 +12333,6 @@ function esc(s){
 
 
 def render_items_search(db: "Db", out: Path) -> None:
-    global _current_context
     index: list[dict] = []
     for resref, i in sorted(db.items.items(),
                             key=lambda kv: nwn_text(db.item_name(kv[0])).lower()):
@@ -12410,7 +12349,7 @@ def render_items_search(db: "Db", out: Path) -> None:
         name = db.item_name(resref)
         if name.startswith("[TLK#") or name == resref:
             continue
-        _current_context = f"item:{resref} ({name})"
+        state._current_context = f"item:{resref} ({name})"
         _bi_raw = fld(i, "BaseItem", None)
         bi = -1 if _bi_raw is None else int(_bi_raw)
         cost_val = item_gp_value(i)
@@ -15953,19 +15892,18 @@ def load_bestiary_stats(db_dir: Path, sessions: list | None = None) -> None:
     so the Server-First page still renders. `sessions` (parsed log sessions, if
     available) supplies a cdkey->player-name mapping for the Top Killers table's
     Player column; kills only store cdkey, not the account/player name."""
-    global _BESTIARY_KILLS, _BESTIARY_TOP, _SERVER_FIRSTS, _BESTIARY_ACTIVE
     import sqlite3
     cdkey_to_name: dict = {}
     for s in (sessions or []):
         if s.get("cdkey") and s.get("player"):
             cdkey_to_name[s["cdkey"]] = s["player"]
-    _BESTIARY_KILLS = {}
-    _BESTIARY_TOP = {}
-    _SERVER_FIRSTS = []
+    state._BESTIARY_KILLS = {}
+    state._BESTIARY_TOP = {}
+    state._SERVER_FIRSTS = []
     db_file = db_dir / "bestiarydb.sqlite3"
     if not db_file.is_file():
         return
-    _BESTIARY_ACTIVE = True
+    state._BESTIARY_ACTIVE = True
     try:
         con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=5.0)
     except sqlite3.Error as e:
@@ -15976,7 +15914,7 @@ def load_bestiary_stats(db_dir: Path, sessions: list | None = None) -> None:
             "SELECT resref, SUM(solo_kills+party_kills), SUM(solo_kills), "
             "SUM(party_kills) FROM kills GROUP BY resref"
         ).fetchall():
-            _BESTIARY_KILLS[resref] = {"total": int(total or 0),
+            state._BESTIARY_KILLS[resref] = {"total": int(total or 0),
                                        "solo": int(solo or 0),
                                        "party": int(party or 0)}
     except sqlite3.Error:
@@ -16011,8 +15949,8 @@ def load_bestiary_stats(db_dir: Path, sessions: list | None = None) -> None:
                     row["player"] = cdkey_to_name[cdkey]
         for (rr, _uuid), row in per_char.items():
             row["total"] = row["solo"] + row["party"]
-            _BESTIARY_TOP.setdefault(rr, []).append(row)
-        for rows_ in _BESTIARY_TOP.values():
+            state._BESTIARY_TOP.setdefault(rr, []).append(row)
+        for rows_ in state._BESTIARY_TOP.values():
             rows_.sort(key=lambda r: (-r["total"], r["name"].lower()))
     except sqlite3.Error:
         pass  # kills table not created yet
@@ -16036,14 +15974,14 @@ def load_bestiary_stats(db_dir: Path, sessions: list | None = None) -> None:
                 ).fetchall()
             ]
         for resref, cr, name, at, cname, player_name in rows:
-            _SERVER_FIRSTS.append({"resref": resref, "cr": cr or 0,
+            state._SERVER_FIRSTS.append({"resref": resref, "cr": cr or 0,
                                    "name": name or "", "cname": cname or resref,
                                    "at": at or "", "player_name": player_name or ""})
     except sqlite3.Error:
         pass  # server_first table not created yet
     con.close()
-    print(f"[nwn-wiki] bestiary: {len(_BESTIARY_KILLS)} creatures with kills, "
-          f"{len(_SERVER_FIRSTS)} server-first record(s)")
+    print(f"[nwn-wiki] bestiary: {len(state._BESTIARY_KILLS)} creatures with kills, "
+          f"{len(state._SERVER_FIRSTS)} server-first record(s)")
 
 
 def backfill_server_first_player_names(db_dir: Path, sessions: list) -> None:
@@ -16104,7 +16042,7 @@ def _render_server_first_body() -> str:
     parts = [
         "<h1>Server First Kills</h1>",
         f"<p>The first adventurer (or party) to slay each fearsome creature of "
-        f"Challenge Rating {BST_SF_CR} or higher, recorded server-wide.</p>",
+        f"Challenge Rating {state.BST_SF_CR} or higher, recorded server-wide.</p>",
         "<p class=\"note\"><strong>How the credited player is chosen:</strong> "
         "the server-first record goes to the player who landed the "
         "<em>killing blow</em>. When a creature is slain by a party, only that "
@@ -16114,12 +16052,12 @@ def _render_server_first_body() -> str:
         "<strong>Character</strong> column the character they were playing at the "
         "time.</p>",
     ]
-    if not _SERVER_FIRSTS:
+    if not state._SERVER_FIRSTS:
         parts.append("<p><em>No server-first kills have been recorded yet — "
                      "the legends are still unwritten.</em></p>")
         return "\n".join(parts)
     rows = []
-    for sf in _SERVER_FIRSTS:
+    for sf in state._SERVER_FIRSTS:
         rr = sf["resref"]
         cname = link(f"../creatures/{rr}.html", sf["cname"])
         cr = int(round(sf["cr"]))
@@ -16139,21 +16077,20 @@ def _render_server_first_body() -> str:
 
 def render_manual_pages(project_root: Path, out: Path) -> None:
     """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each."""
-    global _MANUAL_MENUS, _MANUAL_MENU_ORDER, _HAS_SERVER_FIRSTS
-    _MANUAL_MENUS = {}
-    _MANUAL_MENU_ORDER = {}
+    state._MANUAL_MENUS = {}
+    state._MANUAL_MENU_ORDER = {}
     manual_dir = project_root / "docs.manual"
     if not manual_dir.is_dir():
         return
 
-    # Pass 1: collect all page metadata and content so _MANUAL_MENUS is complete
+    # Pass 1: collect all page metadata and content so state._MANUAL_MENUS is complete
     # before any page HTML is written (the dropdowns on every page must list all docs).
     # (out_path, title, body, root_rel, page_updated_at)
     pages_to_write: list[tuple[Path, str, str, str, str]] = []
 
     def note_menu_order(menu_name: str, menu_order: int | None) -> None:
-        if menu_order is not None and menu_name not in _MANUAL_MENU_ORDER:
-            _MANUAL_MENU_ORDER[menu_name] = menu_order
+        if menu_order is not None and menu_name not in state._MANUAL_MENU_ORDER:
+            state._MANUAL_MENU_ORDER[menu_name] = menu_order
 
     top_files = sorted(
         p for p in manual_dir.iterdir()
@@ -16166,7 +16103,7 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         note_menu_order(menu_name, _manual_menu_order(raw_text))
         title, body = _manual_doc_body(doc_path, text=raw_text)
         stem = doc_path.stem
-        _MANUAL_MENUS.setdefault(menu_name, []).append(
+        state._MANUAL_MENUS.setdefault(menu_name, []).append(
             {"kind": "file", "title": title, "stem": stem, "_order": order})
         pages_to_write.append((out / "manual" / f"{stem}.html", title, body, "..", ""))
 
@@ -16177,13 +16114,13 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
     # rewriting it — this keeps the nav consistent when nwn-wiki-activity re-renders
     # manual pages without DB access.
     sf_path = out / "manual" / "ServerFirsts.html"
-    if _BESTIARY_ACTIVE:
+    if state._BESTIARY_ACTIVE:
         sf_now = datetime.now().strftime("%b %-d, %Y %H:%M")
-        _HAS_SERVER_FIRSTS = True
+        state._HAS_SERVER_FIRSTS = True
         pages_to_write.append((sf_path, "Server Firsts",
                                _render_server_first_body(), "..", sf_now))
     elif sf_path.exists():
-        _HAS_SERVER_FIRSTS = True
+        state._HAS_SERVER_FIRSTS = True
 
     for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
         doc_files = sorted(
@@ -16213,17 +16150,17 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
             pages_to_write.append((
                 out / "manual" / dirname / f"{stem}.html", title, body, "../..", "",
             ))
-        _MANUAL_MENUS.setdefault(folder_menu or "Documents", []).append(
+        state._MANUAL_MENUS.setdefault(folder_menu or "Documents", []).append(
             {"kind": "dir", "title": folder_title, "dirname": dirname,
              "items": items, "_order": folder_order})
 
     # Sort each menu's entries by @order (list.sort is stable, so entries
     # without @order keep their original alphabetical/insertion order,
     # trailing after any explicitly-ordered ones).
-    for entries in _MANUAL_MENUS.values():
+    for entries in state._MANUAL_MENUS.values():
         entries.sort(key=lambda e: e["_order"] if e["_order"] is not None else 10**9)
 
-    # Pass 2: write all pages now that _MANUAL_MENUS is fully populated.
+    # Pass 2: write all pages now that state._MANUAL_MENUS is fully populated.
     for out_path, title, body, root_rel, page_ts in pages_to_write:
         write(out_path, page(title, body, root_rel=root_rel, page_updated_at=page_ts))
 
@@ -16363,9 +16300,9 @@ def generate_tag_conflict_report(
     out_path = module_index_dir / "item_tag_conflicts.json"
     out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     if conflicts:
-        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: item_tag_conflicts.json ({len(conflicts)} conflict(s)) — {out_path}"))
+        state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: item_tag_conflicts.json ({len(conflicts)} conflict(s)) — {out_path}"))
     else:
-        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: item_tag_conflicts.json (none) — {out_path}"))
+        state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: item_tag_conflicts.json (none) — {out_path}"))
 
 
 def generate_store_tag_conflict_report(
@@ -16463,9 +16400,9 @@ def generate_store_tag_conflict_report(
         "conflicts": conflicts,
     }, indent=2, ensure_ascii=False) + "\n")
     if conflicts:
-        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: store_tag_conflicts.json ({len(conflicts)} conflict(s)) — {out_path}"))
+        state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: store_tag_conflicts.json ({len(conflicts)} conflict(s)) — {out_path}"))
     else:
-        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: store_tag_conflicts.json (none) — {out_path}"))
+        state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: store_tag_conflicts.json (none) — {out_path}"))
 
 
 def generate_conversation_conflict_report(
@@ -16552,9 +16489,9 @@ def generate_conversation_conflict_report(
         "duplicates": duplicates,
     }, indent=2, ensure_ascii=False) + "\n")
     if duplicates:
-        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: duplicate_conversations.json ({len(duplicates)} group(s)) — {out_path}"))
+        state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: duplicate_conversations.json ({len(duplicates)} group(s)) — {out_path}"))
     else:
-        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: duplicate_conversations.json (none) — {out_path}"))
+        state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: duplicate_conversations.json (none) — {out_path}"))
 
 
 # ---------------------------------------------------------------------------
@@ -16732,7 +16669,7 @@ def check_counter_gear_freshness(db: "Db", module_index_dir: Path) -> bool:
     """
     path = module_index_dir / "counter_gear.json"
     if not path.is_file():
-        _module_index_summary.append(("warn",
+        state._module_index_summary.append(("warn",
             "[nwn-wiki] module-index: counter_gear.json absent — "
             "run with --counter-gear to build it"))
         return False
@@ -16741,10 +16678,10 @@ def check_counter_gear_freshness(db: "Db", module_index_dir: Path) -> bool:
     except (OSError, ValueError):
         stored = None
     if stored and stored == _counter_gear_fingerprint(db):
-        _module_index_summary.append(("info",
+        state._module_index_summary.append(("info",
             "[nwn-wiki] module-index: counter_gear.json current (inputs unchanged)"))
         return True
-    _module_index_summary.append(("warn",
+    state._module_index_summary.append(("warn",
         "[nwn-wiki] module-index: counter_gear.json is STALE — items, creatures, "
         "2DAs or combat dials changed since it was built. Re-run with "
         "--counter-gear."))
@@ -17275,7 +17212,7 @@ def generate_counter_gear_index(
     (module_index_dir / "counter_gear.md").write_text(
         _counter_gear_markdown(payload), encoding="utf-8")
     sev = "warn" if unbeatable_out else "info"
-    _module_index_summary.append((sev,
+    state._module_index_summary.append((sev,
         f"[nwn-wiki] module-index: counter_gear.json "
         f"({len(creatures_out)} creatures, {len(unbeatable_out)} unwinnable, "
         f"{len(review_out)} review, {time.time() - t0:.0f}s)"))
@@ -17352,7 +17289,7 @@ def generate_module_index(
         "area_count": len(area_graph_data),
         "areas": area_graph_data,
     })
-    _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_graph.json ({len(area_graph_data)} areas)"))
+    state._module_index_summary.append(("info", f"[nwn-wiki] module-index: area_graph.json ({len(area_graph_data)} areas)"))
 
     # ------------------------------------------------------------------ area_paths.json
     if path_from_resref and area_paths is not None:
@@ -17388,7 +17325,7 @@ def generate_module_index(
             "paths": paths_out,
             "unreachable": sorted(unreachable),
         })
-        _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_paths.json ({len(paths_out)} reachable, {len(unreachable)} unreachable)"))
+        state._module_index_summary.append(("info", f"[nwn-wiki] module-index: area_paths.json ({len(paths_out)} reachable, {len(unreachable)} unreachable)"))
 
     # -------------------------------------------------------- duplicate_destination_tags.json
     dup_tag_entries: list[dict] = []
@@ -17442,9 +17379,9 @@ def generate_module_index(
         "duplicate_tags": dup_tag_entries,
     })
     if dup_tag_entries:
-        _module_index_summary.append(("issue", f"[nwn-wiki] module-index: duplicate_destination_tags.json ({len(dup_tag_entries)} duplicate tag(s)) — {module_index_dir / 'duplicate_destination_tags.json'}"))
+        state._module_index_summary.append(("issue", f"[nwn-wiki] module-index: duplicate_destination_tags.json ({len(dup_tag_entries)} duplicate tag(s)) — {module_index_dir / 'duplicate_destination_tags.json'}"))
     else:
-        _module_index_summary.append(("issue", "[nwn-wiki] module-index: duplicate_destination_tags.json (none)"))
+        state._module_index_summary.append(("issue", "[nwn-wiki] module-index: duplicate_destination_tags.json (none)"))
 
     # -------------------------------------------------------- area_tag_conflicts.json
     area_tag_conflicts: list[dict] = []
@@ -17491,9 +17428,9 @@ def generate_module_index(
         "conflicts": area_tag_conflicts,
     })
     if area_tag_conflicts:
-        _module_index_summary.append(("issue", f"[nwn-wiki] module-index: area_tag_conflicts.json ({len(area_tag_conflicts)} conflict(s)) — {module_index_dir / 'area_tag_conflicts.json'}"))
+        state._module_index_summary.append(("issue", f"[nwn-wiki] module-index: area_tag_conflicts.json ({len(area_tag_conflicts)} conflict(s)) — {module_index_dir / 'area_tag_conflicts.json'}"))
     else:
-        _module_index_summary.append(("issue", "[nwn-wiki] module-index: area_tag_conflicts.json (none)"))
+        state._module_index_summary.append(("issue", "[nwn-wiki] module-index: area_tag_conflicts.json (none)"))
 
     # ------------------------------------------------------------------ area_index.json
     area_index: list[dict] = []
@@ -17522,7 +17459,7 @@ def generate_module_index(
         "area_count": len(area_index),
         "areas": area_index,
     })
-    _module_index_summary.append(("info", f"[nwn-wiki] module-index: area_index.json ({len(area_index)} areas)"))
+    state._module_index_summary.append(("info", f"[nwn-wiki] module-index: area_index.json ({len(area_index)} areas)"))
 
     # ------------------------------------------------------------------ creature_index.json
     creature_index: list[dict] = []
@@ -17599,7 +17536,7 @@ def generate_module_index(
         "count": len(creature_index),
         "creatures": creature_index,
     })
-    _module_index_summary.append(("info", f"[nwn-wiki] module-index: creature_index.json ({len(creature_index)} canonical creatures)"))
+    state._module_index_summary.append(("info", f"[nwn-wiki] module-index: creature_index.json ({len(creature_index)} canonical creatures)"))
 
     # ------------------------------------------------------------------ counter_gear.json
     # Opt-in: the simulation runs every creature against the whole attainable
@@ -17679,7 +17616,7 @@ def generate_module_index(
         ),
         "appearances": app_report,
     })
-    _module_index_summary.append(("info", f"[nwn-wiki] module-index: appearance_faction_report.json ({len(app_report)} appearances, {cross_count} cross-faction)"))
+    state._module_index_summary.append(("info", f"[nwn-wiki] module-index: appearance_faction_report.json ({len(app_report)} appearances, {cross_count} cross-faction)"))
 
     # ------------------------------------------------------------------ creature_tag_conflicts.json
     # Canonical entries whose resref was synthesised as bp__v2, bp__v3, …
@@ -17739,7 +17676,7 @@ def generate_module_index(
         ),
         "conflicts": ct_conflicts,
     })
-    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: creature_tag_conflicts.json ({len(ct_conflicts)} blueprint(s) with variants)"))
+    state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: creature_tag_conflicts.json ({len(ct_conflicts)} blueprint(s) with variants)"))
 
     # ------------------------------------------------------------------ item_index.json
     def _item_sources(rr: str) -> list[str]:
@@ -17791,7 +17728,7 @@ def generate_module_index(
         "count": len(item_index),
         "items": item_index,
     })
-    _module_index_summary.append(("info", f"[nwn-wiki] module-index: item_index.json ({len(item_index)} items)"))
+    state._module_index_summary.append(("info", f"[nwn-wiki] module-index: item_index.json ({len(item_index)} items)"))
 
     # ------------------------------------------------------------------ cross_faction_creatures.json
     crr_fids: dict[str, set[int]] = defaultdict(set)
@@ -17848,7 +17785,7 @@ def generate_module_index(
         ),
         "creatures": cf_creatures,
     })
-    _module_index_summary.append(("issue", f"[nwn-wiki] module-index: cross_faction_creatures.json ({len(cf_creatures)} blueprint(s))"))
+    state._module_index_summary.append(("issue", f"[nwn-wiki] module-index: cross_faction_creatures.json ({len(cf_creatures)} blueprint(s))"))
 
     # ------------------------------------------------------------------ faction_bp_instance_discrepancies.json
     # Each entry: a placed GIT instance whose FactionID differs from its blueprint's FactionID.
@@ -17896,7 +17833,7 @@ def generate_module_index(
         ),
         "discrepancies": discrepancies,
     })
-    _module_index_summary.append(("issue", f"[nwn-wiki] module-index: faction_bp_instance_discrepancies.json ({len(discrepancies)} instance(s))"))
+    state._module_index_summary.append(("issue", f"[nwn-wiki] module-index: faction_bp_instance_discrepancies.json ({len(discrepancies)} instance(s))"))
 
     # ------------------------------------------------------------------ inaccessible_items.json
     inac_items: list[dict] = []
@@ -17947,7 +17884,7 @@ def generate_module_index(
         ),
         "items": inac_items,
     })
-    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: inaccessible_items.json ({len(inac_items)} item(s))"))
+    state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: inaccessible_items.json ({len(inac_items)} item(s))"))
 
     # ------------------------------------------------------------------ unspawned_creatures.json
     placed_bps: set[str] = {
@@ -17992,7 +17929,7 @@ def generate_module_index(
         ),
         "creatures": unspawned,
     })
-    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: unspawned_creatures.json ({len(unspawned)} blueprint(s))"))
+    state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: unspawned_creatures.json ({len(unspawned)} blueprint(s))"))
 
     # -------------------------------------------------------- instance_only_conversations.json
     # Creature instances whose Conversation field is set in the GIT placement but
@@ -18049,7 +17986,7 @@ def generate_module_index(
         ),
         "instances": inst_conv_mismatches,
     })
-    _module_index_summary.append(("warn", f"[nwn-wiki] module-index: instance_only_conversations.json ({len(inst_conv_mismatches)} instance(s))"))
+    state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: instance_only_conversations.json ({len(inst_conv_mismatches)} instance(s))"))
 
 
 def _write_json(path: Path, data: Any) -> None:
@@ -18057,7 +17994,6 @@ def _write_json(path: Path, data: Any) -> None:
 
 
 def main() -> int:
-    global _current_context
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", required=True, help="path to unpacked/ tree")
     ap.add_argument("--out", required=True, help="path to output wiki/ dir")
@@ -18163,8 +18099,7 @@ def main() -> int:
                          "fingerprint and warn when the existing report is stale.")
     args = ap.parse_args()
 
-    global _GENERATED_AT
-    _GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
+    state._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
 
     src = Path(args.src).resolve()
     out = Path(args.out).resolve()
@@ -18325,7 +18260,7 @@ def main() -> int:
             if f.is_file():
                 shutil.copy2(f, out / "assets" / f.name)
     (out / "assets" / "meta.json").write_text(
-        json.dumps({"generated_at": _GENERATED_AT}, ensure_ascii=False)
+        json.dumps({"generated_at": state._GENERATED_AT}, ensure_ascii=False)
     )
 
     # Load per-module theme from wiki-theme/ next to the unpacked/ directory.
@@ -18334,11 +18269,11 @@ def main() -> int:
     # Index creature artwork from creature-pics/ and copy the files into the
     # output tree (creatures/pics/). Done after db is built so names resolve.
     scan_creature_pics(src.parent, db)
-    if _CREATURE_PIC_GROUPS:
+    if state._CREATURE_PIC_GROUPS:
         pics_src = src.parent / "creature-pics"
         pics_out = out / "creatures" / "pics"
         pics_out.mkdir(parents=True, exist_ok=True)
-        wanted = {fn for grp in _CREATURE_PIC_GROUPS for fn in grp["images"]}
+        wanted = {fn for grp in state._CREATURE_PIC_GROUPS for fn in grp["images"]}
         for f in pics_src.iterdir():
             if f.is_file() and f.name in wanted:
                 shutil.copy2(f, pics_out / f.name)
@@ -18416,7 +18351,6 @@ def main() -> int:
 
     # Parse server logs and set the activity-page flag BEFORE any page() calls
     # so the Activity nav link appears on every rendered page.
-    global _HAS_ACTIVITY_PAGE
     activity: dict | None = None
     if args.log_dirs:
         log_dir_paths = [Path(d).resolve() for d in args.log_dirs]
@@ -18430,7 +18364,7 @@ def main() -> int:
             if s.get("join") is not None and s.get("role") == "Player"
         ]
         if player_sessions:
-            _HAS_ACTIVITY_PAGE = True
+            state._HAS_ACTIVITY_PAGE = True
             print(f"[nwn-wiki] found {len(player_sessions)} player sessions "
                   f"across {activity['file_count']} log file(s) "
                   f"(cache: {cache_path})")
@@ -18471,7 +18405,7 @@ def main() -> int:
 
     render_manual_pages(src.parent, out)
 
-    if _HAS_ACTIVITY_PAGE:
+    if state._HAS_ACTIVITY_PAGE:
         _act_cmd = [sys.executable, str(SCRIPT_DIR / "nwn-wiki-activity"),
                     "--src", str(src), "--out", str(out)]
         for _d in args.log_dirs:
@@ -18509,20 +18443,20 @@ def main() -> int:
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
     render_creatures_by_race(db, out)
     render_creatures_search(db, out)
-    _current_context = ""
+    state._current_context = ""
     for can_rr in db.canonical_creatures:
-        _current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
+        state._current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
         render_creature_page(db, can_rr, out)
-    _current_context = ""
+    state._current_context = ""
     render_items_index(db, out)
     for resref in db.items:
-        _current_context = f"item:{resref} ({db.item_name(resref)})"
+        state._current_context = f"item:{resref} ({db.item_name(resref)})"
         render_item_page(db, resref, out)
-    _current_context = ""
+    state._current_context = ""
     render_items_by_property(db, out)
-    _current_context = ""
+    state._current_context = ""
     render_items_search(db, out)
-    _current_context = ""
+    state._current_context = ""
     render_stores_index(db, out)
     for area_rr, inst_list in db.area_stores.items():
         if area_rr in db.hidden_areas:
@@ -18549,9 +18483,9 @@ def main() -> int:
 
     # Write lookup warnings to module-index so they're visible outside the build log.
     warnings_path = module_index_dir / "lookup_warnings.json"
-    sorted_warnings = sorted(_warned.keys())
+    sorted_warnings = sorted(state._warned.keys())
     warnings_out = [
-        {"message": msg, "referenced_by": sorted(_warned[msg])}
+        {"message": msg, "referenced_by": sorted(state._warned[msg])}
         for msg in sorted_warnings
     ]
     _write_json(warnings_path, {
@@ -18566,14 +18500,14 @@ def main() -> int:
     # Boss respawn tracker registry (parsed from brd_db.nss BRD_SeedBoss rows —
     # the same list the game seeds into respawndb, and the creatures/bosses.html
     # page renders). Written for LLM-assist consumers.
-    if _BOSS_REGISTRY:
+    if state._BOSS_REGISTRY:
         _write_json(module_index_dir / "bosses.json", {
             "_description": "Bosses tracked by the in-game 'Roll of the Fallen' "
                             "respawn board, parsed from the BRD_SeedBoss rows in "
                             "unpacked/brd_db.nss (single source of truth shared "
                             "with the game). See creatures/bosses.html.",
-            "count": len(_BOSS_REGISTRY),
-            "aliases": _BOSS_ALIASES,
+            "count": len(state._BOSS_REGISTRY),
+            "aliases": state._BOSS_ALIASES,
             "bosses": [
                 {
                     "resref": b["resref"],
@@ -18583,17 +18517,17 @@ def main() -> int:
                     "area_name": b["area_name"],
                     "cr": b["cr"],
                     "has_creature_page": b["resref"] in db.canonical_creatures,
-                    "kills": _BESTIARY_KILLS.get(b["resref"]),
+                    "kills": state._BESTIARY_KILLS.get(b["resref"]),
                 }
-                for b in sorted(_BOSS_REGISTRY, key=lambda b: -b["cr"])
+                for b in sorted(state._BOSS_REGISTRY, key=lambda b: -b["cr"])
             ],
         })
     if warnings_out:
-        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json ({len(warnings_out)} lookup failure(s)) — {warnings_path}"))
+        state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json ({len(warnings_out)} lookup failure(s)) — {warnings_path}"))
     else:
-        _module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json (no lookup failures)"))
+        state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json (no lookup failures)"))
 
-    if _module_index_summary:
+    if state._module_index_summary:
         print()
         print("[nwn-wiki] module-index summary:")
         for label, color, sev in [
@@ -18601,7 +18535,7 @@ def main() -> int:
             ("Warnings",      _C_WARN,  "warn"),
             ("Issues",        _C_ISSUE, "issue"),
         ]:
-            msgs = [m for s, m in _module_index_summary if s == sev]
+            msgs = [m for s, m in state._module_index_summary if s == sev]
             if msgs:
                 print(f"  {color}{label}:{_C_RESET}")
                 for m in msgs:
