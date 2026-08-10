@@ -2164,8 +2164,50 @@ items:
 - id: root-rel-derive
   phase: 2
   title: Derive root_rel from the output path instead of threading it by hand
-  status: pending
+  status: done
   gate: expected-diff
+  commit: 4ddb1b8
+  date: 2026-08-10
+  gate_result: "check --all --expect gates/root-rel-derive.json (empty path allowlist): homers_lotr IDENTICAL (144s), lotr2008 IDENTICAL (88s), lotr2009 IDENTICAL (103s) — the empty diff IS the equivalence proof, so no rebaseline was needed"
+  impl_notes: >
+    New htmlgen/pagectx.py holds a frozen PageCtx dataclass carrying one fact: the
+    page's output-root-relative path.  root_rel, the write location and every link
+    prefix are all derived from it (depth, root_rel, url(), dir_url(), path(out)),
+    so a page whose links point at the wrong depth is no longer expressible —
+    there is one path, and both the links and the file written come from it.
+    page() and the new write_page() take the ctx; all five nav helpers and all six
+    link helpers (_script_link, _conv_link, _faction_dd, _faction_cell, _race_link,
+    plus the manual menu rows) now take a REQUIRED ctx instead of a defaulted
+    root_rel string, which is what kills the contradictory "." vs ".." defaults —
+    there is no default left to disagree with.  The three parallel prefix mechanisms
+    were folded in via dir_url(), which returns a true shortest relative prefix ("" in
+    the same directory) to match what the item tables and creature pictures have
+    always emitted; url() deliberately keeps the <root_rel>/<target> form the rest of
+    the site has always used.  17 files touched, ~350 insertions.  No root_rel
+    parameter survives anywhere in the package — the only two remaining mentions are
+    docstrings explaining what replaced it.
+    VERIFIED THREE WAYS, because a mechanical-equivalence claim deserves more than
+    one: (1) the gate is IDENTICAL on all three corpora against an empty allowlist;
+    (2) the activity/manual path the gate never reaches was built by hand from a
+    reflink-copied homers_lotr fixture WITH --log-dir, pre-change vs post-change, and
+    `diff -rq` over the whole docs tree reported zero differences — that run includes
+    the depth-2 manual/Draft/*.html pages, which correctly emit ../../ and are exactly
+    the case the old "only called from depth 1" rule would have broken; (3)
+    render_activity_page was driven directly on a synthetic session set under both
+    trees and produced byte-identical HTML.  A standalone bin/nwn-wiki-activity
+    refresh over the built tree also came back with an empty diff.
+    No call site disagreed with the derivation — the plan's premise that all page()
+    call sites were correct today held.
+  found:
+    - "_pic_src(filename, prefix) in render/creatures.py is the one helper still
+       taking a bare prefix string rather than a PageCtx; it is a leaf that formats
+       an <img src>, and its caller now computes the prefix with ctx.dir_url(), so
+       the value is derived — but the signature still allows a hand-written one."
+    - "PageCtx.url() keeps the <root_rel>/<target> form rather than a shortest-path
+       relative URL purely to preserve today's bytes; dir_url() is the shortest-path
+       one.  Two URL styles now coexist by design, which is worth a comment in any
+       future item that unifies them (it would be an expected-diff change)."
+
   after: [nav-gate-conditional]
   plan: >
     root_rel is passed as a "." / ".." / "../.." string through 17 functions, and
