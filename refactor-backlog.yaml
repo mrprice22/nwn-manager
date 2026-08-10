@@ -2285,8 +2285,59 @@ items:
 - id: server-firsts-reset
   phase: 2
   title: Reset _HAS_SERVER_FIRSTS and lift it above the docs.manual early return
-  status: pending
+  status: done
   gate: expected-diff
+  commit: 60be1f2
+  date: 2026-08-10
+  gate_result: "check --all --expect gates/server-firsts-reset.json (empty allowlist): homers_lotr IDENTICAL (150s), lotr2008 IDENTICAL (89s), lotr2009 IDENTICAL (107s) — proves no harm only; the fix itself is proven by the fixture below"
+  impl_notes: >
+    THE GATE CANNOT PROVE THIS ITEM.  All three corpora build without --db-dir, so no
+    bestiary is ever active and a correct fix is a no-op on them — which is why the
+    declaration is an empty allowlist and why an IDENTICAL result is the pass
+    condition rather than evidence of success.
+    Two changes in render_manual_pages: state._HAS_SERVER_FIRSTS = False now sits
+    with the existing _MANUAL_MENUS/_MANUAL_MENU_ORDER resets, and the whole
+    ServerFirsts block moved ABOVE the docs.manual/ check, whose early return became
+    `if not manual_dir.is_dir(): _write_manual_pages(out, pages_to_write); return` so
+    the generated page is still written when the module has no manual directory.  The
+    pass-2 write loop was extracted into a module-level _write_manual_pages so both
+    exits share it rather than duplicating the loop or re-indenting 80 lines.
+    SiteChrome ordering needed no change: main() still calls render_manual_pages
+    before freezing the chrome, so the flag reaches chrome.has_server_firsts and
+    .chrome.json; the manual pages themselves shell through active_chrome(), which is
+    still the live snapshot at that point.  In the activity subprocess state.CHROME is
+    loaded from disk first, so the new reset cannot disturb that process's nav.
+    BY-HAND PROOF, both bugs, on a reflink-copied homers_lotr corpus with docs.manual/
+    deliberately omitted and a hand-built sqlite bestiary (one CR-72 server-first
+    record), running HEAD's code against the working tree:
+    Bug 1 — BEFORE: no manual/ directory at all, has_server_firsts false, no nav
+    entry.  AFTER: manual/ServerFirsts.html written with the boss link and player
+    name, has_server_firsts true, Activity dropdown present.  Whole-tree diff shows
+    only the new page, the nav entry appearing on 10,826 pages, and the one
+    .chrome.json line — nothing else moved.
+    Bug 2 — two render_manual_pages calls in one interpreter, the second for a module
+    with no bestiary: BEFORE True -> True, with SiteChrome reporting
+    has_server_firsts=True while ServerFirsts.html was never written (a nav link to a
+    missing page); AFTER True -> False.  Latent today because the CLIs are one-shot
+    processes, but it is what makes the flag safe to freeze into SiteChrome.
+    A no-bestiary control build on the lotr2008 archive was byte-IDENTICAL.
+  found:
+    - "state._BESTIARY_ACTIVE has the identical never-reset defect: load_bestiary_stats
+       clears _BESTIARY_KILLS/_BESTIARY_TOP/_SERVER_FIRSTS but returns early on a
+       missing DB file WITHOUT clearing _BESTIARY_ACTIVE."
+    - "state._HAS_ACTIVITY_PAGE is likewise only ever set True, never reset."
+    - "load_wiki_theme APPENDS to _THEME_HEADER_IMGS/_THEME_HEADER_DIMS without
+       resetting them, so a second in-process build — or nwn-wiki-activity, which
+       calls it again after loading the chrome — accumulates duplicate banners."
+    - "SiteChrome.from_state stores _MANUAL_MENUS/_MANUAL_MENU_ORDER/_THEME_HEADER_*
+       BY REFERENCE, so the 'frozen' snapshot still aliases live mutable state.  It
+       survives only because render_manual_pages rebinds fresh objects instead of
+       mutating in place; a dict()/list() copy would make the freeze real."
+    - "The `elif sf_path.exists()` branch turns the nav entry on from a leftover file
+       in the output tree, so a build into a reused out/ can advertise Server Firsts
+       with no data behind it — deliberate for the activity re-render, but it now
+       applies to no-docs.manual modules too."
+
   after: [typed-link-helpers]
   plan: >
     render_manual_pages resets _MANUAL_MENUS and _MANUAL_MENU_ORDER but not
