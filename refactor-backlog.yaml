@@ -1309,8 +1309,44 @@ items:
 - id: render-items
   phase: 1
   title: Extract item index/page renderers into render/items.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 3951f50
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (131s), lotr2008 IDENTICAL (86s), lotr2009 IDENTICAL (101s)"
+  impl_notes: >
+    render/items.py 924 lines (874 verbatim); cli.py 9,039 -> 8,172.  All eight
+    planned symbols moved, render_item_page as-is at depth 7.  No constants moved —
+    the block owns none; everything it reads already lives in items.py or lookups.py.
+    DRAGGED ALONG: _scroll_spell_sort_key, which lookups-module had left in cli.py
+    for want of nwn_text/_table_lookup/Db.item_name — all now reachable from leaf
+    modules, and its only caller anywhere is render_items_index, so it is an
+    item-render helper and no cli.py import-back is needed.  cli.py imports back
+    _items_col_flags, _items_row and _items_table_head for the store/creature
+    inventory tables, plus the two page renderers for the build driver.  The
+    render/items.py vs nwn_wiki/items.py name collision is handled by absolute
+    imports (`from nwn_wiki.items import ...`), noted in the module docstring.
+    STATE AUDIT: one symbol, state.BASE_TLK, read twice in the broken-item
+    description forks; no writes.  Line multiset: 7 added lines, all the import
+    block; every one of the 874 removed lines present verbatim downstream.  This move
+    left no NEW dead imports in cli.py.
+  found:
+    - "render_items_index and render_inaccessible_index share ~35 near-verbatim lines
+       (the weapon-key split, the _expand closure, ordered_cats assembly, the TOC
+       loop and the per-category table loop) — dedup-items-skeleton's target."
+    - "_item_cost_key is defined identically inside both index renderers."
+    - "cli.py's store/creature inventory table is a third copy of the
+       _items_col_flags/_items_table_head/_items_row call triple; a
+       render_items_table(...) wrapper would collapse all three call sites."
+    - "render_item_page and render_items_index each inline an `accessible`
+       expression byte-identical to nwn_wiki.items._item_accessible, which they
+       apparently predate and were never switched over to."
+    - "render_item_page has `_type_href = f\"index.html#broken\"` — an f-string with
+       no placeholders."
+    - "_scroll_spell_sort_key's docstring says the key is (innate_level,
+       spell_name_lower) but the first element is -(lvl) / 999, i.e. descending with
+       missing levels last.  The docstring is the stale half."
+
   after: [render-creature-page]
   ranges: "10804-11657"
   plan: >
