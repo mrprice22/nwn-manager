@@ -7,10 +7,13 @@ consume: which inventory slots a base item fills (from baseitems.2da
 AC / attack / damage / enhancement bonuses, and gold-piece value.
 
 ``BASEITEM_SLOTS`` starts as a snapshot of the stock table at import time and
-is merged over in place by ``load_2da_overrides()``; never rebind it.
+is merged over in place by ``load_2da_overrides()`` in :mod:`nwn_wiki.twoda`;
+never rebind it.
 
-Depends only on stdlib, gff, lookups and itemprops -- nothing here may touch
-``Db``, ``E()`` or the renderers.
+Depends on stdlib, gff, lookups, itemprops, ``htmlgen.escape`` and
+``sim.combat`` -- nothing here may touch the renderers.  ``extract_item_*`` and
+``_item_accessible`` take a duck-typed ``db`` (``Db`` lives in
+:mod:`nwn_wiki.cli`) so this module stays importable without it.
 """
 
 from __future__ import annotations

@@ -9,9 +9,8 @@ the area map draws.  It then chains the dependent index passes.
 
 One mixin of the stack described in :mod:`nwn_wiki.db`; see that docstring
 for the rules it follows.  The ``*_EVENT_FIELDS`` tables it reads stay on
-the concrete ``Db`` in :mod:`nwn_wiki.cli`, where a dozen other methods and
-several free renderer functions also read them; they resolve through
-``self`` at runtime.
+the concrete ``Db`` in :mod:`nwn_wiki.cli` because several mixins share
+them; they resolve through ``self`` at runtime.
 """
 
 from __future__ import annotations

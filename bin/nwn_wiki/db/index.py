@@ -11,8 +11,8 @@ One mixin of the stack described in :mod:`nwn_wiki.db`; see that docstring for
 the rules it follows.
 
 ``_store_instance_slug`` travels with it because this package may not import
-:mod:`nwn_wiki.cli`.  The monolith still has five other call sites and imports
-it back from here.
+its callers; :mod:`nwn_wiki.render.stores` and :mod:`nwn_wiki.render.areas`
+import it back from here so the slugs they link to match the ones indexed.
 """
 
 from __future__ import annotations

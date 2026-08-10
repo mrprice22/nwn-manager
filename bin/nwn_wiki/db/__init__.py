@@ -20,9 +20,11 @@ The convention, which every `db-*` extraction follows:
   are prepended to the bases list; `DbCore` stays last.  Because mixins are
   disjoint (no method name appears in two of them) the MRO order is not
   load-bearing beyond that rule.
-* Nothing here may import :mod:`nwn_wiki.cli` -- that would be a cycle.  A
-  helper the monolith still owns must therefore travel with the mixin that
-  needs it (see ``_conversation_key`` in :mod:`nwn_wiki.db.core`).
+* Nothing here may import :mod:`nwn_wiki.cli` or the renderers -- that would be
+  a cycle.  A helper a mixin needs must therefore travel with that mixin, and
+  the renderers import it back from here (see ``_conversation_key`` in
+  :mod:`nwn_wiki.db.core`, ``_store_instance_slug`` in
+  :mod:`nwn_wiki.db.index`).
 
 This package deliberately re-exports nothing; import from the submodules.
 """

@@ -1,8 +1,9 @@
 """Creature detail rendering for the wiki.
 
-The per-creature combat-defence extraction shared with the counter-gear
-analysis, the body sections of a creature page, and the creature search page
-and its client-side filter script.
+The per-creature combat offence/defence extraction shared with the
+counter-gear analysis, the body sections of a creature page, the
+variant-diff table, :func:`render_creature_page` itself, and the creature
+search page with its client-side filter script.
 """
 
 from __future__ import annotations

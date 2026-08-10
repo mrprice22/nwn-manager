@@ -12,9 +12,9 @@ passes read stay on the concrete ``Db`` in :mod:`nwn_wiki.cli` and resolve
 through ``self`` at runtime.
 
 ``_quest_slug`` and ``_quest_hidden`` (and the regex the latter uses) travel
-with ``_build_dialog_quest_index`` because this package may not import
-:mod:`nwn_wiki.cli`.  The monolith still has several other call sites and
-imports them back from here.
+with ``_build_dialog_quest_index`` because this package may not import its
+callers; :mod:`nwn_wiki.render.quests` and :mod:`nwn_wiki.cli` import them
+back from here so the slugs and the hidden-quest rule stay in one place.
 """
 
 from __future__ import annotations

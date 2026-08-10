@@ -8,165 +8,69 @@ Reads the unpacked GFF-as-JSON tree, builds derived indexes (waypoint→area
 map, transitions, per-area NPCs/loot/encounters/stores), and writes a static
 multi-page wiki including a force-directed SVG map of all areas.
 
+This module is the entry point only: the argument parser, the concrete ``Db``
+(assembled from the mixins in :mod:`nwn_wiki.db`) and the build pipeline that
+drives the loaders, reports and renderers.  Everything it calls lives in the
+sibling modules of the :mod:`nwn_wiki` package.
+
 Pure stdlib. No third-party deps.
 """
 
 from __future__ import annotations
 
 import argparse
-import html
 import json
-import math
-import os
-import random
-import re
 import shutil
-import struct
 import subprocess
 import sys
 import time
-import urllib.parse
-from collections import Counter, deque
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from nwn_wiki.bestiary import (
-    _utc_to_local,
     backfill_server_first_player_names,
     load_bestiary_stats,
     seed_bestiary_catalogue,
 )
-from nwn_wiki.combat import (
-    EPIC_TOUGHNESS_BASE,
-    FINESSE_BASEITEMS,
-    WEAPON_FINESSE_FEAT,
-    _class_bab,
-    ability_mod,
-    attack_schedule,
-    creature_bab,
-    creature_class_bab,
-    crit_feat_effects,
-    epic_toughness_hp,
-    feat_attack_bonus,
-)
 from nwn_wiki.db.core import DbCore
 from nwn_wiki.db.derived import DbDerivedMixin, _quest_hidden
 from nwn_wiki.db.dialogs import DbDialogsMixin
-from nwn_wiki.db.index import DbIndexMixin, _store_instance_slug
+from nwn_wiki.db.index import DbIndexMixin
 from nwn_wiki.db.names import DbNamesMixin
-from nwn_wiki.db.scripts import DbScriptsMixin, _strip_nss_comments
+from nwn_wiki.db.scripts import DbScriptsMixin
 from nwn_wiki.gff import (
-    STOCK_CREATURE_NAMES,
     STOCK_ITEM_NAMES,
     fld,
-    gff,
     loc,
     read_tlk,
 )
 from nwn_wiki.htmlgen.chrome import (
-    _activity_dropdown,
-    _brand_html,
-    _creature_cr_value,
-    _custom_manual_dropdowns,
-    _docs_dropdown,
-    _img_pixel_size,
-    _manual_menu_rows,
-    _quests_nav,
     load_wiki_theme,
-    page,
     scan_creature_pics,
-    write,
-)
-from nwn_wiki.htmlgen.escape import (
-    E,
-    colorize_damage_words,
-    nwn_first_color,
-)
-from nwn_wiki.htmlgen.links import (
-    _conv_link,
-    _faction_cell,
-    _faction_dd,
-    _race_link,
-    _script_link,
-    link,
-    tileset_label,
-)
-from nwn_wiki.itemprops import (
-    _fmt_hp,
-    _item_prop_key,
-    _table_lookup,
-    _yn,
-)
-from nwn_wiki.items import (
-    SHIELD_BASEITEMS,
-    SLOT_CHEST,
-    SLOT_CWEAP_B,
-    SLOT_CWEAP_L,
-    SLOT_CWEAP_R,
-    SLOT_LEFT,
-    SLOT_NAMES,
-    SLOT_RIGHT,
-    _ARMOR_BASEITEMS,
-    _CEP_WEAPON_BASEITEMS,
-    _CREATURE_ITEM_BASEITEMS,
-    _CREATURE_WEAPON_BASEITEMS,
-    _CWEAP_SLOTS,
-    _SCROLL_BASEITEMS,
-    _TOC_GROUPS,
-    _item_category,
-    _item_category_label,
-    baseitem_slots,
-    extract_item_defense,
-    extract_item_offense,
-    is_ranged_weapon,
-    item_ac_bonus,
-    item_attack_bonus,
-    item_damage_bonus,
-    slot_label,
-    weapon_crit_string,
-    weapon_damage_props,
-    weapon_damage_string,
-    weapon_enhancement,
 )
 from nwn_wiki.layout import layout_areas
 from nwn_wiki.lookups import (
     APPEARANCE,
     BASEITEMS,
-    CLASS_BAB,
     CLASSES,
     FEATS,
     IPROP_DEFS,
     IPRP_FEATS,
     PARTS_CHEST_AC,
-    RACE_ABILITY_ADJ,
     RACES,
     SKILLS,
     SPELL_INFO,
     SPELLS,
-    STOCK_BASEITEMS,
-    STOCK_FEAT_NAMES,
     WEAPONS,
-    _CAST_SPELL_PROP_ID,
-    _DAMAGE_TYPE_LABELS,
-    _scroll_cast_spell_info,
-    _torso_base_ac,
-    baseitem_label,
-    class_name,
-    creature_race_immunities,
-    feat_name,
     load_json_overlay,
-    placeable_name,
-    skill_name,
-    spell_name,
-    tileset_name,
 )
 from nwn_wiki.paths import ASSETS_DIR, DATA_DIR, SCRIPT_DIR
 from nwn_wiki.render.activity import (
-    _load_activity_cache,
-    _save_activity_cache,
+    _load_activity_cache,   # re-export: poked as wiki._load_activity_cache
+    _save_activity_cache,   # re-export: poked as wiki._save_activity_cache
     parse_nwserver_logs,
-    render_activity_page,
+    render_activity_page,   # re-export: poked as wiki.render_activity_page
 )
 from nwn_wiki.render.areas import (
     _OMIT,
@@ -177,19 +81,16 @@ from nwn_wiki.render.areas import (
     render_container_page,
 )
 from nwn_wiki.render.conversations import (
-    _caller_html,
     render_conversation_page,
     render_conversations_index,
 )
 from nwn_wiki.render.creature_page import (
-    _creature_detail_sections,
     render_creature_page,
     render_creatures_search,
 )
 from nwn_wiki.render.creatures import (
-    _pic_figures,
     load_boss_registry,
-    load_boss_registry_from_src,
+    load_boss_registry_from_src,  # re-export: poked as wiki.load_boss_registry_from_src
     render_bosses_index,
     render_creature_pictures,
     render_creatures_by_area,
@@ -204,9 +105,6 @@ from nwn_wiki.render.itemprops_pages import (
     render_items_search,
 )
 from nwn_wiki.render.items import (
-    _items_col_flags,
-    _items_row,
-    _items_table_head,
     render_item_page,
     render_items_index,
 )
@@ -223,11 +121,6 @@ from nwn_wiki.render.scripts import (
     render_scripts_index,
 )
 from nwn_wiki.render.stores import (
-    _buy_limit_str,
-    _creature_store_section,
-    _store_buy_summary,
-    _store_item_gp_stats,
-    _store_opener_html,
     render_store_instance_page,
     render_store_page,
     render_stores_index,
@@ -238,19 +131,11 @@ from nwn_wiki.reports.conflicts import (
     generate_tag_conflict_report,
 )
 from nwn_wiki.reports.module_index import generate_module_index
-from nwn_wiki.sim.combat import (
-    avg_roll,
-    simulate,
-)
-from nwn_wiki.sim.pc import (
-    _FIRST_EPIC_LEVEL,
-    _epic_toughness_tiers,
-    _great_ability_tiers,
-    _kit_pieces,
-)
 from nwn_wiki.twoda import detect_cep_haks, load_2da_overrides
-from nwn_wiki.util import _tz_label_from_env, _write_json
-from nwn_wiki.warn import _warn_once
+from nwn_wiki.util import (
+    _tz_label_from_env,   # re-export: poked as wiki._tz_label_from_env
+    _write_json,
+)
 
 from nwn_wiki import state
 

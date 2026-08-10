@@ -4,9 +4,10 @@ Loads the JSON caches shipped in ``bin/wiki_data`` (baseitems, classes, races,
 feats, skills, spells, item properties, weapon stats, ...) at import time and
 exposes the row -> human-name helpers that read them.
 
-The tables are patched in place at runtime by ``load_2da_overrides()`` (still in
-``cli``), which merges a module's extracted 2DAs on top.  They are only ever
-mutated, never rebound, so importing them by name is safe.
+The tables are patched in place at runtime by ``load_json_overlay()`` (the CEP
+overlay, defined here) and by ``load_2da_overrides()`` in :mod:`nwn_wiki.twoda`
+(a module's extracted 2DAs).  They are only ever mutated, never rebound, so
+importing them by name is safe.
 
 ``STOCK_BASEITEMS`` and ``STOCK_FEAT_NAMES`` are snapshots taken here at import
 time -- i.e. before any override runs -- and the stock-vs-custom row distinction

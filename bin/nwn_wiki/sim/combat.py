@@ -6,8 +6,10 @@ a defence profile (AC, hit points, damage reduction, resistances, immunities,
 regeneration, saves) to give damage per round, rounds to a kill, and the
 scalar score the kit solver maximises.
 
-Pure stdlib -- no ``Db``, no wiki state, no renderers. The weapon-side inputs
-are built by the caller in :mod:`nwn_wiki.cli`.
+Pure stdlib -- no ``Db``, no wiki state, no renderers.  The weapon-side inputs
+are built by the callers: :mod:`nwn_wiki.sim.pc` for the reference PC,
+:mod:`nwn_wiki.render.creature_page` and
+:mod:`nwn_wiki.reports.counter_gear` for creatures.
 """
 
 from __future__ import annotations

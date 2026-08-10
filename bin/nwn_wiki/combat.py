@@ -6,7 +6,11 @@ and to pre-epic levels), the iterative attack schedule that follows from it,
 the flat to-hit bonus its feats contribute, and the standard ability-score
 modifier.
 
-Depends only on stdlib, gff and lookups -- nothing here may touch ``Db``,
+Also the feat-driven corrections that ride on those numbers: Epic Toughness
+hit points, Weapon Finesse eligibility, and the critical-hit feat effects
+(Improved/Overwhelming/Devastating Critical) resolved per base item.
+
+Depends only on stdlib, gff, lookups and util -- nothing here may touch ``Db``,
 ``E()`` or the renderers.
 """
 

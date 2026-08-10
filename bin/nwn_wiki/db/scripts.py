@@ -11,9 +11,9 @@ One mixin of the stack described in :mod:`nwn_wiki.db`; see that docstring
 for the rules it follows.
 
 ``_extract_func_body`` and the retaliation analysis (``_analyze_retaliation``
-and its helpers) travel with it because this package may not import
-:mod:`nwn_wiki.cli`.  The monolith still calls ``_strip_nss_comments`` for the
-boss registry and imports it back from here.
+and its helpers) travel with it because this package may not import its
+callers.  :mod:`nwn_wiki.render.creatures` imports ``_strip_nss_comments``
+back from here for the boss registry.
 """
 
 from __future__ import annotations

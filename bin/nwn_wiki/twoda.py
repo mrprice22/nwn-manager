@@ -4,10 +4,13 @@ bundled CEP overlay onto the stock lookups.
 :func:`parse_2da` / :func:`_2da_split` read the V2.0 whitespace-delimited 2DA
 format used by the files extracted from a module's HAKs (``--2da-dir``).
 
-This is a leaf module: stdlib plus :mod:`nwn_wiki.gff` only.  The override
-loaders that consume these parsers (``load_2da_overrides``, ``load_json_overlay``)
-still live in :mod:`nwn_wiki.cli` because they mutate the id→name lookup tables
-defined there; they move once those tables do.
+:func:`load_2da_overrides` layers a module's extracted 2DAs on top of the
+bundled stock tables in :mod:`nwn_wiki.lookups`, mutating them in place.  The
+sibling JSON-overlay loader (``load_json_overlay``, used for the CEP overlay)
+lives in :mod:`nwn_wiki.lookups` beside the tables it patches.
+
+Depends only on stdlib, :mod:`nwn_wiki.gff` and the tables in
+:mod:`nwn_wiki.lookups` -- nothing here may touch ``Db`` or the renderers.
 """
 
 from __future__ import annotations

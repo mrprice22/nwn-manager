@@ -8,9 +8,9 @@ its blueprint to deserve its own synthetic resref and wiki page.
 It is the base of the mixin stack described in :mod:`nwn_wiki.db` -- it defines
 ``__init__``, so it must stay last in the concrete class's bases.
 
-``_conversation_key`` lives here rather than in :mod:`nwn_wiki.cli` because
-``load`` and ``_intern_creature`` are its only callers and this package may not
-import the monolith.
+``_conversation_key`` lives here because ``load`` and ``_intern_creature`` are
+its only callers and this package may not import :mod:`nwn_wiki.cli` or the
+renderers.
 """
 
 from __future__ import annotations

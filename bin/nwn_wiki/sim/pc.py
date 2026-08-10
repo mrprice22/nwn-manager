@@ -1,11 +1,13 @@
-"""Feat budget for the reference PC of the counter-gear report.
+"""The reference PC of the counter-gear report, and its feat budget.
 
-The two feat pools a pure single-class Fighter build draws on, and the kit
-flattening helper the solver shares with :func:`nwn_wiki.cli.reference_pc`.
+The two feat pools a pure single-class Fighter build draws on, the kit
+flattening helper the solver shares with :func:`reference_pc`, and
+:func:`reference_pc` itself: the attack/defence profiles a level-N Fighter
+wearing a given kit fields.
 
-Pure stdlib -- no ``Db``, no wiki state, no renderers. ``reference_pc`` itself
-still lives in :mod:`nwn_wiki.cli` because it needs the item-property and
-weapon-feat helpers that have not been extracted yet.
+No wiki state, no renderers.  ``reference_pc`` takes a duck-typed ``db``
+(``Db`` lives in :mod:`nwn_wiki.cli`) so this module stays importable
+without it.
 """
 
 from __future__ import annotations
