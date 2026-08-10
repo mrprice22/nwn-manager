@@ -9,7 +9,8 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.htmlgen.escape import E, nwn_first_color, nwn_text
 
 
@@ -37,7 +38,7 @@ def render_map_page(db: Db, out: Path,
         _MAP_HINT_HTML,
         render_map_svg(db, positions, sizes, base_url=base_url),
     ])
-    write(out / "map" / "index.html", page("Map", body, root_rel=".."))
+    write_page(out, PageCtx("map/index.html"), "Map", body)
 
 
 def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],

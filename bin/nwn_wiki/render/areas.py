@@ -13,9 +13,10 @@ from typing import Any
 
 from nwn_wiki.db.index import _store_instance_slug
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _conv_link, link, tileset_label
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.items import item_gp_value
 from nwn_wiki.lookups import (
     baseitem_label,
@@ -322,7 +323,7 @@ def render_areas_index(db: Db, out: Path, *,
         ]
 
     body = "".join(body_parts)
-    write(out / "areas" / "index.html", page("Areas", body, root_rel=".."))
+    write_page(out, PageCtx("areas/index.html"), "Areas", body)
 
 
 def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
@@ -332,6 +333,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
     open the placeable in the toolset."""
     p = c["p"]
     idx = c["idx"]
+    ctx = PageCtx(f"containers/{area_resref}-{idx:03d}.html")
     tag = fld(p, "Tag", "")
     rr = fld(p, "TemplateResRef", "")
     pname = loc(p.get("LocName")) or tag or rr or "(unnamed container)"
@@ -429,8 +431,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
         )
 
     title = f"{pname} — {db.area_name(area_resref)}"
-    write(out / "containers" / f"{area_resref}-{idx:03d}.html",
-          page(title, "\n".join(sections), root_rel=".."))
+    write_page(out, ctx, title, "\n".join(sections))
 
 
 _OMIT: object = object()  # sentinel: "no path-from section on this page"
@@ -441,6 +442,7 @@ def render_area_page(db: Db, resref: str, out: Path,
     a = db.areas.get(resref)
     if not a:
         return
+    ctx = PageCtx(f"areas/{resref}.html")
     name = db.area_name(resref)
     sections: list[str] = []
 
@@ -660,7 +662,7 @@ def render_area_page(db: Db, resref: str, out: Path,
                 f"<td>{E(hp)}</td>"
                 f"<td>{E(cr)}</td>"
                 f"<td>{E(db.faction_name(fld(c, 'FactionID', '')))}</td>"
-                f"<td>{_conv_link(db, conv, root_rel='..')}</td></tr>"
+                f"<td>{_conv_link(db, conv, ctx)}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
@@ -757,7 +759,7 @@ def render_area_page(db: Db, resref: str, out: Path,
                 f"<td>{E(cls_str2)}</td>"
                 f"<td>{E(hp2)}</td>"
                 f"<td>{E(cr2)}</td>"
-                f"<td>{_conv_link(db, conv2, root_rel='..')}</td></tr>"
+                f"<td>{_conv_link(db, conv2, ctx)}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
@@ -833,7 +835,7 @@ def render_area_page(db: Db, resref: str, out: Path,
                 seen_html: set[str] = set()
                 opener_parts = []
                 for o in area_openers[:3]:
-                    h = _store_opener_html(db, o, root_rel="..")
+                    h = _store_opener_html(db, o, ctx)
                     if h not in seen_html:
                         seen_html.add(h)
                         opener_parts.append(h)
@@ -949,5 +951,4 @@ def render_area_page(db: Db, resref: str, out: Path,
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
-    write(out / "areas" / f"{resref}.html",
-          page(name, "\n".join(sections), root_rel=".."))
+    write_page(out, ctx, name, "\n".join(sections))

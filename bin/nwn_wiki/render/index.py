@@ -11,9 +11,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html
 from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.render.manual import _manual_doc_body
 from nwn_wiki.render.map import _MAP_HINT_HTML, render_map_svg
 
@@ -26,6 +27,7 @@ def render_index(db: Db, out: Path, module_title: str,
                  positions: dict[str, tuple[float, float]],
                  sizes: dict[str, tuple[float, float]],
                  base_url: str = "", project_root: Path | None = None) -> None:
+    ctx = PageCtx("index.html")
     # Author-supplied landing page replaces the generated overview/map index.
     # .html takes precedence over .md. Body fragment only (same handling as
     # docs.manual pages) — page() adds the nav header/footer. The map still
@@ -35,7 +37,7 @@ def render_index(db: Db, out: Path, module_title: str,
                          if (project_root / f"index.{ext}").is_file()), None)
         if override is not None:
             _, body_html = _manual_doc_body(override)
-            write(out / "index.html", page(module_title, body_html, root_rel="."))
+            write_page(out, ctx, module_title, body_html)
             print(f"[nwn-wiki] index: using override {override}")
             return
 
@@ -116,4 +118,4 @@ def render_index(db: Db, out: Path, module_title: str,
     overview.append(render_map_svg(db, positions, sizes, base_url=base_url))
 
     body = "\n".join(overview)
-    write(out / "index.html", page(module_title, body, root_rel="."))
+    write_page(out, ctx, module_title, body)

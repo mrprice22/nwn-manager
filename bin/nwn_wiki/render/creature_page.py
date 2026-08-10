@@ -26,9 +26,10 @@ from nwn_wiki.combat import (
     feat_attack_bonus,
 )
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.chrome import _creature_cr_value, page, write
+from nwn_wiki.htmlgen.chrome import _creature_cr_value, write, write_page
 from nwn_wiki.htmlgen.escape import E, colorize_damage_words, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _conv_link, _faction_cell, _race_link, link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.itemprops import (
     _fmt_hp,
     _prop_slug,
@@ -591,13 +592,13 @@ def _creature_detail_sections(
     c: dict,
     *,
     bp: dict | None = None,
-    root_rel: str = "..",
+    ctx: PageCtx,
 ) -> list[str]:
     """Body sections (abilities, combat, weapons, equipment, inventory,
     feats, skills, spells, scripts) shared by blueprint and instance pages.
     When `bp` is provided, fields missing from the instance struct fall
     back to the blueprint — most GIT placements keep the UTC defaults."""
-    items_dir = f"{root_rel}/items"
+    items_dir = ctx.url("items")
 
     def _f(key: str, default: Any = None) -> Any:
         v = fld(c, key, None)
@@ -1530,6 +1531,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     c = entry["c"]
     bp_rr = entry["bp_rr"]
     bp = db.creatures.get(bp_rr) if bp_rr != canonical_rr else None
+    ctx = PageCtx(f"creatures/{canonical_rr}.html")
     name = db.canonical_creature_name(canonical_rr)
 
     def _meta(key: str, default: Any = None) -> Any:
@@ -1551,13 +1553,13 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
         '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(canonical_rr)}</dd>",
         f"<dt>Tag</dt><dd>{E(_meta('Tag', ''))}</dd>",
-        f"<dt>Race</dt><dd>{_race_link(_meta('Race'), root_rel='..')}</dd>",
+        f"<dt>Race</dt><dd>{_race_link(_meta('Race'), ctx)}</dd>",
         f"<dt>Appearance</dt><dd>{E(appearance_name(_meta('Appearance_Type')))}</dd>",
         f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
         f"<dt>HP</dt><dd>{E(_fmt_hp(_eff_hp_meta) if _eff_hp_meta is not None else _fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
         f"<dt>CR</dt><dd>{E(_meta('ChallengeRating', ''))}</dd>",
-        f"<dt>Faction</dt><dd>{_faction_cell(db, canonical_rr, _meta('FactionID', ''), root_rel='..')}</dd>",
-        f"<dt>Conversation</dt><dd>{_conv_link(db, conv, root_rel='..') if conv else '—'}</dd>",
+        f"<dt>Faction</dt><dd>{_faction_cell(db, canonical_rr, _meta('FactionID', ''), ctx)}</dd>",
+        f"<dt>Conversation</dt><dd>{_conv_link(db, conv, ctx) if conv else '—'}</dd>",
     ]
 
     # Variant notice
@@ -1584,7 +1586,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     pics = state._CREATURE_PICS.get(canonical_rr)
     if pics:
         sections.append('<div class="creature-pics">'
-                        + _pic_figures(pics, name) + "</div>")
+                        + _pic_figures(pics, name, ctx) + "</div>")
 
     # Bestiary kill stats (when the module runs the kill-tracking system).
     if state._BESTIARY_ACTIVE:
@@ -1724,14 +1726,13 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     else:
         sections.append("<h2>Where to find</h2><p>Not placed in any area.</p>")
 
-    store_section = _creature_store_section(db, bp_rr, filter_area=None, root_rel="..")
+    store_section = _creature_store_section(db, bp_rr, filter_area=None, ctx=ctx)
     if store_section:
         sections.append(store_section)
 
-    sections.extend(_creature_detail_sections(db, c, bp=bp, root_rel=".."))
+    sections.extend(_creature_detail_sections(db, c, bp=bp, ctx=ctx))
 
-    write(out / "creatures" / f"{canonical_rr}.html",
-          page(name, "\n".join(sections), root_rel=".."))
+    write_page(out, ctx, name, "\n".join(sections))
 
 
 def render_creatures_search(db: Db, out: Path) -> None:
@@ -1918,5 +1919,4 @@ def render_creatures_search(db: Db, out: Path) -> None:
         '<em>Abilities &amp; combat properties</em> table for the full picture.</p>'
         f"<script>{_CREATURE_SEARCH_JS}</script>"
     )
-    write(out / "creatures" / "search.html",
-          page("Search Creatures", body, root_rel=".."))
+    write_page(out, PageCtx("creatures/search.html"), "Search Creatures", body)

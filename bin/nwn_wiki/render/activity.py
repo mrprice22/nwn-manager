@@ -22,7 +22,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.htmlgen.escape import E
 
 
@@ -838,5 +839,6 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         f'<div style="overflow-x:auto;">{chart_dow}</div>\n'
     )
     now_str = datetime.now().strftime("%b %-d, %Y %H:%M")
-    write(out / "activity.html", page("Player Activity", body, page_updated_at=now_str))
+    write_page(out, PageCtx("activity.html"), "Player Activity", body,
+               page_updated_at=now_str)
     print(f"[nwn-wiki] rendered activity page ({n_sessions} sessions, {n_players} players)")

@@ -13,9 +13,10 @@ from typing import Any
 
 from nwn_wiki.db.index import _store_instance_slug
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.items import (
     _CREATURE_WEAPON_BASEITEMS,
     _TOC_GROUPS,
@@ -90,7 +91,7 @@ _CREATURE_STORES_TABLE_HEAD = (
 
 
 def _creature_store_section(db: "Db", creature_resref: str,
-                             filter_area: str | None, root_rel: str) -> str:
+                             filter_area: str | None, ctx: PageCtx) -> str:
     """Return an HTML <h2>Stores</h2> + table for stores this creature opens,
     or empty string if none found. filter_area restricts to one area (instance
     pages); None returns all areas (blueprint pages)."""
@@ -127,12 +128,12 @@ def _creature_store_section(db: "Db", creature_resref: str,
 
             rr = fld(inst, "ResRef", "")
             name = db.store_name(rr) if rr in db.stores else (tag or rr)
-            name_cell = link(f"{root_rel}/stores/{slug}.html", name)
+            name_cell = link(ctx.url(f"stores/{slug}.html"), name)
 
             pages = list_items(inst.get("StoreList"))
             n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
 
-            area_cell = link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
+            area_cell = link(ctx.url(f"areas/{area_rr}.html"), db.area_name(area_rr))
 
             mu_val = fld(inst, "MarkUp", None)
             md_val = fld(inst, "MarkDown", None)
@@ -179,7 +180,7 @@ _STORE_TABLE_HEAD = (
 )
 
 
-def _store_opener_html(db: Db, opener: dict, root_rel: str = "..") -> str:
+def _store_opener_html(db: Db, opener: dict, ctx: PageCtx) -> str:
     """Compact one-liner describing what opens a store, for table cells."""
     kind = opener.get("kind", "")
     rr = opener.get("resref", "")
@@ -191,15 +192,15 @@ def _store_opener_html(db: Db, opener: dict, root_rel: str = "..") -> str:
             idx = opener.get("idx", 0)
             can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
             name = db.canonical_creature_name(can_rr) if can_rr else (rr or "(NPC)")
-            url = f"{root_rel}/creatures/{can_rr}.html" if can_rr else "#"
+            url = ctx.url(f"creatures/{can_rr}.html") if can_rr else "#"
             npc_html = f'<a href="{E(url)}">{nwn_html(name)}</a>'
         else:
             can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
             name = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else (rr or "NPC")
-            npc_html = (link(f"{root_rel}/creatures/{can_rr}.html", name)
+            npc_html = (link(ctx.url(f"creatures/{can_rr}.html"), name)
                         if can_rr in db.canonical_creatures else nwn_html(name))
         if via_dlg and via_dlg in db.dialogs:
-            conv = link(f"{root_rel}/conversations/{via_dlg}.html", "conversation")
+            conv = link(ctx.url(f"conversations/{via_dlg}.html"), "conversation")
             return f"NPC {npc_html} (via {conv})"
         return f"NPC {npc_html}"
 
@@ -208,7 +209,7 @@ def _store_opener_html(db: Db, opener: dict, root_rel: str = "..") -> str:
         areas = opener.get("areas", [])
         area_html = ""
         if areas and areas[0] in db.areas:
-            area_html = " in " + link(f"{root_rel}/areas/{areas[0]}.html",
+            area_html = " in " + link(ctx.url(f"areas/{areas[0]}.html"),
                                       db.area_name(areas[0]))
         return f'Trigger <code>{E(inst_tag)}</code>{area_html}'
 
@@ -217,10 +218,10 @@ def _store_opener_html(db: Db, opener: dict, root_rel: str = "..") -> str:
         return f'Placeable <code>{E(inst_tag)}</code>'
 
     # Fall back to full caller html for any other kind.
-    return _caller_html(db, opener, root_rel=root_rel)
+    return _caller_html(db, opener, ctx)
 
 
-def _store_inventory_html(db: "Db", pages: list, item_prefix: str = "../items/") -> str:
+def _store_inventory_html(db: "Db", pages: list, ctx: PageCtx) -> str:
     """Render store inventory grouped by item category (same scheme as the items index)."""
     all_items: list[tuple[str, dict]] = []
     for p in pages:
@@ -290,7 +291,7 @@ def _store_inventory_html(db: "Db", pages: list, item_prefix: str = "../items/")
             v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
         )
         rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, prefix=item_prefix, show_ac=show_ac,
+            _items_row(rr, i, db, show_base, show_stack, ctx, show_ac=show_ac,
                        show_spell_info=show_spell_info)
             for rr, i in items
         )
@@ -403,6 +404,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
     rr = fld(inst, "ResRef", "") or ""
     tag = fld(inst, "Tag", "") or rr
     slug = _store_instance_slug(area_rr, inst)
+    ctx = PageCtx(f"stores/{slug}.html")
 
     bp_name = db.store_name(rr) if rr in db.stores else ""
     name = bp_name or nwn_text(loc(inst.get("LocName"))) or tag or rr
@@ -452,7 +454,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
         sections.append("<h2>Opened by</h2><ul>")
         seen_html: set[str] = set()
         for o in display_openers:
-            h = _store_opener_html(db, o, root_rel="..")
+            h = _store_opener_html(db, o, ctx)
             if h not in seen_html:
                 seen_html.add(h)
                 sections.append(f"<li>{h}</li>")
@@ -466,7 +468,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
 
     # Instance inventory with floating sidebar TOC
     inv_toc = _store_inventory_toc_html(db, inst_pages)
-    inv_body = "<h2>Inventory</h2>" + _store_inventory_html(db, inst_pages)
+    inv_body = "<h2>Inventory</h2>" + _store_inventory_html(db, inst_pages, ctx)
     if inv_toc:
         inv_section = (
             '<div class="items-layout">'
@@ -478,11 +480,11 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
         inv_section = inv_body
     sections.append(inv_section)
 
-    write(out / "stores" / f"{slug}.html",
-          page(name, "\n".join(sections), root_rel=".."))
+    write_page(out, ctx, name, "\n".join(sections))
 
 
 def render_stores_index(db: Db, out: Path) -> None:
+    ctx = PageCtx("stores/index.html")
     # The GIT instance is the authoritative source: each placed store can have
     # different MarkUp/MarkDown/MaxBuyPrice/inventory from the UTM blueprint.
     # NWN semantics: MarkUp = % of base the store charges you (Sells At, usually >100)
@@ -549,7 +551,7 @@ def render_stores_index(db: Db, out: Path) -> None:
                 seen_html: set[str] = set()
                 opener_parts = []
                 for o in display_openers[:3]:  # cap at 3 in index for readability
-                    h = _store_opener_html(db, o, root_rel="..")
+                    h = _store_opener_html(db, o, ctx)
                     if h not in seen_html:
                         seen_html.add(h)
                         opener_parts.append(h)
@@ -672,13 +674,14 @@ def render_stores_index(db: Db, out: Path) -> None:
             + _IDX_TABLE_HEAD + "\n".join(r[1] for r in unplaced_rows) + "</tbody></table>"
         )
 
-    write(out / "stores" / "index.html", page("Stores", body, root_rel=".."))
+    write_page(out, ctx, "Stores", body)
 
 
 def render_store_page(db: Db, resref: str, out: Path) -> None:
     s = db.stores.get(resref)
     if not s:
         return
+    ctx = PageCtx(f"stores/{resref}.html")
     name = db.store_name(resref)
 
     # Find all placed instances for this blueprint, excluding hidden areas.
@@ -758,7 +761,6 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
         bp_meta.append(f"<dt>Avg Item Value</dt><dd>{bp_avg_gp:,.0f} gp</dd>")
     bp_meta.append('</dl>')
     sections.extend(bp_meta)
-    sections.append("<h2>Blueprint Inventory</h2>" + _store_inventory_html(db, pages))
+    sections.append("<h2>Blueprint Inventory</h2>" + _store_inventory_html(db, pages, ctx))
 
-    write(out / "stores" / f"{resref}.html",
-          page(name, "\n".join(sections), root_rel=".."))
+    write_page(out, ctx, name, "\n".join(sections))

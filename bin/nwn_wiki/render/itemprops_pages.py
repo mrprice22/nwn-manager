@@ -13,9 +13,10 @@ from collections import defaultdict
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write, write_page
 from nwn_wiki.htmlgen.escape import E, nwn_text
 from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.itemprops import (
     _cost_anchor,
     _cost_tiers,
@@ -310,8 +311,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         f'<div class="items-layout">{sidebar}'
         f'<div class="items-content">{body}</div></div>'
     )
-    write(out / "items" / "properties" / "index.html",
-          page("Browse by Property", layout, root_rel="../.."))
+    write_page(out, PageCtx("items/properties/index.html"),
+               "Browse by Property", layout)
 
     # Build prefix-group detail structure:
     # (pname, group_key) → [(actual_subtype, resref, name, cost_str, value_num, qty)]
@@ -498,8 +499,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         back = f'<div><a href="index.html#{E(_pname_anchor(pname))}">← Browse by Property</a></div>'
         detail_sidebar = '<aside class="items-toc">' + back + "".join(toc_parts) + '</aside>'
         layout = f'<div class="items-layout">{detail_sidebar}<div class="items-content">{body}</div></div>'
-        write(out / "items" / "properties" / f"{slug}.html",
-              page(label, layout, root_rel="../.."))
+        write_page(out, PageCtx(f"items/properties/{slug}.html"), label, layout)
 
     # --- combined property pages (one page per property, all subtypes together) ---
     for pname, combined_slug in _COMBINED_PROP_PAGES.items():
@@ -584,8 +584,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
 
         combined_sidebar = '<aside class="items-toc">' + "".join(toc_parts) + '</aside>'
         layout = f'<div class="items-layout">{combined_sidebar}<div class="items-content">{body}</div></div>'
-        write(out / "items" / "properties" / f"{combined_slug}.html",
-              page(pname, layout, root_rel="../.."))
+        write_page(out, PageCtx(f"items/properties/{combined_slug}.html"),
+                   pname, layout)
 
 
 # ---------------------------------------------------------------------------
@@ -913,5 +913,4 @@ def render_items_search(db: "Db", out: Path) -> None:
         '<div id="sr"><p class="muted">Use the filters above and click Search.</p></div>'
         f"<script>{_SEARCH_JS}</script>"
     )
-    write(out / "items" / "search.html",
-          page("Search Items", body, root_rel=".."))
+    write_page(out, PageCtx("items/search.html"), "Search Items", body)

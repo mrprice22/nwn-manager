@@ -14,9 +14,10 @@ from typing import Any
 
 from nwn_wiki.db.derived import _quest_hidden, _quest_slug
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html
 from nwn_wiki.htmlgen.links import _script_link, link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 
 
 # ---------------------------------------------------------------------------
@@ -239,13 +240,13 @@ def render_quests_index(db: Db, out: Path) -> None:
     Comment marks them @hidden are omitted entirely. When any visible quest
     declares `@group 'Name'` in its builder Comment, quests are gathered under
     those headings; otherwise every quest sits in one table."""
+    ctx = PageCtx("quests/index.html")
     cats = _quest_categories(db)
     visible = [i for i in range(len(cats))
                if not _quest_hidden(fld(cats[i], "Comment", ""))]
     if not visible:
         msg = "(no active quests)" if cats else "(no journal quests)"
-        write(out / "quests" / "index.html",
-              page("Quests", f"<h1>Quests</h1><p>{msg}</p>", root_rel=".."))
+        write_page(out, ctx, "Quests", f"<h1>Quests</h1><p>{msg}</p>")
         return
 
     slugs = _quest_slugs(cats)
@@ -409,12 +410,13 @@ def render_quests_index(db: Db, out: Path) -> None:
                 f'<small class="muted">({len(grouped[""])})</small></h2>')
             parts.append(table(grouped[""]))
 
-    write(out / "quests" / "index.html", page("Quests", "".join(parts), root_rel=".."))
+    write_page(out, ctx, "Quests", "".join(parts))
 
 
 def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
     """Detail page for a single quest line: metadata plus its journal entries
     in progression order, cross-referenced to the scripts that award each."""
+    ctx = PageCtx(f"quests/{slug}.html")
     tag = fld(c, "Tag", "")
     qname = loc(c.get("Name")) or tag or "(unnamed quest)"
     prio = _quest_priority_label(fld(c, "Priority"))
@@ -518,7 +520,7 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
             end = fld(e, "End", 0)
             txt = loc(e.get("Text"))
             granters = sorted(grants.get(eid, set()))
-            granter_parts = [_script_link(db, s) for s in granters]
+            granter_parts = [_script_link(db, s, ctx) for s in granters]
             granting_dlgs = sorted(dlg_grants.get(eid, set()))
             for dlg_rr in granting_dlgs:
                 dlg_label = db.dialog_label(dlg_rr)
@@ -557,5 +559,4 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(table_rows) + "</tbody></table>"
         )
 
-    write(out / "quests" / f"{slug}.html",
-          page(f"Quest: {qname}", "\n".join(parts), root_rel=".."))
+    write_page(out, ctx, f"Quest: {qname}", "\n".join(parts))

@@ -13,17 +13,19 @@ from pathlib import Path
 from typing import Any
 
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _race_link, link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.itemprops import _fmt_hp
 from nwn_wiki.lookups import class_name, race_name
 from nwn_wiki.render.creatures import creature_max_hp
 
 
 def render_factions(db: Db, out: Path) -> None:
+    ctx = PageCtx("factions.html")
     if not db.fac:
-        write(out / "factions.html", page("Factions", "<h1>Factions</h1><p>(none)</p>"))
+        write_page(out, ctx, "Factions", "<h1>Factions</h1><p>(none)</p>")
         return
     flist = list_items(db.fac.get("FactionList"))
 
@@ -224,7 +226,7 @@ def render_factions(db: Db, out: Path) -> None:
             col_totals[fid] += n
             row_total += n
             cells += f"<td>{n if n else '&#x2014;'}</td>"
-        rname_cell = _race_link(rid, root_rel=".") if rid is not None else E("(unset)")
+        rname_cell = _race_link(rid, ctx) if rid is not None else E("(unset)")
         rf_rows.append(f"<tr><td>{rname_cell}</td>{cells}<td>{row_total}</td></tr>")
 
     total_cells = "".join(f"<td>{col_totals[fid]}</td>" for fid in factions_with_creatures)
@@ -457,12 +459,13 @@ def render_factions(db: Db, out: Path) -> None:
         f'<div class="items-layout">{sidebar}'
         f'<div class="items-content">{body}</div></div>'
     )
-    write(out / "factions.html", page("Factions", layout))
+    write_page(out, ctx, "Factions", layout)
 
 
 def render_journal(db: Db, out: Path) -> None:
+    ctx = PageCtx("journal.html")
     if not db.jrl:
-        write(out / "journal.html", page("Journal", "<h1>Journal</h1><p>(empty)</p>"))
+        write_page(out, ctx, "Journal", "<h1>Journal</h1><p>(empty)</p>")
         return
     cats = list_items(db.jrl.get("Categories"))
     sections = [f"<h1>Journal</h1><p>{len(cats)} quests.</p>"]
@@ -487,4 +490,4 @@ def render_journal(db: Db, out: Path) -> None:
                 '<table class="data"><thead><tr><th>ID</th><th>End</th><th>Text</th></tr></thead>'
                 "<tbody>" + "\n".join(rows) + "</tbody></table>"
             )
-    write(out / "journal.html", page("Journal", "\n".join(sections)))
+    write_page(out, ctx, "Journal", "\n".join(sections))

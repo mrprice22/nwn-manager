@@ -11,9 +11,10 @@ import re
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _script_link, link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +42,7 @@ _RE_CUSTOM_TOKEN = re.compile(r"&lt;CUSTOM(\d+)&gt;")
 
 def _annotate_custom_tokens(escaped_html: str,
                              token_setters: dict[int, set[str]],
-                             db: "Db", root_rel: str) -> str:
+                             db: "Db", ctx: PageCtx) -> str:
     """Replace HTML-escaped <CUSTOMn> tokens with annotated spans that link to
     the scripts that call SetCustomToken(n, ...). If no setter is found,
     the token is wrapped in a muted span so it's visually distinct."""
@@ -50,7 +51,7 @@ def _annotate_custom_tokens(escaped_html: str,
         setters = sorted(token_setters.get(n, set()))
         raw = m.group(0)  # &lt;CUSTOMn&gt;
         if setters:
-            links = ", ".join(_script_link(db, s, root_rel) for s in setters)
+            links = ", ".join(_script_link(db, s, ctx) for s in setters)
             return (f'<span class="custom-token" '
                     f'title="SetCustomToken({n}, ...) called in: '
                     + ", ".join(setters) + f'">'
@@ -94,7 +95,7 @@ def _render_dialog_node_refs(db: Db, refs_field: list[dict],
 
 
 def _render_dialog_tree(db: Db, entries: list[dict], replies: list[dict],
-                        starts: list[dict]) -> str:
+                        starts: list[dict], ctx: PageCtx) -> str:
     """Render the dialog as nested <details> blocks, recursing from each
     starting entry. Cycles and shared continuations are broken with a
     backref link to the node's first occurrence so the tree can't
@@ -136,7 +137,7 @@ def _render_dialog_tree(db: Db, entries: list[dict], replies: list[dict],
         speaker = fld(e, "Speaker", "")
         action = fld(e, "Script", "")
         text_html = _annotate_custom_tokens(
-            nwn_html(loc(e.get("Text"))), db.token_setters, db, "..") or "<em>(no text)</em>"
+            nwn_html(loc(e.get("Text"))), db.token_setters, db, ctx) or "<em>(no text)</em>"
         head = (f'<span class="dlg-id">entry #{idx}</span>'
                 + (f' <span class="dlg-speaker">[{E(speaker)}]</span>' if speaker else "")
                 + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
@@ -177,7 +178,7 @@ def _render_dialog_tree(db: Db, entries: list[dict], replies: list[dict],
         r = replies[idx]
         action = fld(r, "Script", "")
         text_html = _annotate_custom_tokens(
-            nwn_html(loc(r.get("Text"))), db.token_setters, db, "..") or "<em>(no text)</em>"
+            nwn_html(loc(r.get("Text"))), db.token_setters, db, ctx) or "<em>(no text)</em>"
         head = (f'<span class="dlg-id">reply #{idx}</span>'
                 + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
                 + cond_html(ref_active))
@@ -203,10 +204,10 @@ def _render_dialog_tree(db: Db, entries: list[dict], replies: list[dict],
 
 
 def render_conversations_index(db: Db, out: Path) -> None:
+    ctx = PageCtx("conversations/index.html")
     if not db.dialogs:
-        write(out / "conversations" / "index.html",
-              page("Conversations", "<h1>Conversations</h1><p>(none)</p>",
-                   root_rel=".."))
+        write_page(out, ctx, "Conversations",
+                   "<h1>Conversations</h1><p>(none)</p>")
         return
     rows = []
     for rr in sorted(db.dialogs.keys(),
@@ -253,8 +254,7 @@ def render_conversations_index(db: Db, out: Path) -> None:
         "<th>Callers</th><th>Teleports</th><th>Flags</th>"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
-    write(out / "conversations" / "index.html",
-          page("Conversations", body, root_rel=".."))
+    write_page(out, ctx, "Conversations", body)
 
 
 def render_conversation_page(db: Db, resref: str, out: Path) -> None:
@@ -264,6 +264,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
     dlg = db.dialogs.get(resref)
     if not dlg:
         return
+    ctx = PageCtx(f"conversations/{resref}.html")
     zdlg_handler = dlg.get("__zdlg_handler__")
     entries = list_items(dlg.get("EntryList"))
     replies = list_items(dlg.get("ReplyList"))
@@ -274,11 +275,11 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
                       '<span class="badge">z-dialog</span></h1>')
         meta = [
             '<dl class="meta">',
-            f"<dt>Handler script</dt><dd>{_script_link(db, zdlg_handler, '..')}</dd>",
+            f"<dt>Handler script</dt><dd>{_script_link(db, zdlg_handler, ctx)}</dd>",
         ]
         dispatchers = sorted(db.zdlg_handler_dispatchers.get(zdlg_handler, set()))
         if dispatchers:
-            disp_html = ", ".join(_script_link(db, d, "..") for d in dispatchers)
+            disp_html = ", ".join(_script_link(db, d, ctx) for d in dispatchers)
             meta.append(f"<dt>Opened from</dt><dd>{disp_html}</dd>")
         meta.append('</dl>')
         meta.append(
@@ -306,7 +307,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
     if callers:
         sections.append("<h2>Triggered by</h2><ul class=\"dlg-callers\">")
         for c in callers:
-            sections.append("<li>" + _caller_html(db, c, root_rel="..") + "</li>")
+            sections.append("<li>" + _caller_html(db, c, ctx) + "</li>")
         sections.append("</ul>")
     else:
         sections.append("<h2>Triggered by</h2>"
@@ -428,7 +429,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             token_rows = []
             for n in sorted(all_tokens):
                 setters = sorted(db.token_setters.get(n, set()))
-                setter_html = (", ".join(_script_link(db, s, "..") for s in setters)
+                setter_html = (", ".join(_script_link(db, s, ctx) for s in setters)
                                if setters else '<em class="muted">not found in static analysis</em>')
                 token_rows.append(
                     f"<tr><td><code>&lt;CUSTOM{n}&gt;</code></td>"
@@ -466,7 +467,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
         sections.append("</ul>")
 
     # ---- Conversation flow (recursive tree from each starting entry) ----
-    tree_html = _render_dialog_tree(db, entries, replies, starts)
+    tree_html = _render_dialog_tree(db, entries, replies, starts, ctx)
     if tree_html:
         sections.append("<h2>Conversation flow</h2>")
         sections.append(
@@ -490,7 +491,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             + (f' <span class="dlg-speaker">[{E(speaker)}]</span>' if speaker else "")
             + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
             + '</div>'
-            f'<div class="dlg-text">{_annotate_custom_tokens(nwn_html(text), db.token_setters, db, "..") or "<em>(no text)</em>"}</div>'
+            f'<div class="dlg-text">{_annotate_custom_tokens(nwn_html(text), db.token_setters, db, ctx) or "<em>(no text)</em>"}</div>'
             + _render_dialog_node_refs(db, list_items(e.get("RepliesList")),
                                        "reply", tgt_nodes=replies)
             + '</div>'
@@ -507,26 +508,25 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
             f'<div class="dlg-head"><span class="dlg-id">reply #{i}</span>'
             + (f' <span class="dlg-action">→ <code>{E(action)}</code></span>' if action else "")
             + '</div>'
-            f'<div class="dlg-text">{_annotate_custom_tokens(nwn_html(text), db.token_setters, db, "..") or "<em>(no text)</em>"}</div>'
+            f'<div class="dlg-text">{_annotate_custom_tokens(nwn_html(text), db.token_setters, db, ctx) or "<em>(no text)</em>"}</div>'
             + _render_dialog_node_refs(db, list_items(r.get("EntriesList")),
                                        "entry", tgt_nodes=entries)
             + '</div>'
         )
 
-    write(out / "conversations" / f"{resref}.html",
-          page(f"Conversation {resref}", "\n".join(sections), root_rel=".."))
+    write_page(out, ctx, f"Conversation {resref}", "\n".join(sections))
 
 
-def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
+def _caller_html(db: Db, c: dict, ctx: PageCtx) -> str:
     """One-line description of a dialog caller, with cross-page links."""
     kind = c.get("kind")
     rr = c.get("resref", "")
     if kind == "creature":
         can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
         cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
-        cell = (link(f"{root_rel}/creatures/{can_rr}.html", cname)
+        cell = (link(ctx.url(f"creatures/{can_rr}.html"), cname)
                 if can_rr in db.canonical_creatures else nwn_html(rr))
-        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+        areas = ", ".join(link(ctx.url(f"areas/{a}.html"), db.area_name(a))
                           for a in c.get("areas", []) if a in db.areas)
         return (f'<span class="badge">creature</span> NPC {cell} '
                 f"<code>{E(rr)}</code>" + (f" — in {areas}" if areas else ""))
@@ -535,8 +535,8 @@ def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
         idx = c.get("idx", 0)
         can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
         inst_label = db.canonical_creature_name(can_rr) if can_rr else (db.creature_instance_name(area_rr, idx) or rr or "(unnamed)")
-        inst_url = f"{root_rel}/creatures/{can_rr}.html" if can_rr else "#"
-        area_link = (link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
+        inst_url = ctx.url(f"creatures/{can_rr}.html") if can_rr else "#"
+        area_link = (link(ctx.url(f"areas/{area_rr}.html"), db.area_name(area_rr))
                      if area_rr in db.areas else nwn_html(area_rr))
         return (f'<span class="badge">creature</span> NPC '
                 f'<a href="{E(inst_url)}">{nwn_html(inst_label)}</a>'
@@ -544,19 +544,19 @@ def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
     if kind == "placeable":
         # Placeables don't have their own page; we'll link to one of their
         # area pages instead, which is where the placement lives.
-        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+        areas = ", ".join(link(ctx.url(f"areas/{a}.html"), db.area_name(a))
                           for a in c.get("areas", []) if a in db.areas)
         return (f"Placeable <code>{E(rr)}</code>" +
                 (f" — in {areas}" if areas else ""))
     if kind == "door":
-        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+        areas = ", ".join(link(ctx.url(f"areas/{a}.html"), db.area_name(a))
                           for a in c.get("areas", []) if a in db.areas)
         return (f"Door <code>{E(rr)}</code>" +
                 (f" — in {areas}" if areas else ""))
     if kind in ("placeable-instance", "door-instance"):
         area_rr = c.get("area", "")
         tag = c.get("tag") or ""
-        area_link = (link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
+        area_link = (link(ctx.url(f"areas/{area_rr}.html"), db.area_name(area_rr))
                      if area_rr in db.areas else nwn_html(area_rr))
         bp = f" <small class=\"muted\">(blueprint <code>{E(rr)}</code>)</small>" if rr else ""
         label = "Placeable" if kind == "placeable-instance" else "Door"
@@ -573,11 +573,11 @@ def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
         if kind == "creature-event":
             can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
             cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
-            ent = (link(f"{root_rel}/creatures/{can_rr}.html", cname)
+            ent = (link(ctx.url(f"creatures/{can_rr}.html"), cname)
                    if can_rr in db.canonical_creatures else nwn_html(rr))
             label = f"NPC {ent} <code>{E(rr)}</code>"
         elif kind == "area-event":
-            ent = (link(f"{root_rel}/areas/{rr}.html", db.area_name(rr))
+            ent = (link(ctx.url(f"areas/{rr}.html"), db.area_name(rr))
                    if rr in db.areas else nwn_html(rr))
             label = f"Area {ent} <code>{E(rr)}</code>"
         elif is_instance:
@@ -589,19 +589,19 @@ def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
             label = (f'<span class="badge">instance</span> {entity} {ident}{bp}')
         else:
             label = f"{kind.split('-')[0].title()} <code>{E(rr)}</code>"
-        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
+        areas = ", ".join(link(ctx.url(f"areas/{a}.html"), db.area_name(a))
                           for a in c.get("areas", []) if a in db.areas)
-        return (f"{label} via <code>{E(ev)}</code> script {_script_link(db, s, root_rel)}" +
+        return (f"{label} via <code>{E(ev)}</code> script {_script_link(db, s, ctx)}" +
                 (f" — in {areas}" if areas else ""))
     if kind == "module-event":
         ev = c.get("event", "")
         s = c.get("script", "")
         return (f'<span class="badge global">global</span> '
-                f"Module <code>{E(ev)}</code> via script {_script_link(db, s, root_rel)}")
+                f"Module <code>{E(ev)}</code> via script {_script_link(db, s, ctx)}")
     if kind == "item-script":
-        ent = (link(f"{root_rel}/items/{rr}.html", db.item_name(rr))
+        ent = (link(ctx.url(f"items/{rr}.html"), db.item_name(rr))
                if rr in db.items else nwn_html(rr))
         s = c.get("script", "")
         return (f"Item {ent} <code>{E(rr)}</code> via tag-script "
-                f"{_script_link(db, s, root_rel)}")
+                f"{_script_link(db, s, ctx)}")
     return E(repr(c))

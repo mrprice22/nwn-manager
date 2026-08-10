@@ -14,9 +14,10 @@ from pathlib import Path
 from nwn_wiki.combat import epic_toughness_hp
 from nwn_wiki.db.scripts import _strip_nss_comments
 from nwn_wiki.gff import fld, list_items
-from nwn_wiki.htmlgen.chrome import has_creature_pics_page, page, write
+from nwn_wiki.htmlgen.chrome import has_creature_pics_page, write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.lookups import class_name, race_name
 from nwn_wiki.warn import _warn_once
 
@@ -152,10 +153,8 @@ def render_creatures_index(db: Db, out: Path) -> None:
             + TABLE_HEAD + "\n".join(rows_absent) + "</tbody></table>"
         )
     body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
-    write(out / "creatures" / "index.html",
-          page("Creatures",
-               '<div class="items-layout">' + body + "</div>",
-               root_rel=".."))
+    write_page(out, PageCtx("creatures/index.html"), "Creatures",
+               '<div class="items-layout">' + body + "</div>")
 
 
 # --- Boss respawn tracker ("Roll of the Fallen") ---------------------------
@@ -293,16 +292,23 @@ def render_bosses_index(db: Db, out: Path) -> None:
         f"{kills_head}"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
-    write(out / "creatures" / "bosses.html", page("Bosses", body, root_rel=".."))
+    write_page(out, PageCtx("creatures/bosses.html"), "Bosses", body)
 
 
-def _pic_src(filename: str, prefix: str = "pics") -> str:
-    """URL for a creature-pics image; filenames may contain spaces/apostrophes."""
-    return f"{prefix}/{urllib.parse.quote(filename)}"
+def _pic_src(filename: str, prefix: str) -> str:
+    """URL for a creature-pics image; filenames may contain spaces/apostrophes.
+
+    ``prefix`` is the way to ``creatures/pics/`` from the page holding the
+    image, and already ends in "/" (see PageCtx.dir_url)."""
+    return f"{prefix}{urllib.parse.quote(filename)}"
 
 
-def _pic_figures(images: list[str], alt: str, prefix: str = "pics") -> str:
-    """Render a list of image filenames as full-width <figure><img> blocks."""
+def _pic_figures(images: list[str], alt: str, ctx: PageCtx) -> str:
+    """Render a list of image filenames as full-width <figure><img> blocks.
+
+    ``ctx`` is the page the figures are going into; the image URLs are resolved
+    against it, so the same block works from any depth."""
+    prefix = ctx.dir_url("creatures/pics")
     return "".join(
         f'<figure><img class="creature-pic" src="{E(_pic_src(fn, prefix))}" '
         f'alt="{E(alt)}" loading="lazy"></figure>'
@@ -319,6 +325,7 @@ def render_creature_pictures(db: Db, out: Path) -> None:
     exactly when it is written."""
     if not has_creature_pics_page():
         return
+    ctx = PageCtx("creatures/pictures.html")
 
     def _slug(name: str) -> str:
         s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
@@ -360,14 +367,12 @@ def render_creature_pictures(db: Db, out: Path) -> None:
         else:
             sections.append('<p class="muted">No matching creature in the module.</p>')
         sections.append('<div class="creature-pics">'
-                        + _pic_figures(grp["images"], name) + "</div>")
+                        + _pic_figures(grp["images"], name, ctx) + "</div>")
         sections.append("</section>")
 
     body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
-    write(out / "creatures" / "pictures.html",
-          page("Creature Pictures",
-               '<div class="items-layout">' + body + "</div>",
-               root_rel=".."))
+    write_page(out, ctx, "Creature Pictures",
+               '<div class="items-layout">' + body + "</div>")
 
 
 def render_creatures_by_area(db: Db, out: Path) -> None:
@@ -479,10 +484,8 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
         )
 
     body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
-    write(out / "creatures" / "by-area" / "index.html",
-          page("Creatures by Area",
-               '<div class="items-layout">' + body + "</div>",
-               root_rel="../.."))
+    write_page(out, PageCtx("creatures/by-area/index.html"), "Creatures by Area",
+               '<div class="items-layout">' + body + "</div>")
 
 
 def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> None:
@@ -619,10 +622,9 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
         sections.append(_render_cr_section("cr-unknown", "Unknown CR", unknown))
 
     body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
-    write(out / "creatures" / "by-cr" / "index.html",
-          page("Creatures by Challenge Rating",
-               '<div class="items-layout">' + body + "</div>",
-               root_rel="../.."))
+    write_page(out, PageCtx("creatures/by-cr/index.html"),
+               "Creatures by Challenge Rating",
+               '<div class="items-layout">' + body + "</div>")
 
 
 def render_creatures_by_race(db: Db, out: Path) -> None:
@@ -737,7 +739,5 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
         )
 
     body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
-    write(out / "creatures" / "by-race" / "index.html",
-          page("Creatures by Race",
-               '<div class="items-layout">' + body + "</div>",
-               root_rel="../.."))
+    write_page(out, PageCtx("creatures/by-race/index.html"), "Creatures by Race",
+               '<div class="items-layout">' + body + "</div>")

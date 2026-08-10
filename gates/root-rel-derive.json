@@ -1,0 +1,4 @@
+{
+  "reason": "root_rel is threaded by hand as a '.' / '..' / '../..' string through 17 functions whose defaults contradict each other, and correctness rests on an unwritten 'only called from depth 1' rule. Derive the depth from the output path instead. All 34 page() call sites are correct today, so this is a mechanical equivalence: no output may change at all, and the empty diff is the proof.",
+  "paths": []
+}

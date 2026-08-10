@@ -14,9 +14,10 @@ from collections import defaultdict
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, colorize_damage_words, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.itemprops import (
     _cost_anchor,
     _is_raw_subtype,
@@ -104,8 +105,11 @@ def _items_table_head(show_base: bool, show_stack: bool, show_ac: bool = False,
 
 
 def _items_row(rr: str, i: dict, db: "Db", show_base: bool, show_stack: bool,
-               prefix: str = "", show_ac: bool = False, reason: str | None = None,
+               ctx: PageCtx, show_ac: bool = False, reason: str | None = None,
                show_spell_info: bool = False) -> str:
+    """One <tr> for item ``rr``; ``ctx`` is the page the table is going into,
+    which is what decides how the item link reaches ``items/``."""
+    prefix = ctx.dir_url("items")
     cells = [
         f"<td>{link(f'{prefix}{rr}.html', db.item_name(rr))}</td>",
         f"<td>{E(rr)}</td>",
@@ -143,6 +147,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
     """
     if not has_inaccessible_items(db):
         return
+    ctx = PageCtx("items/inaccessible/index.html")
 
     def _item_cost_key(entry: tuple[str, dict]) -> int:
         return item_gp_value(entry[1])
@@ -228,7 +233,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
             v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
         )
         rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, prefix="../", show_ac=show_ac,
+            _items_row(rr, i, db, show_base, show_stack, ctx, show_ac=show_ac,
                        reason=_inaccessible_reason_html(rr, db),
                        show_spell_info=show_spell_info)
             for rr, i in items
@@ -241,8 +246,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
         )
 
     layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
-    write(out / "items" / "inaccessible" / "index.html",
-          page("Inaccessible Items", layout, root_rel="../.."))
+    write_page(out, ctx, "Inaccessible Items", layout)
 
 
 def item_is_accessible(db: Db, rr: str) -> bool:
@@ -283,6 +287,7 @@ def has_inaccessible_items(db: Db) -> bool:
 
 
 def render_items_index(db: Db, out: Path) -> None:
+    ctx = PageCtx("items/index.html")
 
     # Classify every item; broken = TLK-only or completely unnamed.
     buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
@@ -399,7 +404,7 @@ def render_items_index(db: Db, out: Path) -> None:
             v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
         )
         rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, show_ac=show_ac,
+            _items_row(rr, i, db, show_base, show_stack, ctx, show_ac=show_ac,
                        show_spell_info=show_spell_info)
             for rr, i in items
         )
@@ -452,7 +457,7 @@ def render_items_index(db: Db, out: Path) -> None:
         )
 
     layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
-    write(out / "items" / "index.html", page("Accessible Items", layout, root_rel=".."))
+    write_page(out, ctx, "Accessible Items", layout)
 
     # Render the inaccessible items on their own page.
     render_inaccessible_index(db, inaccessible, out)
@@ -462,6 +467,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     i = db.items.get(resref)
     if not i:
         return
+    ctx = PageCtx(f"items/{resref}.html")
     name = db.item_name(resref)
     # TLK-placeholder names mean the item's name is not available without the
     # base game TLK file; show the resref as the page title instead.
@@ -956,5 +962,4 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
-    write(out / "items" / f"{resref}.html",
-          page(name, "\n".join(sections), root_rel=".."))
+    write_page(out, ctx, name, "\n".join(sections))

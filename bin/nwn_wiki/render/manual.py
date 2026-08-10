@@ -18,10 +18,11 @@ from datetime import datetime
 from pathlib import Path
 
 from nwn_wiki.bestiary import _utc_to_local
-from nwn_wiki.htmlgen.chrome import _md_title, page, write
+from nwn_wiki.htmlgen.chrome import _md_title, write_page
 from nwn_wiki.htmlgen.escape import E
 from nwn_wiki.htmlgen.links import link
 from nwn_wiki.htmlgen.markdown import md_to_html
+from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.util import _tz_label_from_env
 
 from nwn_wiki import state
@@ -158,8 +159,8 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
 
     # Pass 1: collect all page metadata and content so state._MANUAL_MENUS is complete
     # before any page HTML is written (the dropdowns on every page must list all docs).
-    # (out_path, title, body, root_rel, page_updated_at)
-    pages_to_write: list[tuple[Path, str, str, str, str]] = []
+    # (ctx, title, body, page_updated_at)
+    pages_to_write: list[tuple[PageCtx, str, str, str]] = []
 
     def note_menu_order(menu_name: str, menu_order: int | None) -> None:
         if menu_order is not None and menu_name not in state._MANUAL_MENU_ORDER:
@@ -178,7 +179,7 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         stem = doc_path.stem
         state._MANUAL_MENUS.setdefault(menu_name, []).append(
             {"kind": "file", "title": title, "stem": stem, "_order": order})
-        pages_to_write.append((out / "manual" / f"{stem}.html", title, body, "..", ""))
+        pages_to_write.append((PageCtx(f"manual/{stem}.html"), title, body, ""))
 
     # Generated (data-driven) page: Server-First kill leaderboard. Surfaced via the
     # Activity nav dropdown (see _activity_dropdown), not Documents. Its content is
@@ -186,12 +187,13 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
     # prior full build already produced the page, keep it in the nav without
     # rewriting it — this keeps the nav consistent when nwn-wiki-activity re-renders
     # manual pages without DB access.
-    sf_path = out / "manual" / "ServerFirsts.html"
+    sf_ctx = PageCtx("manual/ServerFirsts.html")
+    sf_path = sf_ctx.path(out)
     if state._BESTIARY_ACTIVE:
         sf_now = datetime.now().strftime("%b %-d, %Y %H:%M")
         state._HAS_SERVER_FIRSTS = True
-        pages_to_write.append((sf_path, "Server Firsts",
-                               _render_server_first_body(), "..", sf_now))
+        pages_to_write.append((sf_ctx, "Server Firsts",
+                               _render_server_first_body(), sf_now))
     elif sf_path.exists():
         state._HAS_SERVER_FIRSTS = True
 
@@ -221,7 +223,7 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
             stem = doc_path.stem
             items.append({"title": title, "stem": stem})
             pages_to_write.append((
-                out / "manual" / dirname / f"{stem}.html", title, body, "../..", "",
+                PageCtx(f"manual/{dirname}/{stem}.html"), title, body, "",
             ))
         state._MANUAL_MENUS.setdefault(folder_menu or "Documents", []).append(
             {"kind": "dir", "title": folder_title, "dirname": dirname,
@@ -234,8 +236,8 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         entries.sort(key=lambda e: e["_order"] if e["_order"] is not None else 10**9)
 
     # Pass 2: write all pages now that state._MANUAL_MENUS is fully populated.
-    for out_path, title, body, root_rel, page_ts in pages_to_write:
-        write(out_path, page(title, body, root_rel=root_rel, page_updated_at=page_ts))
+    for ctx, title, body, page_ts in pages_to_write:
+        write_page(out, ctx, title, body, page_updated_at=page_ts)
 
     total = len(pages_to_write)
     if total:

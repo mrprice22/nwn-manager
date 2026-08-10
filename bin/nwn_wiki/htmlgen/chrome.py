@@ -30,6 +30,7 @@ from pathlib import Path
 
 from nwn_wiki.gff import fld
 from nwn_wiki.htmlgen.escape import E, nwn_text
+from nwn_wiki.htmlgen.pagectx import PageCtx
 
 from nwn_wiki import state
 
@@ -173,19 +174,22 @@ def active_chrome() -> SiteChrome:
     return SiteChrome.from_state()
 
 
-def _manual_menu_rows(entries: list[dict], root_rel: str) -> list[str]:
+def _manual_menu_rows(entries: list[dict], ctx: PageCtx) -> list[str]:
     """Return nav row HTML (links / submenus) for a list of manual-page entries."""
     rows: list[str] = []
     for entry in entries:
         if entry["kind"] == "file":
+            href = ctx.url("manual/{}.html".format(entry["stem"]))
             rows.append(
-                f'<a href="{E(root_rel)}/manual/{E(entry["stem"])}.html">'
+                f'<a href="{E(href)}">'
                 f'{E(entry["title"])}</a>'
             )
         else:
+            dirname = entry["dirname"]
             sub_items = "\n".join(
-                f'<a href="{E(root_rel)}/manual/{E(entry["dirname"])}/{E(it["stem"])}.html">'
-                f'{E(it["title"])}</a>'
+                '<a href="{}">{}</a>'.format(
+                    E(ctx.url(f'manual/{dirname}/{it["stem"]}.html')),
+                    E(it["title"]))
                 for it in entry["items"]
             )
             rows.append(
@@ -197,7 +201,7 @@ def _manual_menu_rows(entries: list[dict], root_rel: str) -> list[str]:
     return rows
 
 
-def _quests_nav(chrome: SiteChrome, root_rel: str) -> str:
+def _quests_nav(chrome: SiteChrome, ctx: PageCtx) -> str:
     """Return the Quests nav entry: a plain link to the generated quest index,
     or a dropdown when manual pages target @menu 'Quests'.
 
@@ -205,8 +209,8 @@ def _quests_nav(chrome: SiteChrome, root_rel: str) -> str:
     exactly as before; declaring one turns the entry into a dropdown and the
     generated index becomes "Journal Entries" inside it.
     """
-    index_link = f'{E(root_rel)}/quests/index.html'
-    rows = _manual_menu_rows(chrome.manual_menus.get("Quests", []), root_rel)
+    index_link = E(ctx.url("quests/index.html"))
+    rows = _manual_menu_rows(chrome.manual_menus.get("Quests", []), ctx)
     if not rows:
         return f'<a href="{index_link}">Quests</a>'
     rows.append(f'<a href="{index_link}">Journal Entries</a>')
@@ -219,22 +223,23 @@ def _quests_nav(chrome: SiteChrome, root_rel: str) -> str:
     )
 
 
-def _activity_dropdown(chrome: SiteChrome, root_rel: str) -> str:
+def _activity_dropdown(chrome: SiteChrome, ctx: PageCtx) -> str:
     """Return the Activity nav dropdown HTML (manual pages targeting @menu
     'Activity', then Player Activity + Server Firsts).
 
     Player Activity / Server Firsts are refreshed more often than the rest of
     the wiki (via nwn-wiki-activity). Shown only when at least one entry exists.
     """
-    manual_rows = _manual_menu_rows(chrome.manual_menus.get("Activity", []), root_rel)
+    manual_rows = _manual_menu_rows(chrome.manual_menus.get("Activity", []), ctx)
     if not (chrome.has_activity or chrome.has_server_firsts or manual_rows):
         return ""
     rows: list[str] = list(manual_rows)
     if chrome.has_activity:
-        rows.append(f'<a href="{E(root_rel)}/activity.html">Player Activity</a>')
+        rows.append(
+            f'<a href="{E(ctx.url("activity.html"))}">Player Activity</a>')
     if chrome.has_server_firsts:
         rows.append(
-            f'<a href="{E(root_rel)}/manual/ServerFirsts.html">Server Firsts</a>'
+            f'<a href="{E(ctx.url("manual/ServerFirsts.html"))}">Server Firsts</a>'
         )
     inner = "\n".join(rows)
     return (
@@ -245,12 +250,12 @@ def _activity_dropdown(chrome: SiteChrome, root_rel: str) -> str:
     )
 
 
-def _docs_dropdown(chrome: SiteChrome, root_rel: str) -> str:
+def _docs_dropdown(chrome: SiteChrome, ctx: PageCtx) -> str:
     """Return the Documents nav dropdown HTML, or empty string if none."""
     entries = chrome.manual_menus.get("Documents", [])
     if not entries:
         return ""
-    inner = "\n".join(_manual_menu_rows(entries, root_rel))
+    inner = "\n".join(_manual_menu_rows(entries, ctx))
     return (
         '<div class="nav-dropdown">'
         '<span class="nav-dropdown-label">Documents &#9660;</span>'
@@ -259,7 +264,7 @@ def _docs_dropdown(chrome: SiteChrome, root_rel: str) -> str:
     )
 
 
-def _custom_manual_dropdowns(chrome: SiteChrome, root_rel: str) -> str:
+def _custom_manual_dropdowns(chrome: SiteChrome, ctx: PageCtx) -> str:
     """Return nav dropdown HTML for any custom @menu names (excluding the
     built-in Documents/Activity/Quests dropdowns), ordered by @menu-order then
     first-seen position."""
@@ -269,7 +274,7 @@ def _custom_manual_dropdowns(chrome: SiteChrome, root_rel: str) -> str:
                                       list(chrome.manual_menus).index(n)))
     blocks: list[str] = []
     for name in custom_names:
-        inner = "\n".join(_manual_menu_rows(chrome.manual_menus[name], root_rel))
+        inner = "\n".join(_manual_menu_rows(chrome.manual_menus[name], ctx))
         blocks.append(
             '<div class="nav-dropdown">'
             f'<span class="nav-dropdown-label">{E(name)} &#9660;</span>'
@@ -288,7 +293,7 @@ def _md_title(text: str, stem: str) -> str:
     return stem.replace("-", " ").replace("_", " ").title()
 
 
-def _brand_html(chrome: SiteChrome, root_rel: str) -> str:
+def _brand_html(chrome: SiteChrome, ctx: PageCtx) -> str:
     """Return the site-header brand: a banner image when the theme supplies one,
     otherwise plain text.
 
@@ -299,11 +304,11 @@ def _brand_html(chrome: SiteChrome, root_rel: str) -> str:
     script that runs the moment the <img> is parsed, so only the chosen image is
     ever fetched and the reserved box matches it.
     """
-    home = f'{E(root_rel)}/index.html'
+    home = E(ctx.url("index.html"))
     if not chrome.theme_header_imgs:
         return f'<a class="brand" href="{home}">Module Wiki</a>'
 
-    srcs = [f"{root_rel}/assets/{n}" for n in chrome.theme_header_imgs]
+    srcs = [ctx.url(f"assets/{n}") for n in chrome.theme_header_imgs]
     dims = chrome.theme_header_dims or [None] * len(srcs)
 
     def size_attrs(i: int) -> str:
@@ -332,9 +337,14 @@ def _brand_html(chrome: SiteChrome, root_rel: str) -> str:
             f'{size_attrs(0)} alt="Home"></noscript></a>')
 
 
-def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "",
+def page(title: str, body: str, ctx: PageCtx, page_updated_at: str = "",
          chrome: SiteChrome | None = None) -> str:
     """Wrap body in the standard wiki page shell.
+
+    ``ctx`` is where the page will be written; every link below is built from
+    it, so the nav can only ever point at the real output root.  Prefer
+    :func:`write_page`, which takes the same ctx and writes to exactly the path
+    the links were built for.
 
     ``chrome`` defaults to the build's published SiteChrome (``state.CHROME``),
     so every page in a run — including the ones the nwn-wiki-activity
@@ -342,18 +352,19 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "",
     """
     if chrome is None:
         chrome = active_chrome()
-    extra_css = (f'\n  <link rel="stylesheet" href="{E(root_rel)}/assets/{E(chrome.theme_extra_css)}">'
+    u = ctx.url
+    extra_css = (f'\n  <link rel="stylesheet" href="{E(u("assets/" + chrome.theme_extra_css))}">'
                  if chrome.theme_extra_css else "")
-    favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(chrome.theme_favicon)}">'
+    favicon = (f'\n  <link rel="icon" href="{E(u("assets/" + chrome.theme_favicon))}">'
                if chrome.theme_favicon else "")
-    brand = _brand_html(chrome, root_rel)
+    brand = _brand_html(chrome, ctx)
     # Both entries carry their own leading newline+indent so that switching them
     # off removes the whole line rather than leaving a blank one behind.
     pictures_nav = (
-        f'\n          <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>'
+        f'\n          <a href="{E(u("creatures/pictures.html"))}">Pictures</a>'
         if chrome.has_creature_pics else "")
     inaccessible_nav = (
-        f'\n          <a href="{E(root_rel)}/items/inaccessible/index.html">Inaccessible</a>'
+        f'\n          <a href="{E(u("items/inaccessible/index.html"))}">Inaccessible</a>'
         if chrome.has_inaccessible else "")
     return f"""<!doctype html>
 <html lang="en">
@@ -361,47 +372,47 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "",
   <meta charset="utf-8">
   <title>{E(nwn_text(title))}</title>
   <script>document.documentElement.classList.add('js-nav','nav-pending');</script>
-  <link rel="stylesheet" href="{E(root_rel)}/assets/style.css">{extra_css}{favicon}
-  <script src="{E(root_rel)}/assets/site.js" defer></script>
+  <link rel="stylesheet" href="{E(u('assets/style.css'))}">{extra_css}{favicon}
+  <script src="{E(u('assets/site.js'))}" defer></script>
 </head>
 <body>
   <header class="site-header">
     {brand}
     <nav>
-      <a href="{E(root_rel)}/map/index.html">Map</a>
-      <a href="{E(root_rel)}/areas/index.html">Areas</a>
+      <a href="{E(u('map/index.html'))}">Map</a>
+      <a href="{E(u('areas/index.html'))}">Areas</a>
       <div class="nav-dropdown">
         <span class="nav-dropdown-label">Creatures &#9660;</span>
         <div class="nav-dropdown-menu">
-          <a href="{E(root_rel)}/creatures/index.html">All Creatures</a>
-          <a href="{E(root_rel)}/creatures/by-area/index.html">By Area</a>
-          <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
-          <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
-          <a href="{E(root_rel)}/creatures/search.html">Search</a>
-          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if chrome.has_bosses else ''}{pictures_nav}
+          <a href="{E(u('creatures/index.html'))}">All Creatures</a>
+          <a href="{E(u('creatures/by-area/index.html'))}">By Area</a>
+          <a href="{E(u('creatures/by-cr/index.html'))}">By Challenge Rating</a>
+          <a href="{E(u('creatures/by-race/index.html'))}">By Race</a>
+          <a href="{E(u('creatures/search.html'))}">Search</a>
+          {f'<a href="{E(u("creatures/bosses.html"))}">Bosses</a>' if chrome.has_bosses else ''}{pictures_nav}
         </div>
       </div>
       <div class="nav-dropdown">
         <span class="nav-dropdown-label">Items &#9660;</span>
         <div class="nav-dropdown-menu">
-          <a href="{E(root_rel)}/items/index.html">Accessible</a>{inaccessible_nav}
-          <a href="{E(root_rel)}/items/properties/index.html">By Property</a>
-          <a href="{E(root_rel)}/items/search.html">Search</a>
+          <a href="{E(u('items/index.html'))}">Accessible</a>{inaccessible_nav}
+          <a href="{E(u('items/properties/index.html'))}">By Property</a>
+          <a href="{E(u('items/search.html'))}">Search</a>
         </div>
       </div>
-      <a href="{E(root_rel)}/stores/index.html">Stores</a>
-      <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
-      <a href="{E(root_rel)}/factions.html">Factions</a>
-      {_quests_nav(chrome, root_rel)}
-      {_activity_dropdown(chrome, root_rel)}
-      {_docs_dropdown(chrome, root_rel)}
-      {_custom_manual_dropdowns(chrome, root_rel)}
+      <a href="{E(u('stores/index.html'))}">Stores</a>
+      <a href="{E(u('conversations/index.html'))}">Conversations</a>
+      <a href="{E(u('factions.html'))}">Factions</a>
+      {_quests_nav(chrome, ctx)}
+      {_activity_dropdown(chrome, ctx)}
+      {_docs_dropdown(chrome, ctx)}
+      {_custom_manual_dropdowns(chrome, ctx)}
     </nav>
   </header>
   <main>
 {body}
   </main>
-  <footer>generated by <a href="https://github.com/mrprice22/nwn-manager">nwn-manager</a> &mdash; <span id="wiki-generated-at" data-meta-url="{E(root_rel)}/assets/meta.json">{E(f"last updated {page_updated_at}") if page_updated_at else ""}</span></footer>
+  <footer>generated by <a href="https://github.com/mrprice22/nwn-manager">nwn-manager</a> &mdash; <span id="wiki-generated-at" data-meta-url="{E(u('assets/meta.json'))}">{E(f"last updated {page_updated_at}") if page_updated_at else ""}</span></footer>
 </body>
 </html>
 """
@@ -410,6 +421,20 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "",
 def write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+def write_page(out: Path, ctx: PageCtx, title: str, body: str,
+               page_updated_at: str = "",
+               chrome: SiteChrome | None = None) -> None:
+    """Shell ``body`` and write it to the path ``ctx`` names under ``out``.
+
+    The single ctx feeds both halves, so a page cannot be written to one depth
+    while its nav links point at another -- the failure mode the hand-threaded
+    ``root_rel`` argument used to make possible.
+    """
+    write(ctx.path(out),
+          page(title, body, ctx, page_updated_at=page_updated_at,
+               chrome=chrome))
 
 
 def _img_pixel_size(path: Path) -> tuple[int, int] | None:

@@ -7,9 +7,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E
 from nwn_wiki.htmlgen.links import _conv_link, link
+from nwn_wiki.htmlgen.pagectx import PageCtx
 
 
 def render_script_page(db: "Db", resref: str, out: Path) -> None:
@@ -19,6 +20,7 @@ def render_script_page(db: "Db", resref: str, out: Path) -> None:
     path = db.script_paths.get(resref)
     if not path:
         return
+    ctx = PageCtx(f"scripts/{resref}.html")
     try:
         source = path.read_text(errors="replace")
     except Exception as e:
@@ -29,10 +31,10 @@ def render_script_page(db: "Db", resref: str, out: Path) -> None:
     meta_rows = []
     if starts:
         meta_rows.append("<dt>Starts dialogs</dt><dd>" + ", ".join(
-            _conv_link(db, d, "..") for d in starts) + "</dd>")
+            _conv_link(db, d, ctx) for d in starts) + "</dd>")
     if zstarts:
         meta_rows.append("<dt>Opens z-dialogs</dt><dd>" + ", ".join(
-            _conv_link(db, d, "..") for d in zstarts) + "</dd>")
+            _conv_link(db, d, ctx) for d in zstarts) + "</dd>")
     if teleports:
         parts = []
         for t in teleports:
@@ -49,8 +51,7 @@ def render_script_page(db: "Db", resref: str, out: Path) -> None:
         + meta
         + f'<pre class="nss-source"><code>{E(source)}</code></pre>'
     )
-    write(out / "scripts" / f"{resref}.html",
-          page(f"Script {resref}", body, root_rel=".."))
+    write_page(out, ctx, f"Script {resref}", body)
 
 
 def render_scripts_index(db: "Db", out: Path) -> None:
@@ -81,5 +82,4 @@ def render_scripts_index(db: "Db", out: Path) -> None:
         "<th>ResRef</th><th>Notes</th>"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
-    write(out / "scripts" / "index.html",
-          page("Scripts", body, root_rel=".."))
+    write_page(out, PageCtx("scripts/index.html"), "Scripts", body)
