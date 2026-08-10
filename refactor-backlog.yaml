@@ -1529,8 +1529,36 @@ items:
 - id: render-conversations
   phase: 1
   title: Extract dialog-tree renderers into render/conversations.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 9e91f68
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (134s), lotr2008 IDENTICAL (84s), lotr2009 IDENTICAL (107s)"
+  impl_notes: >
+    render/conversations.py 607 lines; cli.py 5,474 -> 4,977; render/stores.py 852 ->
+    764.  Moved _dialog_node_anchor, _dialog_text_preview, _RE_CUSTOM_TOKEN,
+    _annotate_custom_tokens, _render_dialog_node_refs, _render_dialog_tree,
+    render_conversations_index and render_conversation_page (the backlog plan called
+    the last one render_dialog_page — that symbol does not exist).  _caller_html WAS
+    reclaimed from render/stores.py: conversations.py needs nothing from stores.py,
+    so the edge is one-way and stores.py now imports it; _script_link went with it
+    and left stores.py's htmlgen.links import.  Nothing else dragged.
+    generate_conversation_conflict_report stayed — it is a report generator outside
+    this item's range (reports-conflicts owns it).  STATE AUDIT: zero — no state
+    reference anywhere in the moved code; all data flows through db and arguments.
+    Line multiset verified on BOTH files: cli.py 501 removed / 4 added, stores.py 89
+    removed / 1 added, and conversations.py is exactly header + the two moved blocks.
+  found:
+    - "render_conversation_page's docstring says the dialog is rendered as a flat
+       outline 'since a tree expansion is impractical', but the function also renders
+       the recursive _render_dialog_tree section — the docstring predates it."
+    - "render_conversation_page hardcodes '..' as root_rel in ~6 places rather than
+       taking it as a parameter, unlike the store and creature renderers; the two
+       _script_link call sites in _render_dialog_tree do the same.  Grist for
+       root-rel-derive."
+    - "render/__init__.py's docstring still lists only areas and map — it is now
+       stale for eight submodules."
+
   after: [render-quests]
   ranges: "14290-14878"
 
