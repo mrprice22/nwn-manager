@@ -1794,8 +1794,37 @@ items:
 - id: render-index
   phase: 1
   title: Extract the site index page into render/index.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: f2dd055
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (141s), lotr2008 IDENTICAL (95s), lotr2009 IDENTICAL (108s)"
+  impl_notes: >
+    render/index.py 119 lines; cli.py 2,844 -> 2,736.  render_index moved verbatim
+    with the orphaned '# Renderers' banner (it was the last renderer in cli.py).
+    Nothing left behind — it had no cli-local dependencies at all.
+    _MAP_HINT_HTML CONFIRMED: render_index was its only other consumer, so cli.py's
+    import-back is fully dropped and the constant now has exactly two consumers, both
+    inside render/.  Two more cli.py imports fell out with it: _manual_doc_body (same
+    story) and htmlgen.escape.nwn_html.  CYCLE CHECK clean: render.index ->
+    {gff, htmlgen.*, render.manual, render.map}, neither of which imports it, and no
+    module in the package imports cli.  STATE AUDIT: zero state references — the page
+    is a function of db, positions, sizes, project_root and the override file.  Line
+    multiset: every moved line removed from cli.py and present byte-identically
+    downstream; the only extra deletions are import plumbing.
+  found:
+    - "There are now two index.py modules — nwn_wiki/db/index.py and
+       nwn_wiki/render/index.py.  No runtime issue, but greps and any future
+       re-export shorthand get ambiguous."
+    - "render_index's override branch discards the title _manual_doc_body extracts
+       and uses module_title instead, unlike render_manual_pages which honours the
+       page's own title — so an author-supplied index.md with an H1 gets a <title>
+       that ignores it.  Behavioural question, not a move."
+    - "render/__init__.py's docstring lists two submodules while the package now has
+       14; it should be completed or reduced to a sentence."
+    - "No linter is installed in this environment (pyflakes/ruff absent), so the
+       dead-import sweep should install one rather than rely on AST heuristics."
+
   after: [render-activity]
   ranges: "6037-6149"
 
