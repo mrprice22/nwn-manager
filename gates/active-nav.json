@@ -1,0 +1,5 @@
+{
+  "reason": "There is no active-nav state today — no aria-current, no active class. Now that page() knows the current output path (PageCtx, commit 4ddb1b8), mark the nav entry whose target is the page being rendered. Exactly one nav anchor per page gains aria-current=\"page\" and a class hook; no other markup moves, and no CSS is added, so nothing changes visually.",
+  "paths": ["docs/**/*.html", "docs/*.html"],
+  "line_patterns": ["<a [^>]*href=", "aria-current"]
+}

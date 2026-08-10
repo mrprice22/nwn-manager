@@ -26,7 +26,7 @@ import struct
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from nwn_wiki.gff import fld
 from nwn_wiki.htmlgen.escape import E, nwn_text
@@ -174,22 +174,44 @@ def active_chrome() -> SiteChrome:
     return SiteChrome.from_state()
 
 
+#: Marks the one nav anchor that points at the page being rendered.  Paired
+#: with aria-current="page" (which is the part that actually carries meaning --
+#: screen readers announce it, and it needs no stylesheet to work).  The class
+#: is only a styling hook; nothing in wiki_assets/style.css or site.js claims
+#: this name today, so adding it is inert until someone writes a rule for it.
+NAV_CURRENT_CLASS = "nav-current"
+
+
+def _nav_link(ctx: PageCtx, target: str, label: str) -> str:
+    """One nav anchor pointing at ``target`` (an output-root-relative path).
+
+    When ``target`` *is* the page being rendered the anchor gains
+    ``aria-current="page"`` and :data:`NAV_CURRENT_CLASS`.  The comparison is
+    made against ``ctx.rel`` -- the same fact write_page() writes the file from
+    -- so "am I the current page?" cannot drift from "where did this page land?"
+    the way a hand-passed flag or a title match would.  A page with no nav entry
+    of its own (any detail page: an area, an item, a creature) simply matches
+    nothing and gets no marked anchor.
+    """
+    mark = (f' class="{NAV_CURRENT_CLASS}" aria-current="page"'
+            if PurePosixPath(target) == ctx.rel else "")
+    return f'<a href="{E(ctx.url(target))}"{mark}>{E(label)}</a>'
+
+
 def _manual_menu_rows(entries: list[dict], ctx: PageCtx) -> list[str]:
     """Return nav row HTML (links / submenus) for a list of manual-page entries."""
     rows: list[str] = []
     for entry in entries:
         if entry["kind"] == "file":
-            href = ctx.url("manual/{}.html".format(entry["stem"]))
             rows.append(
-                f'<a href="{E(href)}">'
-                f'{E(entry["title"])}</a>'
+                _nav_link(ctx, "manual/{}.html".format(entry["stem"]),
+                          entry["title"])
             )
         else:
             dirname = entry["dirname"]
             sub_items = "\n".join(
-                '<a href="{}">{}</a>'.format(
-                    E(ctx.url(f'manual/{dirname}/{it["stem"]}.html')),
-                    E(it["title"]))
+                _nav_link(ctx, f'manual/{dirname}/{it["stem"]}.html',
+                          it["title"])
                 for it in entry["items"]
             )
             rows.append(
@@ -209,11 +231,10 @@ def _quests_nav(chrome: SiteChrome, ctx: PageCtx) -> str:
     exactly as before; declaring one turns the entry into a dropdown and the
     generated index becomes "Journal Entries" inside it.
     """
-    index_link = E(ctx.url("quests/index.html"))
     rows = _manual_menu_rows(chrome.manual_menus.get("Quests", []), ctx)
     if not rows:
-        return f'<a href="{index_link}">Quests</a>'
-    rows.append(f'<a href="{index_link}">Journal Entries</a>')
+        return _nav_link(ctx, "quests/index.html", "Quests")
+    rows.append(_nav_link(ctx, "quests/index.html", "Journal Entries"))
     inner = "\n".join(rows)
     return (
         '<div class="nav-dropdown">'
@@ -235,12 +256,10 @@ def _activity_dropdown(chrome: SiteChrome, ctx: PageCtx) -> str:
         return ""
     rows: list[str] = list(manual_rows)
     if chrome.has_activity:
-        rows.append(
-            f'<a href="{E(ctx.url("activity.html"))}">Player Activity</a>')
+        rows.append(_nav_link(ctx, "activity.html", "Player Activity"))
     if chrome.has_server_firsts:
         rows.append(
-            f'<a href="{E(ctx.url("manual/ServerFirsts.html"))}">Server Firsts</a>'
-        )
+            _nav_link(ctx, "manual/ServerFirsts.html", "Server Firsts"))
     inner = "\n".join(rows)
     return (
         '<div class="nav-dropdown">'
@@ -361,10 +380,11 @@ def page(title: str, body: str, ctx: PageCtx, page_updated_at: str = "",
     # Both entries carry their own leading newline+indent so that switching them
     # off removes the whole line rather than leaving a blank one behind.
     pictures_nav = (
-        f'\n          <a href="{E(u("creatures/pictures.html"))}">Pictures</a>'
+        "\n          " + _nav_link(ctx, "creatures/pictures.html", "Pictures")
         if chrome.has_creature_pics else "")
     inaccessible_nav = (
-        f'\n          <a href="{E(u("items/inaccessible/index.html"))}">Inaccessible</a>'
+        "\n          " + _nav_link(ctx, "items/inaccessible/index.html",
+                                   "Inaccessible")
         if chrome.has_inaccessible else "")
     return f"""<!doctype html>
 <html lang="en">
@@ -379,30 +399,30 @@ def page(title: str, body: str, ctx: PageCtx, page_updated_at: str = "",
   <header class="site-header">
     {brand}
     <nav>
-      <a href="{E(u('map/index.html'))}">Map</a>
-      <a href="{E(u('areas/index.html'))}">Areas</a>
+      {_nav_link(ctx, 'map/index.html', 'Map')}
+      {_nav_link(ctx, 'areas/index.html', 'Areas')}
       <div class="nav-dropdown">
         <span class="nav-dropdown-label">Creatures &#9660;</span>
         <div class="nav-dropdown-menu">
-          <a href="{E(u('creatures/index.html'))}">All Creatures</a>
-          <a href="{E(u('creatures/by-area/index.html'))}">By Area</a>
-          <a href="{E(u('creatures/by-cr/index.html'))}">By Challenge Rating</a>
-          <a href="{E(u('creatures/by-race/index.html'))}">By Race</a>
-          <a href="{E(u('creatures/search.html'))}">Search</a>
-          {f'<a href="{E(u("creatures/bosses.html"))}">Bosses</a>' if chrome.has_bosses else ''}{pictures_nav}
+          {_nav_link(ctx, 'creatures/index.html', 'All Creatures')}
+          {_nav_link(ctx, 'creatures/by-area/index.html', 'By Area')}
+          {_nav_link(ctx, 'creatures/by-cr/index.html', 'By Challenge Rating')}
+          {_nav_link(ctx, 'creatures/by-race/index.html', 'By Race')}
+          {_nav_link(ctx, 'creatures/search.html', 'Search')}
+          {_nav_link(ctx, 'creatures/bosses.html', 'Bosses') if chrome.has_bosses else ''}{pictures_nav}
         </div>
       </div>
       <div class="nav-dropdown">
         <span class="nav-dropdown-label">Items &#9660;</span>
         <div class="nav-dropdown-menu">
-          <a href="{E(u('items/index.html'))}">Accessible</a>{inaccessible_nav}
-          <a href="{E(u('items/properties/index.html'))}">By Property</a>
-          <a href="{E(u('items/search.html'))}">Search</a>
+          {_nav_link(ctx, 'items/index.html', 'Accessible')}{inaccessible_nav}
+          {_nav_link(ctx, 'items/properties/index.html', 'By Property')}
+          {_nav_link(ctx, 'items/search.html', 'Search')}
         </div>
       </div>
-      <a href="{E(u('stores/index.html'))}">Stores</a>
-      <a href="{E(u('conversations/index.html'))}">Conversations</a>
-      <a href="{E(u('factions.html'))}">Factions</a>
+      {_nav_link(ctx, 'stores/index.html', 'Stores')}
+      {_nav_link(ctx, 'conversations/index.html', 'Conversations')}
+      {_nav_link(ctx, 'factions.html', 'Factions')}
       {_quests_nav(chrome, ctx)}
       {_activity_dropdown(chrome, ctx)}
       {_docs_dropdown(chrome, ctx)}
