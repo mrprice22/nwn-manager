@@ -2028,8 +2028,66 @@ items:
 - id: site-chrome-object
   phase: 2
   title: Replace the nav globals with one SiteChrome object built once
-  status: pending
+  status: done
   gate: expected-diff
+  commit: 95da34d
+  date: 2026-08-10
+  gate_result: "check --all --expect gates/site-chrome-object.json: OK — all diffs declared on all three corpora, the only diff being `added docs/.chrome.json`; rebaselined --all afterwards"
+  impl_notes: >
+    SiteChrome is a dataclass in htmlgen/chrome.py holding has_activity,
+    has_server_firsts, has_bosses, manual_menus, manual_menu_order, the four theme
+    fields, plus the carried-but-unread has_inaccessible/has_creature_pics.  It
+    carries has_bosses rather than the whole boss_registry — the nav only ever reads
+    bool(state._BOSS_REGISTRY), and serialising the registry would duplicate
+    module-index/bosses.json for no consumer.  page() gained a `chrome=None`
+    parameter that falls back to active_chrome() (state.CHROME if the build has
+    published one, else SiteChrome.from_state()), so all 63 call sites stayed
+    untouched; the fallback is genuinely needed because manual pages render in the
+    same pass that discovers the menus, before the chrome can exist, and that
+    snapshot is byte-equivalent to the globals it replaced.  All five nav helpers now
+    take the chrome and read no state.  cli.main() builds and saves it immediately
+    after render_manual_pages — after theme, creature pics, activity flag, server
+    firsts, boss registry and menus have loaded, and before the activity subprocess.
+    has_inaccessible needed a real value and chrome.py cannot import render/items.py
+    (that module imports chrome), so the existing predicate was factored out of
+    render_items_index into item_is_accessible(db, rr) and has_inaccessible_items(db)
+    — a pure extraction, classification unchanged.  Pictures and Inaccessible are
+    still emitted unconditionally; gating them is nav-gate-conditional.
+    bin/nwn-wiki-activity now computes NO nav fact: it loads the chrome file and
+    assigns state.CHROME, dropping the unconditional _HAS_ACTIVITY_PAGE = True and
+    the load_boss_registry_from_src call.  FALLBACK: load() returns None on a missing
+    OR unparseable file and the script reverts to exactly the old behaviour with a
+    stderr warning naming the path — an older docs/ tree or a truncated write should
+    degrade, never crash the live publish path.  Judgment call: when the file says
+    has_activity false, the script honours it (writes the page, omits the nav link)
+    and prints a note; overriding it would reinstate the desync.
+    BY-HAND VERIFICATION (the gate never passes --log-dir, so it cannot see this
+    path): built the 2009 archive corpus reflink-copied to scratch with a fixture
+    docs.manual/, wiki-theme/ and nwserver log, old tree vs new: diff -rq shows one
+    new file and nothing else, the sole content difference being activity.html's
+    pre-existing one-minute footer clock skew.  Nav+head of activity.html, all five
+    manual pages, creatures, items, factions and quests all match index.html.
+    Standalone nwn-wiki-activity reproduces the manual pages byte-identically.
+    DESYNC DEMONSTRATED: with wiki-theme/ moved aside and only the subprocess re-run,
+    the old code silently stripped theme.css, favicon and banner from the manual
+    pages while the rest of the wiki kept them; the new code rewrites them
+    byte-identically.  Both fallback paths (deleted and corrupted file) verified.
+  found:
+    - "bin/nwn-wiki-activity overwrites state._GENERATED_AT with its own now(), so
+       activity.html and every manual page carry a footer timestamp minutes newer
+       than the rest of the wiki.  A second, surviving chrome desync — deliberately
+       left out of SiteChrome because folding it in would change page bytes."
+    - "bin/wiki-golden never passes --log-dir, so the entire activity/subprocess path
+       — where these desyncs live — is outside the gate's fingerprint.  A corpus
+       variant with a frozen fake log dir would close that hole."
+    - "state._MANUAL_MENUS entries carry an _order key that is pure sort scratch
+       (None on most rows) and now gets serialised into .chrome.json."
+    - "The activity subprocess still calls render_manual_pages purely for its page
+       side effects, yet it also resets state._MANUAL_MENUS/_HAS_SERVER_FIRSTS —
+       dead writes in the chrome path.  Worth splitting scan from write."
+    - "SiteChrome.load() treats missing and corrupt identically; a corrupt file is a
+       real bug signal and arguably deserves a louder failure than a silent degrade."
+
   after: [cli-module]
   plan: >
     Build a SiteChrome in cli.main() AFTER every loader has run, carrying the
