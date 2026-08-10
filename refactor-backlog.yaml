@@ -1665,8 +1665,45 @@ items:
 - id: render-scripts-manual
   phase: 1
   title: Extract script pages and manual-page rendering into render/
-  status: pending
+  status: done
   gate: zero-diff
+  commit: b630991
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (134s), lotr2008 IDENTICAL (83s), lotr2009 IDENTICAL (108s)"
+  impl_notes: >
+    render/scripts.py 85 lines (render_script_page, render_scripts_index);
+    render/manual.py 90 lines (_html_title, _manual_menu, _manual_sort_order,
+    _manual_menu_order, _manual_doc_body plus the four _RE_MANUAL_* constants and
+    their directive-scheme comment block).  cli.py 3,966 -> 3,817, and its _md_title
+    / md_to_html imports died with the code that used them.
+    SCOPE REDUCED: render_manual_pages stayed in cli.py.  It calls
+    _render_server_first_body -> _tz_label_from_env, both of which render-activity
+    owns, and a submodule may not import cli.  The blocker is exactly one 20-line
+    generic helper.  render-activity's plan now covers finishing this.
+    STATE AUDIT: neither new module reads or writes state — the whole mutable surface
+    (_MANUAL_MENUS, _MANUAL_MENU_ORDER, _HAS_SERVER_FIRSTS) lives in the function
+    that did not move.  Verified at runtime anyway with a fixture manual dir: the
+    moved helpers drove render_manual_pages to write _MANUAL_MENUS/{'Lore','Documents',
+    'Guides'} and _MANUAL_MENU_ORDER {'Lore': 3}, and chrome._docs_dropdown,
+    _custom_manual_dropdowns and _activity_dropdown all observed those writes.
+    Line multiset: additions are the 13 import lines; the only non-obvious residue is
+    the two section banners whose contents all left, and the two def lines where the
+    Db annotation is quoted in the new module (string annotations either way under
+    PEP 563 — the render/areas.py precedent).
+    The two phase-2 bugs in render_manual_pages were confirmed and left untouched for
+    server-firsts-reset.
+  found:
+    - "_tz_label_from_env is a generic TZ-label helper with no activity-specific
+       logic; util.py is arguably its home, and moving it there would unblock
+       render_manual_pages independently of render-activity."
+    - "cli.py's '# Main' banner labelled _html_title and the manual directive block,
+       not main() 2,900 lines below — a mislabelled header, deleted with its
+       contents."
+    - "The moved directive comment says 'see _RE_QUEST_GROUP et al. above'; those now
+       live in render/quests.py."
+    - "render/ still has no TYPE_CHECKING import anywhere, so no type checker can
+       resolve Db in any of its modules."
+
   after: [render-conversations]
   ranges: "14879-15080, 16142-16236"
   plan: >
@@ -1691,6 +1728,13 @@ items:
     ALSO take _render_server_first_body, which bestiary-module had to leave in
     cli.py because it calls _tz_label_from_env; once that lands here, decide whether
     it belongs in this module or follows the rest of the bestiary code.
+    THEN FINISH render-scripts-manual: render_manual_pages is still in cli.py for
+    exactly the same reason (it calls _render_server_first_body).  Once the activity
+    helpers have homes, move it into render/manual.py — it writes state._MANUAL_MENUS,
+    state._MANUAL_MENU_ORDER and state._HAS_SERVER_FIRSTS, which chrome.py reads, so
+    keep every access on the state module object and re-verify the nav by hand.
+    Consider putting _tz_label_from_env in util.py instead: it is generic, and that
+    alone unblocks render_manual_pages.
   notes: >
     NOT covered by the gate — needs --log-dir, which the golden build omits.
     After this item, run bin/nwn-wiki-activity --check-online by hand against a
