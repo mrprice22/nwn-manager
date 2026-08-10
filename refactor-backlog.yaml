@@ -1489,8 +1489,40 @@ items:
 - id: render-quests
   phase: 1
   title: Extract quest renderers into render/quests.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 829cc9f
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (137s), lotr2008 IDENTICAL (84s), lotr2009 IDENTICAL (108s)"
+  impl_notes: >
+    render/quests.py 561 lines (540 moved); cli.py 6,010 -> 5,474.  The whole cluster
+    moved verbatim: _QUEST_PRIORITY_LABELS, _quest_priority_label, _quest_categories,
+    _quest_slugs, _quest_entry_id, the directive comment block with _RE_QUEST_GROUP/
+    _RE_QUEST_ORDER/_RE_QUEST_GROUP_ORDER/_RE_QUEST_DIRECTIVE, _quest_group,
+    _quest_sort_order, _quest_group_order, _quest_comment_display,
+    _quest_group_anchor, _quest_start_locations, _quest_loc_cell,
+    render_quests_index and render_quest_page — whose nested _item_link was left
+    unhoisted for typed-link-helpers.  _quest_slug/_quest_hidden are imported from
+    db/derived.py rather than duplicated; cli.py's derived import dropped _quest_slug
+    and kept _quest_hidden for the build driver.  quests.py imports only gff,
+    htmlgen.* and db.derived.  STATE AUDIT: no state. hits at all in the moved range.
+    Line multiset: 543 removed (542 in quests.py plus the rewritten derived import
+    line), 7 added, all imports.
+  found:
+    - "cli.py's @menu directive comment still says it mirrors the quest @group/@order
+       scheme 'see _RE_QUEST_GROUP et al. above' — those regexes are no longer above
+       it."
+    - "In _trace_dlg_callers the comprehension variable `loc` shadows the imported
+       gff.loc() helper.  Correct today because loc() is not called later in that
+       scope, but a latent trap."
+    - "Quest-directive parsing is now split across two modules: _RE_QUEST_HIDDEN,
+       _quest_hidden and _quest_slug in db/derived.py, the other four regexes and
+       their accessors in render/quests.py.  A shared nwn_wiki/questdirectives.py
+       both could import would reunite them."
+    - "Two pre-existing PEP8 gaps travelled with the code: zero blank lines between
+       _quest_loc_cell and render_quests_index, three between _quest_comment_display
+       and _quest_group_anchor."
+
   after: [render-factions]
   ranges: "13726-14289"
 
