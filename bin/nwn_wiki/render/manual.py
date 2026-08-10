@@ -1,16 +1,30 @@
 """Manual-page rendering helpers for the wiki.
 
 Title extraction and the builder-authored ``@menu``/``@order``/``@menu-order``
-nav directives that decide where a ``docs.manual/`` page lands in the site nav.
+nav directives that decide where a ``docs.manual/`` page lands in the site nav,
+plus ``render_manual_pages()`` itself and the one generated (data-driven) manual
+page, the Server-First kill leaderboard.
+
+Mutable build state (the manual menus and the server-firsts flag) lives in
+:mod:`nwn_wiki.state` and is always reached through the module object --
+``state.X`` -- so writes here are visible to the nav builders in
+:mod:`nwn_wiki.htmlgen.chrome`.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 
-from nwn_wiki.htmlgen.chrome import _md_title
+from nwn_wiki.bestiary import _utc_to_local
+from nwn_wiki.htmlgen.chrome import _md_title, page, write
+from nwn_wiki.htmlgen.escape import E
+from nwn_wiki.htmlgen.links import link
 from nwn_wiki.htmlgen.markdown import md_to_html
+from nwn_wiki.util import _tz_label_from_env
+
+from nwn_wiki import state
 
 
 def _html_title(text: str, stem: str) -> str:
@@ -88,3 +102,141 @@ def _manual_doc_body(path: Path, text: str | None = None) -> tuple[str, str]:
         return _html_title(text, path.stem), body
     cleaned = _RE_MANUAL_DIRECTIVE.sub("", text)
     return _md_title(cleaned, path.stem), md_to_html(cleaned)
+
+
+# ---------------------------------------------------------------------------
+# Bestiary kill stats (read from / seeded into the live NWNX:EE campaign DB)
+# ---------------------------------------------------------------------------
+
+
+def _render_server_first_body() -> str:
+    """Inner HTML for the generated Server-First leaderboard manual page."""
+    tz_label = _tz_label_from_env()
+    parts = [
+        "<h1>Server First Kills</h1>",
+        f"<p>The first adventurer (or party) to slay each fearsome creature of "
+        f"Challenge Rating {state.BST_SF_CR} or higher, recorded server-wide.</p>",
+        "<p class=\"note\"><strong>How the credited player is chosen:</strong> "
+        "the server-first record goes to the player who landed the "
+        "<em>killing blow</em>. When a creature is slain by a party, only that "
+        "finisher is named here — every contributing party member still gets "
+        "the kill counted on the creature's own page (under Party). The "
+        "<strong>Player</strong> column is the player’s account name and the "
+        "<strong>Character</strong> column the character they were playing at the "
+        "time.</p>",
+    ]
+    if not state._SERVER_FIRSTS:
+        parts.append("<p><em>No server-first kills have been recorded yet — "
+                     "the legends are still unwritten.</em></p>")
+        return "\n".join(parts)
+    rows = []
+    for sf in state._SERVER_FIRSTS:
+        rr = sf["resref"]
+        cname = link(f"../creatures/{rr}.html", sf["cname"])
+        cr = int(round(sf["cr"]))
+        player_display = sf["player_name"] or sf["name"]
+        rows.append(
+            f"<tr><td>{cname}</td><td>{cr}</td>"
+            f"<td>{E(player_display)}</td><td>{E(sf['name'])}</td>"
+            f"<td>{E(_utc_to_local(sf['at']))}</td></tr>"
+        )
+    parts.append(
+        '<table class="data"><thead><tr>'
+        f"<th>Creature</th><th>CR</th><th>Player</th><th>Character</th><th>When ({tz_label})</th>"
+        "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+    )
+    return "\n".join(parts)
+
+
+def render_manual_pages(project_root: Path, out: Path) -> None:
+    """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each."""
+    state._MANUAL_MENUS = {}
+    state._MANUAL_MENU_ORDER = {}
+    manual_dir = project_root / "docs.manual"
+    if not manual_dir.is_dir():
+        return
+
+    # Pass 1: collect all page metadata and content so state._MANUAL_MENUS is complete
+    # before any page HTML is written (the dropdowns on every page must list all docs).
+    # (out_path, title, body, root_rel, page_updated_at)
+    pages_to_write: list[tuple[Path, str, str, str, str]] = []
+
+    def note_menu_order(menu_name: str, menu_order: int | None) -> None:
+        if menu_order is not None and menu_name not in state._MANUAL_MENU_ORDER:
+            state._MANUAL_MENU_ORDER[menu_name] = menu_order
+
+    top_files = sorted(
+        p for p in manual_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".md", ".html")
+    )
+    for doc_path in top_files:
+        raw_text = doc_path.read_text(encoding="utf-8")
+        menu_name = _manual_menu(raw_text)
+        order = _manual_sort_order(raw_text)
+        note_menu_order(menu_name, _manual_menu_order(raw_text))
+        title, body = _manual_doc_body(doc_path, text=raw_text)
+        stem = doc_path.stem
+        state._MANUAL_MENUS.setdefault(menu_name, []).append(
+            {"kind": "file", "title": title, "stem": stem, "_order": order})
+        pages_to_write.append((out / "manual" / f"{stem}.html", title, body, "..", ""))
+
+    # Generated (data-driven) page: Server-First kill leaderboard. Surfaced via the
+    # Activity nav dropdown (see _activity_dropdown), not Documents. Its content is
+    # (re)generated only when the bestiary DB was loaded this run; otherwise, if a
+    # prior full build already produced the page, keep it in the nav without
+    # rewriting it — this keeps the nav consistent when nwn-wiki-activity re-renders
+    # manual pages without DB access.
+    sf_path = out / "manual" / "ServerFirsts.html"
+    if state._BESTIARY_ACTIVE:
+        sf_now = datetime.now().strftime("%b %-d, %Y %H:%M")
+        state._HAS_SERVER_FIRSTS = True
+        pages_to_write.append((sf_path, "Server Firsts",
+                               _render_server_first_body(), "..", sf_now))
+    elif sf_path.exists():
+        state._HAS_SERVER_FIRSTS = True
+
+    for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
+        doc_files = sorted(
+            p for p in sub_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".md", ".html")
+        )
+        if not doc_files:
+            continue
+        dirname = sub_dir.name
+        folder_title = dirname.replace("-", " ").replace("_", " ")
+        items: list[dict] = []
+        # Folder-level @menu/@order/@menu-order are taken from the first file
+        # (in sorted order) that declares them — first found wins, mirroring
+        # the quest @group-order rule.
+        folder_menu: str | None = None
+        folder_order: int | None = None
+        for doc_path in doc_files:
+            raw_text = doc_path.read_text(encoding="utf-8")
+            if folder_menu is None and _RE_MANUAL_MENU.search(raw_text):
+                folder_menu = _manual_menu(raw_text)
+            if folder_order is None:
+                folder_order = _manual_sort_order(raw_text)
+            note_menu_order(_manual_menu(raw_text), _manual_menu_order(raw_text))
+            title, body = _manual_doc_body(doc_path, text=raw_text)
+            stem = doc_path.stem
+            items.append({"title": title, "stem": stem})
+            pages_to_write.append((
+                out / "manual" / dirname / f"{stem}.html", title, body, "../..", "",
+            ))
+        state._MANUAL_MENUS.setdefault(folder_menu or "Documents", []).append(
+            {"kind": "dir", "title": folder_title, "dirname": dirname,
+             "items": items, "_order": folder_order})
+
+    # Sort each menu's entries by @order (list.sort is stable, so entries
+    # without @order keep their original alphabetical/insertion order,
+    # trailing after any explicitly-ordered ones).
+    for entries in state._MANUAL_MENUS.values():
+        entries.sort(key=lambda e: e["_order"] if e["_order"] is not None else 10**9)
+
+    # Pass 2: write all pages now that state._MANUAL_MENUS is fully populated.
+    for out_path, title, body, root_rel, page_ts in pages_to_write:
+        write(out_path, page(title, body, root_rel=root_rel, page_updated_at=page_ts))
+
+    total = len(pages_to_write)
+    if total:
+        print(f"[nwn-wiki] rendered {total} manual page(s) from {manual_dir}")

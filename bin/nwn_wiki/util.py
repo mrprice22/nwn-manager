@@ -8,6 +8,8 @@ renderers.
 
 from __future__ import annotations
 
+import os
+from datetime import datetime
 from typing import Any
 
 
@@ -18,3 +20,25 @@ def _try_int(v: Any, default: int = 0) -> int:
         return int(v or 0)
     except (TypeError, ValueError):
         return default
+
+
+def _tz_label_from_env() -> str:
+    """Derive a GMT±N label from the TZ environment variable.
+
+    Uses the zoneinfo module (Python 3.9+) so DST is handled correctly
+    (e.g. America/Chicago → 'GMT-5' in winter, 'GMT-4' in summer).
+    Falls back to 'GMT+0' when TZ is unset or the name is unrecognised.
+    """
+    tz_name = os.environ.get("TZ", "")
+    if not tz_name:
+        return "GMT+0"
+    try:
+        from zoneinfo import ZoneInfo
+        zi = ZoneInfo(tz_name)
+        offset = datetime.now(zi).utcoffset()
+        total_sec = int(offset.total_seconds())
+        h, m = divmod(abs(total_sec) // 60, 60)
+        sign = "+" if total_sec >= 0 else "-"
+        return f"GMT{sign}{h}" if m == 0 else f"GMT{sign}{h}:{m:02d}"
+    except Exception:
+        return tz_name
