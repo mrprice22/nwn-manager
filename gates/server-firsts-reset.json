@@ -1,0 +1,4 @@
+{
+  "reason": "render_manual_pages resets _MANUAL_MENUS and _MANUAL_MENU_ORDER but never _HAS_SERVER_FIRSTS, which is only ever set True; and the ServerFirsts block sits below the `if not manual_dir: return` early return, so a module with a bestiary but no docs.manual/ gets neither ServerFirsts.html nor its Activity nav entry. The three gate corpora are all built without --db-dir, so no bestiary is active and the fix must be a no-op on them: an empty diff is the expected result. Any page diff at all would mean the fix fired where no server-first data exists.",
+  "paths": []
+}

@@ -149,18 +149,50 @@ def _render_server_first_body() -> str:
     return "\n".join(parts)
 
 
+def _write_manual_pages(out: Path,
+                        pages: list[tuple[PageCtx, str, str, str]]) -> None:
+    """Write the collected (ctx, title, body, page_updated_at) pages."""
+    for ctx, title, body, page_ts in pages:
+        write_page(out, ctx, title, body, page_updated_at=page_ts)
+
+
 def render_manual_pages(project_root: Path, out: Path) -> None:
-    """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each."""
+    """Scan <project_root>/docs.manual/ for .md/.html files and subdirs, render each,
+    plus the generated Server-First page (which needs no docs.manual/ at all)."""
     state._MANUAL_MENUS = {}
     state._MANUAL_MENU_ORDER = {}
+    # Reset too: this is set True below and never back to False, so without the
+    # reset a second build in the same interpreter (or a caller that reuses the
+    # process) would keep a stale Server Firsts nav entry from the previous run.
+    state._HAS_SERVER_FIRSTS = False
     manual_dir = project_root / "docs.manual"
-    if not manual_dir.is_dir():
-        return
 
     # Pass 1: collect all page metadata and content so state._MANUAL_MENUS is complete
     # before any page HTML is written (the dropdowns on every page must list all docs).
     # (ctx, title, body, page_updated_at)
     pages_to_write: list[tuple[PageCtx, str, str, str]] = []
+
+    # Generated (data-driven) page: Server-First kill leaderboard. Surfaced via the
+    # Activity nav dropdown (see _activity_dropdown), not Documents. Its content is
+    # (re)generated only when the bestiary DB was loaded this run; otherwise, if a
+    # prior full build already produced the page, keep it in the nav without
+    # rewriting it — this keeps the nav consistent when nwn-wiki-activity re-renders
+    # manual pages without DB access. It depends on the bestiary DB, not on
+    # docs.manual/, so it is resolved *before* the docs.manual/ scan below: a module
+    # with a bestiary and no docs.manual/ still gets the page and its nav entry.
+    sf_ctx = PageCtx("manual/ServerFirsts.html")
+    sf_path = sf_ctx.path(out)
+    if state._BESTIARY_ACTIVE:
+        sf_now = datetime.now().strftime("%b %-d, %Y %H:%M")
+        state._HAS_SERVER_FIRSTS = True
+        pages_to_write.append((sf_ctx, "Server Firsts",
+                               _render_server_first_body(), sf_now))
+    elif sf_path.exists():
+        state._HAS_SERVER_FIRSTS = True
+
+    if not manual_dir.is_dir():
+        _write_manual_pages(out, pages_to_write)
+        return
 
     def note_menu_order(menu_name: str, menu_order: int | None) -> None:
         if menu_order is not None and menu_name not in state._MANUAL_MENU_ORDER:
@@ -180,22 +212,6 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         state._MANUAL_MENUS.setdefault(menu_name, []).append(
             {"kind": "file", "title": title, "stem": stem, "_order": order})
         pages_to_write.append((PageCtx(f"manual/{stem}.html"), title, body, ""))
-
-    # Generated (data-driven) page: Server-First kill leaderboard. Surfaced via the
-    # Activity nav dropdown (see _activity_dropdown), not Documents. Its content is
-    # (re)generated only when the bestiary DB was loaded this run; otherwise, if a
-    # prior full build already produced the page, keep it in the nav without
-    # rewriting it — this keeps the nav consistent when nwn-wiki-activity re-renders
-    # manual pages without DB access.
-    sf_ctx = PageCtx("manual/ServerFirsts.html")
-    sf_path = sf_ctx.path(out)
-    if state._BESTIARY_ACTIVE:
-        sf_now = datetime.now().strftime("%b %-d, %Y %H:%M")
-        state._HAS_SERVER_FIRSTS = True
-        pages_to_write.append((sf_ctx, "Server Firsts",
-                               _render_server_first_body(), sf_now))
-    elif sf_path.exists():
-        state._HAS_SERVER_FIRSTS = True
 
     for sub_dir in sorted(d for d in manual_dir.iterdir() if d.is_dir()):
         doc_files = sorted(
@@ -236,8 +252,7 @@ def render_manual_pages(project_root: Path, out: Path) -> None:
         entries.sort(key=lambda e: e["_order"] if e["_order"] is not None else 10**9)
 
     # Pass 2: write all pages now that state._MANUAL_MENUS is fully populated.
-    for ctx, title, body, page_ts in pages_to_write:
-        write_page(out, ctx, title, body, page_updated_at=page_ts)
+    _write_manual_pages(out, pages_to_write)
 
     total = len(pages_to_write)
     if total:

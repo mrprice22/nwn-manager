@@ -200,9 +200,9 @@ def main() -> int:
     # Re-render the manual pages so their content is current (and, when
     # --db-dir was given and _BESTIARY_ACTIVE is True, so ServerFirsts.html
     # picks up the new data). render_manual_pages is idempotent; re-writing
-    # existing pages is harmless, and the call is skipped entirely when
-    # docs.manual/ is absent. Their nav comes from the chrome file, not from
-    # the menus this call rebuilds.
+    # existing pages is harmless, and with no docs.manual/ it writes only that
+    # generated page. Their nav comes from the chrome file, not from the menus
+    # this call rebuilds.
     wiki.render_manual_pages(src.parent, out)
 
     wiki.render_activity_page(activity, out, tz_label=wiki._tz_label_from_env())
