@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from nwn_wiki.bestiary import _utc_to_local
 from nwn_wiki.combat import (
     FINESSE_BASEITEMS,
     WEAPON_FINESSE_FEAT,
@@ -19,13 +20,14 @@ from nwn_wiki.combat import (
     attack_schedule,
     creature_bab,
     creature_class_bab,
+    crit_feat_effects,
     epic_toughness_hp,
     feat_attack_bonus,
 )
 from nwn_wiki.gff import fld, list_items, loc
 from nwn_wiki.htmlgen.chrome import _creature_cr_value, page, write
 from nwn_wiki.htmlgen.escape import E, colorize_damage_words, nwn_html, nwn_text
-from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.links import _conv_link, _faction_cell, _race_link, link
 from nwn_wiki.itemprops import (
     _fmt_hp,
     _prop_slug,
@@ -47,17 +49,20 @@ from nwn_wiki.items import (
     _item_category,
     _item_category_label,
     baseitem_name,
+    extract_item_offense,
     is_ranged_weapon,
     item_ac_bonus,
     item_attack_bonus,
     item_damage_bonus,
     weapon_crit_string,
+    weapon_damage_props,
     weapon_damage_string,
 )
 from nwn_wiki.lookups import (
     RACE_ABILITY_ADJ,
     WEAPONS,
     _torso_base_ac,
+    appearance_name,
     class_name,
     creature_race_immunities,
     feat_name,
@@ -65,6 +70,10 @@ from nwn_wiki.lookups import (
     skill_name,
     spell_name,
 )
+from nwn_wiki.render.creatures import _pic_figures, creature_max_hp
+from nwn_wiki.render.stores import _creature_store_section
+from nwn_wiki.sim.combat import attack_profile
+from nwn_wiki.util import _try_int
 
 from nwn_wiki import state
 
@@ -416,6 +425,163 @@ def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
         "spell_immunities": spell_immunities, "regen": regen, "vampiric": vampiric,
         "dmg_script": dmg_script, "hard_required_tags": hard_required_tags,
         "mitigates_damage": mitigates_damage, "retaliation": retaliation,
+    }
+
+
+def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> dict:
+    """Compute a creature's *offensive* threat (what the player must survive), as
+    plain data for the counter-gear survivability matcher. Reuses the ability
+    mods / BAB / feats / equipment already resolved by extract_creature_defenses
+    (passed in as `D`) so the combat math is computed once. Returns:
+
+      attack_bonus       best (first-iterative) to-hit across its weapons
+      ac_target          AC at which the creature misses ~half the time
+      damage_types_dealt damage types its attacks deal (weapon physical + extras)
+      save_threats       special abilities the player must save against, with an
+                         *estimated* DC (innate spell level is not in our caches,
+                         so it is derived from caster level — labelled an estimate)
+      attack_profiles    one attack_profile() per wielded weapon (see that
+                         function) — the full iterative schedule plus damage
+                         dice/crit/elemental data the combat simulator needs.
+                         `attack_bonus` is still just the best schedule[0], so
+                         the published creature-page figure is unaffected.
+    """
+    equip_by_slot: dict[int, dict] = D["equip_by_slot"]
+    str_mod, dex_mod = D["str_mod"], D["dex_mod"]
+    bab, feat_ids = D["bab"], D["feat_ids"]
+    monk_bab, monk_levels = D["monk_bab"], D["monk_levels"]
+
+    def _resref(e: dict) -> str:
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _item(e: dict) -> dict | None:
+        irr = _resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        return e if "BaseItem" in e else None
+
+    best_atk: int | None = None
+    dtypes: set[str] = set()
+    have_weapon = False
+    profiles: list[dict] = []
+
+    # Creatures get only the critical feats they were actually built with — no
+    # "assume specced" here, unlike the reference PC.
+    _feat_set = set(feat_ids)
+    _str_score = D.get("ability_scores", {}).get("Str") or 10
+
+    def _profile(sched: list[int], bi: int, item: dict | None, off: dict,
+                 str_bonus: int) -> dict:
+        """Build the simulator's attack_profile for one wielded weapon."""
+        stats = WEAPONS.get(bi) or {}
+        prop_flat, elem = weapon_damage_props(item)
+        crit = crit_feat_effects(
+            bi, bab=bab, str_score=_str_score,
+            has_feat=lambda fid: fid in _feat_set,
+            devcrit_bonus_dice=db.devcrit_bonus_dice)
+        return attack_profile(
+            sched,
+            num_dice=_try_int(stats.get("NumDice"), 0),
+            die=_try_int(stats.get("DieToRoll"), 0),
+            flat=str_bonus + prop_flat,
+            crit_threat=(_try_int(stats.get("CritThreat"), 1) or 1) * crit["threat_mult"],
+            crit_mult=_try_int(stats.get("CritHitMult"), 2) or 2,
+            phys_types=off["physical_dtypes"],
+            elem=elem,
+            enhancement=off["enhancement"],
+            crit_bonus=crit["crit_bonus"],
+            devcrit_save_dc=crit["devcrit_save_dc"],
+        )
+
+    for slot in (SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B):
+        e = equip_by_slot.get(slot)
+        if not e:
+            continue
+        item = _item(e)
+        if item is None:
+            continue
+        base_row = fld(item, "BaseItem")
+        bi = int(base_row) if base_row is not None else -1
+        if slot == SLOT_LEFT and bi in SHIELD_BASEITEMS:
+            continue
+        off = extract_item_offense(db, item, _resref(e) or "")
+        if not off["is_weapon"]:
+            continue
+        have_weapon = True
+        dtypes.update(off["damage_dtypes"])
+        ranged = off["is_ranged"]
+        _is_cweap = slot in _CWEAP_SLOTS
+        _finesse = (WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+                    and (_is_cweap or bi in FINESSE_BASEITEMS))
+        _melee_ab = dex_mod if _finesse else str_mod
+        _feat_ab = feat_attack_bonus(feat_ids, baseitem_name(bi) if bi >= 0 else "")
+        atk_mod = (dex_mod if ranged else _melee_ab) + off["attack_bonus"] + _feat_ab
+        _monk_atk_bab = monk_bab if (_is_cweap and monk_levels >= 1 and not ranged) else 0
+        sched = attack_schedule(bab, ability_mod=atk_mod, monk_unarmed_bab=_monk_atk_bab)
+        if sched and (best_atk is None or sched[0] > best_atk):
+            best_atk = sched[0]
+        if sched:
+            # Ranged weapons add no Str to damage unless Mighty; melee adds the
+            # same ability the attack used (finesse switches to Dex for to-hit
+            # only — damage stays Str in NWN).
+            profiles.append(_profile(sched, bi, item, off, 0 if ranged else str_mod))
+
+    if not have_weapon:
+        dtypes = {"Bludgeoning"}  # unarmed
+        if bab > 0:
+            _u_finesse = WEAPON_FINESSE_FEAT in feat_ids and dex_mod > str_mod
+            _u_ability = (dex_mod if _u_finesse else str_mod) + feat_attack_bonus(feat_ids, "unarmed")
+            sched = attack_schedule(
+                bab, ability_mod=_u_ability,
+                monk_unarmed_bab=(monk_bab if monk_levels >= 1 else 0))
+            if sched:
+                best_atk = sched[0]
+                # Unarmed: 1d3 bludgeoning + Str, no crit multiplier beyond x2.
+                profiles.append(attack_profile(
+                    sched, num_dice=1, die=3, flat=str_mod,
+                    crit_threat=1, crit_mult=2,
+                    phys_types=["Bludgeoning"], elem={}, enhancement=0))
+
+    attack_bonus = best_atk if best_atk is not None else 0
+
+    # ----- Special abilities: what the player must save against --------------
+    spec = list_items(c.get("SpecAbilityList"))
+    if not spec and bp is not None:
+        spec = list_items(bp.get("SpecAbilityList"))
+    scores = D.get("ability_scores", {})
+    _mental = max((ability_mod(scores.get(a)) for a in ("Int", "Wis", "Cha")
+                   if scores.get(a) is not None), default=0)
+    seen: set[tuple] = set()
+    save_threats: list[dict] = []
+    for s in spec:
+        sid = fld(s, "Spell")
+        if sid is None:
+            continue
+        cl = fld(s, "SpellCasterLevel", 0) or 0
+        try:
+            cl = int(cl)
+        except (TypeError, ValueError):
+            cl = 0
+        key = (sid, cl)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Innate spell level isn't in our caches; estimate it from caster level
+        # (≈ half, capped at 9) for a build-agnostic DC ballpark.
+        lvl_est = max(1, min(9, (cl + 1) // 2))
+        save_threats.append({
+            "name": nwn_text(spell_name(sid)),
+            "caster_level": cl,
+            "dc_est": 10 + lvl_est + _mental,
+        })
+    save_threats.sort(key=lambda t: t["dc_est"], reverse=True)
+
+    return {
+        "attack_bonus": attack_bonus,
+        "ac_target": attack_bonus + 10,
+        "damage_types_dealt": sorted(dtypes),
+        "save_threats": save_threats,
+        "attack_profiles": profiles,
     }
 
 
@@ -1228,6 +1394,343 @@ function esc(s){
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 })();"""
+
+
+def _variant_diff_items(
+    c: dict, base_c: dict, db: "Db", *, bp: dict | None = None, base_bp: dict | None = None
+) -> list[str]:
+    """Return human-readable difference strings between a variant creature and its base.
+
+    `c`/`bp` are the variant's instance struct + blueprint fallback.
+    `base_c`/`base_bp` are the base canonical's struct + blueprint fallback.
+    """
+    def _fv(key):
+        v = fld(c, key)
+        return fld(bp, key) if v is None and bp is not None else v
+
+    def _fb(key):
+        v = fld(base_c, key)
+        return fld(base_bp, key) if v is None and base_bp is not None else v
+
+    def _lstv(key):
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    def _lstb(key):
+        items = list_items(base_c.get(key))
+        if not items and base_bp is not None:
+            items = list_items(base_bp.get(key))
+        return items
+
+    diffs: list[str] = []
+
+    # Abilities
+    ABILITY_KEYS = ("Str", "Dex", "Con", "Int", "Wis", "Cha")
+    ab_diffs = []
+    for key in ABILITY_KEYS:
+        bv, vv = _fb(key), _fv(key)
+        if bv != vv and vv is not None:
+            if bv is not None:
+                delta = int(vv) - int(bv)
+                ab_diffs.append(f"{key} {int(bv)}→{int(vv)} ({'+' if delta > 0 else ''}{delta})")
+            else:
+                ab_diffs.append(f"{key} +{int(vv)}")
+    if ab_diffs:
+        diffs.append("Abilities: " + ", ".join(ab_diffs))
+
+    # Classes
+    base_cls = {fld(cl, "Class"): fld(cl, "ClassLevel") for cl in _lstb("ClassList")}
+    var_cls  = {fld(cl, "Class"): fld(cl, "ClassLevel") for cl in _lstv("ClassList")}
+    cls_diffs = []
+    for cid in sorted(set(base_cls) | set(var_cls), key=lambda x: int(x) if x is not None else 0):
+        bl, vl = base_cls.get(cid), var_cls.get(cid)
+        cname = class_name(cid)
+        if bl is None:
+            cls_diffs.append(f"+{cname} {vl}")
+        elif vl is None:
+            cls_diffs.append(f"−{cname}")
+        elif bl != vl:
+            cls_diffs.append(f"{cname} {bl}→{vl}")
+    if cls_diffs:
+        diffs.append("Classes: " + ", ".join(cls_diffs))
+
+    # Feats
+    base_feats = {int(fld(f, "Feat")) for f in _lstb("FeatList") if fld(f, "Feat") is not None}
+    var_feats  = {int(fld(f, "Feat")) for f in _lstv("FeatList") if fld(f, "Feat") is not None}
+    feat_diffs = (
+        [f"+{feat_name(f)}" for f in sorted(var_feats - base_feats)] +
+        [f"−{feat_name(f)}" for f in sorted(base_feats - var_feats)]
+    )
+    if feat_diffs:
+        diffs.append("Feats: " + ", ".join(feat_diffs))
+
+    # Special abilities
+    base_sab = {(fld(s, "Spell"), fld(s, "SpellCasterLevel")) for s in _lstb("SpecAbilityList")}
+    var_sab  = {(fld(s, "Spell"), fld(s, "SpellCasterLevel")) for s in _lstv("SpecAbilityList")}
+    sab_diffs = (
+        [f"+{spell_name(sp)} (CL {lv})" for sp, lv in sorted(var_sab - base_sab, key=lambda x: str(x))] +
+        [f"−{spell_name(sp)} (CL {lv})" for sp, lv in sorted(base_sab - var_sab, key=lambda x: str(x))]
+    )
+    if sab_diffs:
+        diffs.append("Special abilities: " + ", ".join(sab_diffs))
+
+    # Equipment
+    base_eq = {fld(e, "__struct_id"): (fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or "")
+               for e in _lstb("Equip_ItemList")}
+    var_eq  = {fld(e, "__struct_id"): (fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or "")
+               for e in _lstv("Equip_ItemList")}
+    eq_diffs = []
+    for slot_id in sorted(set(base_eq) | set(var_eq), key=lambda x: int(x) if x is not None else 0):
+        bi, vi = base_eq.get(slot_id, ""), var_eq.get(slot_id, "")
+        if bi == vi:
+            continue
+        slot_label = SLOT_NAMES.get(int(slot_id) if slot_id is not None else 0, f"Slot {slot_id}")
+        bn = db.item_name(bi) or bi
+        vn = db.item_name(vi) or vi
+        if not bi:
+            eq_diffs.append(f"{slot_label}: +{vn}")
+        elif not vi:
+            eq_diffs.append(f"{slot_label}: −{bn}")
+        else:
+            eq_diffs.append(f"{slot_label}: {bn} → {vn}")
+    if eq_diffs:
+        diffs.append("Equipment: " + ", ".join(eq_diffs))
+
+    # Natural AC
+    bac, vac = _fb("NaturalAC"), _fv("NaturalAC")
+    if bac != vac and vac is not None:
+        diffs.append(f"Natural AC: {bac}→{vac}" if bac is not None else f"Natural AC: +{vac}")
+
+    # Race
+    br, vr = _fb("Race"), _fv("Race")
+    if br != vr and vr is not None:
+        diffs.append(f"Race: {race_name(br)} → {race_name(vr)}")
+
+    # Display name (a renamed placement of an otherwise-identical blueprint)
+    def _disp(fc: dict, fbp: dict | None) -> str:
+        f = loc(fc.get("FirstName")) or (loc(fbp.get("FirstName")) if fbp else None)
+        l = loc(fc.get("LastName")) or (loc(fbp.get("LastName")) if fbp else None)
+        return ((f or "") + " " + (l or "")).strip()
+    vname, bname = _disp(c, bp), _disp(base_c, base_bp)
+    if vname and vname != bname:
+        diffs.append(f'Named "{vname}" (vs "{bname}")' if bname else f'Named "{vname}"')
+
+    return diffs
+
+
+def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
+    """One page per unique creature (canonical entity).  Replaces the old
+    separate blueprint page + instance page model."""
+    entry = db.canonical_creatures.get(canonical_rr)
+    if not entry:
+        return
+    c = entry["c"]
+    bp_rr = entry["bp_rr"]
+    bp = db.creatures.get(bp_rr) if bp_rr != canonical_rr else None
+    name = db.canonical_creature_name(canonical_rr)
+
+    def _meta(key: str, default: Any = None) -> Any:
+        v = fld(c, key, None)
+        if v is None and bp is not None:
+            v = fld(bp, key, default)
+        return default if v is None else v
+
+    classes = list_items(c.get("ClassList")) or (list_items(bp.get("ClassList")) if bp else [])
+    cls_str = "/".join(
+        f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+        for cl in classes
+    )
+    conv = _meta("Conversation", "")
+    _eff_hp_meta = creature_max_hp(c, bp)
+
+    sections = [
+        f"<h1>{nwn_html(name)}</h1>",
+        '<dl class="meta">',
+        f"<dt>ResRef</dt><dd>{E(canonical_rr)}</dd>",
+        f"<dt>Tag</dt><dd>{E(_meta('Tag', ''))}</dd>",
+        f"<dt>Race</dt><dd>{_race_link(_meta('Race'), root_rel='..')}</dd>",
+        f"<dt>Appearance</dt><dd>{E(appearance_name(_meta('Appearance_Type')))}</dd>",
+        f"<dt>Class(es)</dt><dd>{E(cls_str)}</dd>",
+        f"<dt>HP</dt><dd>{E(_fmt_hp(_eff_hp_meta) if _eff_hp_meta is not None else _fmt_hp(_meta('MaxHitPoints', _meta('HitPoints', ''))))}</dd>",
+        f"<dt>CR</dt><dd>{E(_meta('ChallengeRating', ''))}</dd>",
+        f"<dt>Faction</dt><dd>{_faction_cell(db, canonical_rr, _meta('FactionID', ''), root_rel='..')}</dd>",
+        f"<dt>Conversation</dt><dd>{_conv_link(db, conv, root_rel='..') if conv else '—'}</dd>",
+    ]
+
+    # Variant notice
+    is_variant = db.canonical_bp_of.get(canonical_rr) != canonical_rr
+    if is_variant:
+        base_rr = db.canonical_bp_of[canonical_rr]
+        base_entry = db.canonical_creatures.get(base_rr, {})
+        base_c = base_entry.get("c", {})
+        base_bp_rr = base_entry.get("bp_rr", base_rr)
+        base_bp = db.creatures.get(base_bp_rr) if base_bp_rr != base_rr else None
+        diff_items = _variant_diff_items(c, base_c, db, bp=bp, base_bp=base_bp)
+        if diff_items:
+            diff_detail = "; ".join(diff_items)
+        else:
+            diff_detail = "differs in equipment, class levels, or feats"
+        sections.append(
+            f'<dt>Variant of</dt><dd>'
+            f'{link(f"{base_rr}.html", db.canonical_creature_name(base_rr))}'
+            f'<br><small class="muted">{E(diff_detail)}</small></dd>'
+        )
+    sections.append('</dl>')
+
+    # Creature artwork (from creature-pics/), just after the meta box.
+    pics = state._CREATURE_PICS.get(canonical_rr)
+    if pics:
+        sections.append('<div class="creature-pics">'
+                        + _pic_figures(pics, name) + "</div>")
+
+    # Bestiary kill stats (when the module runs the kill-tracking system).
+    if state._BESTIARY_ACTIVE:
+        sf = next((s for s in state._SERVER_FIRSTS if s["resref"] == canonical_rr), None)
+        if sf:
+            slayer = E(sf["name"])
+            if sf.get("player_name"):
+                slayer += f" [{E(sf['player_name'])}]"
+            sections.append(
+                '<p class="server-first-badge"><strong>&#9733; Server First:</strong> '
+                f"first slain by {slayer}"
+                + (f" on {E(_utc_to_local(sf['at']))}" if sf["at"] else "") + ".</p>"
+            )
+        k = state._BESTIARY_KILLS.get(canonical_rr)
+        if k:
+            sections.append(
+                "<h2>Kills</h2>"
+                '<table class="data"><thead><tr>'
+                "<th>Total</th><th>Solo</th><th>Party</th></tr></thead><tbody>"
+                f"<tr><td>{k['total']}</td><td>{k['solo']}</td>"
+                f"<td>{k['party']}</td></tr></tbody></table>"
+            )
+        else:
+            sections.append("<h2>Kills</h2><p>Not yet slain by any adventurer.</p>")
+        # Top Killers leaderboard — per-character kill counts for this
+        # creature. Merge boss variant blueprints into their canonical (same
+        # summing the Bosses index does) so e.g. the leveled Xanith .utcs
+        # don't split a character's count. Omitted when nobody has a kill.
+        variant_rrs = [canonical_rr] + [v for v, canon in state._BOSS_ALIASES.items()
+                                        if canon == canonical_rr]
+        merged: dict[str, dict] = {}
+        for v_rr in variant_rrs:
+            for r in state._BESTIARY_TOP.get(v_rr, []):
+                m = merged.get(r["uuid"])
+                if m is None:
+                    merged[r["uuid"]] = dict(r)
+                else:
+                    m["solo"] += r["solo"]
+                    m["party"] += r["party"]
+                    m["total"] += r["total"]
+                    if r["last"] >= m["last"]:
+                        m["last"] = r["last"]
+                        m["name"] = r["name"] or m["name"]
+                        m["player"] = r["player"] or m["player"]
+        top = sorted(merged.values(),
+                     key=lambda r: (-r["total"], r["name"].lower()))[:10]
+        if top:
+            tk_rows = "\n".join(
+                f"<tr><td>{i}</td><td>{E(r.get('player', ''))}</td>"
+                f"<td>{E(r['name'])}</td>"
+                f"<td>{r['solo']}</td><td>{r['party']}</td>"
+                f"<td>{r['total']}</td>"
+                f"<td>{E(_utc_to_local(r['last'])[:10] if r['last'] else '')}</td></tr>"
+                for i, r in enumerate(top, 1)
+            )
+            sections.append(
+                "<h3>Top Killers</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>#</th><th>Player</th><th>Character</th><th>Solo</th><th>Party</th>"
+                "<th>Total</th><th>Last Kill</th>"
+                "</tr></thead><tbody>" + tk_rows + "</tbody></table>"
+            )
+
+    # "Where to find" section
+    locs = db.canonical_locations.get(canonical_rr, [])
+    placed_locs  = [l for l in locs if l["kind"] == "placed"]
+    enc_locs     = [l for l in locs if l["kind"] == "encounter"]
+    script_locs  = [l for l in locs if l["kind"] == "script"]
+
+    if placed_locs or enc_locs or script_locs:
+        sections.append("<h2>Where to find</h2>")
+        if placed_locs:
+            # Aggregate by area
+            placed_by_area: dict[str, int] = {}
+            for l in placed_locs:
+                placed_by_area[l["area"]] = placed_by_area.get(l["area"], 0) + l["count"]
+            place_rows = []
+            for area_rr in sorted(placed_by_area.keys(),
+                                  key=lambda r: db.area_name(r).lower()):
+                cnt = placed_by_area[area_rr]
+                place_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{cnt}</td></tr>"
+                )
+            sections.append(
+                "<h3>Placed directly</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Count</th>"
+                "</tr></thead><tbody>" + "\n".join(place_rows) + "</tbody></table>"
+            )
+        if enc_locs:
+            # Aggregate by (area, enc_rr)
+            enc_by_key: dict[tuple[str, str], int] = {}
+            for l in enc_locs:
+                k = (l["area"], l["enc_rr"] or "")
+                enc_by_key[k] = enc_by_key.get(k, 0) + l["count"]
+            enc_rows = []
+            for (area_rr, enc_rr) in sorted(
+                enc_by_key.keys(),
+                key=lambda k: (db.area_name(k[0]).lower(), k[1]),
+            ):
+                blueprint = db.encounters.get(enc_rr, {})
+                ename = loc(blueprint.get("LocalizedName")) or enc_rr or "(unnamed)"
+                enc_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{nwn_html(ename)}</td>"
+                    f"<td><code>{E(enc_rr)}</code></td></tr>"
+                )
+            sections.append(
+                "<h3>Encounter pools</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Encounter</th><th>Encounter ResRef</th>"
+                "</tr></thead><tbody>" + "\n".join(enc_rows) + "</tbody></table>"
+            )
+        if script_locs:
+            script_by_area: dict[str, list[str]] = defaultdict(list)
+            for l in script_locs:
+                srcs = [e["script"] for e in db.area_script_spawns.get(l["area"], [])
+                        if e["can_rr"] == canonical_rr]
+                script_by_area[l["area"]].extend(srcs)
+            script_rows = []
+            for area_rr in sorted(script_by_area.keys(),
+                                  key=lambda r: db.area_name(r).lower()):
+                scripts = sorted(set(script_by_area[area_rr]))
+                script_cell = (", ".join(f"<code>{E(s)}</code>" for s in scripts)
+                               if scripts else "—")
+                script_rows.append(
+                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<td>{script_cell}</td></tr>"
+                )
+            sections.append(
+                "<h3>Script-spawned</h3>"
+                '<table class="data"><thead><tr>'
+                "<th>Area</th><th>Spawn script</th>"
+                "</tr></thead><tbody>" + "\n".join(script_rows) + "</tbody></table>"
+            )
+    else:
+        sections.append("<h2>Where to find</h2><p>Not placed in any area.</p>")
+
+    store_section = _creature_store_section(db, bp_rr, filter_area=None, root_rel="..")
+    if store_section:
+        sections.append(store_section)
+
+    sections.extend(_creature_detail_sections(db, c, bp=bp, root_rel=".."))
+
+    write(out / "creatures" / f"{canonical_rr}.html",
+          page(name, "\n".join(sections), root_rel=".."))
 
 
 def render_creatures_search(db: Db, out: Path) -> None:
