@@ -1240,8 +1240,59 @@ items:
 - id: render-creature-page
   phase: 1
   title: Extract creature detail rendering into render/creature_page.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: d4f502f
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (133s), lotr2008 IDENTICAL (88s), lotr2009 IDENTICAL (103s)"
+  impl_notes: >
+    render/creature_page.py 1,418 lines; cli.py 10,383 -> 9,039 (6 insertions,
+    1,350 deletions).  Moved _retaliation_sentence, extract_creature_defenses,
+    _creature_detail_sections, _CREATURE_SEARCH_JS, render_creatures_search and —
+    verified sole-consumer — TUMBLE_SKILL_ID, ARMOR_SKIN_FEAT, MONK_CLASS_ID with
+    their banner.  _ABIL_NAME_KEY left cli.py's items import; it existed only for
+    extract_creature_defenses.  cli.py imports four names back for its remaining
+    callers (render_creature_page, generate_module_index,
+    generate_counter_gear_index, main).
+    DECISION on _retaliation_sentence: it stays in render/creature_page.py rather
+    than joining the analysis in db/scripts.py — it is pure presentation, turning an
+    already-analysed dict into player-facing prose, and db/ owns the analysis only
+    because _parse_scripts calls it.
+    SCOPE REDUCED: render_creature_page stayed in cli.py.  Its blocker is
+    _creature_store_section, and dragging that means dragging
+    _CREATURE_STORES_TABLE_HEAD, _store_buy_summary, _store_buy_base_types,
+    _buy_limit_str and _store_item_gp_stats (~166 lines) which have 7-8 other cli.py
+    call sites each, so render/stores.py would later have to import store helpers
+    back out of render/creature_page.py — the same drag-chain that made render-areas
+    leave render_area_page behind.  _variant_diff_items stays with it.  New item
+    render-creature-page-2 picks it up after render-stores.
+    STATE AUDIT: only render_creatures_search touches state — reads _BOSS_REGISTRY
+    (x2), writes _current_context per creature and clears it after the loop.  The
+    other three moved functions touch no state at all (AST free-name analysis plus a
+    state. grep).  Line multiset: 6 added lines, all the import block; none of the
+    1,350 removed lines missing from the new module.
+  found:
+    - "This move left 15 more dead imports in cli.py (RACE_ABILITY_ADJ, SLOT_CHEST,
+       _creature_cr_value, _yn, creature_bab, creature_class_bab,
+       creature_race_immunities, epic_toughness_hp, is_ranged_weapon, item_ac_bonus,
+       item_attack_bonus, item_damage_bonus, skill_name, weapon_crit_string,
+       weapon_damage_string) on top of ~35 pre-existing ones."
+    - "render/__init__.py's module list still names only areas and map — creatures
+       and creature_page are missing."
+    - "extract_creature_defenses and extract_creature_offense are now split across
+       creature_page.py and cli.py despite being a designed pair called back-to-back
+       by generate_counter_gear_index.  extract_creature_offense has no cli-local
+       deps and would move cleanly; it was simply not in this item's plan."
+    - "_creature_store_section has exactly one caller (render_creature_page) yet
+       lives 3,300 lines away in the store cluster — render-stores should decide
+       whether it is a store renderer or a creature-page section."
+    - "_creature_detail_sections reaches nesting depth 7 in the weapons/equipment
+       block and rebuilds the same instance->blueprint fallback closures that
+       _variant_diff_items and _creature_key spell out."
+    - "render_creatures_search's clear of state._current_context is not guarded by
+       try/finally, so an exception mid-loop leaves a stale context string for later
+       warnings."
+
   after: [render-creature-index]
   ranges: "7768-8190, 9061-10051"
   plan: >
@@ -1311,6 +1362,27 @@ items:
   gate: zero-diff
   after: [render-quests]
   ranges: "14290-14878"
+
+- id: render-creature-page-2
+  phase: 1
+  title: Move render_creature_page into render/creature_page.py
+  status: pending
+  gate: zero-diff
+  after: [render-stores]
+  plan: >
+    render-creature-page had to leave render_creature_page in cli.py: it calls
+    _creature_store_section, whose helpers (_CREATURE_STORES_TABLE_HEAD,
+    _store_buy_summary, _store_buy_base_types, _buy_limit_str,
+    _store_item_gp_stats) have 7-8 other cli.py call sites each, so dragging them
+    would have forced render/stores.py to import store helpers back out of
+    render/creature_page.py.  Once render-stores has homed them, move
+    render_creature_page — and _variant_diff_items, its other cli-local dependency,
+    which itemprops-module also left behind.
+  notes: >
+    Decide with render-stores whether _creature_store_section is a store renderer or
+    a creature-page section; it has exactly one caller.  Consider moving
+    extract_creature_offense alongside extract_creature_defenses at the same time —
+    they are a designed pair, and the offence half has no cli-local dependencies.
 
 - id: render-area-page
   phase: 1
