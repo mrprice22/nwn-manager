@@ -8,6 +8,13 @@ shell depend on.
 Mutable build state (theme assets, manual menus, boss registry, creature pics)
 lives in :mod:`nwn_wiki.state` and is always reached through the module object
 -- ``state.X`` -- so writes by the loaders here are visible to the renderers.
+
+Once every loader has run, ``cli.main()`` freezes the subset of that state the
+page shell actually reads into a single :class:`SiteChrome`, publishes it as
+``state.CHROME`` and serialises it to ``<out>/.chrome.json``.  That file is what
+``bin/nwn-wiki-activity`` loads when it re-writes ``activity.html`` and the
+manual pages in a separate interpreter, so the nav bar it emits cannot drift
+from the nav bar the main build emitted.
 """
 
 from __future__ import annotations
@@ -18,12 +25,137 @@ import shutil
 import struct
 import sys
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from nwn_wiki.gff import fld
 from nwn_wiki.htmlgen.escape import E, nwn_text
 
 from nwn_wiki import state
+
+CHROME_FILE = ".chrome.json"
+_CHROME_FORMAT = 1
+
+
+@dataclass
+class SiteChrome:
+    """The facts the page shell and nav bar depend on, resolved once per build.
+
+    Built by :meth:`from_state` after every loader has run, so it is a snapshot
+    of a settled build rather than a live view: any consumer holding one is
+    guaranteed to render the same chrome as every other consumer, including the
+    ``nwn-wiki-activity`` subprocess running in its own interpreter.
+
+    ``has_inaccessible`` / ``has_creature_pics`` are recorded but not yet read:
+    page() still emits those two nav entries unconditionally, exactly as before.
+    Gating them is a separate backlog item.
+    """
+
+    has_activity: bool = False
+    has_server_firsts: bool = False
+    has_bosses: bool = False
+    manual_menus: dict[str, list[dict]] = field(default_factory=dict)
+    manual_menu_order: dict[str, int] = field(default_factory=dict)
+    theme_favicon: str = ""
+    theme_header_imgs: list[str] = field(default_factory=list)
+    theme_header_dims: list[tuple[int, int] | None] = field(default_factory=list)
+    theme_extra_css: str = ""
+    # Default True = "assume present", which is what the unconditional nav
+    # entries mean today; a build that knows better passes the real value.
+    has_inaccessible: bool = True
+    has_creature_pics: bool = True
+
+    @classmethod
+    def from_state(cls, has_inaccessible: bool = True,
+                   has_creature_pics: bool | None = None) -> "SiteChrome":
+        """Snapshot the current :mod:`nwn_wiki.state` nav globals."""
+        if has_creature_pics is None:
+            has_creature_pics = bool(state._CREATURE_PIC_GROUPS)
+        return cls(
+            has_activity=bool(state._HAS_ACTIVITY_PAGE),
+            has_server_firsts=bool(state._HAS_SERVER_FIRSTS),
+            has_bosses=bool(state._BOSS_REGISTRY),
+            manual_menus=state._MANUAL_MENUS,
+            manual_menu_order=state._MANUAL_MENU_ORDER,
+            theme_favicon=state._THEME_FAVICON,
+            theme_header_imgs=state._THEME_HEADER_IMGS,
+            theme_header_dims=state._THEME_HEADER_DIMS,
+            theme_extra_css=state._THEME_EXTRA_CSS,
+            has_inaccessible=bool(has_inaccessible),
+            has_creature_pics=bool(has_creature_pics),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "format": _CHROME_FORMAT,
+            "has_activity": self.has_activity,
+            "has_server_firsts": self.has_server_firsts,
+            "has_bosses": self.has_bosses,
+            "manual_menus": self.manual_menus,
+            "manual_menu_order": self.manual_menu_order,
+            "theme_favicon": self.theme_favicon,
+            "theme_header_imgs": list(self.theme_header_imgs),
+            "theme_header_dims": [list(d) if d else None
+                                  for d in self.theme_header_dims],
+            "theme_extra_css": self.theme_extra_css,
+            "has_inaccessible": self.has_inaccessible,
+            "has_creature_pics": self.has_creature_pics,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SiteChrome":
+        return cls(
+            has_activity=bool(d.get("has_activity")),
+            has_server_firsts=bool(d.get("has_server_firsts")),
+            has_bosses=bool(d.get("has_bosses")),
+            manual_menus=d.get("manual_menus") or {},
+            manual_menu_order=d.get("manual_menu_order") or {},
+            theme_favicon=d.get("theme_favicon") or "",
+            theme_header_imgs=list(d.get("theme_header_imgs") or []),
+            theme_header_dims=[tuple(x) if x else None
+                               for x in (d.get("theme_header_dims") or [])],
+            theme_extra_css=d.get("theme_extra_css") or "",
+            has_inaccessible=bool(d.get("has_inaccessible", True)),
+            has_creature_pics=bool(d.get("has_creature_pics", True)),
+        )
+
+    def save(self, out: Path) -> Path:
+        """Serialise to ``<out>/.chrome.json`` and return the path written."""
+        path = out / CHROME_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self.to_dict(), ensure_ascii=False, indent=2,
+                       sort_keys=True) + "\n"
+        )
+        return path
+
+    @classmethod
+    def load(cls, out: Path) -> "SiteChrome | None":
+        """Read ``<out>/.chrome.json``, or None when it is absent/unreadable.
+
+        None means "this wiki tree predates the chrome file (or it is corrupt)"
+        and the caller should fall back to deriving the nav facts itself.
+        """
+        path = Path(out) / CHROME_FILE
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return cls.from_dict(data)
+
+
+def active_chrome() -> SiteChrome:
+    """The SiteChrome page() renders with.
+
+    ``state.CHROME`` once the build has published one; before that (manual pages
+    are rendered in the same pass that discovers them) a snapshot of the live
+    globals, which is what the nav used to read directly.
+    """
+    if state.CHROME is not None:
+        return state.CHROME
+    return SiteChrome.from_state()
 
 
 def _manual_menu_rows(entries: list[dict], root_rel: str) -> list[str]:
@@ -50,7 +182,7 @@ def _manual_menu_rows(entries: list[dict], root_rel: str) -> list[str]:
     return rows
 
 
-def _quests_nav(root_rel: str) -> str:
+def _quests_nav(chrome: SiteChrome, root_rel: str) -> str:
     """Return the Quests nav entry: a plain link to the generated quest index,
     or a dropdown when manual pages target @menu 'Quests'.
 
@@ -59,7 +191,7 @@ def _quests_nav(root_rel: str) -> str:
     generated index becomes "Journal Entries" inside it.
     """
     index_link = f'{E(root_rel)}/quests/index.html'
-    rows = _manual_menu_rows(state._MANUAL_MENUS.get("Quests", []), root_rel)
+    rows = _manual_menu_rows(chrome.manual_menus.get("Quests", []), root_rel)
     if not rows:
         return f'<a href="{index_link}">Quests</a>'
     rows.append(f'<a href="{index_link}">Journal Entries</a>')
@@ -72,20 +204,20 @@ def _quests_nav(root_rel: str) -> str:
     )
 
 
-def _activity_dropdown(root_rel: str) -> str:
+def _activity_dropdown(chrome: SiteChrome, root_rel: str) -> str:
     """Return the Activity nav dropdown HTML (manual pages targeting @menu
     'Activity', then Player Activity + Server Firsts).
 
     Player Activity / Server Firsts are refreshed more often than the rest of
     the wiki (via nwn-wiki-activity). Shown only when at least one entry exists.
     """
-    manual_rows = _manual_menu_rows(state._MANUAL_MENUS.get("Activity", []), root_rel)
-    if not (state._HAS_ACTIVITY_PAGE or state._HAS_SERVER_FIRSTS or manual_rows):
+    manual_rows = _manual_menu_rows(chrome.manual_menus.get("Activity", []), root_rel)
+    if not (chrome.has_activity or chrome.has_server_firsts or manual_rows):
         return ""
     rows: list[str] = list(manual_rows)
-    if state._HAS_ACTIVITY_PAGE:
+    if chrome.has_activity:
         rows.append(f'<a href="{E(root_rel)}/activity.html">Player Activity</a>')
-    if state._HAS_SERVER_FIRSTS:
+    if chrome.has_server_firsts:
         rows.append(
             f'<a href="{E(root_rel)}/manual/ServerFirsts.html">Server Firsts</a>'
         )
@@ -98,9 +230,9 @@ def _activity_dropdown(root_rel: str) -> str:
     )
 
 
-def _docs_dropdown(root_rel: str) -> str:
+def _docs_dropdown(chrome: SiteChrome, root_rel: str) -> str:
     """Return the Documents nav dropdown HTML, or empty string if none."""
-    entries = state._MANUAL_MENUS.get("Documents", [])
+    entries = chrome.manual_menus.get("Documents", [])
     if not entries:
         return ""
     inner = "\n".join(_manual_menu_rows(entries, root_rel))
@@ -112,17 +244,17 @@ def _docs_dropdown(root_rel: str) -> str:
     )
 
 
-def _custom_manual_dropdowns(root_rel: str) -> str:
+def _custom_manual_dropdowns(chrome: SiteChrome, root_rel: str) -> str:
     """Return nav dropdown HTML for any custom @menu names (excluding the
     built-in Documents/Activity/Quests dropdowns), ordered by @menu-order then
     first-seen position."""
-    custom_names = [n for n in state._MANUAL_MENUS
+    custom_names = [n for n in chrome.manual_menus
                     if n not in ("Documents", "Activity", "Quests")]
-    custom_names.sort(key=lambda n: (state._MANUAL_MENU_ORDER.get(n, 10**9),
-                                      list(state._MANUAL_MENUS).index(n)))
+    custom_names.sort(key=lambda n: (chrome.manual_menu_order.get(n, 10**9),
+                                      list(chrome.manual_menus).index(n)))
     blocks: list[str] = []
     for name in custom_names:
-        inner = "\n".join(_manual_menu_rows(state._MANUAL_MENUS[name], root_rel))
+        inner = "\n".join(_manual_menu_rows(chrome.manual_menus[name], root_rel))
         blocks.append(
             '<div class="nav-dropdown">'
             f'<span class="nav-dropdown-label">{E(name)} &#9660;</span>'
@@ -141,7 +273,7 @@ def _md_title(text: str, stem: str) -> str:
     return stem.replace("-", " ").replace("_", " ").title()
 
 
-def _brand_html(root_rel: str) -> str:
+def _brand_html(chrome: SiteChrome, root_rel: str) -> str:
     """Return the site-header brand: a banner image when the theme supplies one,
     otherwise plain text.
 
@@ -153,11 +285,11 @@ def _brand_html(root_rel: str) -> str:
     ever fetched and the reserved box matches it.
     """
     home = f'{E(root_rel)}/index.html'
-    if not state._THEME_HEADER_IMGS:
+    if not chrome.theme_header_imgs:
         return f'<a class="brand" href="{home}">Module Wiki</a>'
 
-    srcs = [f"{root_rel}/assets/{n}" for n in state._THEME_HEADER_IMGS]
-    dims = state._THEME_HEADER_DIMS or [None] * len(srcs)
+    srcs = [f"{root_rel}/assets/{n}" for n in chrome.theme_header_imgs]
+    dims = chrome.theme_header_dims or [None] * len(srcs)
 
     def size_attrs(i: int) -> str:
         d = dims[i] if i < len(dims) else None
@@ -185,13 +317,21 @@ def _brand_html(root_rel: str) -> str:
             f'{size_attrs(0)} alt="Home"></noscript></a>')
 
 
-def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") -> str:
-    """Wrap body in the standard wiki page shell."""
-    extra_css = (f'\n  <link rel="stylesheet" href="{E(root_rel)}/assets/{E(state._THEME_EXTRA_CSS)}">'
-                 if state._THEME_EXTRA_CSS else "")
-    favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(state._THEME_FAVICON)}">'
-               if state._THEME_FAVICON else "")
-    brand = _brand_html(root_rel)
+def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "",
+         chrome: SiteChrome | None = None) -> str:
+    """Wrap body in the standard wiki page shell.
+
+    ``chrome`` defaults to the build's published SiteChrome (``state.CHROME``),
+    so every page in a run — including the ones the nwn-wiki-activity
+    subprocess rewrites — is shelled from the same set of facts.
+    """
+    if chrome is None:
+        chrome = active_chrome()
+    extra_css = (f'\n  <link rel="stylesheet" href="{E(root_rel)}/assets/{E(chrome.theme_extra_css)}">'
+                 if chrome.theme_extra_css else "")
+    favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(chrome.theme_favicon)}">'
+               if chrome.theme_favicon else "")
+    brand = _brand_html(chrome, root_rel)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -215,7 +355,7 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
           <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
           <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
           <a href="{E(root_rel)}/creatures/search.html">Search</a>
-          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if state._BOSS_REGISTRY else ''}
+          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if chrome.has_bosses else ''}
           <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>
         </div>
       </div>
@@ -231,10 +371,10 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "") 
       <a href="{E(root_rel)}/stores/index.html">Stores</a>
       <a href="{E(root_rel)}/conversations/index.html">Conversations</a>
       <a href="{E(root_rel)}/factions.html">Factions</a>
-      {_quests_nav(root_rel)}
-      {_activity_dropdown(root_rel)}
-      {_docs_dropdown(root_rel)}
-      {_custom_manual_dropdowns(root_rel)}
+      {_quests_nav(chrome, root_rel)}
+      {_activity_dropdown(chrome, root_rel)}
+      {_docs_dropdown(chrome, root_rel)}
+      {_custom_manual_dropdowns(chrome, root_rel)}
     </nav>
   </header>
   <main>

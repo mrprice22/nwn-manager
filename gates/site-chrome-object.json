@@ -1,0 +1,4 @@
+{
+  "reason": "Build the nav facts once into a SiteChrome object in cli.main() and serialise it to docs/.chrome.json, so bin/nwn-wiki-activity loads that file instead of re-deriving the globals in a fresh interpreter. The chrome file is new output; no rendered page may change, because the same facts still drive page().",
+  "paths": ["docs/.chrome.json"]
+}

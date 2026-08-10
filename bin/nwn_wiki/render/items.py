@@ -239,6 +239,33 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
           page("Inaccessible Items", layout, root_rel="../.."))
 
 
+def item_is_accessible(db: Db, rr: str) -> bool:
+    """True when players can reach item ``rr`` (store, container, droppable
+    carrier or script reward). Everything else lands on the Inaccessible page."""
+    return (
+        rr in db.item_sold_at
+        or rr in db.item_in_container
+        or any(e.get("dropable") or e.get("pickpocketable")
+               for e in db.item_carried_by.get(rr, []))
+        or rr in db.item_from_script
+    )
+
+
+def has_inaccessible_items(db: Db) -> bool:
+    """True when items/inaccessible/index.html will have any rows.
+
+    Mirrors the classification in render_items_index(): broken (TLK-only or
+    unnamed) items are excluded, they get their own bucket.
+    """
+    for rr in db.items:
+        name = db.item_name(rr)
+        if name.startswith("[TLK#") or name == rr:
+            continue
+        if not item_is_accessible(db, rr):
+            return True
+    return False
+
+
 def render_items_index(db: Db, out: Path) -> None:
 
     # Classify every item; broken = TLK-only or completely unnamed.
@@ -252,13 +279,7 @@ def render_items_index(db: Db, out: Path) -> None:
         if name.startswith("[TLK#") or name == rr:
             broken.append((rr, i))
         else:
-            accessible = (
-                rr in db.item_sold_at
-                or rr in db.item_in_container
-                or any(e.get("dropable") or e.get("pickpocketable")
-                       for e in db.item_carried_by.get(rr, []))
-                or rr in db.item_from_script
-            )
+            accessible = item_is_accessible(db, rr)
             if accessible:
                 buckets[_item_category(i, nwn_text(name))].append((rr, i))
             else:

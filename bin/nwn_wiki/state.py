@@ -34,6 +34,15 @@ _HAS_ACTIVITY_PAGE: bool = False
 _HAS_SERVER_FIRSTS: bool = False  # set in render_manual_pages(); drives Activity nav
 _GENERATED_AT: str = ""  # set in main(); included in every page footer
 
+# The build's resolved nav/page-shell facts (htmlgen.chrome.SiteChrome), frozen
+# once every loader has run and read by page() for the rest of the run. None
+# until then, which makes page() snapshot the live globals above instead --
+# manual pages are rendered by the same pass that discovers them, so they are
+# shelled before the chrome can exist. Also set by bin/nwn-wiki-activity, from
+# the <out>/.chrome.json the main build wrote, so that subprocess renders the
+# same nav rather than re-deriving it.
+CHROME = None  # type: "nwn_wiki.htmlgen.chrome.SiteChrome | None"
+
 # Bestiary kill-tracking stats, read from the live NWNX:EE campaign DB
 # (<db-dir>/bestiarydb.sqlite3) when the module uses the bestiary system. The
 # filename must match the module's campaign DB name (BST_DB="bestiarydb" in

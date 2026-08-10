@@ -46,6 +46,7 @@ from nwn_wiki.gff import (
     read_tlk,
 )
 from nwn_wiki.htmlgen.chrome import (
+    SiteChrome,
     load_wiki_theme,
     scan_creature_pics,
 )
@@ -105,6 +106,7 @@ from nwn_wiki.render.itemprops_pages import (
     render_items_search,
 )
 from nwn_wiki.render.items import (
+    has_inaccessible_items,
     render_item_page,
     render_items_index,
 )
@@ -628,6 +630,17 @@ def main() -> int:
     load_boss_registry(db)
 
     render_manual_pages(src.parent, out)
+
+    # Every loader that the page shell depends on has now run (theme, creature
+    # pics, activity flag, server firsts, boss registry, manual menus), so
+    # freeze those facts into one SiteChrome. From here on page() reads it
+    # instead of the individual globals, and .chrome.json hands the identical
+    # facts to the nwn-wiki-activity subprocess below — which is why that
+    # subprocess can no longer emit a nav bar that disagrees with this build.
+    state.CHROME = SiteChrome.from_state(
+        has_inaccessible=has_inaccessible_items(db),
+    )
+    state.CHROME.save(out)
 
     if state._HAS_ACTIVITY_PAGE:
         _act_cmd = [sys.executable, str(SCRIPT_DIR / "nwn-wiki-activity"),
