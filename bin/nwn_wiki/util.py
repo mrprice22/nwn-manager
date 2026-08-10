@@ -8,8 +8,10 @@ renderers.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 
@@ -42,3 +44,7 @@ def _tz_label_from_env() -> str:
         return f"GMT{sign}{h}" if m == 0 else f"GMT{sign}{h}:{m:02d}"
     except Exception:
         return tz_name
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
