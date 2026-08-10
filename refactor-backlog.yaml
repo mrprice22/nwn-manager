@@ -1925,8 +1925,35 @@ items:
 - id: reports-module-index
   phase: 1
   title: Extract generate_module_index into reports/module_index.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 37fb113
+  date: 2026-08-10
+  gate_result: "check --all: homers_lotr IDENTICAL (133s), lotr2008 IDENTICAL (87s), lotr2009 IDENTICAL (105s)"
+  impl_notes: >
+    reports/module_index.py 802 lines (the 767-line function plus its banner,
+    byte-identical); cli.py 1,675 -> 889.  Moved as-is — module-index-split owns
+    breaking it up.  Nothing left behind: the area/creature tag-conflict writers are
+    inline sections INSIDE the function, so they travelled with it (the item/store/
+    conversation writers were already in reports/conflicts.py).  cli.py's whole
+    reports.counter_gear import block went away — all three names were used only by
+    this function, and module_index.py imports them as a sibling, exactly as
+    reports-counter-gear predicted.  Twelve more cli.py imports died with the code
+    and were pruned; fld, _write_json, Path, Any, datetime and state stay for main().
+    STATE AUDIT: one symbol, state._module_index_summary, 16 .append() sites and no
+    reads; it is defined once in state.py and never reassigned anywhere in bin/, and
+    main() still reads it through the module object for the final summary.  Line
+    multiset: every removed line present downstream bar the 9 edited import lines;
+    cli.py gained exactly 3.
+  found:
+    - "cli.py had 121 dead imports before this item even ran.  The sweep is
+       cli-module's and should use a real linter."
+    - "generate_module_index takes 8+ positional parameters and mixes ~15 independent
+       report writers in one body — module-index-split should consider a params
+       dataclass or a per-report registry, not just a mechanical split."
+    - "module_index.py's docstring references nwn_wiki.cli.Db, which will need
+       updating if Db ever moves out of cli.py."
+
   after: [reports-counter-gear]
   ranges: "17288-18059 (767 lines — the longest function in the program)"
 
