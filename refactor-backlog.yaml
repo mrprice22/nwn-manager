@@ -1831,8 +1831,45 @@ items:
 - id: reports-conflicts
   phase: 1
   title: Extract the tag/conversation conflict reports into reports/conflicts.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: daf9f28
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (141s), lotr2008 IDENTICAL (91s), lotr2009 IDENTICAL (113s)"
+  impl_notes: >
+    New reports/ subpackage (docstring-only __init__.py, 9 lines, re-exporting
+    nothing like render/ and sim/); reports/conflicts.py 347 lines; cli.py 2,736 ->
+    2,415.  Moved generate_tag_conflict_report, generate_store_tag_conflict_report
+    and generate_conversation_conflict_report with their banner — a diff of the
+    original cli.py slice against the new module's body is empty.  The cluster owns
+    no module-level constants.  cli.py pruned _store_inv_key and itemprop_oneliner,
+    now used only by the new module.  STATE AUDIT: one symbol,
+    state._module_index_summary, at six sites, all .append() on the list object,
+    never rebound, all through the state module.  Line multiset: 326 lines lost, 324
+    accounted for downstream plus those two pruned import names; gains are the
+    5-line import block.
+  found:
+    - "All three functions open with a near-identical ~12-line base_url/wiki_out URL-
+       prefix closure differing only in the /items/, /stores/, /conversations/
+       segment, and _module_index_url_helpers in cli.py is a fourth copy of the same
+       idiom.  One shared helper would replace all four."
+    - "Each binds project_root = module_index_dir.parent and uses it only in the else
+       branch — dead when base_url is set."
+    - "generate_conversation_conflict_report reaches into db._dialog_key_registry and
+       db.dialogs[rr]['__zdlg_handler__'] — private state and a magic key that want
+       a Db accessor."
+    - "generate_tag_conflict_report wraps already-frozenset values in frozenset()
+       again when building unique_sigs."
+    - "Severity choice looks inconsistent rather than intentional: these three report
+       ('warn', ...) while the sibling area/creature conflict reports still in cli.py
+       use ('issue', ...) for area_tag_conflicts.json and ('warn', ...) for
+       creature_tag_conflicts.json."
+    - "generate_store_tag_conflict_report's docstring promises empty/self-named tags
+       are still included, but the filter is db.store_tag_groups + len(resrefs) < 2,
+       so that guarantee now depends on how db/ builds store_tag_groups."
+    - "_store_areas re-walks all of db.area_stores for every conflicting resref —
+       O(areas x instances), only material on large modules."
+
   after: [render-index]
   ranges: "16237-16561"
 
