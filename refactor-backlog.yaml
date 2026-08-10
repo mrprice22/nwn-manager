@@ -1876,8 +1876,44 @@ items:
 - id: reports-counter-gear
   phase: 1
   title: Extract the counter-gear report into reports/counter_gear.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 723cb39
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (142s), lotr2008 IDENTICAL (85s), lotr2009 IDENTICAL (104s)"
+  impl_notes: >
+    reports/counter_gear.py 765 lines (718 verbatim); cli.py 2,415 -> 1,675.  All 13
+    planned symbols moved plus the three constants they exclusively own (_CR_TIERS,
+    _COUNTER_GEAR_ALGO_VERSION, _ATTRITION_ROUNDS).  _parse_cr moved untouched — the
+    _parse_cr/_creature_cr_value sentinel fork stays for dedup-formatting.
+    ONE FORCED RELOCATION: generate_counter_gear_index calls _write_json, which lived
+    in cli.py with 18 other callers there, and a submodule may not import cli — so
+    _write_json moved verbatim into util.py (44 -> 50 lines), whose contract is
+    exactly "generic helpers with no NWN domain knowledge".  cli.py imports it back.
+    _module_index_url_helpers came here as planned; cli.py resolves it from this
+    module in the meantime (verified: cli._module_index_url_helpers.__module__ is
+    nwn_wiki.reports.counter_gear), and reports-module-index can import it as a
+    sibling and drop that line.  STATE AUDIT: one symbol,
+    state._module_index_summary, four .append() sites, never rebound or read.  Line
+    multiset: the 718-line block is a byte-exact contiguous substring of the new
+    module; 5 lines added; the only unaccounted removals are _write_json's two lines
+    (verbatim in util.py), the rewritten util import and six import names pruned as a
+    computed before/after delta so that only imports killed BY THIS MOVE went.
+  found:
+    - "cli.py carries ~115 already-dead imports from earlier extractions.  Leaving
+       them means every future extraction has to compute a before/after delta rather
+       than just scanning — prune them in cli-module."
+    - "reports/conflicts.py inlines `out_path.write_text(json.dumps(report, indent=2,
+       ensure_ascii=False) + '\\n')` three times, which is exactly util._write_json.
+       Point it at the helper in phase 3."
+    - "devcrit_mode is public-named but its only caller is _counter_gear_markdown's
+       payload builder inside the same module — a rename-pass candidate."
+    - "_module_index_url_helpers is generic module-index plumbing that only
+       incidentally serves counter-gear; once reports/module_index.py exists it
+       probably belongs there or in a shared reports/_urls.py."
+    - "counter_gear.py imports Any solely for a quoted, never-evaluated annotation
+       (-> \"tuple[Any, Any, Any, Any]\") that is really a tuple of callables."
+
   after: [reports-conflicts]
   ranges: "16562-17287"
   plan: >
