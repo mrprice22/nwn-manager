@@ -1960,8 +1960,54 @@ items:
 - id: cli-module
   phase: 1
   title: Reduce cli.py to argument parsing and the build pipeline
-  status: pending
+  status: done
   gate: zero-diff
+  commit: e564999
+  date: 2026-08-10
+  gate_result: "check --all: homers_lotr IDENTICAL (131s), lotr2008 IDENTICAL (86s), lotr2009 IDENTICAL (104s)"
+  impl_notes: >
+    PHASE 1 COMPLETE.  cli.py 18,618 -> 774 lines: docstring, imports, the four _C_*
+    colour constants, `class Db(DbNamesMixin, DbDerivedMixin, DbDialogsMixin,
+    DbScriptsMixin, DbIndexMixin, DbCore)` whose body is only the six *_EVENT_FIELDS
+    dicts, and main() (~520 lines) with its __main__ shim.  bin/nwn-wiki is unchanged
+    — still 16 lines, still executable at the same path, --help byte-identical to
+    HEAD.  49 files, 19,917 lines total; only four modules exceed ~900 lines
+    (render/creature_page 1922, render/areas 953, render/items 924,
+    render/itemprops_pages 917) and all four are already phase-4 targets.
+    IMPORT PRUNE: pyflakes 3.4.0 (installed into a scratchpad venv) found 125 unused
+    imports in cli.py; 120 were removed and 5 KEPT with `# re-export: poked as
+    wiki.X` comments because bin/nwn-wiki-activity and bin/recover-activity-gap reach
+    them by attribute (_load_activity_cache, _save_activity_cache,
+    render_activity_page, load_boss_registry_from_src, _tz_label_from_env).  Safety
+    checked four ways: nothing in bin/ imports names FROM cli; sorted(sys.modules)
+    after importing cli is identical to HEAD's (49 modules), so no import-time side
+    effect was dropped; all ten poked attributes resolve and the six non-obvious ones
+    are `is`-identical to their defining modules' objects; and all three entry-point
+    --help runs pass with nwn-wiki's output byte-identical.
+    DOCSTRINGS: 16 files corrected — twoda, lookups, items, combat, sim/pc,
+    sim/combat, sim/__init__, render/__init__ (it listed 2 of 14 modules),
+    render/creature_page, all six db/* files (stale 'the monolith still calls X'
+    claims) and htmlgen/__init__, plus a paragraph on cli.py's own.  Verified no
+    docstring reaches output: __doc__ is read in three places, all .splitlines()[0]
+    of a line left untouched.
+  found:
+    - "combat.py's crit_feat_effects annotates a parameter Callable without importing
+       it from typing — a genuine missing import that survives only under PEP 563 and
+       would NameError under typing.get_type_hints()."
+    - "Four unused locals package-wide: itemprops.py cost_table_id, render/areas.py
+       bp_cell, render/creature_page.py race_immunities, reports/counter_gear.py
+       by_resref.  race_immunities is a computed-then-discarded lookup that may mark a
+       dropped feature — worth a look before deleting."
+    - "Eleven f-strings without placeholders across cli.py (2), render/conversations,
+       render/factions (2), render/items, render/map (3) and render/stores."
+    - "cli.py's main() still owns two report writers (lookup_warnings.json,
+       bosses.json) and the _DATA_AUDIT pre-flight, which read more like reports/ than
+       pipeline.  Fold into main-split or a new reports item."
+    - "bin/nwn-wiki-activity and bin/recover-activity-gap poke helpers that now live
+       in render.activity, util and render.creatures.  Pointing them at the defining
+       modules would let the five re-export imports go — but it touches files outside
+       the package."
+
   after: [reports-module-index]
   ranges: "18061-18618 (main, 554 lines)"
   plan: >
