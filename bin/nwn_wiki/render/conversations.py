@@ -13,7 +13,8 @@ from pathlib import Path
 from nwn_wiki.gff import fld, list_items, loc
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
-from nwn_wiki.htmlgen.links import _script_link, link
+from nwn_wiki.htmlgen.links import (_area_link, _creature_link, _item_link,
+                                    _script_link, link)
 from nwn_wiki.htmlgen.pagectx import PageCtx
 
 
@@ -323,7 +324,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
         for t in teleports:
             anchor = _dialog_node_anchor(t["node_kind"], t["node_index"])
             dst_area = t.get("area")
-            dst_cell = (link(f"../areas/{dst_area}.html", db.area_name(dst_area))
+            dst_cell = (_area_link(db, dst_area, ctx)
                         if dst_area else f'<em class="muted">unresolved</em>')
             rows.append(
                 f"<tr><td><code>{E(t['tag'])}</code></td>"
@@ -362,7 +363,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
                     if dst_area:
                         tp_parts.append(
                             f"<code>{E(t)}</code> ("
-                            + link(f"../areas/{dst_area}.html", db.area_name(dst_area))
+                            + _area_link(db, dst_area, ctx)
                             + ")"
                         )
                     else:
@@ -387,7 +388,7 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
         for item_rr in sorted(checked_items, key=lambda r: db.item_name(r).lower()):
             name = db.item_name(item_rr)
             item_links.append(
-                link(f"../items/{item_rr}.html", name)
+                _item_link(db, item_rr, ctx, name)
                 if item_rr in db.items else E(name)
             )
         sections.append(
@@ -524,9 +525,9 @@ def _caller_html(db: Db, c: dict, ctx: PageCtx) -> str:
     if kind == "creature":
         can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
         cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
-        cell = (link(ctx.url(f"creatures/{can_rr}.html"), cname)
+        cell = (_creature_link(db, can_rr, ctx, cname)
                 if can_rr in db.canonical_creatures else nwn_html(rr))
-        areas = ", ".join(link(ctx.url(f"areas/{a}.html"), db.area_name(a))
+        areas = ", ".join(_area_link(db, a, ctx)
                           for a in c.get("areas", []) if a in db.areas)
         return (f'<span class="badge">creature</span> NPC {cell} '
                 f"<code>{E(rr)}</code>" + (f" — in {areas}" if areas else ""))
@@ -536,7 +537,7 @@ def _caller_html(db: Db, c: dict, ctx: PageCtx) -> str:
         can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
         inst_label = db.canonical_creature_name(can_rr) if can_rr else (db.creature_instance_name(area_rr, idx) or rr or "(unnamed)")
         inst_url = ctx.url(f"creatures/{can_rr}.html") if can_rr else "#"
-        area_link = (link(ctx.url(f"areas/{area_rr}.html"), db.area_name(area_rr))
+        area_link = (_area_link(db, area_rr, ctx)
                      if area_rr in db.areas else nwn_html(area_rr))
         return (f'<span class="badge">creature</span> NPC '
                 f'<a href="{E(inst_url)}">{nwn_html(inst_label)}</a>'
@@ -544,19 +545,19 @@ def _caller_html(db: Db, c: dict, ctx: PageCtx) -> str:
     if kind == "placeable":
         # Placeables don't have their own page; we'll link to one of their
         # area pages instead, which is where the placement lives.
-        areas = ", ".join(link(ctx.url(f"areas/{a}.html"), db.area_name(a))
+        areas = ", ".join(_area_link(db, a, ctx)
                           for a in c.get("areas", []) if a in db.areas)
         return (f"Placeable <code>{E(rr)}</code>" +
                 (f" — in {areas}" if areas else ""))
     if kind == "door":
-        areas = ", ".join(link(ctx.url(f"areas/{a}.html"), db.area_name(a))
+        areas = ", ".join(_area_link(db, a, ctx)
                           for a in c.get("areas", []) if a in db.areas)
         return (f"Door <code>{E(rr)}</code>" +
                 (f" — in {areas}" if areas else ""))
     if kind in ("placeable-instance", "door-instance"):
         area_rr = c.get("area", "")
         tag = c.get("tag") or ""
-        area_link = (link(ctx.url(f"areas/{area_rr}.html"), db.area_name(area_rr))
+        area_link = (_area_link(db, area_rr, ctx)
                      if area_rr in db.areas else nwn_html(area_rr))
         bp = f" <small class=\"muted\">(blueprint <code>{E(rr)}</code>)</small>" if rr else ""
         label = "Placeable" if kind == "placeable-instance" else "Door"
@@ -573,11 +574,11 @@ def _caller_html(db: Db, c: dict, ctx: PageCtx) -> str:
         if kind == "creature-event":
             can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
             cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
-            ent = (link(ctx.url(f"creatures/{can_rr}.html"), cname)
+            ent = (_creature_link(db, can_rr, ctx, cname)
                    if can_rr in db.canonical_creatures else nwn_html(rr))
             label = f"NPC {ent} <code>{E(rr)}</code>"
         elif kind == "area-event":
-            ent = (link(ctx.url(f"areas/{rr}.html"), db.area_name(rr))
+            ent = (_area_link(db, rr, ctx)
                    if rr in db.areas else nwn_html(rr))
             label = f"Area {ent} <code>{E(rr)}</code>"
         elif is_instance:
@@ -589,7 +590,7 @@ def _caller_html(db: Db, c: dict, ctx: PageCtx) -> str:
             label = (f'<span class="badge">instance</span> {entity} {ident}{bp}')
         else:
             label = f"{kind.split('-')[0].title()} <code>{E(rr)}</code>"
-        areas = ", ".join(link(ctx.url(f"areas/{a}.html"), db.area_name(a))
+        areas = ", ".join(_area_link(db, a, ctx)
                           for a in c.get("areas", []) if a in db.areas)
         return (f"{label} via <code>{E(ev)}</code> script {_script_link(db, s, ctx)}" +
                 (f" — in {areas}" if areas else ""))
@@ -599,7 +600,7 @@ def _caller_html(db: Db, c: dict, ctx: PageCtx) -> str:
         return (f'<span class="badge global">global</span> '
                 f"Module <code>{E(ev)}</code> via script {_script_link(db, s, ctx)}")
     if kind == "item-script":
-        ent = (link(ctx.url(f"items/{rr}.html"), db.item_name(rr))
+        ent = (_item_link(db, rr, ctx)
                if rr in db.items else nwn_html(rr))
         s = c.get("script", "")
         return (f"Item {ent} <code>{E(rr)}</code> via tag-script "

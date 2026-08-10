@@ -1,0 +1,5 @@
+{
+  "reason": "111 anchors are hand-written f-string <a href=...> against 129 link() calls, so ~46% of anchors bypass link()'s escaping, and the relative prefixes are spelled out by hand at 48 sites. Add _area_link/_item_link/_creature_link beside the existing _script_link/_conv_link and route the call sites through them. Routing an anchor through link() can only change bytes where a name needed escaping, so any diff must be an escaped character inside an anchor.",
+  "paths": ["docs/**/*.html", "docs/*.html"],
+  "line_patterns": ["<a [^>]*href=", "&amp;|&lt;|&gt;|&quot;|&#x27;"]
+}

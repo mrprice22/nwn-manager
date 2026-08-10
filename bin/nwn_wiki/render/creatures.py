@@ -16,7 +16,7 @@ from nwn_wiki.db.scripts import _strip_nss_comments
 from nwn_wiki.gff import fld, list_items
 from nwn_wiki.htmlgen.chrome import has_creature_pics_page, write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
-from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.links import _area_link, link
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.lookups import class_name, race_name
 from nwn_wiki.warn import _warn_once
@@ -210,6 +210,7 @@ def render_bosses_index(db: Db, out: Path) -> None:
     Fallen board, same columns as the creatures index, sorted by CR desc."""
     if not state._BOSS_REGISTRY:
         return
+    ctx = PageCtx("creatures/bosses.html")
     rows = []
     for boss in sorted(state._BOSS_REGISTRY, key=lambda b: (-b["cr"], b["name"].lower())):
         rr = boss["resref"]
@@ -246,7 +247,7 @@ def render_bosses_index(db: Db, out: Path) -> None:
             cr = boss["cr"]
         area_rr = boss["area"]
         if area_rr in db.areas and area_rr not in db.hidden_areas:
-            lair_cell = link(f"../areas/{area_rr}.html", boss["area_name"])
+            lair_cell = _area_link(db, area_rr, ctx, boss["area_name"])
         else:
             lair_cell = E(boss["area_name"])
         if state._BESTIARY_ACTIVE:
@@ -292,7 +293,7 @@ def render_bosses_index(db: Db, out: Path) -> None:
         f"{kills_head}"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
-    write_page(out, PageCtx("creatures/bosses.html"), "Bosses", body)
+    write_page(out, ctx, "Bosses", body)
 
 
 def _pic_src(filename: str, prefix: str) -> str:
@@ -378,6 +379,7 @@ def render_creature_pictures(db: Db, out: Path) -> None:
 def render_creatures_by_area(db: Db, out: Path) -> None:
     """Creatures grouped by area. One row per unique creature per area, with
     spawn-method badges and a count of total appearances."""
+    ctx = PageCtx("creatures/by-area/index.html")
     # Build area → {can_rr → {"placed": N, "enc": N, "script": N, "enc_rrs": set}}
     area_map: dict[str, dict[str, dict]] = defaultdict(dict)
     for can_rr, locs in db.canonical_locations.items():
@@ -430,7 +432,7 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
         slug = f"area-{area_rr}"
         sections.append(
             f'<h2 id="{E(slug)}">'
-            f'{link(f"../../areas/{area_rr}.html", db.area_name(area_rr))} '
+            f'{_area_link(db, area_rr, ctx)} '
             f'<small class="muted">({len(can_rrs)})</small></h2>'
         )
         rows = []
@@ -484,7 +486,7 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
         )
 
     body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
-    write_page(out, PageCtx("creatures/by-area/index.html"), "Creatures by Area",
+    write_page(out, ctx, "Creatures by Area",
                '<div class="items-layout">' + body + "</div>")
 
 

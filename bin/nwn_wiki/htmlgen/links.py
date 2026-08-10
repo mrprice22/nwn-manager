@@ -45,6 +45,34 @@ def _conv_link(db: "Db", resref: str | None, ctx: PageCtx) -> str:
     return f"<code>{E(resref)}</code>"
 
 
+def _area_link(db: "Db", resref: str, ctx: PageCtx, text: str | None = None) -> str:
+    """Link to an area's page, labelled with the area's name by default.
+
+    Unconditional: whether the target exists is the call site's business (the
+    fallbacks differ -- plain text, ``<code>``, a dash), so this helper owns
+    only the URL shape.  Pass ``text`` to override the label.
+    """
+    label = db.area_name(resref) if text is None else text
+    return link(ctx.url(f"areas/{resref}.html"), label)
+
+
+def _item_link(db: "Db", resref: str, ctx: PageCtx, text: str | None = None) -> str:
+    """Link to an item's page, labelled with the item's name by default.
+
+    Unconditional -- see :func:`_area_link`."""
+    label = db.item_name(resref) if text is None else text
+    return link(ctx.url(f"items/{resref}.html"), label)
+
+
+def _creature_link(db: "Db", canonical_rr: str, ctx: PageCtx,
+                   text: str | None = None) -> str:
+    """Link to a canonical creature's page, labelled with its name by default.
+
+    Unconditional -- see :func:`_area_link`."""
+    label = db.canonical_creature_name(canonical_rr) if text is None else text
+    return link(ctx.url(f"creatures/{canonical_rr}.html"), label)
+
+
 def _faction_dd(db: Db, faction_id, ctx: PageCtx) -> str:
     """Render a faction id as <name> (<id>) linking to the factions page,
     falling back to just the raw id when no name is resolvable."""

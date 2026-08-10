@@ -9,7 +9,7 @@ from pathlib import Path
 
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E
-from nwn_wiki.htmlgen.links import _conv_link, link
+from nwn_wiki.htmlgen.links import _area_link, _conv_link, link
 from nwn_wiki.htmlgen.pagectx import PageCtx
 
 
@@ -41,7 +41,7 @@ def render_script_page(db: "Db", resref: str, out: Path) -> None:
             a = db.tag_to_area.get(t)
             if a and a in db.areas:
                 parts.append(f"<code>{E(t)}</code> ("
-                             + link(f"../areas/{a}.html", db.area_name(a)) + ")")
+                             + _area_link(db, a, ctx) + ")")
             else:
                 parts.append(f"<code>{E(t)}</code>")
         meta_rows.append("<dt>Teleports to</dt><dd>" + ", ".join(parts) + "</dd>")

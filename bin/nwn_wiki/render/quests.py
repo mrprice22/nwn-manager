@@ -16,7 +16,8 @@ from nwn_wiki.db.derived import _quest_hidden, _quest_slug
 from nwn_wiki.gff import fld, list_items, loc
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html
-from nwn_wiki.htmlgen.links import _script_link, link
+from nwn_wiki.htmlgen.links import (_area_link, _creature_link, _item_link,
+                                    _script_link, link)
 from nwn_wiki.htmlgen.pagectx import PageCtx
 
 
@@ -331,11 +332,11 @@ def render_quests_index(db: Db, out: Path) -> None:
         )
         npc_cell = _quest_loc_cell(
             npcs,
-            lambda it: (link(f"../creatures/{it[0]}.html", it[1])
+            lambda it: (_creature_link(db, it[0], ctx, it[1])
                         if it[0] else nwn_html(it[1])))
         area_cell = _quest_loc_cell(
             areas,
-            lambda it: link(f"../areas/{it[0]}.html", it[1]))
+            lambda it: _area_link(db, it[0], ctx, it[1]))
         return (
             f"<tr><td>{link(f'{slugs[i]}.html', qname)}</td>"
             f"<td><code>{E(tag)}</code></td>"
@@ -456,15 +457,11 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
         if t:
             tag_to_item_rr.setdefault(t, rr)
 
-    def _item_link(irr: str) -> str:
-        return (link(f"../items/{irr}.html", db.item_name(irr))
-                if irr in db.items else E(db.item_name(irr)))
-
     def _items_html(item_set: set[str]) -> str:
         if not item_set:
             return '<span class="muted">&mdash;</span>'
         return ", ".join(
-            _item_link(irr)
+            _item_link(db, irr, ctx) if irr in db.items else E(db.item_name(irr))
             for irr in sorted(item_set, key=lambda r: db.item_name(r).lower())
         )
 

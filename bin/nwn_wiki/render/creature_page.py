@@ -28,7 +28,8 @@ from nwn_wiki.combat import (
 from nwn_wiki.gff import fld, list_items, loc
 from nwn_wiki.htmlgen.chrome import _creature_cr_value, write, write_page
 from nwn_wiki.htmlgen.escape import E, colorize_damage_words, nwn_html, nwn_text
-from nwn_wiki.htmlgen.links import _conv_link, _faction_cell, _race_link, link
+from nwn_wiki.htmlgen.links import (_area_link, _conv_link, _faction_cell,
+                                    _race_link, link)
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.itemprops import (
     _fmt_hp,
@@ -1668,7 +1669,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
                                   key=lambda r: db.area_name(r).lower()):
                 cnt = placed_by_area[area_rr]
                 place_rows.append(
-                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<tr><td>{_area_link(db, area_rr, ctx)}</td>"
                     f"<td>{cnt}</td></tr>"
                 )
             sections.append(
@@ -1691,7 +1692,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
                 blueprint = db.encounters.get(enc_rr, {})
                 ename = loc(blueprint.get("LocalizedName")) or enc_rr or "(unnamed)"
                 enc_rows.append(
-                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<tr><td>{_area_link(db, area_rr, ctx)}</td>"
                     f"<td>{nwn_html(ename)}</td>"
                     f"<td><code>{E(enc_rr)}</code></td></tr>"
                 )
@@ -1714,7 +1715,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
                 script_cell = (", ".join(f"<code>{E(s)}</code>" for s in scripts)
                                if scripts else "—")
                 script_rows.append(
-                    f"<tr><td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                    f"<tr><td>{_area_link(db, area_rr, ctx)}</td>"
                     f"<td>{script_cell}</td></tr>"
                 )
             sections.append(

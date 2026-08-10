@@ -15,7 +15,8 @@ from nwn_wiki.db.index import _store_instance_slug
 from nwn_wiki.gff import fld, list_items, loc
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
-from nwn_wiki.htmlgen.links import _conv_link, link, tileset_label
+from nwn_wiki.htmlgen.links import (_area_link, _conv_link, _creature_link,
+                                    _item_link, link, tileset_label)
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.items import item_gp_value
 from nwn_wiki.lookups import (
@@ -366,7 +367,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
     sections = [
         f"<h1>{nwn_html(pname)}</h1>",
         '<dl class="meta">',
-        f"<dt>Area</dt><dd>{link(f'../areas/{area_resref}.html', db.area_name(area_resref))}</dd>",
+        f"<dt>Area</dt><dd>{_area_link(db, area_resref, ctx)}</dd>",
         f"<dt>Tag</dt><dd><code>{E(tag)}</code></dd>",
         f"<dt>ResRef</dt><dd>{E(rr)}</dd>",
         f"<dt>Position (X, Y, Z)</dt><dd>{x:.2f}, {y:.2f}, {z:.2f}</dd>",
@@ -415,7 +416,7 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
             stack = fld(it, "StackSize", 1)
             base = baseitem_label(fld(it, "BaseItem"))
             cost = item_gp_value(it) or fld(it, "Cost", "")
-            cell = (link(f"../items/{irr}.html", iname)
+            cell = (_item_link(db, irr, ctx, iname)
                     if irr in db.items else nwn_html(iname))
             rows.append(
                 f"<tr><td>{cell}</td>"
@@ -561,7 +562,7 @@ def render_area_page(db: Db, resref: str, out: Path,
                 kt = t.get("key_tag", "")
                 if t.get("key_required") and kt:
                     item_rr = tag_to_item_rr.get(kt.lower())
-                    key_cell = (f"<td>{link(f'../items/{item_rr}.html', db.item_name(item_rr))}</td>"
+                    key_cell = (f"<td>{_item_link(db, item_rr, ctx)}</td>"
                                 if item_rr else f"<td><code>{E(kt)}</code></td>")
                 else:
                     key_cell = "<td></td>"
@@ -599,7 +600,7 @@ def render_area_page(db: Db, resref: str, out: Path,
                 kt = t.get("key_tag", "")
                 if t.get("key_required") and kt:
                     item_rr = tag_to_item_rr.get(kt.lower())
-                    key_cell = (f"<td>{link(f'../items/{item_rr}.html', db.item_name(item_rr))}</td>"
+                    key_cell = (f"<td>{_item_link(db, item_rr, ctx)}</td>"
                                 if item_rr else f"<td><code>{E(kt)}</code></td>")
                 else:
                     key_cell = "<td></td>"
@@ -649,9 +650,8 @@ def render_area_page(db: Db, resref: str, out: Path,
             if not conv and bp:
                 conv = fld(bp, "Conversation", "") or ""
             can_rr = db.canonical_for_inst.get((resref, idx), rr)
-            inst_url = f"../creatures/{can_rr}.html"
-            name_cell = f'<a href="{E(inst_url)}">{nwn_html(disp)}</a>'
-            bp_cell = (link(f"../creatures/{can_rr}.html", db.canonical_creature_name(can_rr))
+            name_cell = _creature_link(db, can_rr, ctx, disp)
+            bp_cell = (_creature_link(db, can_rr, ctx)
                        if can_rr in db.canonical_creatures else
                        (f"<code>{E(rr)}</code>" if rr else ""))
             rows.append(
@@ -697,7 +697,7 @@ def render_area_page(db: Db, resref: str, out: Path,
                     cr = fld(s, "CR", "")
                     can_srr = db.canonical_for_bp.get(srr, srr)
                     disp = db.canonical_creature_name(can_srr) if can_srr in db.canonical_creatures else (db.creature_name(srr) if srr in db.creatures else srr)
-                    cell = (link(f"../creatures/{can_srr}.html", disp)
+                    cell = (_creature_link(db, can_srr, ctx, disp)
                             if can_srr in db.canonical_creatures else nwn_html(disp))
                     spawn_cells.append(f"{cell}<small> CR {E(cr)}</small>")
                 enc_groups[rr] = {
@@ -753,7 +753,7 @@ def render_area_page(db: Db, resref: str, out: Path,
             cr2 = fld(bp2, "ChallengeRating", "")
             conv2 = fld(bp2, "Conversation", "")
             ss_rows.append(
-                f"<tr><td>{link(f'../creatures/{can_rr2}.html', name2)}</td>"
+                f"<tr><td>{_creature_link(db, can_rr2, ctx, name2)}</td>"
                 f"<td><code>{E(sp['bp_rr'])}</code></td>"
                 f"<td>{E(race_name(fld(bp2, 'Race')))}</td>"
                 f"<td>{E(cls_str2)}</td>"

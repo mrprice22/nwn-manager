@@ -15,7 +15,8 @@ from nwn_wiki.db.index import _store_instance_slug
 from nwn_wiki.gff import fld, list_items, loc
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
-from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.links import (_area_link, _creature_link, _item_link,
+                                    link)
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.items import (
     _CREATURE_WEAPON_BASEITEMS,
@@ -133,7 +134,7 @@ def _creature_store_section(db: "Db", creature_resref: str,
             pages = list_items(inst.get("StoreList"))
             n_items = sum(len(list_items(p.get("ItemList"))) for p in pages)
 
-            area_cell = link(ctx.url(f"areas/{area_rr}.html"), db.area_name(area_rr))
+            area_cell = _area_link(db, area_rr, ctx)
 
             mu_val = fld(inst, "MarkUp", None)
             md_val = fld(inst, "MarkDown", None)
@@ -197,7 +198,7 @@ def _store_opener_html(db: Db, opener: dict, ctx: PageCtx) -> str:
         else:
             can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
             name = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else (rr or "NPC")
-            npc_html = (link(ctx.url(f"creatures/{can_rr}.html"), name)
+            npc_html = (_creature_link(db, can_rr, ctx, name)
                         if can_rr in db.canonical_creatures else nwn_html(name))
         if via_dlg and via_dlg in db.dialogs:
             conv = link(ctx.url(f"conversations/{via_dlg}.html"), "conversation")
@@ -209,8 +210,7 @@ def _store_opener_html(db: Db, opener: dict, ctx: PageCtx) -> str:
         areas = opener.get("areas", [])
         area_html = ""
         if areas and areas[0] in db.areas:
-            area_html = " in " + link(ctx.url(f"areas/{areas[0]}.html"),
-                                      db.area_name(areas[0]))
+            area_html = " in " + _area_link(db, areas[0], ctx)
         return f'Trigger <code>{E(inst_tag)}</code>{area_html}'
 
     if kind in ("placeable-event", "placeable-event-instance"):
@@ -412,7 +412,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
     sections = [f"<h1>{nwn_html(name)}</h1>"]
 
     # Location and blueprint metadata
-    area_link = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+    area_link = (_area_link(db, area_rr, ctx)
                  if area_rr in db.areas else E(area_rr))
     meta = [
         f"<dt>Area</dt><dd>{area_link}</dd>",
@@ -437,7 +437,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
     inst_pages = list_items(inst.get("StoreList"))
     max_gp, max_irr, max_name, avg_gp = _store_item_gp_stats(db, inst_pages)
     if max_gp > 0:
-        max_item_html = (link(f"../items/{max_irr}.html", max_name)
+        max_item_html = (_item_link(db, max_irr, ctx, max_name)
                          if max_irr in db.items else E(max_name))
         meta.append(f"<dt>Most Valuable Item</dt><dd>{max_item_html} ({max_gp:,} gp)</dd>")
         meta.append(f"<dt>Avg Item Value</dt><dd>{avg_gp:,.0f} gp</dd>")
@@ -539,7 +539,7 @@ def render_stores_index(db: Db, out: Path) -> None:
             mu_str = f"{mu_val}%" if mu_val is not None else "—"
             md_str = (f"{md_val}%" if md_val is not None else "—") if buys_any else "N/A"
 
-            area_cell = link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+            area_cell = _area_link(db, area_rr, ctx)
 
             # Only show openers in the same area. All store-opening scripts use
             # GetNearestObjectByTag (area-local), so a cross-area NPC with the
@@ -647,10 +647,10 @@ def render_stores_index(db: Db, out: Path) -> None:
     body += _IDX_TABLE_HEAD + "\n".join(r[1] for r in placed_rows) + "</tbody></table>"
 
     if gm_cost > 0:
-        item_html = (link(f"../items/{gm_irr}.html", gm_item_name)
+        item_html = (_item_link(db, gm_irr, ctx, gm_item_name)
                      if gm_irr in db.items else E(gm_item_name))
         store_html = link(f"{gm_slug}.html", gm_store_name)
-        area_html = link(f"../areas/{gm_area_rr}.html", db.area_name(gm_area_rr))
+        area_html = _area_link(db, gm_area_rr, ctx)
         body += (
             "<h2>Most Valuable Item for Sale</h2>"
             f"<p>{item_html} — <strong>{gm_cost:,} gp</strong> base value, "
@@ -710,7 +710,7 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
             slug = _store_instance_slug(area_rr, inst)
             inst_rows.append(
                 f"<tr>"
-                f"<td>{link(f'../areas/{area_rr}.html', db.area_name(area_rr))}</td>"
+                f"<td>{_area_link(db, area_rr, ctx)}</td>"
                 f"<td>{link(f'{slug}.html', inst_tag) if inst_tag else '—'}</td>"
                 f"<td>{n_items}</td>"
                 f"<td>{f'{mu}%' if mu is not None else '—'}</td>"
@@ -739,7 +739,7 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
     bp_max_gp, bp_max_irr, bp_max_name, bp_avg_gp = _store_item_gp_stats(db, pages)
     bp_max_item_html = ""
     if bp_max_gp > 0:
-        bp_max_item_html = (link(f"../items/{bp_max_irr}.html", bp_max_name)
+        bp_max_item_html = (_item_link(db, bp_max_irr, ctx, bp_max_name)
                             if bp_max_irr in db.items else E(bp_max_name))
     _bp_buy_html, _bp_buys_any = _store_buy_summary(s)
     bp_meta = [

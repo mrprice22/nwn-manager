@@ -16,7 +16,7 @@ from pathlib import Path
 from nwn_wiki.gff import fld, list_items, loc
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, colorize_damage_words, nwn_html, nwn_text
-from nwn_wiki.htmlgen.links import link
+from nwn_wiki.htmlgen.links import _area_link, _creature_link, link
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.itemprops import (
     _cost_anchor,
@@ -647,7 +647,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 dests = sorted({t["area"] for t in tps if t.get("area")})
                 if dests:
                     tp_note = " — teleports to " + ", ".join(
-                        link(f"../areas/{a}.html", db.area_name(a))
+                        _area_link(db, a, ctx)
                         for a in dests if a in db.areas)
             sections.append(
                 f"<li>{link(f'../conversations/{d}.html', db.dialog_label(d))} "
@@ -745,7 +745,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             rows = []
             for s in sold_at:
                 area_rr = s["area_rr"]
-                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                area_cell = (_area_link(db, area_rr, ctx)
                              if area_rr in db.areas else E(area_rr))
                 store_cell = link(f"../stores/{s['slug']}.html", s["name"])
                 rows.append(f"<tr><td>{store_cell}</td><td>{area_cell}</td></tr>")
@@ -758,7 +758,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             rows = []
             for c in in_containers:
                 area_rr = c["area_rr"]
-                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                area_cell = (_area_link(db, area_rr, ctx)
                              if area_rr in db.areas else E(area_rr))
                 href = f"../containers/{area_rr}-{c['idx']:03d}.html"
                 lock_note = ""
@@ -777,10 +777,10 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             rows = []
             for c in carried_by:
                 area_rr = c["area_rr"]
-                area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+                area_cell = (_area_link(db, area_rr, ctx)
                              if area_rr in db.areas else E(area_rr))
                 crr = c["crr"]
-                creature_cell = (link(f"../creatures/{crr}.html", c["cname"])
+                creature_cell = (_creature_link(db, crr, ctx, c["cname"])
                                  if crr in db.canonical_creatures else E(c["cname"]))
                 drops = c.get("dropable", False)
                 drop_cell = "Yes" if drops else '<span class="muted">No</span>'
@@ -806,7 +806,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 script_rr = src["script"]
                 areas = src.get("areas") or []
                 area_cells = ", ".join(
-                    link(f"../areas/{a}.html", db.area_name(a))
+                    _area_link(db, a, ctx)
                     for a in areas if a in db.areas
                 ) or "—"
                 if kind == "module-event":
@@ -820,7 +820,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                     crr = src.get("crr") or ""
                     can_crr = db.canonical_for_bp.get(crr, crr) if crr else ""
                     cname = db.canonical_creature_name(can_crr) if can_crr else script_rr
-                    creature_html = (link(f"../creatures/{can_crr}.html", cname)
+                    creature_html = (_creature_link(db, can_crr, ctx, cname)
                                      if can_crr in db.canonical_creatures else E(cname))
                     source_cell = f"{creature_html} <small class=\"muted\">({E(src['label'])})</small>"
                 else:  # placeable-event
@@ -851,7 +851,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
         rows = []
         for kf in key_for:
             area_rr = kf["area_rr"]
-            area_cell = (link(f"../areas/{area_rr}.html", db.area_name(area_rr))
+            area_cell = (_area_link(db, area_rr, ctx)
                          if area_rr in db.areas else E(area_rr))
             if kf["kind"] == "container":
                 obj_cell = link(
@@ -867,7 +867,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             if has_dst:
                 dst_rr = kf.get("dst_area")
                 if dst_rr:
-                    dst_cell = (link(f"../areas/{dst_rr}.html", db.area_name(dst_rr))
+                    dst_cell = (_area_link(db, dst_rr, ctx)
                                 if dst_rr in db.areas else E(dst_rr))
                 else:
                     dst_cell = ""
@@ -912,7 +912,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 ctx_cell = E(kind)
             areas = sc.get("areas") or []
             area_cells = ", ".join(
-                link(f"../areas/{a}.html", db.area_name(a))
+                _area_link(db, a, ctx)
                 for a in areas if a in db.areas
             ) or "—"
             rows.append(
