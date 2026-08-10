@@ -2225,8 +2225,52 @@ items:
 - id: typed-link-helpers
   phase: 2
   title: Add _area_link/_item_link/_creature_link and route hand-built hrefs
-  status: pending
+  status: done
   gate: expected-diff
+  commit: 502c72e
+  date: 2026-08-10
+  gate_result: "check --all --expect gates/typed-link-helpers.json: homers_lotr IDENTICAL (144s), lotr2008 IDENTICAL (91s), lotr2009 IDENTICAL (104s) — zero diff, as predicted; no rebaseline needed"
+  impl_notes: >
+    THE ITEM'S PREMISE WAS STALE and the survey says so: the '111 raw anchors bypass
+    link()'s escaping, ~46% of anchors' claim predates the phase-1 split, and earlier
+    items had already routed the typed targets through link().  Of the 111 <a href
+    f-strings left in the package, only 5 target area/item/creature pages; the rest
+    are in-page #anchors, nav chrome, SVG map anchors or embedded-JS strings.  Every
+    converted site already emitted E(href) + nwn_html(text), so nothing became newly
+    escaped — hence the predicted and observed zero diff.  The real defect this item
+    fixed was the OTHER half of its plan: directory prefixes spelled out by hand at
+    47 sites (areas 22, items 8, creatures 9, conversations 5, stores 2, scripts 1),
+    plus 15 more that used ctx.url() but still inlined the directory.
+    Added _area_link/_item_link/_creature_link to htmlgen/links.py, each taking the
+    PageCtx introduced by root-rel-derive and building the URL through ctx.url(), with
+    the label defaulting to db.area_name / db.item_name / db.canonical_creature_name.
+    They are deliberately UNCONDITIONAL, unlike _script_link/_conv_link: the
+    missing-target fallbacks genuinely differ across call sites (E(), nwn_html(),
+    <code>, "", em-dash), so existence policy stays at the call site.
+    50 sites converted (_area_link 31, _item_link 9, _creature_link 10) across eight
+    render modules; none spells a ../ prefix any more.  render_bosses_index and
+    render_creatures_by_area gained a local ctx that now also feeds their write_page.
+    The local _item_link inside render_quest_page is hoisted away, its `in db.items`
+    guard inlined at its one caller.
+    DELIBERATELY NOT CONVERTED, because each would change more than escaping and the
+    declaration forbids that: _render_server_first_body (has neither db nor ctx in
+    scope), three `creature url if can_rr else "#"` sites where the else branch is not
+    a creature URL, and the hrefs built inside embedded JavaScript.
+  found:
+    - "_render_server_first_body builds a creature link with no db/ctx in scope;
+       threading both in would let it route through _creature_link."
+    - "render/areas.py, render/stores.py and render/conversations.py hold three copies
+       of the same `creature-url-or-#` idiom — one shared helper should own the
+       missing-target case."
+    - "Five sites label conversation links with db.dialog_label(); _conv_link needs a
+       text= override before they can route through it."
+    - "No _store_link exists, so two sites still spell ../stores/, and one script link
+       spells ../scripts/ although _script_link's <code> fallback already matches it."
+    - "render/map.py's SVG <a> wrappers use a hand-built url_prefix rather than a
+       PageCtx; they wrap elements rather than text, so link() cannot own them as-is."
+    - "render/creature_page.py and render/itemprops_pages.py duplicate the site's URL
+       shapes in client-side JS, which no Python helper can own today."
+
   after: [root-rel-derive]
   plan: >
     111 anchors are written as raw f-string <a href=...> against 129 link()
