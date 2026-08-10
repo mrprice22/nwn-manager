@@ -1717,8 +1717,59 @@ items:
 - id: render-activity
   phase: 1
   title: Extract log parsing and the activity page into render/activity.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 3844cb1
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (134s), lotr2008 IDENTICAL (88s), lotr2009 IDENTICAL (102s) — the gate does NOT reach this code; see the side-by-side run below"
+  impl_notes: >
+    render/activity.py 842 lines, state-free (log regexes, _collect_log_files, the
+    cache trio, _parse_one_log_file, parse_nwserver_logs, the chart builders,
+    render_activity_page).  util.py 20 -> 44; render/manual.py 90 -> 242; cli.py
+    3,817 -> 2,844.
+    DECISIONS: _tz_label_from_env went to util.py — pure TZ->label, stdlib only, and
+    putting it there is what unblocked everything else (manual.py gets it without
+    importing render.activity, and activity.py stops needing os).
+    _render_server_first_body went to render/manual.py, not activity.py or
+    bestiary.py: its only caller is render_manual_pages and what it produces IS a
+    manual page (manual/ServerFirsts.html), while bestiary.py is a loader module with
+    no page()/write()/link() and would have gained an htmlgen.links edge for one
+    function.  With that resolved, render_manual_pages itself moved into
+    render/manual.py, finishing render-scripts-manual.  Its two phase-2 bugs are
+    confirmed still present and untouched for server-firsts-reset.
+    STATE AUDIT (16 accesses, all state.X): manual.py writes _MANUAL_MENUS,
+    _MANUAL_MENU_ORDER and _HAS_SERVER_FIRSTS and reads _BESTIARY_ACTIVE,
+    _SERVER_FIRSTS and BST_SF_CR; activity.py touches no state at all.
+    BY-HAND VERIFICATION (the gate is blind here): built a fake corpus — docs.manual/
+    with @menu/@order/@menu-order directives and a <title>-only .html, an nwserver-
+    format log with a restart marker plus 2 player and 1 GM session, an Anvil-format
+    log with an open session, and a sqlite bestiary DB — then ran HEAD's tree
+    (git archive) and the worktree's bin/nwn-wiki-activity against identical copies
+    under TZ=America/Chicago.  diff -r IDENTICAL on activity.html and all four manual
+    pages, with and without --db-dir (the second pass also exercises the
+    _HAS_SERVER_FIRSTS elif branch and the fingerprint-skip path); the sessions cache
+    differed only in its absolute path key.  The generated nav carried Player
+    Activity + Server Firsts + Intro Page and a Lore submenu — runtime proof that
+    manual.py's state writes reach chrome.py's nav builders.  Every wiki.<attr> the
+    external entry points poke was asserted to resolve, and a _load_activity_cache ->
+    mutate -> _save_activity_cache round-trip through cli.* worked (v2, .bak written).
+    --check-online, --check-should-refresh and the no---log-dir error path all return
+    their documented exit codes.
+    Line multiset: 980 lines left cli.py, 7 added; the only removed lines absent
+    downstream are the four dead manual imports and the rewritten util import line.
+  found:
+    - "cli.py now also has five dead stdlib imports (math, html, Counter, date,
+       timedelta) on top of ~100 dead from-imports."
+    - "The '# Bestiary kill stats' banner rode into render/manual.py where it now
+       titles only _render_server_first_body and reads oddly."
+    - "nwn-wiki-activity's _load_nwn_wiki() docstring still claims it returns
+       nwn_wiki.cli because the script sets module attributes on the result; it now
+       sets them on nwn_wiki.state directly, and the cli import is only a facade for
+       eight function attributes that could point at their real modules."
+    - "_render_server_first_body re-derives tz_label via _tz_label_from_env() while
+       render_activity_page takes it as a parameter, so the two could disagree if a
+       caller ever passed a non-default label."
+
   after: [render-scripts-manual]
   ranges: "15081-15874"
   plan: >
