@@ -1396,8 +1396,53 @@ items:
 - id: render-stores
   phase: 1
   title: Extract store renderers into render/stores.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: f1fae85
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (133s), lotr2008 IDENTICAL (81s), lotr2009 IDENTICAL (107s)"
+  impl_notes: >
+    render/stores.py 852 lines (826 verbatim); cli.py 7,293 -> 6,478.  Moved the whole
+    cluster: _buy_limit_str, _store_buy_base_types, _store_buy_summary,
+    _CREATURE_STORES_TABLE_HEAD, _creature_store_section, _STORE_TABLE_HEAD,
+    _store_opener_html, _store_inventory_html, _store_inventory_toc_html,
+    _store_item_gp_stats, render_store_instance_page, render_stores_index (which owns
+    the function-local _IDX_TABLE_HEAD) and render_store_page.  DRAGGED ALONG:
+    _caller_html, because _store_opener_html falls through to it — it is a
+    conversations helper by nature, so render-conversations should relocate it from
+    here later (sibling import, no cycle either way).  cli.py imports nine names back
+    for render_area_page, render_creature_page, render_dialog_page and main.
+    _store_instance_slug DECISION: left in db/index.py, imported by render/stores.py.
+    Moving it would make db/ import render/, inverting the package layering that
+    db/'s own docstring records; no cycle would form today, but the inversion is
+    worse than the status quo, and the 'small slug/link leaf' alternative is a
+    new-module decision, not a move.
+    STATE AUDIT: zero — AST free-name analysis plus a state. grep found no state
+    reference at all in either moved block.
+    BOTH DEPENDENT ITEMS ARE NOW UNBLOCKED: render/creature_page.py can import
+    _creature_store_section, and render/areas.py can import _store_buy_summary,
+    _buy_limit_str, _store_item_gp_stats and _store_opener_html; render/stores.py
+    imports neither of those modules, so no cycle.  render-area-page also needs
+    _caller_html, which resolves via render/stores.py today or render/conversations.py
+    if that item lands first.
+  found:
+    - "_STORE_TABLE_HEAD is dead — no reader anywhere in the tree, before or after
+       the move.  Delete it in a later phase."
+    - "render_stores_index defines _IDX_TABLE_HEAD as a function-local constant,
+       rebuilt on every call, while its two sibling table heads are module-level."
+    - "The 4-column store table header HTML is duplicated verbatim FOUR times:
+       _CREATURE_STORES_TABLE_HEAD, _IDX_TABLE_HEAD, inline in render_store_page and
+       inline in render_area_page.  dedup-layout-wrappers should fold all four."
+    - "The `'N/A' if not buys_any else _buy_limit_str(...)` cell expression repeats 6
+       times across the cluster and areas."
+    - "_store_inventory_html and _store_inventory_toc_html each carry a byte-identical
+       ~25-line bucketing/_expand/weapon-key preamble, itself a near-copy of logic in
+       render/items.py — dedup-items-skeleton's target."
+    - "cli.py's dead-import count is now ~71 (this move added 8).  One sweep at the
+       end of phase 1 clears them all; cli-module owns it."
+    - "_store_opener_html is essentially a compact re-implementation of _caller_html's
+       first three branches (creature/trigger/placeable)."
+
   after: [render-itemprops]
   ranges: "12515-13256"
 
