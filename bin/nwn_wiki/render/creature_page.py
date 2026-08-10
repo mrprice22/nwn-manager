@@ -73,7 +73,7 @@ from nwn_wiki.lookups import (
     skill_name,
     spell_name,
 )
-from nwn_wiki.render.creatures import _pic_figures, creature_max_hp
+from nwn_wiki.render.creatures import _bp_field, _pic_figures, creature_max_hp
 from nwn_wiki.render.stores import _creature_store_section
 from nwn_wiki.sim.combat import attack_profile
 from nwn_wiki.util import _try_int
@@ -1757,11 +1757,7 @@ def render_creatures_search(db: Db, out: Path) -> None:
         bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
         state._current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
 
-        def _f(key, default=None, _c=c, _bp=bp):
-            v = fld(_c, key)
-            if v is None and _bp is not None:
-                v = fld(_bp, key)
-            return default if v is None else v
+        _f = _bp_field(c, bp)
 
         D = extract_creature_defenses(db, c, bp)
 

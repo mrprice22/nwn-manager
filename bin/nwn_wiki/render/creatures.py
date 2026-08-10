@@ -45,6 +45,85 @@ def creature_max_hp(c: dict | None, bp: dict | None = None) -> int | None:
     return base + epic_toughness_hp(creature_feat_ids(c, bp))
 
 
+def _bp_field(c: dict | None, bp: dict | None):
+    """Field getter for a creature: instance value first, blueprint fallback.
+
+    Every creature table needs the same instance-then-blueprint lookup; the
+    returned closure captures the pair so call sites read as ``_f('Race')``."""
+
+    def _f(key, default=None):
+        v = fld(c, key)
+        if v is None and bp is not None:
+            v = fld(bp, key)
+        return default if v is None else v
+
+    return _f
+
+
+def _class_str(c: dict | None, bp: dict | None) -> str:
+    """"Class Lvl/Class Lvl" summary of a creature's ClassList (bp fallback)."""
+    classes = list_items((c or {}).get("ClassList")) or (
+        list_items(bp.get("ClassList")) if bp else [])
+    return "/".join(
+        f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
+        for cl in classes
+    )
+
+
+def _kills_head() -> str:
+    """<th>s for the bestiary kill columns; empty when no bestiary is loaded."""
+    return ("<th>Kills</th><th>Solo</th><th>Party</th>"
+            if state._BESTIARY_ACTIVE else "")
+
+
+def _kills_cells(resrefs: list[str]) -> str:
+    """Kill <td>s matching _kills_head(), summed over ``resrefs`` (a boss counts
+    its variant blueprints as one). Kept beside the header so the two can't drift."""
+    if not state._BESTIARY_ACTIVE:
+        return ""
+    ks = [state._BESTIARY_KILLS[r] for r in resrefs if r in state._BESTIARY_KILLS]
+    if not ks:
+        return "<td>—</td><td>—</td><td>—</td>"
+    return (f"<td>{sum(k['total'] for k in ks)}</td>"
+            f"<td>{sum(k['solo'] for k in ks)}</td>"
+            f"<td>{sum(k['party'] for k in ks)}</td>")
+
+
+def _faction_cell(db: Db, c: dict | None, bp: dict | None) -> str:
+    """<td> holding a creature's faction name; empty for a creature-less row."""
+    if c is None:
+        return "<td></td>"
+    return f"<td>{E(db.faction_name(_bp_field(c, bp)('FactionID', '')))}</td>"
+
+
+def _creature_row(name_cell: str, c: dict | None, bp: dict | None, *,
+                  after_name: str = "", show_race: bool = True,
+                  cr_default="", tail: str = "") -> str:
+    """One <tr> of the shape every creature table shares.
+
+    Columns: Name, ``after_name`` cells, [Race], Class, HP, CR, ``tail`` cells.
+    ``c``/``bp`` are the canonical instance and its blueprint; pass ``c=None``
+    for a row with no creature behind it (a boss-registry resref with no page),
+    which blanks race/class/HP and falls back to ``cr_default``."""
+    if c is None:
+        race, cls_str, hp, cr = "", "", None, cr_default
+    else:
+        _f = _bp_field(c, bp)
+        race = race_name(_f("Race"))
+        cls_str = _class_str(c, bp)
+        hp = creature_max_hp(c, bp)
+        cr = _f("ChallengeRating", cr_default)
+    return (
+        f"<tr><td>{name_cell}</td>"
+        f"{after_name}"
+        f"{f'<td>{E(race)}</td>' if show_race else ''}"
+        f"<td>{E(cls_str)}</td>"
+        f"<td>{E(hp if hp is not None else '')}</td>"
+        f"<td>{E(cr)}</td>"
+        f"{tail}</tr>"
+    )
+
+
 def render_creatures_index(db: Db, out: Path) -> None:
     rows_present = []
     rows_absent = []
@@ -54,18 +133,6 @@ def render_creatures_index(db: Db, out: Path) -> None:
         c = entry["c"]
         bp_rr = entry["bp_rr"]
         bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
-
-        def _f(key, default=None):
-            v = fld(c, key)
-            if v is None and bp is not None:
-                v = fld(bp, key)
-            return default if v is None else v
-
-        classes = list_items(c.get("ClassList")) or (list_items(bp.get("ClassList")) if bp else [])
-        cls_str = "/".join(
-            f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
-            for cl in classes
-        )
         is_variant = db.canonical_bp_of.get(can_rr) != can_rr
         if is_variant:
             base_rr = db.canonical_bp_of[can_rr]
@@ -75,27 +142,12 @@ def render_creatures_index(db: Db, out: Path) -> None:
             )
         else:
             variant_note = ""
-        _eff_hp = creature_max_hp(c, bp)
         total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
-        if state._BESTIARY_ACTIVE:
-            k = state._BESTIARY_KILLS.get(can_rr)
-            kills_cells = (
-                f"<td>{k['total'] if k else '—'}</td>"
-                f"<td>{k['solo'] if k else '—'}</td>"
-                f"<td>{k['party'] if k else '—'}</td>"
-            )
-        else:
-            kills_cells = ""
-        row = (
-            f"<tr><td>{link(f'{can_rr}.html', db.canonical_creature_name(can_rr))}"
-            f"{variant_note}</td>"
-            f"<td>{total_count if total_count else '—'}</td>"
-            f"<td>{E(race_name(_f('Race')))}</td>"
-            f"<td>{E(cls_str)}</td>"
-            f"<td>{E(_eff_hp if _eff_hp is not None else '')}</td>"
-            f"<td>{E(_f('ChallengeRating', ''))}</td>"
-            f"<td>{E(db.faction_name(_f('FactionID', '')))}</td>"
-            f"{kills_cells}</tr>"
+        row = _creature_row(
+            f"{link(f'{can_rr}.html', db.canonical_creature_name(can_rr))}{variant_note}",
+            c, bp,
+            after_name=f"<td>{total_count if total_count else '—'}</td>",
+            tail=_faction_cell(db, c, bp) + _kills_cells([can_rr]),
         )
         if total_count:
             rows_present.append(row)
@@ -108,13 +160,11 @@ def render_creatures_index(db: Db, out: Path) -> None:
         f" ({n_variants} equipment/class/name variant{'s' if n_variants != 1 else ''})"
         if n_variants else ""
     )
-    kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
-                  if state._BESTIARY_ACTIVE else "")
     TABLE_HEAD = (
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>Count</th><th>Race</th><th>Class</th>"
         "<th>HP</th><th>CR</th><th>Faction</th>"
-        f"{kills_head}"
+        f"{_kills_head()}"
         "</tr></thead><tbody>"
     )
     toc_parts = [
@@ -220,64 +270,28 @@ def render_bosses_index(db: Db, out: Path) -> None:
             c = entry["c"]
             bp_rr = entry["bp_rr"]
             bp = db.creatures.get(bp_rr) if bp_rr != rr else None
-
-            def _f(key, default=None):
-                v = fld(c, key)
-                if v is None and bp is not None:
-                    v = fld(bp, key)
-                return default if v is None else v
-
-            classes = (list_items(c.get("ClassList"))
-                       or (list_items(bp.get("ClassList")) if bp else []))
-            cls_str = "/".join(
-                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
-                for cl in classes
-            )
-            race = race_name(_f("Race"))
-            hp = creature_max_hp(c, bp)
-            cr = _f("ChallengeRating", boss["cr"])
-            faction = db.faction_name(_f("FactionID", ""))
         else:
             # Registry row without a matching creature page — registry/module
             # drift; render unlinked and surface it in lookup_warnings.json.
             _warn_once(f"boss registry resref '{rr}' has no creature page "
                        f"(check BRD_SeedBoss rows in brd_db.nss)")
             name_cell = E(boss["name"])
-            cls_str, race, hp, faction = "", "", None, ""
-            cr = boss["cr"]
+            c = bp = None
         area_rr = boss["area"]
         if area_rr in db.areas and area_rr not in db.hidden_areas:
             lair_cell = _area_link(db, area_rr, ctx, boss["area_name"])
         else:
             lair_cell = E(boss["area_name"])
-        if state._BESTIARY_ACTIVE:
-            # Sum kills across the boss's variant blueprints (e.g. the five
-            # leveled Xanith .utcs all count as one boss on the board).
-            variant_rrs = [rr] + [v for v, canon in state._BOSS_ALIASES.items()
-                                  if canon == rr]
-            ks = [state._BESTIARY_KILLS[v] for v in variant_rrs if v in state._BESTIARY_KILLS]
-            if ks:
-                kills_cells = (
-                    f"<td>{sum(k['total'] for k in ks)}</td>"
-                    f"<td>{sum(k['solo'] for k in ks)}</td>"
-                    f"<td>{sum(k['party'] for k in ks)}</td>"
-                )
-            else:
-                kills_cells = "<td>—</td><td>—</td><td>—</td>"
-        else:
-            kills_cells = ""
-        rows.append(
-            f"<tr><td>{name_cell}</td>"
-            f"<td>{lair_cell}</td>"
-            f"<td>{E(race)}</td>"
-            f"<td>{E(cls_str)}</td>"
-            f"<td>{E(hp if hp is not None else '')}</td>"
-            f"<td>{E(cr)}</td>"
-            f"<td>{E(faction)}</td>"
-            f"{kills_cells}</tr>"
-        )
-    kills_head = ("<th>Kills</th><th>Solo</th><th>Party</th>"
-                  if state._BESTIARY_ACTIVE else "")
+        # Sum kills across the boss's variant blueprints (e.g. the five
+        # leveled Xanith .utcs all count as one boss on the board).
+        variant_rrs = [rr] + [v for v, canon in state._BOSS_ALIASES.items()
+                              if canon == rr]
+        rows.append(_creature_row(
+            name_cell, c, bp,
+            after_name=f"<td>{lair_cell}</td>",
+            cr_default=boss["cr"],
+            tail=_faction_cell(db, c, bp) + _kills_cells(variant_rrs),
+        ))
     n = len(state._BOSS_REGISTRY)
     body = (
         "<h1>Bosses</h1>"
@@ -290,7 +304,7 @@ def render_bosses_index(db: Db, out: Path) -> None:
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>Lair</th><th>Race</th><th>Class</th>"
         "<th>HP</th><th>CR</th><th>Faction</th>"
-        f"{kills_head}"
+        f"{_kills_head()}"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
     write_page(out, ctx, "Bosses", body)
@@ -442,19 +456,6 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
             c2 = entry["c"]
             bp2_rr = entry["bp_rr"]
             bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
-
-            def _f2(key, default=None):
-                v = fld(c2, key)
-                if v is None and bp2 is not None:
-                    v = fld(bp2, key)
-                return default if v is None else v
-
-            classes2 = list_items(c2.get("ClassList")) or (
-                list_items(bp2.get("ClassList")) if bp2 else [])
-            cls_str2 = "/".join(
-                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
-                for cl in classes2
-            )
             info = area_map[can_rr][area_rr]
             placed = info["placed"]
             enc = info["enc"]
@@ -468,16 +469,11 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
                 badges.append('<span class="badge">script</span>')
             method = " + ".join(badges) if badges else "—"
             count = placed + enc + script
-            _eff_hp2 = creature_max_hp(c2, bp2)
-            rows.append(
-                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
-                f"<td>{E(race_name(_f2('Race')))}</td>"
-                f"<td>{E(cls_str2)}</td>"
-                f"<td>{E(_eff_hp2 if _eff_hp2 is not None else '')}</td>"
-                f"<td>{E(_f2('ChallengeRating', ''))}</td>"
-                f"<td>{method}</td>"
-                f"<td>{count}</td></tr>"
-            )
+            rows.append(_creature_row(
+                link(f"../{can_rr}.html", db.canonical_creature_name(can_rr)),
+                c2, bp2,
+                tail=f"<td>{method}</td><td>{count}</td>",
+            ))
         sections.append(
             '<table class="data"><thead><tr>'
             "<th>Name</th><th>Race</th><th>Class</th>"
@@ -503,9 +499,7 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
         c2 = entry["c"]
         bp2_rr = entry["bp_rr"]
         bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
-        raw = fld(c2, "ChallengeRating")
-        if raw is None and bp2 is not None:
-            raw = fld(bp2, "ChallengeRating")
+        raw = _bp_field(c2, bp2)("ChallengeRating")
         if raw is None:
             return None
         try:
@@ -587,28 +581,11 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
             c2 = entry["c"]
             bp2_rr = entry["bp_rr"]
             bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
-
-            def _f3(key, default=None, _c2=c2, _bp2=bp2):
-                v = fld(_c2, key)
-                if v is None and _bp2 is not None:
-                    v = fld(_bp2, key)
-                return default if v is None else v
-
-            classes3 = list_items(c2.get("ClassList")) or (
-                list_items(bp2.get("ClassList")) if bp2 else [])
-            cls_str3 = "/".join(
-                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
-                for cl in classes3
-            )
-            _eff_hp3 = creature_max_hp(c2, bp2)
-            rows.append(
-                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
-                f"<td>{E(race_name(_f3('Race')))}</td>"
-                f"<td>{E(cls_str3)}</td>"
-                f"<td>{E(_eff_hp3 if _eff_hp3 is not None else '')}</td>"
-                f"<td>{E(_f3('ChallengeRating', ''))}</td>"
-                f"<td>{E(db.faction_name(_f3('FactionID', '')))}</td></tr>"
-            )
+            rows.append(_creature_row(
+                link(f"../{can_rr}.html", db.canonical_creature_name(can_rr)),
+                c2, bp2,
+                tail=_faction_cell(db, c2, bp2),
+            ))
         return (
             f'<h2 id="{E(anchor)}">{E(label)}'
             f' <small class="muted">({len(rows)})</small></h2>'
@@ -637,9 +614,7 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
         c2 = entry["c"]
         bp2_rr = entry["bp_rr"]
         bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
-        raw = fld(c2, "Race")
-        if raw is None and bp2 is not None:
-            raw = fld(bp2, "Race")
+        raw = _bp_field(c2, bp2)("Race")
         if raw is None:
             return None
         try:
@@ -711,29 +686,14 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
             c2 = entry["c"]
             bp2_rr = entry["bp_rr"]
             bp2 = db.creatures.get(bp2_rr) if bp2_rr != can_rr else None
-
-            def _f4(key, default=None, _c2=c2, _bp2=bp2):
-                v = fld(_c2, key)
-                if v is None and _bp2 is not None:
-                    v = fld(_bp2, key)
-                return default if v is None else v
-
-            classes4 = list_items(c2.get("ClassList")) or (
-                list_items(bp2.get("ClassList")) if bp2 else [])
-            cls_str4 = "/".join(
-                f"{class_name(fld(cl, 'Class'))} {fld(cl, 'ClassLevel', '')}"
-                for cl in classes4
-            )
             total_count = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
-            _eff_hp4 = creature_max_hp(c2, bp2)
-            rows.append(
-                f"<tr><td>{link(f'../{can_rr}.html', db.canonical_creature_name(can_rr))}</td>"
-                f"<td>{total_count if total_count else '&#x2014;'}</td>"
-                f"<td>{E(cls_str4)}</td>"
-                f"<td>{E(_eff_hp4 if _eff_hp4 is not None else '')}</td>"
-                f"<td>{E(_f4('ChallengeRating', ''))}</td>"
-                f"<td>{E(db.faction_name(_f4('FactionID', '')))}</td></tr>"
-            )
+            rows.append(_creature_row(
+                link(f"../{can_rr}.html", db.canonical_creature_name(can_rr)),
+                c2, bp2,
+                after_name=f"<td>{total_count if total_count else '&#x2014;'}</td>",
+                show_race=False,
+                tail=_faction_cell(db, c2, bp2),
+            ))
         sections.append(
             f'<h2 id="{E(anchor)}">{E(rname)}'
             f' <small class="muted">({len(rows)})</small></h2>'
