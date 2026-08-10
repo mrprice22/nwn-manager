@@ -1449,8 +1449,37 @@ items:
 - id: render-factions
   phase: 1
   title: Extract render_factions into render/factions.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 6e366b5
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (135s), lotr2008 IDENTICAL (87s), lotr2009 IDENTICAL (110s)"
+  impl_notes: >
+    render/factions.py 490 lines (467 body); cli.py 6,478 -> 6,010.  render_factions
+    and the orphaned render_journal moved verbatim; render_journal is still uncalled,
+    as journal-decide requires.  Nothing dragged or left behind — the block owns no
+    module-level constants (_QUEST_PRIORITY_LABELS below it belongs to Quests and
+    stayed) and its three helpers (_int_fid, _total_levels, _faction_anchor) are
+    function-local.  One-way dependency render.factions -> render.creatures, no
+    cycle.  Iteration order, sort keys and set/dict construction untouched, so the
+    PYTHONHASHSEED-sensitive faction tables are unchanged.  STATE AUDIT: zero — no
+    state symbol is read or written; everything comes off the db object.  Line
+    multiset exact apart from two blank separator lines now supplied by the new
+    module's header.
+  found:
+    - "The '(None) faction' detail section is a near-verbatim clone of the per-faction
+       detail loop body with every local renamed to a _-prefixed variant — prime
+       dedup target."
+    - "render_factions is 437 lines covering five distinct sub-renders (TOC, summary
+       table, race x faction matrix, per-faction details, cross-faction alert)."
+    - "_faction_anchor re-slugs the faction name on every call, inside several inner
+       loops, rather than computing the anchor list once."
+    - "Both detail loops build cls_str with the same '/'.join(...) class-string
+       expression that other renderers also duplicate — a class_list_str() helper
+       wants to exist."
+    - "65535, the no-faction sentinel, is hardcoded in seven places here with no named
+       constant (also flagged on _faction_dd in htmlgen-escape-links)."
+
   after: [render-stores]
   ranges: "13257-13725 (render_factions 437; render_journal 13696 is orphaned)"
   notes: >
