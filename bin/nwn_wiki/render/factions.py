@@ -12,7 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from nwn_wiki.gff import fld, list_items, loc
+from nwn_wiki.gff import fld, list_items
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _race_link, link
@@ -460,34 +460,3 @@ def render_factions(db: Db, out: Path) -> None:
         f'<div class="items-content">{body}</div></div>'
     )
     write_page(out, ctx, "Factions", layout)
-
-
-def render_journal(db: Db, out: Path) -> None:
-    ctx = PageCtx("journal.html")
-    if not db.jrl:
-        write_page(out, ctx, "Journal", "<h1>Journal</h1><p>(empty)</p>")
-        return
-    cats = list_items(db.jrl.get("Categories"))
-    sections = [f"<h1>Journal</h1><p>{len(cats)} quests.</p>"]
-    for c in cats:
-        tag = fld(c, "Tag", "")
-        qname = loc(c.get("Name")) or tag
-        prio = fld(c, "Priority", "")
-        xp = fld(c, "XP", "")
-        sections.append(f"<h2>{nwn_html(qname)} <small>({E(tag)})</small></h2>")
-        sections.append(f"<p>Priority: {E(prio)} · XP: {E(xp)}</p>")
-        entries = list_items(c.get("EntryList"))
-        if entries:
-            rows = []
-            for e in entries:
-                eid = fld(e, "ID", "")
-                end = fld(e, "End", "")
-                txt = loc(e.get("Text"))
-                rows.append(
-                    f"<tr><td>{E(eid)}</td><td>{E('end' if end else '')}</td><td>{nwn_html(txt)}</td></tr>"
-                )
-            sections.append(
-                '<table class="data"><thead><tr><th>ID</th><th>End</th><th>Text</th></tr></thead>'
-                "<tbody>" + "\n".join(rows) + "</tbody></table>"
-            )
-    write_page(out, ctx, "Journal", "\n".join(sections))

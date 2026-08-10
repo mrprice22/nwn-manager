@@ -1,0 +1,4 @@
+{
+  "reason": "render_journal has been dead since c76e6d0 (2026-05-29), whose message says the admin was 'removing duplicate journal page' when the Quests index superseded it; that commit deleted the render_journal(db, out) call from main() and left the function orphaned. Deleting dead code that nothing calls cannot change output, so the expected diff is empty.",
+  "paths": []
+}
