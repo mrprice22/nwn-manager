@@ -1565,8 +1565,41 @@ items:
 - id: render-creature-page-2
   phase: 1
   title: Move render_creature_page into render/creature_page.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: c9c7ead
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (135s), lotr2008 IDENTICAL (83s), lotr2009 IDENTICAL (102s)"
+  impl_notes: >
+    render/creature_page.py 1,418 -> 1,921; cli.py 4,977 -> 4,484.  All three moved
+    verbatim: _variant_diff_items (its only caller was render_creature_page, so no
+    import-back), extract_creature_offense and render_creature_page.
+    extract_creature_offense WAS taken: it turned out to have no cli-local deps at
+    all, so it now sits immediately after extract_creature_defenses, its designed
+    pair.  cli.py re-imports only extract_creature_offense (for
+    generate_counter_gear_index) and render_creature_page (for main).  Cycle check
+    clean: stores.py, creatures.py and bestiary.py none of them import creature_page,
+    so the new edges creature_page -> {bestiary, render.creatures, render.stores,
+    sim.combat, util} are acyclic, verified by importing the module standalone.
+    STATE AUDIT: the moved code reads state._CREATURE_PICS, _BESTIARY_ACTIVE,
+    _SERVER_FIRSTS, _BESTIARY_KILLS, _BOSS_ALIASES and _BESTIARY_TOP — all reads, all
+    already through state.X, and this is exactly why: every one of the six is REBOUND
+    (not mutated in place) by loaders in bestiary.py, chrome.py and
+    render/creatures.py, so a from-import would have snapshotted {} / False.  Line
+    multiset: 2 added lines, no non-blank line lost; the sole whitespace delta is a
+    stray third blank line at the old _variant_diff_items site normalised to two.
+  found:
+    - "This move alone left 25 more dead from-imports in cli.py; the running total is
+       ~90 across phase 1.  Nothing imports names FROM cli, so none of them are
+       re-exports and the sweep is safe — cli-module owns it."
+    - "render/creature_page.py's docstring no longer describes the module: it now
+       also holds offence extraction, variant diffing and the whole creature page."
+    - "creature_page.py is now 1,921 lines, the largest render module; a later split
+       (creature stat extraction vs page rendering) may be warranted beyond phase-4's
+       creature-sections-split."
+    - "The package has no TYPE_CHECKING block anywhere, so every `db: Db` annotation
+       in render/ and db/ resolves only because of PEP 563."
+
   after: [render-stores]
   plan: >
     render-creature-page had to leave render_creature_page in cli.py: it calls
