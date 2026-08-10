@@ -15,7 +15,7 @@ from nwn_wiki.db.index import _store_instance_slug
 from nwn_wiki.gff import fld, list_items, loc
 from nwn_wiki.htmlgen.chrome import page, write
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
-from nwn_wiki.htmlgen.links import _script_link, link
+from nwn_wiki.htmlgen.links import link
 from nwn_wiki.items import (
     _CREATURE_WEAPON_BASEITEMS,
     _TOC_GROUPS,
@@ -24,6 +24,7 @@ from nwn_wiki.items import (
     item_gp_value,
 )
 from nwn_wiki.lookups import SPELL_INFO, STOCK_BASEITEMS, baseitem_name
+from nwn_wiki.render.conversations import _caller_html
 from nwn_wiki.render.items import _items_col_flags, _items_row, _items_table_head
 
 
@@ -761,92 +762,3 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
 
     write(out / "stores" / f"{resref}.html",
           page(name, "\n".join(sections), root_rel=".."))
-
-def _caller_html(db: Db, c: dict, root_rel: str = "..") -> str:
-    """One-line description of a dialog caller, with cross-page links."""
-    kind = c.get("kind")
-    rr = c.get("resref", "")
-    if kind == "creature":
-        can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
-        cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
-        cell = (link(f"{root_rel}/creatures/{can_rr}.html", cname)
-                if can_rr in db.canonical_creatures else nwn_html(rr))
-        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
-                          for a in c.get("areas", []) if a in db.areas)
-        return (f'<span class="badge">creature</span> NPC {cell} '
-                f"<code>{E(rr)}</code>" + (f" — in {areas}" if areas else ""))
-    if kind == "creature-instance":
-        area_rr = c.get("area", "")
-        idx = c.get("idx", 0)
-        can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
-        inst_label = db.canonical_creature_name(can_rr) if can_rr else (db.creature_instance_name(area_rr, idx) or rr or "(unnamed)")
-        inst_url = f"{root_rel}/creatures/{can_rr}.html" if can_rr else "#"
-        area_link = (link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
-                     if area_rr in db.areas else nwn_html(area_rr))
-        return (f'<span class="badge">creature</span> NPC '
-                f'<a href="{E(inst_url)}">{nwn_html(inst_label)}</a>'
-                f" — in {area_link}")
-    if kind == "placeable":
-        # Placeables don't have their own page; we'll link to one of their
-        # area pages instead, which is where the placement lives.
-        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
-                          for a in c.get("areas", []) if a in db.areas)
-        return (f"Placeable <code>{E(rr)}</code>" +
-                (f" — in {areas}" if areas else ""))
-    if kind == "door":
-        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
-                          for a in c.get("areas", []) if a in db.areas)
-        return (f"Door <code>{E(rr)}</code>" +
-                (f" — in {areas}" if areas else ""))
-    if kind in ("placeable-instance", "door-instance"):
-        area_rr = c.get("area", "")
-        tag = c.get("tag") or ""
-        area_link = (link(f"{root_rel}/areas/{area_rr}.html", db.area_name(area_rr))
-                     if area_rr in db.areas else nwn_html(area_rr))
-        bp = f" <small class=\"muted\">(blueprint <code>{E(rr)}</code>)</small>" if rr else ""
-        label = "Placeable" if kind == "placeable-instance" else "Door"
-        ident = f"<code>{E(tag)}</code>" if tag else "(untagged)"
-        return (f'<span class="badge">instance</span> {label} {ident}'
-                f"{bp} — in {area_link}")
-    if kind in ("creature-event", "placeable-event", "door-event",
-                "trigger-event", "area-event",
-                "placeable-event-instance", "door-event-instance",
-                "trigger-event-instance"):
-        ev = c.get("event", "")
-        s = c.get("script", "")
-        is_instance = kind.endswith("-instance")
-        if kind == "creature-event":
-            can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
-            cname = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else rr
-            ent = (link(f"{root_rel}/creatures/{can_rr}.html", cname)
-                   if can_rr in db.canonical_creatures else nwn_html(rr))
-            label = f"NPC {ent} <code>{E(rr)}</code>"
-        elif kind == "area-event":
-            ent = (link(f"{root_rel}/areas/{rr}.html", db.area_name(rr))
-                   if rr in db.areas else nwn_html(rr))
-            label = f"Area {ent} <code>{E(rr)}</code>"
-        elif is_instance:
-            tag = c.get("tag") or ""
-            ident = f"<code>{E(tag)}</code>" if tag else "(untagged)"
-            bp = (f" <small class=\"muted\">(blueprint <code>{E(rr)}</code>)</small>"
-                  if rr else "")
-            entity = kind.split("-")[0].title()  # Placeable / Door / Trigger
-            label = (f'<span class="badge">instance</span> {entity} {ident}{bp}')
-        else:
-            label = f"{kind.split('-')[0].title()} <code>{E(rr)}</code>"
-        areas = ", ".join(link(f"{root_rel}/areas/{a}.html", db.area_name(a))
-                          for a in c.get("areas", []) if a in db.areas)
-        return (f"{label} via <code>{E(ev)}</code> script {_script_link(db, s, root_rel)}" +
-                (f" — in {areas}" if areas else ""))
-    if kind == "module-event":
-        ev = c.get("event", "")
-        s = c.get("script", "")
-        return (f'<span class="badge global">global</span> '
-                f"Module <code>{E(ev)}</code> via script {_script_link(db, s, root_rel)}")
-    if kind == "item-script":
-        ent = (link(f"{root_rel}/items/{rr}.html", db.item_name(rr))
-               if rr in db.items else nwn_html(rr))
-        s = c.get("script", "")
-        return (f"Item {ent} <code>{E(rr)}</code> via tag-script "
-                f"{_script_link(db, s, root_rel)}")
-    return E(repr(c))
