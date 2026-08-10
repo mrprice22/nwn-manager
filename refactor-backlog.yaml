@@ -1619,8 +1619,34 @@ items:
 - id: render-area-page
   phase: 1
   title: Move render_area_page into render/areas.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 7a569c1
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (136s), lotr2008 IDENTICAL (85s), lotr2009 IDENTICAL (96s)"
+  impl_notes: >
+    render/areas.py 418 -> 953; cli.py 4,484 -> 3,966.  _OMIT and render_area_page
+    moved verbatim, the 515-line body still at nesting depth 6 (render-page-split
+    owns flattening it).  cli.py imports both back for main().  areas.py picked up
+    typing.Any, db.index._store_instance_slug, htmlgen.links._conv_link/tileset_label,
+    lookups.class_name/race_name, render.creatures.creature_max_hp and four store
+    helpers from render.stores.  Nothing left behind.  CYCLE CHECK: no module in the
+    package imports render.areas, and stores/creatures/conversations import none of
+    it, so the new edges areas -> {creatures, stores, db.index} are acyclic; verified
+    by importing live.  STATE AUDIT: zero — render_area_page touches no state symbol,
+    and its free globals are all pure functions or constants read-only.  Line
+    multiset: exactly two added lines, no unaccounted non-blank line lost.
+  found:
+    - "cli.py's dead-import count reached 98 pre-existing plus 7 new here
+       (_buy_limit_str, _store_buy_summary, _store_instance_slug,
+       _store_item_gp_stats, _store_opener_html, class_name, tileset_label).  The
+       sweep is cli-module's."
+    - "render/areas.py is now internally inconsistent about the Db annotation —
+       unquoted in render_area_page, quoted in build_area_graph — with no Db import
+       or TYPE_CHECKING block in the file at all."
+    - "render_area_page contains two near-duplicate creature-row blocks (the
+       hp/cls_str and hp2/cls_str2 pair) — a target for render-page-split."
+
   after: [render-stores, render-conversations]
   plan: >
     render-areas had to leave render_area_page (515 lines, nesting depth 6) and its
