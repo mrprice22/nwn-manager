@@ -4,6 +4,8 @@
   duplicate-conversation reports exported into ``module-index/``.
 * :mod:`nwn_wiki.reports.counter_gear` -- the counter-gear simulation report
   (``counter_gear.json`` / ``counter_gear.md``) and its staleness check.
+* :mod:`nwn_wiki.reports.module_index` -- the LLM-friendly JSON exports that
+  make up the rest of ``module-index/``.
 
 This package deliberately re-exports nothing; import from the submodules.
 """
