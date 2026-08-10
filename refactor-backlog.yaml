@@ -2350,8 +2350,27 @@ items:
 - id: journal-decide
   phase: 2
   title: Wire up or delete the orphaned render_journal
-  status: pending
+  status: done
   gate: expected-diff
+  commit: d1765f3
+  date: 2026-08-10
+  gate_result: "check --all --expect gates/journal-decide.json (empty allowlist): homers_lotr IDENTICAL (148s), lotr2008 IDENTICAL (86s), lotr2009 IDENTICAL (114s)"
+  impl_notes: >
+    DECIDED: deleted, and the design-question hatch was NOT needed because git
+    history answers it outright.  `git log -S"render_journal(db"` lands on c76e6d0
+    (2026-05-29), "WIKI: Quests index 1.1: using quest tags to group related quests,
+    removing duplicate journal page", whose diff removes exactly the line
+    `render_journal(db, out)` from main() and adds the quest-category/slug rendering
+    in its place.  So the admin already made this call fourteen months ago and
+    deliberately retired the page as a duplicate of the Quests index; only the
+    function body was left behind.  Wiring it back in would undo a decision, not
+    honour one.
+    Removed the 31-line function from render/factions.py (493 -> 462 lines) and the
+    gff.loc import it was the last user of.  Nothing references render_journal
+    anywhere in bin/ afterwards.  Done inline rather than in a subagent, per the
+    runbook's allowance for deleting a dead function.
+    Output is unchanged, which is exactly what deleting never-called code should do.
+
   after: [server-firsts-reset]
   plan: >
     render_journal emits journal.html with a full nav bar but is never called
