@@ -14,7 +14,7 @@ from pathlib import Path
 from nwn_wiki.combat import epic_toughness_hp
 from nwn_wiki.db.scripts import _strip_nss_comments
 from nwn_wiki.gff import fld, list_items
-from nwn_wiki.htmlgen.chrome import page, write
+from nwn_wiki.htmlgen.chrome import has_creature_pics_page, page, write
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import link
 from nwn_wiki.lookups import class_name, race_name
@@ -312,8 +312,12 @@ def _pic_figures(images: list[str], alt: str, prefix: str = "pics") -> str:
 
 def render_creature_pictures(db: Db, out: Path) -> None:
     """Gallery page grouping creature artwork (from creature-pics/) by NPC,
-    sorted by descending CR, with a floating left-hand name navigation."""
-    if not state._CREATURE_PIC_GROUPS:
+    sorted by descending CR, with a floating left-hand name navigation.
+
+    The early return reads has_creature_pics_page() -- the same predicate
+    SiteChrome gates the Pictures nav entry on -- so the nav links to this page
+    exactly when it is written."""
+    if not has_creature_pics_page():
         return
 
     def _slug(name: str) -> str:

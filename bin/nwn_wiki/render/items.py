@@ -134,8 +134,14 @@ def _inaccessible_reason_html(rr: str, db: "Db") -> str:
 
 
 def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out: Path) -> None:
-    """Render items/inaccessible/index.html — mirrors the main items index layout."""
-    if not inaccessible:
+    """Render items/inaccessible/index.html — mirrors the main items index layout.
+
+    The early return is has_inaccessible_items(db) — literally the call
+    SiteChrome gates the Inaccessible nav entry on — so the nav links to this
+    page exactly when it is written.  ``inaccessible`` is non-empty exactly then
+    because render_items_index() fills it with the same _item_access_class().
+    """
+    if not has_inaccessible_items(db):
         return
 
     def _item_cost_key(entry: tuple[str, dict]) -> int:
@@ -251,19 +257,29 @@ def item_is_accessible(db: Db, rr: str) -> bool:
     )
 
 
+def _item_access_class(db: Db, rr: str) -> str:
+    """Which items index ``rr`` belongs to: "broken", "accessible" or
+    "inaccessible".
+
+    The single classifier: render_items_index() splits its three lists with it
+    and has_inaccessible_items() polls it, so the Inaccessible page's contents
+    and the predicate that gates its nav entry cannot drift apart.  Broken =
+    TLK-only or completely unnamed; those get their own bucket and never count
+    as inaccessible.
+    """
+    name = db.item_name(rr)
+    if name.startswith("[TLK#") or name == rr:
+        return "broken"
+    return "accessible" if item_is_accessible(db, rr) else "inaccessible"
+
+
 def has_inaccessible_items(db: Db) -> bool:
     """True when items/inaccessible/index.html will have any rows.
 
-    Mirrors the classification in render_items_index(): broken (TLK-only or
-    unnamed) items are excluded, they get their own bucket.
+    Drives both render_inaccessible_index()'s early return and the Inaccessible
+    nav entry in SiteChrome, so the nav offers the page exactly when it exists.
     """
-    for rr in db.items:
-        name = db.item_name(rr)
-        if name.startswith("[TLK#") or name == rr:
-            continue
-        if not item_is_accessible(db, rr):
-            return True
-    return False
+    return any(_item_access_class(db, rr) == "inaccessible" for rr in db.items)
 
 
 def render_items_index(db: Db, out: Path) -> None:
@@ -276,14 +292,13 @@ def render_items_index(db: Db, out: Path) -> None:
     for rr in sorted(db.items.keys(), key=lambda r: nwn_text(db.item_name(r)).lower()):
         i = db.items[rr]
         name = db.item_name(rr)
-        if name.startswith("[TLK#") or name == rr:
+        cls = _item_access_class(db, rr)
+        if cls == "broken":
             broken.append((rr, i))
+        elif cls == "accessible":
+            buckets[_item_category(i, nwn_text(name))].append((rr, i))
         else:
-            accessible = item_is_accessible(db, rr)
-            if accessible:
-                buckets[_item_category(i, nwn_text(name))].append((rr, i))
-            else:
-                inaccessible.append((rr, i))
+            inaccessible.append((rr, i))
 
     total = sum(len(v) for v in buckets.values()) + len(broken)
 

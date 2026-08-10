@@ -1,0 +1,5 @@
+{
+  "reason": "page() emits the Pictures and Inaccessible nav entries unconditionally, but render_creature_pictures and render_inaccessible_index both early-return when their data is empty, so the nav can link to pages that were never written. Gate the two entries on has_creature_pics / has_inaccessible, the way bosses.html is already gated. Only nav list items may disappear, and only on corpora that lack the target page.",
+  "paths": ["docs/**/*.html", "docs/*.html"],
+  "line_patterns": ["creatures/pictures\\.html", "items/inaccessible/index\\.html"]
+}

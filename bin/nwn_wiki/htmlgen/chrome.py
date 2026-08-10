@@ -37,6 +37,18 @@ CHROME_FILE = ".chrome.json"
 _CHROME_FORMAT = 1
 
 
+def has_creature_pics_page() -> bool:
+    """True when creatures/pictures.html will be written.
+
+    The single source of truth for that fact: render_creature_pictures()
+    early-returns on ``not has_creature_pics_page()`` and SiteChrome gates the
+    Pictures nav entry on the same call, so the nav and the page cannot
+    disagree.  Reads state through the module object because
+    scan_creature_pics() fills _CREATURE_PIC_GROUPS at load time.
+    """
+    return bool(state._CREATURE_PIC_GROUPS)
+
+
 @dataclass
 class SiteChrome:
     """The facts the page shell and nav bar depend on, resolved once per build.
@@ -46,9 +58,12 @@ class SiteChrome:
     guaranteed to render the same chrome as every other consumer, including the
     ``nwn-wiki-activity`` subprocess running in its own interpreter.
 
-    ``has_inaccessible`` / ``has_creature_pics`` are recorded but not yet read:
-    page() still emits those two nav entries unconditionally, exactly as before.
-    Gating them is a separate backlog item.
+    ``has_inaccessible`` / ``has_creature_pics`` gate the Items > Inaccessible
+    and Creatures > Pictures nav entries.  Each is fed by the *same* predicate
+    its renderer early-returns on -- ``has_inaccessible_items()`` for
+    render_inaccessible_index, ``has_creature_pics()`` for
+    render_creature_pictures -- so the nav cannot offer a page that was never
+    written.
     """
 
     has_activity: bool = False
@@ -70,7 +85,7 @@ class SiteChrome:
                    has_creature_pics: bool | None = None) -> "SiteChrome":
         """Snapshot the current :mod:`nwn_wiki.state` nav globals."""
         if has_creature_pics is None:
-            has_creature_pics = bool(state._CREATURE_PIC_GROUPS)
+            has_creature_pics = has_creature_pics_page()
         return cls(
             has_activity=bool(state._HAS_ACTIVITY_PAGE),
             has_server_firsts=bool(state._HAS_SERVER_FIRSTS),
@@ -332,6 +347,14 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "",
     favicon = (f'\n  <link rel="icon" href="{E(root_rel)}/assets/{E(chrome.theme_favicon)}">'
                if chrome.theme_favicon else "")
     brand = _brand_html(chrome, root_rel)
+    # Both entries carry their own leading newline+indent so that switching them
+    # off removes the whole line rather than leaving a blank one behind.
+    pictures_nav = (
+        f'\n          <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>'
+        if chrome.has_creature_pics else "")
+    inaccessible_nav = (
+        f'\n          <a href="{E(root_rel)}/items/inaccessible/index.html">Inaccessible</a>'
+        if chrome.has_inaccessible else "")
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -355,15 +378,13 @@ def page(title: str, body: str, root_rel: str = ".", page_updated_at: str = "",
           <a href="{E(root_rel)}/creatures/by-cr/index.html">By Challenge Rating</a>
           <a href="{E(root_rel)}/creatures/by-race/index.html">By Race</a>
           <a href="{E(root_rel)}/creatures/search.html">Search</a>
-          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if chrome.has_bosses else ''}
-          <a href="{E(root_rel)}/creatures/pictures.html">Pictures</a>
+          {f'<a href="{E(root_rel)}/creatures/bosses.html">Bosses</a>' if chrome.has_bosses else ''}{pictures_nav}
         </div>
       </div>
       <div class="nav-dropdown">
         <span class="nav-dropdown-label">Items &#9660;</span>
         <div class="nav-dropdown-menu">
-          <a href="{E(root_rel)}/items/index.html">Accessible</a>
-          <a href="{E(root_rel)}/items/inaccessible/index.html">Inaccessible</a>
+          <a href="{E(root_rel)}/items/index.html">Accessible</a>{inaccessible_nav}
           <a href="{E(root_rel)}/items/properties/index.html">By Property</a>
           <a href="{E(root_rel)}/items/search.html">Search</a>
         </div>
