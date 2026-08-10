@@ -2383,8 +2383,54 @@ items:
 - id: active-nav
   phase: 2
   title: Mark the current page in the nav (aria-current + class)
-  status: pending
+  status: done
   gate: expected-diff
+  commit: c7e82c0
+  date: 2026-08-10
+  gate_result: "check --all --expect gates/active-nav.json: OK — all diffs declared on all three corpora (147s/90s/102s); rebaselined --all afterwards"
+  impl_notes: >
+    SCOPE: markup only.  Every nav anchor now goes through one helper,
+    _nav_link(ctx, target, label), which appends ` class="nav-current"
+    aria-current="page"` when PurePosixPath(target) == ctx.rel — the same ctx.rel
+    write_page() derives the output path from, so "am I current?" and "where was I
+    written?" are one fact and cannot drift.  It covers the top-level links, the
+    Creatures/Items dropdown rows including the conditional Bosses/Pictures/
+    Inaccessible entries, _quests_nav, _activity_dropdown and _manual_menu_rows
+    (both file rows and nav-submenu sub-items).
+    NO CSS OR JS WAS ADDED, deliberately.  The item allowed dropping itself if the
+    styling needed design input; instead the half that needs none was kept — the
+    aria-current attribute is a standards-based accessibility win, and nav-current is
+    the hook the admin can style whenever they choose a visual treatment.  Class name
+    checked against wiki_assets/style.css and site.js: the existing family is nav,
+    nav-dropdown(-label/-menu), nav-submenu(-label/-menu), nav-open, nav-pending,
+    nav-grace and JS's `navigating`; nav-current collides with none, and site.js only
+    ever tests .nav-dropdown/.nav-submenu/nav-open, so an extra class on an anchor is
+    inert.  Unmarked anchors are byte-identical — attributes are appended after href,
+    nothing reordered, and the conditional entries keep their leading newline+indent.
+    VERIFIED ON A REAL BUILD (10,837 files): the aria-current count per page is 0 on
+    10,809 pages and 1 on 28, never more.  Uniqueness was established structurally,
+    not by luck — the 28 nav targets extracted from the rendered nav are 28 distinct
+    paths, all exist on disk, all are marked, and no marked page lies outside that
+    set.  Spot checks: areas/index.html marks Areas alone; creature and area DETAIL
+    pages mark nothing, as they should since the nav only links indexes;
+    creatures/by-cr/index.html marks the row inside the Creatures dropdown; manual
+    submenu entries behave the same.  A 13-case unit check against a stub chrome with
+    all four dropdown kinds populated confirmed every non-current page stays
+    byte-identical to HEAD.
+  found:
+    - "The home page can never be marked: docs/index.html has no nav entry at all —
+       the brand <a class=\"brand\"> is the only link home and sits outside <nav>.
+       Marking it would need a decision (mark the brand, or add a Home entry?)."
+    - "Latent duplicate-target collision: _activity_dropdown emits
+       manual/ServerFirsts.html from chrome.has_server_firsts independently of
+       _MANUAL_MENUS, so a module shipping docs.manual/ServerFirsts.md would get two
+       nav anchors with the same target AND two writes to the same output path.
+       Pre-existing; active-nav would surface it as two marked anchors.  No corpus
+       triggers it today."
+    - "The gate never renders activity.html or manual/ServerFirsts.html (no --log-dir
+       or --db-dir), so those two nav rows' active-nav behaviour is covered only by
+       the unit-level check, not by the golden gate."
+
   after: [journal-decide]
   plan: >
     There is no active-nav state today — no aria-current, no active class.  Now
