@@ -1357,8 +1357,37 @@ items:
 - id: render-itemprops
   phase: 1
   title: Extract the by-property pages and item search into render/itemprops_pages.py
-  status: pending
+  status: done
   gate: zero-diff
+  commit: c542e2d
+  date: 2026-08-09
+  gate_result: "check --all: homers_lotr IDENTICAL (133s), lotr2008 IDENTICAL (81s), lotr2009 IDENTICAL (107s)"
+  impl_notes: >
+    render/itemprops_pages.py 917 lines; cli.py 8,172 -> 7,293.  Moved
+    _PROP_GROUP_ORDER, render_items_by_property (511 lines, depth 7, unflattened),
+    _SEARCH_JS, render_items_search and both section banners.  DRAGGED ALONG:
+    _where_snippet, which itemprops-module had left in cli.py for want of Db/E()/
+    nwn_text — all four of its call sites are inside render_items_by_property, so no
+    import-back was needed.  Nothing left behind; the block resolves entirely against
+    gff, htmlgen, itemprops, items, lookups and state.  Ten import entries that went
+    dead in cli.py were pruned (_cost_anchor, _cost_tiers, _is_raw_subtype,
+    _prop_group, _prop_slug, itemprop_format, _COMBINED_PROP_PAGES,
+    _SPELL_PROP_TABLES, _iprp_name_spell_info, _spell_level_classes) — each line
+    reappears verbatim in the new module's import block, so the multiset check still
+    holds: 883 removed lines all present downstream, exactly 4 added.
+    STATE AUDIT: one symbol — state._current_context, WRITTEN at both item-loop heads
+    and never read here.
+  found:
+    - "render_items_by_property recomputes the _SPELL_PROP_TABLES/SPELL_INFO 'has
+       spell info' lookup in four places under four different local names."
+    - "The slug idiom re.sub(r'[^a-z0-9]+', '-', x.lower()).strip('-') is open-coded
+       twice in the module while itemprops._prop_slug does the same job."
+    - "render_items_search's inline _prop_row hardcodes range(1, 5) while _SEARCH_JS
+       hardcodes var N=4 — two halves of one constant with nothing tying them."
+    - "render_items_by_property and render_items_search use DIFFERENT accessibility
+       predicates (the search one also counts pickpocketable and keeps non-accessible
+       carried items).  Looks intentional but is undocumented."
+
   after: [render-items]
   ranges: "11658-12514"
   plan: >
