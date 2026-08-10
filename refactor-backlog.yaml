@@ -2105,8 +2105,52 @@ items:
 - id: nav-gate-conditional
   phase: 2
   title: Gate the Pictures and Inaccessible nav entries on those pages existing
-  status: pending
+  status: done
   gate: expected-diff
+  commit: ab2c145
+  date: 2026-08-10
+  gate_result: "check --all --expect gates/nav-gate-conditional.json: homers_lotr IDENTICAL (150s), lotr2008 OK — all diffs declared (92s), lotr2009 OK — all diffs declared (113s); rebaselined --all afterwards"
+  impl_notes: >
+    The two nav conditions and their renderers' early returns are now THE SAME CALL,
+    not two mirrored conditions — that is the whole point, since a fix that leaves
+    two implementations only moves the bug.  Pictures: new
+    chrome.has_creature_pics_page() (bool(state._CREATURE_PIC_GROUPS)) is what
+    SiteChrome.from_state() defaults from AND what render_creature_pictures's early
+    return calls; the chrome is frozen in main() after scan_creature_pics and before
+    any renderer runs, and nothing writes the groups afterwards.  Inaccessible: new
+    render/items._item_access_class(db, rr) -> broken|accessible|inaccessible is used
+    by has_inaccessible_items(), by render_items_index's classification loop and
+    (through the former) by render_inaccessible_index's guard, so "predicate true"
+    and "list non-empty" are one statement over one keyset instead of two hand-
+    mirrored snippets.
+    The nav entries are spliced as strings carrying their own leading newline and
+    indent rather than sitting alone on a source line like the existing bosses entry.
+    That is deliberate: the bosses idiom leaves a whitespace-only line behind when
+    false, and wiki-golden applies line_patterns to blank lines too, so such a line
+    could never match a URL pattern and would fail its own expected-diff check.
+    PREDICTION MADE BEFORE BUILDING, and matched exactly: homers_lotr unchanged (it
+    has both pages), lotr2008 and lotr2009 lose only the Pictures line (neither
+    archive has a creature-pics/ dir; both do have inaccessible items).  A by-hand
+    lotr2008 build confirmed every HTML page changed, zero files added or removed,
+    zero non-HTML changes, and exactly three unique removed lines — the ./, ../ and
+    ../../ variants of the Pictures anchor — with no added lines at all.
+  found:
+    - "SiteChrome.has_inaccessible/has_creature_pics default to True, including in
+       from_dict for legacy .chrome.json files.  That was right while the nav was
+       unconditional; now a stale or corrupt chrome file makes nwn-wiki-activity
+       re-emit a nav linking to pages that may not exist.  Default them False, or
+       make load()'s fallback explicit."
+    - "wiki-golden's _offending_lines applies line_patterns to whitespace-only lines,
+       so the bosses-style 'conditional alone on its own line' idiom is a trap for
+       any future expected-diff nav item.  Either the checker should skip blank
+       lines or the bosses entry should adopt the newline-carrying form."
+    - "render_inaccessible_index still takes an `inaccessible` list parameter while
+       deriving its guard from db; the argument is now redundant with
+       _item_access_class and could be built inside the renderer."
+    - "wiki-golden's PROJECT_INPUTS symlinks creature-pics only when it exists, which
+       is why the archives exercise the empty-pics path.  That is now load-bearing
+       for nav coverage rather than incidental — worth saying so in its docstring."
+
   after: [site-chrome-object]
   plan: >
     page() emits items/inaccessible/index.html and creatures/pictures.html
