@@ -2445,8 +2445,54 @@ items:
 - id: dedup-creature-row
   phase: 3
   title: One _creature_row() and _bp_field() for the six creature tables
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 52ff4cb
+  date: 2026-08-10
+  gate_result: "check --all: homers_lotr IDENTICAL (176s), lotr2008 IDENTICAL (106s), lotr2009 IDENTICAL (117s)"
+  impl_notes: >
+    It is FIVE tables, not six: render_creatures_search emits a JSON search index,
+    not a row, so it takes only the shared field getter.  creatures.py 746 -> 705
+    lines (-162/+118 across both files, ~78 of the additions being the new helpers
+    and their docstrings).
+    Unified into render/creatures.py: _bp_field(c, bp) (the instance-then-blueprint
+    getter, replacing 5 identical closures plus 2 hand-inlined copies here and the
+    search closure in creature_page.py), _class_str (5 -> 1), _kills_head/_kills_cells
+    (now adjacent so header and cells cannot drift; _kills_cells takes a resref LIST,
+    which subsumes both the index's single lookup and bosses' variant-alias sum),
+    _faction_cell, and _creature_row(name_cell, c, bp, *, after_name, show_race,
+    cr_default, tail).
+    The real differences are PARAMETERS, not normalised away — that is why the gate
+    stayed green: after_name carries Count/Lair, show_race=False for by-race,
+    cr_default for the boss CR fallback, tail carries Faction/Kills/Method/Count, and
+    c=None yields the creature-less boss-drift row.  by-race's dash is the entity
+    &#x2014; where the index uses a literal em-dash; that byte difference was
+    preserved rather than unified.
+    Two paths the corpus cannot reach (no active bestiary, no boss-registry drift)
+    were checked by comparing old and new expression output directly in the
+    interpreter: the creature-less boss row and all three _kills_cells branches match
+    the pre-refactor strings exactly.
+  found:
+    - "_race_sort_key uses `fld(c, 'ChallengeRating') or (bp and fld(bp, ...))` —
+       truthiness rather than `is None` — so an instance CR of 0 falls through to the
+       blueprint and the expression can evaluate to None/False/0.  Inconsistent with
+       _bp_field; affects sort order within a race group only.  Left alone because
+       fixing it changes output."
+    - "The class-string join still has 5 copies outside creatures.py: render/areas.py
+       (x2), render/factions.py (x2), render/creature_page.py.  Moving _class_str
+       somewhere neutral would let all of them share it."
+    - "extract_creature_defenses and _creature_detail_sections each carry an _f that
+       differs from _bp_field only by passing `default` into the blueprint fld() call.
+       Equivalent in every reachable case, but collapsing it is an equivalence
+       argument rather than a move."
+    - "creature_page.py now imports _pic_figures, _bp_field and creature_max_hp from
+       render/creatures.py, so the detail page depends on the index module — backwards.
+       A render/creature_common.py, or moving them to a nwn_wiki/creatures.py, would
+       fix the direction."
+    - "The Count dash is a literal em-dash in render_creatures_index and the &#x2014;
+       entity in render_creatures_by_race.  Visually identical, byte-different, and it
+       is what blocks sharing that cell — normalising it needs an expected-diff item."
+
   after: [active-nav]
   plan: >
     The blueprint-fallback closure (_f/_f2/_f3) is re-declared 12 times and the
