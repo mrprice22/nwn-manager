@@ -2769,7 +2769,7 @@ items:
 - id: cr-sentinel-fork
   phase: 3
   title: Five CR parsers, four sentinels — decide whether to unify
-  status: design
+  status: pending
   gate: zero-diff
   after: [dedup-formatting]
   plan: >
@@ -2832,8 +2832,21 @@ items:
         expected-diff item.
         Take the recommended _try_float factoring, the None-core rewrite, or
         leave all five as they are?
-      status: open
-      answer: null
+      status: answered
+      answer: >
+        FACTOR THE PARSE ONLY (the recommended option).  Add _try_float(v, default)
+        to nwn_wiki/util.py alongside _try_int and route all five CR sites through
+        it, each passing its own existing default explicitly: -1.0 for
+        _creature_cr_value, 0.0 for _parse_cr, None for _cr_val, float("-inf") for
+        _race_sort_key, 0.0 for bestiary.py.  Do NOT unify the sentinels and do NOT
+        take the None-core rewrite.  Keep _creature_cr_value's db resolution
+        (canonical -> instance -> blueprint) exactly where it is — only the
+        try/float/except tail moves.
+        This must come out zero-diff: every sentinel keeps its current value, so no
+        emitted byte should change.  If any diff appears, the factoring is wrong —
+        stop rather than declaring an expectation.
+        Leave counter_gear's 0.0-into-the-lowest-tier behaviour alone; it stays
+        recorded in found: as a latent issue for a future expected-diff item.
 
 - id: dedup-map-js
   phase: 3
@@ -3316,7 +3329,7 @@ items:
 - id: sort-set-iteration
   phase: 4
   title: Sort the set iterations that make the build non-deterministic
-  status: design
+  status: pending
   gate: expected-diff
   after: [main-split]
   plan: >
@@ -3333,5 +3346,31 @@ items:
         to spot.  Recommend fixing it (sort at emission; one-off large diff, then
         stable output forever).  Fix it, or leave it and keep the
         PYTHONHASHSEED=0 pin in the gate?
-      status: open
-      answer: null
+      status: answered
+      answer: >
+        FIX IT — sort at the point of emission.  Sort key for CREATURE rows:
+        descending CR, then ascending Name for ties.
+        SCOPE NOTE, flagged to the admin when the answer was recorded and NOT
+        separately answered: the CR/Name key only applies where the emitted rows
+        are creatures (the faction tables are the main case).  The other
+        hash-ordered sites do not have a CR to sort by — the area-map SVG nodes are
+        areas, the conversation tables are dialog nodes, and the two sites recorded
+        in db-index-split's found: are tag maps (dup_dest_tags, keyed off a
+        set[str]) and the item-script caller set.  For those, sort by the identity
+        the page already displays — display name ascending, falling back to resref
+        or numeric id ascending where there is no name — so the order is stable and
+        reads sensibly.  Do NOT invent a CR-shaped key for non-creature rows.  If a
+        specific site has no obvious display identity, park that ONE site as a new
+        design question rather than guessing.
+        This is an expected-diff item and the diff will be large (~1700 lines on
+        lotr2008 alone).  Write gates/sort-set-iteration.json BEFORE implementing,
+        and expect the churn to be confined to the pages named above — if other
+        pages move, the prediction was wrong and the fix reached further than
+        intended, so stop rather than widening.
+        Rebaseline all three corpora once it passes.
+        FOLLOW-UP worth doing in the same item: once emission is sorted, the
+        PYTHONHASHSEED=0 pin in bin/wiki-golden is no longer load-bearing.  Leave
+        the pin in place (belt and braces) but drop the "there is a backlog item to
+        sort those iterations properly" note from its comment, and verify the claim
+        by running the gate ONCE without the pin — if output is still identical,
+        record that in gate_result as proof the non-determinism is actually gone.
