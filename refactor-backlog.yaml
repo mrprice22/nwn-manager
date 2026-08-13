@@ -3102,8 +3102,54 @@ items:
 - id: creature-sections-split
   phase: 4
   title: Break up _creature_detail_sections
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 2145df6
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (149s), lotr2008 IDENTICAL (91s), lotr2009 IDENTICAL (114s)"
+  impl_notes: >
+    Finished in one run; hatch 3b not needed.  619 lines became 12 one-per-section
+    functions plus a 63-line orchestrator: _section_abilities (32),
+    _section_classes (15), _section_description (9), _section_combat (94),
+    _section_combat_properties (162), _section_weapons (94), _section_spells (85),
+    _section_equipment (24), _section_inventory (36), _section_feats (18),
+    _section_skills (21), _section_scripts (20).
+    The move was kept literally pure: section bodies sat at indent level 4 inside
+    the old function and stay at indent level 4 as top-level function bodies, so
+    NOT ONE moved line was reindented or retyped.  Each section opens with
+    `sections: list[str] = []` and ends `return sections`, leaving every original
+    sections.append(...) call byte-identical.  Verified mechanically by sorting the
+    old block against the new: exactly one original line is absent (the dead local
+    below), everything else verbatim.
+    Shared state handled as required: D = extract_creature_defenses(db, c, bp) is
+    still computed ONCE in the orchestrator and passed down, with each section
+    unpacking only the D keys it reads (plain dict reads, no recomputation, so no
+    iteration-order risk).  The four shared closures (_f, _list, _equip_resref,
+    _equip_item) stay in the orchestrator and are passed explicitly to the sections
+    that need them, rather than being duplicated or swapped for the similar
+    imported _bp_field.  No conditional-emission behaviour changed — sections that
+    emitted nothing now return [] and the extend is a no-op.  No state import
+    touched and no new backwards dependency on render/creatures.py.
+  found:
+    - "`race_immunities = D[\"race_immunities\"]` in the old combat preamble was a
+       DEAD LOCAL — bound but never read anywhere in the 619 lines (only
+       misc_immunities is used, and extract_creature_defenses already folds racial
+       immunities into it).  It is the one line that did not survive the move,
+       because there was no section to move it to.  Worth confirming whether
+       D[\"race_immunities\"] has any remaining consumer at all."
+    - "_section_combat needs _f for exactly one field (ScriptDamaged) and
+       _section_scripts for the script-event list.  A later phase could give both a
+       small explicit dmg_script / field-list parameter and drop the closure
+       passing, but that is a signature change."
+    - "The local _f closure is behaviourally identical to the already-imported
+       _bp_field(c, bp) from render/creatures.py (both do instance-then-blueprint
+       with a default fallback).  Deduping them would have meant leaning harder on
+       the backwards dependency recorded under dedup-creature-row, so it was left
+       alone."
+    - "_section_combat_properties at 162 lines is still the largest piece and is
+       really ~12 independent property-row builders sharing one cprop_rows
+       accumulator — a natural follow-up split (table-driven row builders) if the
+       backlog wants to go further."
   after: [module-index-split]
   plan: 619 lines. One function per section of the creature page.
 
