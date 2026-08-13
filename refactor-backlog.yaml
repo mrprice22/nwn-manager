@@ -2624,8 +2624,69 @@ items:
 - id: dedup-search-js
   phase: 3
   title: Move the shared search engine into wiki_assets/site.js
-  status: pending
-  gate: zero-diff
+  status: done
+  gate: expected-diff
+  gate_decl: gates/dedup-search-js.json
+  commit: 908ae80
+  date: 2026-08-12
+  gate_result: "check --all --expect gates/dedup-search-js.json: homers_lotr OK — all diffs declared (149s), lotr2008 OK (99s), lotr2009 OK (105s); exactly the three declared paths in every corpus.  Baselines rebaselined --all."
+  impl_notes: >
+    Converted to expected-diff as this item's own notes anticipated.  The
+    declaration was written before any code was edited and held exactly: the only
+    files that moved, in all three corpora, were docs/assets/site.js,
+    docs/items/search.html and docs/creatures/search.html.  No line_patterns —
+    the change is a wholesale relocation of arbitrary JS lines, so any regex
+    covering them would have been vacuous; the three-path allowlist was the real
+    prediction.
+    site.js gained initSearch(cfg) (+125 lines, exposed as window.initSearch from
+    inside the existing IIFE) plus a searchUtils() toolbox u = {$, num, esc,
+    fillSel, results, data}.  The engine owns: condition-row element lookup, index
+    fetch, property/subtype option population, the property -> subtype cascade,
+    condition-row reading including has/lacks, condition matching, the
+    ascending/descending sort wrapper, and dispatch to the page's render.
+    Each page keeps only its own half inline — populateFilters, readForm, filter*,
+    compare, render (+ onReady for creatures) — ending in a DOMContentLoaded
+    handler that calls initSearch({...}).  The handler is REQUIRED: assets/site.js
+    is loaded with defer, so initSearch does not exist at inline-parse time;
+    deferred scripts run before DOMContentLoaded, so the ordering is safe.
+    _prop_row/_cond_row folded into htmlgen/blocks.py::prop_filter_rows(prop_id,
+    sub_id, min_id, *, mode_id="", label="", n=4); its output was verified
+    byte-identical against both golden search pages BEFORE gating, so the form
+    markup did not move at all (it shows up as pure context in the diff).
+    Behavioural differences between the two blobs, all parameterised rather than
+    normalised: element ids (formId/resultsId/ids{prop,sub,min}); the creature-only
+    has/lacks select (ids.mode — absent means modeSels is empty and neg is always
+    false, matching the item blob); index field names
+    (keys{list,prop,sub,val} covers it.properties[].{prop,subtype,value_num} vs
+    cr.props[].{p,s,v}); the item-only back-fill of matched=[properties[0]]
+    (fillFirstMatch); the creature-only "N creatures indexed" notice (onReady);
+    wholly different dropdown population (populate); different form reads
+    (readForm, contract: returns .asc); record filtering (filter); different sorts
+    (compare returns ascending, engine negates on !f.asc exactly as both blobs
+    did); different rendering (render, with pairs now uniformly {rec, matched}).
+    esc() was duplicated in both and is now u.esc; the window._subs/_csubs globals
+    became an engine-local subs (nothing else read them).
+    Two equivalences checked rather than assumed: (p[keys.val]||0) < c.minv never
+    differs from p.value_num < c.minv because _prop_value_num() always returns an
+    int, and conds.every(...) on an empty array is the item blob's
+    !conds.length || conds.every(...).
+    -286 lines across the two page modules, +125 landing once in site.js.
+  found:
+    - "NOTHING EXECUTES THE JS.  The golden gate compares emitted text only, so a
+       JS regression on either search page would ship silently — this item is the
+       first one where the runbook's 'output is a complete behavioural fingerprint'
+       claim does not hold.  No node/deno/bun is installed on this box; the three
+       sources were syntax-checked with the Python esprima parser and the cfg
+       contract reviewed by hand (every callback's signature and the .asc contract
+       verified at both call sites).  A headless DOM smoke test, or even a parse
+       step in bin/, would close the hole and is worth its own backlog item."
+    - "site.js now ships the search engine to EVERY page (~4 KB on pages that never
+       search).  If that matters, split search.js out as a second asset loaded only
+       by the two search pages."
+    - "gates/active-nav.json lists both docs/**/*.html and docs/*.html; fnmatch '*'
+       already crosses '/', so the second glob is redundant and the first is far
+       broader than it reads.  Cosmetic, but worth knowing when writing future
+       declarations."
   after: [dedup-layout-wrappers]
   plan: >
     _CREATURE_SEARCH_JS (188 lines) and _SEARCH_JS (206 lines) are near-copies —
