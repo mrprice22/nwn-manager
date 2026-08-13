@@ -3365,9 +3365,89 @@ items:
 - id: sort-set-iteration
   phase: 4
   title: Sort the set iterations that make the build non-deterministic
-  status: pending
+  status: done
   gate: expected-diff
+  gate_decl: gates/sort-set-iteration.json
   after: [main-split]
+  commit: 53f1125
+  date: 2026-08-13
+  gate_result: >
+    check --all --expect gates/sort-set-iteration.json: homers_lotr OK — all diffs
+    declared (139s), lotr2008 OK (98s), lotr2009 OK (100s).  Exactly the declared
+    paths moved and nothing else: factions.html + map/index.html + a handful of
+    conversations/*.html in all three corpora, index.html in lotr2008/lotr2009
+    only (homers_lotr's is an author override with no map), quests/index.html in
+    homers_lotr only.  Baselines rebaselined --all.
+    DETERMINISM PROVEN: with the baselines rebuilt, bin/wiki-golden was
+    temporarily repointed at PYTHONHASHSEED=4242 and lotr2008 came out IDENTICAL
+    (88s) against the seed-0 baseline, then the pin was restored.  The
+    PYTHONHASHSEED=0 pin is no longer load-bearing.
+  impl_notes: >
+    Sites fixed and the key each got.  layout.py: the component-discovery BFS
+    picked its root with max() over a set (max returns the FIRST maximum, so ties
+    were hash-ordered) and walked adj[u] unsorted — that alone shifted the pos
+    dict's insertion order, hence every per-node RNG jitter draw, hence every
+    coordinate in the map SVG (~1700 lines/corpus).  render/map.py: emit nodes in
+    sorted(positions.items()) order.  render/factions.py x3 and
+    render/quests.py _items_html: these were ALREADY sorted() calls, but over a
+    set with a non-unique display-name key — a stable sort over a hash-ordered
+    input — so the tie-break got the resref/race-id appended (the observed churn
+    was "Great East Road" x3, "Old Forest" x2, "The Misty Mountains" x2).
+    db/dialogs.py: script_teleport_tags iteration (conversation "Teleport
+    destinations" rows) and the {resref, tag} item-script caller set.
+    db/index.py: _referenced_tags in the dup-dest-tag annotator.
+    render/items.py: the same {resref, tag} candidate set.
+    render/quests.py _quest_start_locations x7: sorted the ITERATIONS, not the
+    resulting rows — the priority-1/2/3 fill order is deliberate and the index
+    prints only the first three entries of each dict, so sorting the output would
+    have changed which NPCs/areas are shown, not merely their order.
+    NO creature-row site turned out to be hash-ordered — the faction creature
+    tables already sort over dicts — so the admin's descending-CR-then-Name key
+    was not needed anywhere.  Every fixed site is areas/tags/scripts/items, sorted
+    by displayed identity per the scope note.  Nothing was parked as a new design
+    question.
+    Sample hunk (homers_lotr docs/factions.html, faction 2 Areas list):
+    "…Ettenmoors</a>, <a href="areas/greateastroadd.html">Great East Road</a>,
+    <a href="areas/greateastroada.html">Great East Road</a>, …" becomes
+    "…Ettenmoors</a>, <a href="areas/greateastroada.html">Great East Road</a>,
+    <a href="areas/greateastroadd.html">Great East Road</a>, …" — the tied names
+    now order by resref.
+    Follow-up done: bin/wiki-golden keeps the PYTHONHASHSEED=0 pin but its comment
+    no longer claims a backlog item is outstanding.
+  found:
+    - "db/scripts.py:571 iterates script_teleport_tags (set[str]) into
+       script_transitions, whose order reaches area-page transition tables,
+       build_area_graph edge order and hence --path-from route choice.  Left
+       unsorted deliberately: no area page moved under randomised hashing across
+       3 corpora / 3 seeds, so it does not currently reach emission unsorted, and
+       sorting it would have needed docs/areas/*.html in a declaration that
+       predicted no such change.  Same class as the fixed sites — a follow-up
+       item could sort it with areas/ declared."
+    - "Same latent class in db/derived.py lines ~280/395/397/410/491 and 554/573
+       (dlg_set, script_checks_item_tags, script_store_tags) ordering
+       dialog_item_checks, item_script_checks and store_tag_openers.  Unexercised
+       by any corpus.  db/derived.py 462/475 iterate sets only to .add() into
+       other sets — order-independent, nothing to fix."
+    - "Sets of INTS are not hash-randomised (int hash is identity), so
+       dialog_quest_grants_rev eids, canonical_inst_factions and the feat-id sets
+       are already deterministic; sorting them would change output for no
+       determinism gain.  Remember this before any future 'sort all the sets'
+       sweep."
+    - "The general defect class is sorted(<set>, key=<display name>) with a
+       non-unique key: stable sort, hash-ordered input.  An AST sweep found
+       exactly four such sites (factions.py 207/271/359, quests.py 464), all
+       fixed.  The same sorted(x, key=name) pattern over dicts/lists
+       (module_index.py:640, factions.py:429, creatures.py:641, areas.py:212,
+       stores.py:137, counter_gear.py:529) is safe only because those containers
+       have deterministic order — turning any of them into a set would silently
+       reintroduce this."
+    - "bin/wiki-golden hardcodes PYTHONHASHSEED=0 inside build(), so proving
+       determinism means patching the file (as this item did) or writing a side
+       script.  A --hashseed flag on `check` would make that verification a
+       one-liner."
+    - "bin/wiki-golden is extensionless, so importlib.util.spec_from_file_location
+       returns None for it; importing it as a module needs an explicit
+       SourceFileLoader.  Only matters for tooling that wants to import it."
   plan: >
     The build is not reproducible run-to-run: with PYTHONHASHSEED unset, string
     hash randomisation reorders the area-map SVG nodes, the faction table rows
