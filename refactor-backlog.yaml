@@ -2906,8 +2906,64 @@ items:
 - id: db-init-schema
   phase: 4
   title: Turn Db.__init__ from 248 lines of attributes into a declared schema
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 8a2757f
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (156s), lotr2008 IDENTICAL (88s), lotr2009 IDENTICAL (105s)"
+  impl_notes: >
+    Took the low-risk reading of the plan's two options — "dataclass fields", not
+    "grouped sub-objects".  DbCore is now @dataclass(eq=False, repr=False) with
+    all 90 attributes declared as fields IN THE ORIGINAL ORDER, under the original
+    names, with the original type annotations and every interleaved comment block
+    preserved verbatim.  Grouped sub-objects (db.area.npcs) would have rewritten
+    every read site in the render layer for no behavioural gain; that reading was
+    considered and rejected rather than skipped.
+    Two module-private helpers keep each field to one line: _new(factory) wraps
+    field(default_factory=...), and _index(value_factory) wraps
+    field(default_factory=partial(defaultdict, ...)).  So
+    `self.area_npcs: dict[str, list[dict]] = defaultdict(list)` became
+    `area_npcs: dict[str, list[dict]] = _index(list)`; the three nested ones use
+    _index(partial(defaultdict, set)), behaviourally identical to the old
+    lambda: defaultdict(set).  The 9 immutable defaults (ifo/jrl/fac, the three
+    level dials, twoda_dir, run_counter_gear, devcrit_bonus_dice) stay as plain
+    literal defaults.
+    Deliberate safety choices, all commented in the code: eq=False because a
+    generated __eq__ would deep-compare the whole module DB and would null out
+    Db.__hash__; repr=False because a generated __repr__ would print the entire
+    database; and NO frozen and NO slots, because loaders and renderers assign to
+    a live Db at runtime.
+    Verified structurally as well as by the gate: a harness loaded the HEAD copy
+    of the module alongside the new one and constructed both.  list(vars(db)) is
+    identical — same 91 names in the same __dict__ insertion order (90 fields +
+    src); every default's runtime type and value matches, including defaultdict vs
+    dict and the nested defaultdict(defaultdict(set)) shape; no mutable default is
+    shared between instances; dir(Db) gained only __dataclass_fields__,
+    __dataclass_params__, __match_args__, __replace__ and the 9 literal-default
+    class attributes (always shadowed by the instance attribute) and lost nothing,
+    with Db.__eq__ is object.__eq__ and Db.__repr__ is object.__repr__ both
+    holding.  No mixin defines __init__ and Db(src) in cli.py is the only
+    construction site, so the generated signature is compatible.
+    The block did not get much shorter (248 -> ~245 lines): the win is that it is
+    now a declaration rather than a procedure.  Shrinking it further would mean
+    dropping the comments or the annotations, and both are worth more than the
+    lines.
+  found:
+    - "db-mixins already recorded that the five CLI-configured dials
+       (max_character_level, max_ability_bonus, max_player_level, twoda_dir,
+       run_counter_gear) are config rather than state and want to arrive as
+       constructor arguments.  They ARE now accepted as constructor keyword
+       arguments — but cli.main() still constructs Db(src) and overwrites them
+       afterwards.  Wiring main() to pass them at construction is now a two-line
+       change and would fit naturally into main-split."
+    - "_item_prop_registry, _creature_key_registry and _dialog_key_registry are
+       private interning state declared in the same flat namespace as the public
+       index attributes.  They are the one group where a genuine sub-object (a
+       small _InternRegistry) would read better, and unlike the public attributes
+       they have few call sites, all inside db/.  Worth its own small item rather
+       than a whole-schema regrouping."
+    - "Db.load still prints parse warnings via print() to stderr rather than
+       through nwn_wiki/warn.py (already recorded under db-mixins; unchanged)."
   after: [dedup-map-js]
   plan: >
     ~60 index dicts/sets initialised inline with interleaved comment blocks.  It
