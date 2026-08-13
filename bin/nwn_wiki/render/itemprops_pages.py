@@ -13,7 +13,8 @@ from collections import defaultdict
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items
-from nwn_wiki.htmlgen.blocks import items_layout, meta_dl, toc_sidebar
+from nwn_wiki.htmlgen.blocks import (items_layout, meta_dl, prop_filter_rows,
+                                     toc_sidebar)
 from nwn_wiki.htmlgen.chrome import write, write_page
 from nwn_wiki.htmlgen.escape import E, nwn_text
 from nwn_wiki.htmlgen.links import link
@@ -586,19 +587,11 @@ def render_items_by_property(db: "Db", out: Path) -> None:
 # Item search page + JSON index
 # ---------------------------------------------------------------------------
 
+#: The item search page. Everything generic — index fetch, property/subtype
+#: dropdowns and cascade, condition rows, sort, submit plumbing — lives in
+#: initSearch() in wiki_assets/site.js; this is only the item-specific half.
+#: site.js is deferred, so the call waits for DOMContentLoaded.
 _SEARCH_JS = r"""(function(){
-var N=4,data=[],form=document.getElementById('sf'),results=document.getElementById('sr');
-var propSels=[],subSels=[],minVals=[];
-for(var i=1;i<=N;i++){
-  propSels.push(document.getElementById('fp'+i));
-  subSels.push(document.getElementById('fs'+i));
-  minVals.push(document.getElementById('fv'+i));
-}
-
-fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
-  data=d; populateFilters();
-});
-
 var _FIXED_VALS={
   'Heavy Armor':1,'Medium Armor':1,'Light Armor':1,'Cloth & Robes':1,
   'Small Shields':1,'Large Shields':1,'Tower Shields':1,
@@ -617,17 +610,10 @@ function _addOpts(grp,opts,bisSet){
   return added;
 }
 
-function populateFilters(){
-  var bisSet={},props={},subs={};
-  data.forEach(function(it){
-    bisSet[it.base_item]=1;
-    it.properties.forEach(function(p){
-      props[p.prop]=1;
-      if(p.subtype){if(!subs[p.prop])subs[p.prop]={};subs[p.prop][p.subtype]=1;}
-    });
-  });
-  window._subs=subs;
-  var biSel=document.getElementById('fb');
+function populateFilters(data,u){
+  var bisSet={};
+  data.forEach(function(it){bisSet[it.base_item]=1;});
+  var biSel=u.$('fb');
 
   var GROUPS=[
     {label:'Armor',opts:[
@@ -679,69 +665,34 @@ function populateFilters(){
     }
     if(added>0)biSel.appendChild(grp);
   });
-
-  var propOpts=Object.keys(props).sort();
-  propSels.forEach(function(sel){
-    propOpts.forEach(function(p){sel.appendChild(new Option(p,p));});
-  });
 }
 
-propSels.forEach(function(sel,idx){
-  sel.addEventListener('change',function(){
-    var chosen=sel.value,sub=(window._subs||{})[chosen]||{};
-    subSels[idx].innerHTML='<option value="">— any —</option>';
-    Object.keys(sub).sort().forEach(function(s){subSels[idx].appendChild(new Option(s,s));});
-    subSels[idx].disabled=!chosen||!Object.keys(sub).length;
-  });
-});
+function readForm(u){
+  return {
+    bi:u.$('fb').value,
+    sortBy:u.$('fo').value,
+    asc:u.$('fd').value==='asc',
+    inclNonDrop:u.$('fnd').checked,
+    ppOnly:u.$('fpp').checked
+  };
+}
 
-form.addEventListener('submit',function(e){
-  e.preventDefault();
-  var bi=document.getElementById('fb').value;
-  var sortBy=document.getElementById('fo').value;
-  var asc=document.getElementById('fd').value==='asc';
-  var inclNonDrop=document.getElementById('fnd').checked;
-  var ppOnly=document.getElementById('fpp').checked;
-  var conds=[];
-  for(var i=0;i<N;i++){
-    var prop=propSels[i].value,sub=subSels[i].value;
-    var minv=parseInt(minVals[i].value,10)||0;
-    if(prop||sub||minv>0)conds.push({prop:prop,sub:sub,minv:minv});
-  }
-  var out=[];
-  data.forEach(function(it){
-    if(!it.accessible&&!inclNonDrop)return;
-    if(ppOnly&&!it.pickpocketable)return;
-    if(bi){
-      if(it.base_item!==bi)return;
-    }
-    var matched=[];
-    var ok=!conds.length||conds.every(function(c){
-      var mp=it.properties.filter(function(p){
-        if(c.prop&&p.prop!==c.prop)return false;
-        if(c.sub&&p.subtype!==c.sub)return false;
-        if(c.minv>0&&p.value_num<c.minv)return false;
-        return true;
-      });
-      if(!mp.length)return false;
-      matched.push(mp[0]);
-      return true;
-    });
-    if(!ok)return;
-    if(!matched.length&&it.properties.length)matched=[it.properties[0]];
-    out.push({it:it,matched:matched});
-  });
-  out.sort(function(a,b){
-    var v;
-    if(sortBy==='cost')v=a.it.cost-b.it.cost;
-    else if(sortBy==='value')v=(a.matched[0]?a.matched[0].value_num:0)-(b.matched[0]?b.matched[0].value_num:0);
-    else v=a.it.name.localeCompare(b.it.name);
-    return asc?v:-v;
-  });
-  render(out,!!conds.length,inclNonDrop);
-});
+function filterItem(it,f){
+  if(!it.accessible&&!f.inclNonDrop)return false;
+  if(f.ppOnly&&!it.pickpocketable)return false;
+  if(f.bi&&it.base_item!==f.bi)return false;
+  return true;
+}
 
-function render(rows,showProps,showAccess){
+function compare(a,b,f){
+  if(f.sortBy==='cost')return a.rec.cost-b.rec.cost;
+  if(f.sortBy==='value')return (a.matched[0]?a.matched[0].value_num:0)-(b.matched[0]?b.matched[0].value_num:0);
+  return a.rec.name.localeCompare(b.rec.name);
+}
+
+function render(rows,f,conds,u){
+  var esc=u.esc,results=u.results;
+  var showProps=conds.length>0,showAccess=f.inclNonDrop;
   if(!rows.length){results.innerHTML='<p class="muted">No items match.</p>';return;}
   var cols='<th>Name</th>'
     +(showAccess?'<th>Reachable</th>':'')
@@ -771,26 +722,32 @@ function render(rows,showProps,showAccess){
       }
       return '<span>'+propLink+detail+'</span>';
     }).join('<br>');
-    var idxBase=r.it.accessible?'index.html':'inaccessible/index.html';
-    var biHref=idxBase+'#'+esc(r.it.base_item_anchor||'');
-    var biCell=r.it.base_item_anchor
-      ?'<a href="'+biHref+'">'+esc(r.it.base_item)+'</a>'
-      :esc(r.it.base_item);
-    var dropBadge=(!showAccess&&!r.it.accessible)?' <span class="badge-no-drop" title="Carried by NPCs but not flagged as droppable \u2014 cannot be looted">no drop</span>':'';
-    var accessCell=showAccess?(r.it.accessible?'<td>Yes</td>':'<td><span class="muted">No</span></td>'):'';
-    html+='<tr><td><a href="'+esc(r.it.url)+'">'+esc(r.it.name)+'</a>'+dropBadge+'</td>'
+    var idxBase=r.rec.accessible?'index.html':'inaccessible/index.html';
+    var biHref=idxBase+'#'+esc(r.rec.base_item_anchor||'');
+    var biCell=r.rec.base_item_anchor
+      ?'<a href="'+biHref+'">'+esc(r.rec.base_item)+'</a>'
+      :esc(r.rec.base_item);
+    var dropBadge=(!showAccess&&!r.rec.accessible)?' <span class="badge-no-drop" title="Carried by NPCs but not flagged as droppable \u2014 cannot be looted">no drop</span>':'';
+    var accessCell=showAccess?(r.rec.accessible?'<td>Yes</td>':'<td><span class="muted">No</span></td>'):'';
+    html+='<tr><td><a href="'+esc(r.rec.url)+'">'+esc(r.rec.name)+'</a>'+dropBadge+'</td>'
          +accessCell
          +'<td>'+biCell+'</td>'
          +(showProps?'<td>'+props+'</td>':'')
-         +'<td>'+(r.it.cost?r.it.cost.toLocaleString()+' gp':'\u2014')+'</td></tr>';
+         +'<td>'+(r.rec.cost?r.rec.cost.toLocaleString()+' gp':'\u2014')+'</td></tr>';
   });
   results.innerHTML=html+'</tbody></table>';
 }
 
-function esc(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+document.addEventListener('DOMContentLoaded',function(){
+  initSearch({
+    formId:'sf',resultsId:'sr',
+    ids:{prop:'fp',sub:'fs',min:'fv'},
+    keys:{list:'properties',prop:'prop',sub:'subtype',val:'value_num'},
+    fillFirstMatch:true,
+    populate:populateFilters,readForm:readForm,filter:filterItem,
+    compare:compare,render:render
+  });
+});
 })();"""
 
 
@@ -864,18 +821,7 @@ def render_items_search(db: "Db", out: Path) -> None:
     write(out / "items" / "search-index.json",
           json.dumps(index, ensure_ascii=False, separators=(",", ":")))
 
-    def _prop_row(n: int) -> str:
-        return (
-            f'<div class="prop-row">'
-            f'<label>Property {n}</label>'
-            f'<select id="fp{n}" class="prop-sel"><option value="">— any —</option></select>'
-            f'<select id="fs{n}" class="subtype-sel" disabled>'
-            f'<option value="">— any —</option></select>'
-            f'<input id="fv{n}" type="number" min="0" placeholder="min value">'
-            f'</div>'
-        )
-
-    prop_rows = "".join(_prop_row(n) for n in range(1, 5))
+    prop_rows = prop_filter_rows("fp", "fs", "fv", label="Property")
 
     body = (
         "<h1>Search Items</h1>"

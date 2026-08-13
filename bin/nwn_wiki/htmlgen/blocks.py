@@ -41,3 +41,31 @@ def meta_dl(rows: Iterable[str], sep: str = "") -> str:
     list passes ``sep="\\n"`` and gets byte-identical output.
     """
     return sep.join(['<dl class="meta">', *rows, "</dl>"])
+
+
+def prop_filter_rows(prop_id: str, sub_id: str, min_id: str, *,
+                     mode_id: str = "", label: str = "", n: int = 4) -> str:
+    """The N property/subtype/min-value condition rows of a search form.
+
+    Both search pages (items, creatures) use the same row shape; the ids and
+    two optional extras differ. ``label`` prefixes each row with a
+    ``<label>{label} {i}</label>`` caption (items); ``mode_id`` prepends a
+    has/lacks select (creatures). ``prop_id``/``sub_id``/``min_id``/``mode_id``
+    are id *prefixes* -- row *i* uses ``f"{prop_id}{i}"`` and so on. The
+    engine that drives these rows is ``initSearch()`` in wiki_assets/site.js.
+    """
+    out = []
+    for i in range(1, n + 1):
+        out.append(
+            f'<div class="prop-row">'
+            + (f'<label>{label} {i}</label>' if label else "")
+            + (f'<select id="{mode_id}{i}" class="mode-sel">'
+               f'<option value="has">has</option><option value="lacks">lacks</option>'
+               f'</select>' if mode_id else "")
+            + f'<select id="{prop_id}{i}" class="prop-sel"><option value="">— any —</option></select>'
+            f'<select id="{sub_id}{i}" class="subtype-sel" disabled>'
+            f'<option value="">— any —</option></select>'
+            f'<input id="{min_id}{i}" type="number" min="0" placeholder="min value">'
+            f'</div>'
+        )
+    return "".join(out)

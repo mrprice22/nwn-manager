@@ -26,7 +26,7 @@ from nwn_wiki.combat import (
     feat_attack_bonus,
 )
 from nwn_wiki.gff import fld, list_items, loc
-from nwn_wiki.htmlgen.blocks import meta_dl
+from nwn_wiki.htmlgen.blocks import meta_dl, prop_filter_rows
 from nwn_wiki.htmlgen.chrome import _creature_cr_value, write, write_page
 from nwn_wiki.htmlgen.escape import E, colorize_damage_words, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import (_area_link, _conv_link, _faction_cell,
@@ -1210,155 +1210,104 @@ def _creature_detail_sections(
     return sections
 
 
+#: The creature search page. The generic half — index fetch, property/subtype
+#: dropdowns and cascade, has/lacks condition rows, sort, submit plumbing —
+#: lives in initSearch() in wiki_assets/site.js, shared with the item search;
+#: this is only the creature-specific half. site.js is deferred, so the call
+#: waits for DOMContentLoaded.
 _CREATURE_SEARCH_JS = r"""(function(){
-var N=4,data=[],form=document.getElementById('cf'),results=document.getElementById('cr_out');
-var modeSels=[],propSels=[],subSels=[],minVals=[];
-for(var i=1;i<=N;i++){
-  modeSels.push(document.getElementById('cm'+i));
-  propSels.push(document.getElementById('cp'+i));
-  subSels.push(document.getElementById('cs'+i));
-  minVals.push(document.getElementById('cv'+i));
-}
-function $(id){return document.getElementById(id);}
-function num(id){var v=parseFloat($(id).value);return isNaN(v)?null:v;}
-
-fetch('search-index.json').then(function(r){return r.json();}).then(function(d){
-  data=d; populateFilters();
-  results.innerHTML='<p class="muted">'+data.length+' creatures indexed. Set filters above and click Search.</p>';
-});
-
-function fillSel(sel,vals){
-  vals.forEach(function(v){sel.appendChild(new Option(v,v));});
-}
-
-function populateFilters(){
-  var props={},subs={},races={},classes={},areas={},factions={};
+function populateFilters(data,u){
+  var races={},classes={},areas={},factions={};
   data.forEach(function(cr){
     if(cr.race)races[cr.race]=1;
     if(cr.faction)factions[cr.faction]=1;
     (cr.classes||[]).forEach(function(c){classes[c.n]=1;});
     (cr.areas||[]).forEach(function(a){areas[a]=1;});
-    (cr.props||[]).forEach(function(p){
-      props[p.p]=1;
-      if(p.s){if(!subs[p.p])subs[p.p]={};subs[p.p][p.s]=1;}
-    });
   });
-  window._csubs=subs;
-  fillSel($('frace'),Object.keys(races).sort());
-  fillSel($('fclass'),Object.keys(classes).sort());
-  fillSel($('farea'),Object.keys(areas).sort());
-  fillSel($('ffac'),Object.keys(factions).sort());
-  var propOpts=Object.keys(props).sort();
-  propSels.forEach(function(sel){fillSel(sel,propOpts);});
+  u.fillSel(u.$('frace'),Object.keys(races).sort());
+  u.fillSel(u.$('fclass'),Object.keys(classes).sort());
+  u.fillSel(u.$('farea'),Object.keys(areas).sort());
+  u.fillSel(u.$('ffac'),Object.keys(factions).sort());
 }
 
-propSels.forEach(function(sel,idx){
-  sel.addEventListener('change',function(){
-    var chosen=sel.value,sub=(window._csubs||{})[chosen]||{};
-    subSels[idx].innerHTML='<option value="">— any —</option>';
-    Object.keys(sub).sort().forEach(function(s){subSels[idx].appendChild(new Option(s,s));});
-    subSels[idx].disabled=!chosen||!Object.keys(sub).length;
-  });
-});
-
-function propMatches(cr,c){
-  return (cr.props||[]).filter(function(p){
-    if(c.prop&&p.p!==c.prop)return false;
-    if(c.sub&&p.s!==c.sub)return false;
-    if(c.minv>0&&(p.v||0)<c.minv)return false;
-    return true;
-  });
+function onReady(data,u){
+  u.results.innerHTML='<p class="muted">'+data.length+' creatures indexed. Set filters above and click Search.</p>';
 }
 
-form.addEventListener('submit',function(e){
-  e.preventDefault();
-  var q=($('fq').value||'').trim().toLowerCase();
-  var race=$('frace').value,cls=$('fclass').value,area=$('farea').value,fac=$('ffac').value;
-  var clvl=parseInt($('fclvl').value,10)||0;
-  var crMin=num('fcrmin'),crMax=num('fcrmax');
-  var hpMin=num('fhpmin'),hpMax=num('fhpmax');
-  var acMin=num('facmin'),babMin=num('fbabmin'),srMin=num('fsrmin');
-  var saveMin=num('fsavemin');
-  var inMod=$('fim').checked;
-  var bossEl=$('fboss'),bossOnly=bossEl&&bossEl.checked;
-  var sortBy=$('fo').value,asc=$('fd').value==='asc';
+function readForm(u){
+  var bossEl=u.$('fboss');
+  return {
+    q:(u.$('fq').value||'').trim().toLowerCase(),
+    race:u.$('frace').value,cls:u.$('fclass').value,
+    area:u.$('farea').value,fac:u.$('ffac').value,
+    clvl:parseInt(u.$('fclvl').value,10)||0,
+    crMin:u.num('fcrmin'),crMax:u.num('fcrmax'),
+    hpMin:u.num('fhpmin'),hpMax:u.num('fhpmax'),
+    acMin:u.num('facmin'),babMin:u.num('fbabmin'),srMin:u.num('fsrmin'),
+    saveMin:u.num('fsavemin'),
+    inMod:u.$('fim').checked,
+    bossOnly:bossEl&&bossEl.checked,
+    sortBy:u.$('fo').value,asc:u.$('fd').value==='asc'
+  };
+}
 
-  var conds=[];
-  for(var i=0;i<N;i++){
-    var prop=propSels[i].value,sub=subSels[i].value;
-    var minv=parseInt(minVals[i].value,10)||0;
-    if(prop||sub||minv>0)conds.push({prop:prop,sub:sub,minv:minv,neg:modeSels[i].value==='lacks'});
+function filterCreature(cr,f){
+  if(f.q&&cr.name.toLowerCase().indexOf(f.q)<0)return false;
+  if(f.race&&cr.race!==f.race)return false;
+  if(f.fac&&cr.faction!==f.fac)return false;
+  if(f.area&&(cr.areas||[]).indexOf(f.area)<0)return false;
+  if(f.inMod&&!cr.count)return false;
+  if(f.bossOnly&&!cr.boss)return false;
+  if(f.cls){
+    var hit=(cr.classes||[]).some(function(c){return c.n===f.cls&&c.l>=f.clvl;});
+    if(!hit)return false;
+  }else if(f.clvl>0){
+    if(!(cr.classes||[]).some(function(c){return c.l>=f.clvl;}))return false;
   }
+  if(f.crMin!==null&&(cr.cr===null||cr.cr<f.crMin))return false;
+  if(f.crMax!==null&&(cr.cr===null||cr.cr>f.crMax))return false;
+  if(f.hpMin!==null&&(cr.hp===null||cr.hp<f.hpMin))return false;
+  if(f.hpMax!==null&&(cr.hp===null||cr.hp>f.hpMax))return false;
+  if(f.acMin!==null&&(cr.ac||0)<f.acMin)return false;
+  if(f.babMin!==null&&(cr.bab||0)<f.babMin)return false;
+  if(f.srMin!==null&&(cr.sr||0)<f.srMin)return false;
+  if(f.saveMin!==null&&Math.min(cr.fort||0,cr.ref||0,cr.will||0)<f.saveMin)return false;
+  return true;
+}
 
-  var out=[];
-  data.forEach(function(cr){
-    if(q&&cr.name.toLowerCase().indexOf(q)<0)return;
-    if(race&&cr.race!==race)return;
-    if(fac&&cr.faction!==fac)return;
-    if(area&&(cr.areas||[]).indexOf(area)<0)return;
-    if(inMod&&!cr.count)return;
-    if(bossOnly&&!cr.boss)return;
-    if(cls){
-      var hit=(cr.classes||[]).some(function(c){return c.n===cls&&c.l>=clvl;});
-      if(!hit)return;
-    }else if(clvl>0){
-      if(!(cr.classes||[]).some(function(c){return c.l>=clvl;}))return;
-    }
-    if(crMin!==null&&(cr.cr===null||cr.cr<crMin))return;
-    if(crMax!==null&&(cr.cr===null||cr.cr>crMax))return;
-    if(hpMin!==null&&(cr.hp===null||cr.hp<hpMin))return;
-    if(hpMax!==null&&(cr.hp===null||cr.hp>hpMax))return;
-    if(acMin!==null&&(cr.ac||0)<acMin)return;
-    if(babMin!==null&&(cr.bab||0)<babMin)return;
-    if(srMin!==null&&(cr.sr||0)<srMin)return;
-    if(saveMin!==null&&Math.min(cr.fort||0,cr.ref||0,cr.will||0)<saveMin)return;
-
-    var matched=[];
-    var ok=conds.every(function(c){
-      var mp=propMatches(cr,c);
-      if(c.neg)return mp.length===0;
-      if(!mp.length)return false;
-      matched.push(mp[0]);
-      return true;
-    });
-    if(!ok)return;
-    out.push({c:cr,matched:matched});
-  });
-
-  out.sort(function(a,b){
-    var v;
-    if(sortBy==='name')v=a.c.name.localeCompare(b.c.name);
-    else if(sortBy==='value')v=(a.matched[0]?(a.matched[0].v||0):0)-(b.matched[0]?(b.matched[0].v||0):0);
-    else v=(a.c[sortBy]===null?-Infinity:(a.c[sortBy]||0))-(b.c[sortBy]===null?-Infinity:(b.c[sortBy]||0));
-    if(v===0)v=a.c.name.localeCompare(b.c.name);
-    return asc?v:-v;
-  });
-  render(out,conds.length>0);
-});
+function compare(a,b,f){
+  var v;
+  if(f.sortBy==='name')v=a.rec.name.localeCompare(b.rec.name);
+  else if(f.sortBy==='value')v=(a.matched[0]?(a.matched[0].v||0):0)-(b.matched[0]?(b.matched[0].v||0):0);
+  else v=(a.rec[f.sortBy]===null?-Infinity:(a.rec[f.sortBy]||0))-(b.rec[f.sortBy]===null?-Infinity:(b.rec[f.sortBy]||0));
+  if(v===0)v=a.rec.name.localeCompare(b.rec.name);
+  return v;
+}
 
 function crBucket(cr){
   if(cr===null)return 'CR unset';
   var lo=Math.floor(cr/5)*5;
-  return 'CR '+lo+'–'+(lo+4);
+  return 'CR '+lo+'\u2013'+(lo+4);
 }
 
-function tally(rows,keyFn){
+function tally(rows,keyFn,esc){
   var m={};
-  rows.forEach(function(r){var k=keyFn(r.c);m[k]=(m[k]||0)+1;});
+  rows.forEach(function(r){var k=keyFn(r.rec);m[k]=(m[k]||0)+1;});
   return Object.keys(m).sort(function(a,b){return m[b]-m[a]||a.localeCompare(b);})
     .map(function(k){return '<li>'+esc(k)+' <strong>'+m[k]+'</strong></li>';}).join('');
 }
 
-function render(rows,showProps){
-  var total=data.length;
+function render(rows,f,conds,u){
+  var esc=u.esc,results=u.results,showProps=conds.length>0;
+  var total=u.data.length;
   var head='<p><strong>'+rows.length+'</strong> of '+total+' creature'+(total!==1?'s':'')
     +' match'+(rows.length===1?'es':'')
     +' <span class="muted">('+(total-rows.length)+' excluded)</span></p>';
   if(!rows.length){results.innerHTML=head+'<p class="muted">No creatures match.</p>';return;}
   head+='<details class="search-breakdown"><summary>Breakdown of the '+rows.length+' matches</summary>'
     +'<div class="breakdown-cols">'
-    +'<div><h4>By race</h4><ul>'+tally(rows,function(c){return c.race||'(unset)';})+'</ul></div>'
-    +'<div><h4>By challenge rating</h4><ul>'+tally(rows,function(c){return crBucket(c.cr);})+'</ul></div>'
+    +'<div><h4>By race</h4><ul>'+tally(rows,function(c){return c.race||'(unset)';},esc)+'</ul></div>'
+    +'<div><h4>By challenge rating</h4><ul>'+tally(rows,function(c){return crBucket(c.cr);},esc)+'</ul></div>'
     +'</div></details>';
 
   var cols='<th>Name</th><th>Count</th><th>Race</th><th>Class</th>'
@@ -1366,37 +1315,42 @@ function render(rows,showProps){
     +(showProps?'<th>Matched</th>':'');
   var html=head+'<table class="data"><thead><tr>'+cols+'</tr></thead><tbody>';
   rows.forEach(function(r){
-    var c=r.c;
+    var c=r.rec;
     var cls=(c.classes||[]).map(function(x){return esc(x.n)+' '+x.l;}).join('/');
     var props=r.matched.map(function(p){
       var label=p.a
         ?'<a href="../items/properties/index.html#'+esc(p.a)+'">'+esc(p.p)+'</a>'
         :esc(p.p);
       var det='';
-      if(p.s&&p.c)det=': '+esc(p.s)+' — '+esc(p.c);
+      if(p.s&&p.c)det=': '+esc(p.s)+' \u2014 '+esc(p.c);
       else if(p.s)det=': '+esc(p.s);
-      else if(p.c)det=' — '+esc(p.c);
+      else if(p.c)det=' \u2014 '+esc(p.c);
       var tag=p.src==='race'?' <span class="muted">(racial)</span>':'';
       return '<span>'+label+det+tag+'</span>';
     }).join('<br>');
     var boss=c.boss?' <span class="badge-boss">boss</span>':'';
     html+='<tr><td><a href="'+esc(c.url)+'">'+esc(c.name)+'</a>'+boss+'</td>'
-      +'<td>'+(c.count?c.count:'—')+'</td>'
+      +'<td>'+(c.count?c.count:'\u2014')+'</td>'
       +'<td>'+esc(c.race||'')+'</td>'
       +'<td>'+cls+'</td>'
-      +'<td>'+(c.cr===null?'—':c.cr)+'</td>'
-      +'<td>'+(c.hp===null?'—':c.hp.toLocaleString())+'</td>'
-      +'<td>'+(c.ac||'—')+'</td>'
+      +'<td>'+(c.cr===null?'\u2014':c.cr)+'</td>'
+      +'<td>'+(c.hp===null?'\u2014':c.hp.toLocaleString())+'</td>'
+      +'<td>'+(c.ac||'\u2014')+'</td>'
       +(showProps?'<td>'+props+'</td>':'')
       +'</tr>';
   });
   results.innerHTML=html+'</tbody></table>';
 }
 
-function esc(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+document.addEventListener('DOMContentLoaded',function(){
+  initSearch({
+    formId:'cf',resultsId:'cr_out',
+    ids:{mode:'cm',prop:'cp',sub:'cs',min:'cv'},
+    keys:{list:'props',prop:'p',sub:'s',val:'v'},
+    populate:populateFilters,onReady:onReady,readForm:readForm,
+    filter:filterCreature,compare:compare,render:render
+  });
+});
 })();"""
 
 
@@ -1831,20 +1785,7 @@ def render_creatures_search(db: Db, out: Path) -> None:
     write(out / "creatures" / "search-index.json",
           json.dumps(index, ensure_ascii=False, separators=(",", ":")))
 
-    def _cond_row(n: int) -> str:
-        return (
-            f'<div class="prop-row">'
-            f'<select id="cm{n}" class="mode-sel">'
-            f'<option value="has">has</option><option value="lacks">lacks</option>'
-            f'</select>'
-            f'<select id="cp{n}" class="prop-sel"><option value="">— any —</option></select>'
-            f'<select id="cs{n}" class="subtype-sel" disabled>'
-            f'<option value="">— any —</option></select>'
-            f'<input id="cv{n}" type="number" min="0" placeholder="min value">'
-            f'</div>'
-        )
-
-    cond_rows = "".join(_cond_row(n) for n in range(1, 5))
+    cond_rows = prop_filter_rows("cp", "cs", "cv", mode_id="cm")
     boss_box = (
         '<label class="checkbox-label"><input type="checkbox" id="fboss"> Bosses only</label>'
         if state._BOSS_REGISTRY else ""

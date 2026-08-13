@@ -1,0 +1,8 @@
+{
+  "reason": "_CREATURE_SEARCH_JS and _SEARCH_JS are near-copies of one search engine (index fetch, property/subtype option population, subtype cascade, condition build, sort, submit plumbing). The shared engine moves into wiki_assets/site.js as a global initSearch(cfg); each page keeps only its own populate/readForm/filter/compare/render callbacks and calls initSearch from a DOMContentLoaded handler (site.js is deferred, so the inline script cannot call it at parse time). The rendered form markup is unchanged — the two Python row builders are folded into one htmlgen.blocks.prop_filter_rows() that emits byte-identical HTML — so the only output that may move is the inline <script> body on the two search pages plus the copied assets/site.js. No line_patterns: this is a wholesale relocation of arbitrary JavaScript lines between two files, so any regex covering every moved line would be vacuous; the three-file path allowlist is the real prediction.",
+  "paths": [
+    "docs/assets/site.js",
+    "docs/items/search.html",
+    "docs/creatures/search.html"
+  ]
+}
