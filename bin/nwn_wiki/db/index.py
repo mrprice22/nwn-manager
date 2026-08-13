@@ -43,6 +43,24 @@ class DbIndexMixin:
 
     def index(self) -> None:
         t0 = time.time()
+        self._index_factions()
+        self._index_area_objects()
+        self._index_transitions()
+        self._index_containers()
+        self._index_encounter_spawns()
+        self._index_hidden_areas()
+        self._index_canonical_creatures()
+        self._index_canonical_locations()
+        self._index_item_sources()
+        self._backfill_stock_items()
+
+        hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
+                      if self.hidden_areas else "")
+        print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
+              f"{len(self.transitions)} transitions, "
+              f"{len(self.creatures)} creatures, {len(self.items)} items{hidden_msg}")
+
+    def _index_factions(self) -> None:
         # Faction friendliness: faction is "friendly" if its rep with PC
         # (faction id 0) is >= 50 in repute.fac.json's RepList. Default
         # friendly for ids 0/2/3/4 (PC, Commoner, Merchant, Defender by
@@ -61,6 +79,7 @@ class DbIndexMixin:
                 elif f2 == 0 and isinstance(f1, int):
                     self.faction_friendly[f1] = (v >= 50)
 
+    def _index_area_objects(self) -> None:
         # Waypoint tag → area resref. Walk every git's WaypointList.
         for area_resref, git in self.gits.items():
             for wp in list_items(git.get("WaypointList")):
@@ -87,44 +106,9 @@ class DbIndexMixin:
             for d in list_items(git.get("Door List")):
                 self.area_doors[area_resref].append(d)
 
-        # Door/trigger tag → area indexes. NWN's `LinkedTo` is a tag
-        # reference, not specifically a waypoint tag — door-to-door pairs
-        # (each door's LinkedTo holds the *other door's* tag) are common, and
-        # so are trigger-to-trigger pairs. Resolving against only waypoints
-        # makes those transitions render as "(unresolved waypoint)" and
-        # silently disappear from the overview map.
-        door_tag_area: dict[str, str] = {}
-        trigger_tag_area: dict[str, str] = {}
-        for area_resref, doors in self.area_doors.items():
-            for d in doors:
-                tag = fld(d, "Tag")
-                if tag and tag not in door_tag_area:
-                    door_tag_area[tag] = area_resref
-        for area_resref, triggers in self.area_triggers.items():
-            for t in triggers:
-                tag = fld(t, "Tag")
-                if tag and tag not in trigger_tag_area:
-                    trigger_tag_area[tag] = area_resref
-
-        # Multi-map: tag → ALL objects carrying it (waypoints, doors, triggers).
-        # Used to detect ambiguous LinkedTo targets where the game's "first match"
-        # resolution may send the player to an unexpected area.
-        _tag_all_objects: dict[str, list[dict]] = defaultdict(list)
-        for _ar, _git in self.gits.items():
-            for _wp in list_items(_git.get("WaypointList")):
-                _t = fld(_wp, "Tag")
-                if _t and _ar in self.areas:
-                    _tag_all_objects[_t].append({"kind": "waypoint", "area": _ar, "tag_label": _t})
-        for _ar, _doors in self.area_doors.items():
-            for _d in _doors:
-                _t = fld(_d, "Tag")
-                if _t and _ar in self.areas:
-                    _tag_all_objects[_t].append({"kind": "door", "area": _ar, "tag_label": _t})
-        for _ar, _triggers in self.area_triggers.items():
-            for _tr in _triggers:
-                _t = fld(_tr, "Tag")
-                if _t and _ar in self.areas:
-                    _tag_all_objects[_t].append({"kind": "trigger", "area": _ar, "tag_label": _t})
+    def _index_transitions(self) -> None:
+        door_tag_area, trigger_tag_area = self._build_link_tag_maps()
+        _tag_all_objects = self._collect_tag_objects()
 
         def resolve_link(linked: str) -> str | None:
             return (self.waypoint_area.get(linked)
@@ -169,6 +153,52 @@ class DbIndexMixin:
                     "key_required": bool(int(fld(d, "KeyRequired", 0) or 0)),
                 })
 
+        self._annotate_dup_dest_tags(_tag_all_objects)
+
+    def _build_link_tag_maps(self) -> tuple[dict[str, str], dict[str, str]]:
+        # Door/trigger tag → area indexes. NWN's `LinkedTo` is a tag
+        # reference, not specifically a waypoint tag — door-to-door pairs
+        # (each door's LinkedTo holds the *other door's* tag) are common, and
+        # so are trigger-to-trigger pairs. Resolving against only waypoints
+        # makes those transitions render as "(unresolved waypoint)" and
+        # silently disappear from the overview map.
+        door_tag_area: dict[str, str] = {}
+        trigger_tag_area: dict[str, str] = {}
+        for area_resref, doors in self.area_doors.items():
+            for d in doors:
+                tag = fld(d, "Tag")
+                if tag and tag not in door_tag_area:
+                    door_tag_area[tag] = area_resref
+        for area_resref, triggers in self.area_triggers.items():
+            for t in triggers:
+                tag = fld(t, "Tag")
+                if tag and tag not in trigger_tag_area:
+                    trigger_tag_area[tag] = area_resref
+        return door_tag_area, trigger_tag_area
+
+    def _collect_tag_objects(self) -> dict[str, list[dict]]:
+        # Multi-map: tag → ALL objects carrying it (waypoints, doors, triggers).
+        # Used to detect ambiguous LinkedTo targets where the game's "first match"
+        # resolution may send the player to an unexpected area.
+        _tag_all_objects: dict[str, list[dict]] = defaultdict(list)
+        for _ar, _git in self.gits.items():
+            for _wp in list_items(_git.get("WaypointList")):
+                _t = fld(_wp, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "waypoint", "area": _ar, "tag_label": _t})
+        for _ar, _doors in self.area_doors.items():
+            for _d in _doors:
+                _t = fld(_d, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "door", "area": _ar, "tag_label": _t})
+        for _ar, _triggers in self.area_triggers.items():
+            for _tr in _triggers:
+                _t = fld(_tr, "Tag")
+                if _t and _ar in self.areas:
+                    _tag_all_objects[_t].append({"kind": "trigger", "area": _ar, "tag_label": _t})
+        return _tag_all_objects
+
+    def _annotate_dup_dest_tags(self, _tag_all_objects: dict[str, list[dict]]) -> None:
         # Identify transitions whose LinkedTo tag maps to multiple objects.
         # The game engine resolves to whichever object it finds first, so the
         # destination is effectively ambiguous and may surprise the builder.
@@ -188,6 +218,7 @@ class DbIndexMixin:
                 tr["is_dup_tag"] = True
                 tr["dst_area_alts"] = [a for a in all_areas if a != tr["dst_area"]]
 
+    def _index_containers(self) -> None:
         # Containers: placeables that hold an inventory.
         for area_resref, placeables in self.area_placeables.items():
             for idx, p in enumerate(placeables):
@@ -195,6 +226,7 @@ class DbIndexMixin:
                 if items:
                     self.area_containers[area_resref].append({"idx": idx, "p": p})
 
+    def _index_encounter_spawns(self) -> None:
         # Encounter spawn pools: walk every encounter placement, pull its
         # CreatureList (preferring the placement's, falling back to the
         # blueprint's), and record which creatures can spawn where. At runtime
@@ -215,11 +247,14 @@ class DbIndexMixin:
                             {"area": area_resref, "encounter_resref": rr,
                              "cr": fld(s, "CR"), "appearance": fld(s, "Appearance")}
                         )
+
+    def _index_hidden_areas(self) -> None:
         self.hidden_areas = {
             rr for rr, a in self.areas.items()
             if "WIKI_HIDDEN" in (fld(a, "Comments") or "").upper()
         }
 
+    def _index_canonical_creatures(self) -> None:
         # ---- Build canonical creature index --------------------------------
         # Pass 1: register each UTC blueprint as its own canonical.
         for bp_rr, bp in self.creatures.items():
@@ -253,6 +288,7 @@ class DbIndexMixin:
                     can_rr = reg[key]
                 self.canonical_for_inst[(area_rr, idx)] = can_rr
 
+    def _index_canonical_locations(self) -> None:
         # Pass 3: canonical_locations from encounter spawn pools.
         # Aggregate by (can_rr, area_rr, enc_rr) → count.
         # Skip blueprints not found in the module's files (e.g. stock NWN
@@ -314,11 +350,16 @@ class DbIndexMixin:
             )
         # ---- End canonical creature index ----------------------------------
 
+    def _index_item_sources(self) -> None:
         # Build item-source cross-references, absorbing inline items through
         # _intern_item() so that instances with different PropertiesList get
         # their own synthetic resref (base__v2, __v3 …) and their own accurate
         # "where to find" entries rather than being merged under one blueprint.
+        self._index_store_items()
+        self._index_container_items()
+        self._index_carried_items()
 
+    def _index_store_items(self) -> None:
         # Stand-alone UTM blueprints — absorb items without area cross-refs.
         for s in self.stores.values():
             for p in list_items(s.get("StoreList")):
@@ -348,6 +389,7 @@ class DbIndexMixin:
                                     {"area_rr": area_rr, "slug": slug, "name": sname}
                                 )
 
+    def _index_container_items(self) -> None:
         # Container placeables — absorb and build item_in_container.
         for area_rr, containers in self.area_containers.items():
             skip = area_rr in self.hidden_areas
@@ -371,6 +413,7 @@ class DbIndexMixin:
                                  "pname": pname, "locked": locked, "dc": dc}
                             )
 
+    def _index_carried_items(self) -> None:
         # Creature instances — absorb and build item_carried_by.
         # crr in item_carried_by entries is now the canonical_rr so item pages
         # can link directly to the canonical creature page.
@@ -457,23 +500,16 @@ class DbIndexMixin:
                              "pickpocketable": pickpocketable}
                         )
 
+    def _backfill_stock_items(self) -> None:
         # Back-fill stock BaseItem/Cost/PropertiesList for plain references.
         # For variant resrefs, use the base resref for stock data lookup; skip
         # PropertiesList backfill for variants (they already have explicit props).
-        def _backfill_stock_items() -> None:
-            for irr, it in self.items.items():
-                base = self.item_is_variant_of.get(irr, irr)
-                if fld(it, "BaseItem") is None and base in STOCK_ITEM_BASE:
-                    it["BaseItem"] = STOCK_ITEM_BASE[base]
-                if fld(it, "Cost", "") in ("", None) and base in STOCK_ITEM_COST:
-                    it["Cost"] = STOCK_ITEM_COST[base]
-                if (not list_items(it.get("PropertiesList"))
-                        and irr == base and irr in STOCK_ITEM_PROPS):
-                    it["PropertiesList"] = STOCK_ITEM_PROPS[irr]
-        _backfill_stock_items()
-
-        hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
-                      if self.hidden_areas else "")
-        print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
-              f"{len(self.transitions)} transitions, "
-              f"{len(self.creatures)} creatures, {len(self.items)} items{hidden_msg}")
+        for irr, it in self.items.items():
+            base = self.item_is_variant_of.get(irr, irr)
+            if fld(it, "BaseItem") is None and base in STOCK_ITEM_BASE:
+                it["BaseItem"] = STOCK_ITEM_BASE[base]
+            if fld(it, "Cost", "") in ("", None) and base in STOCK_ITEM_COST:
+                it["Cost"] = STOCK_ITEM_COST[base]
+            if (not list_items(it.get("PropertiesList"))
+                    and irr == base and irr in STOCK_ITEM_PROPS):
+                it["PropertiesList"] = STOCK_ITEM_PROPS[irr]

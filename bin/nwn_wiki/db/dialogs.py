@@ -33,7 +33,28 @@ class DbDialogsMixin:
         self._build_tag_to_area()
         self._resolve_script_creature_spawns()
         self._synthesize_zdialogs()
+        self._index_dialog_node_scripts()
+        self._index_dialog_callers()
+        n_excluded_edges = self._build_conv_transitions()
 
+        n_glob = len(self.global_convo_pseudo)
+        n_conv_edges = len(self.conv_transitions)
+        n_callers = sum(len(v) for v in self.dialog_callers.values())
+        excl_msg = (f", {n_excluded_edges} edges suppressed by --exclude-conv-option"
+                    if n_excluded_edges else "")
+        print(f"  dialog xref in {time.time()-t0:.1f}s — {len(self.dialogs)} dialogs, "
+              f"{n_callers} callers, {n_glob} global pseudo-nodes, "
+              f"{n_conv_edges} conv map edges{excl_msg}")
+
+        self._build_direct_teleport_transitions()
+        self._build_store_openers()
+        self._index_script_item_sources()
+        self._index_random_treasure_containers()
+        self._index_key_items()
+        self._index_script_item_checks()
+        self._build_dialog_quest_index()
+
+    def _index_dialog_node_scripts(self) -> None:
         # Per-dialog: action / active scripts and teleport destinations.
         for dlg_resref, dlg in self.dialogs.items():
             for kind, idx, node in self._walk_dialog_nodes(dlg):
@@ -74,11 +95,23 @@ class DbDialogsMixin:
                         "node_kind": "start", "node_index": -1,
                     })
 
-        # Caller bookkeeping helper.
-        def _add_caller(dlg_resref: str, caller: dict) -> None:
-            if dlg_resref in self.dialogs:
-                self.dialog_callers[dlg_resref].append(caller)
+    # Caller bookkeeping helper.
+    def _add_caller(self, dlg_resref: str, caller: dict) -> None:
+        if dlg_resref in self.dialogs:
+            self.dialog_callers[dlg_resref].append(caller)
 
+    def _index_dialog_callers(self) -> None:
+        (creature_areas, placeable_areas,
+         door_areas, trigger_areas) = self._blueprint_area_index()
+        self._index_conversation_field_callers(creature_areas, placeable_areas,
+                                               door_areas)
+        self._index_event_script_callers(creature_areas, placeable_areas,
+                                         door_areas, trigger_areas)
+        self._index_item_script_callers()
+        self._dedupe_dialog_callers()
+
+    def _blueprint_area_index(self) -> tuple[dict[str, set[str]], dict[str, set[str]],
+                                             dict[str, set[str]], dict[str, set[str]]]:
         # Where each blueprint is placed (resref → set of area resrefs).
         creature_areas: dict[str, set[str]] = defaultdict(set)
         placeable_areas: dict[str, set[str]] = defaultdict(set)
@@ -104,12 +137,17 @@ class DbDialogsMixin:
                 rr = fld(t, "TemplateResRef", "")
                 if rr:
                     trigger_areas[rr].add(ar)
+        return creature_areas, placeable_areas, door_areas, trigger_areas
 
+    def _index_conversation_field_callers(
+            self, creature_areas: dict[str, set[str]],
+            placeable_areas: dict[str, set[str]],
+            door_areas: dict[str, set[str]]) -> None:
         # 1. Direct Conversation field on creature/placeable/door blueprints.
         for rr, c in self.creatures.items():
             dlg = (fld(c, "Conversation", "") or "").lower()
             if dlg and dlg in self.dialogs:
-                _add_caller(dlg, {
+                self._add_caller(dlg, {
                     "kind": "creature", "resref": rr,
                     "areas": sorted(creature_areas.get(rr, set())),
                 })
@@ -123,7 +161,7 @@ class DbDialogsMixin:
             c = inst["c"]
             dlg = (fld(c, "Conversation", "") or "").lower()
             if dlg and dlg in self.dialogs:
-                _add_caller(dlg, {
+                self._add_caller(dlg, {
                     "kind": "creature-instance",
                     "area": inst["area"], "idx": inst["idx"],
                     "resref": fld(c, "TemplateResRef", "") or "",
@@ -132,42 +170,34 @@ class DbDialogsMixin:
         for rr, p in self.placeables.items():
             dlg = (fld(p, "Conversation", "") or "").lower()
             if dlg and dlg in self.dialogs:
-                _add_caller(dlg, {
+                self._add_caller(dlg, {
                     "kind": "placeable", "resref": rr,
                     "areas": sorted(placeable_areas.get(rr, set())),
                 })
         for rr, d in self.doors.items():
             dlg = (fld(d, "Conversation", "") or "").lower()
             if dlg and dlg in self.dialogs:
-                _add_caller(dlg, {
+                self._add_caller(dlg, {
                     "kind": "door", "resref": rr,
                     "areas": sorted(door_areas.get(rr, set())),
                 })
 
+    def _index_event_script_callers(
+            self, creature_areas: dict[str, set[str]],
+            placeable_areas: dict[str, set[str]],
+            door_areas: dict[str, set[str]],
+            trigger_areas: dict[str, set[str]]) -> None:
         # 2. Scripts bound to per-blueprint event slots that statically
         #    call ActionStartConversation (or StartDlg) with a literal
         #    dlg / z-dialog handler resref.
-        def _add_blueprint_event_callers(blueprints: dict, fields: dict[str, str],
-                                         kind: str, areas_idx: dict[str, set[str]]):
-            for rr, bp in blueprints.items():
-                for fld_name, label in fields.items():
-                    s = (fld(bp, fld_name, "") or "").lower()
-                    if not s:
-                        continue
-                    for dlg in self._script_dialog_targets(s):
-                        _add_caller(dlg, {
-                            "kind": kind, "resref": rr,
-                            "event": label, "script": s,
-                            "areas": sorted(areas_idx.get(rr, set())),
-                        })
-        _add_blueprint_event_callers(self.creatures, self.CREATURE_EVENT_FIELDS,
-                                     "creature-event", creature_areas)
-        _add_blueprint_event_callers(self.placeables, self.PLACEABLE_EVENT_FIELDS,
-                                     "placeable-event", placeable_areas)
-        _add_blueprint_event_callers(self.doors, self.DOOR_EVENT_FIELDS,
-                                     "door-event", door_areas)
-        _add_blueprint_event_callers(self.triggers, self.TRIGGER_EVENT_FIELDS,
-                                     "trigger-event", trigger_areas)
+        self._add_blueprint_event_callers(self.creatures, self.CREATURE_EVENT_FIELDS,
+                                          "creature-event", creature_areas)
+        self._add_blueprint_event_callers(self.placeables, self.PLACEABLE_EVENT_FIELDS,
+                                          "placeable-event", placeable_areas)
+        self._add_blueprint_event_callers(self.doors, self.DOOR_EVENT_FIELDS,
+                                          "door-event", door_areas)
+        self._add_blueprint_event_callers(self.triggers, self.TRIGGER_EVENT_FIELDS,
+                                          "trigger-event", trigger_areas)
 
         # 2a. Per-instance overrides on placeables/doors/triggers. The
         #     toolset lets a builder swap any blueprint script slot (or, for
@@ -175,39 +205,12 @@ class DbDialogsMixin:
         #     placement — used heavily in HoMERs LotR for things like the
         #     legendary leveler statue, where a generic statue blueprint is
         #     overridden per-placement with `OnUsed = hgll_start_dlg`.
-        def _add_instance_event_callers(area_lists: dict, fields: dict[str, str],
-                                         kind_event: str, kind_conv: str | None):
-            for area_rr, items in area_lists.items():
-                for idx, inst in enumerate(items):
-                    tag = fld(inst, "Tag", "") or ""
-                    bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
-                    if kind_conv is not None:
-                        dlg = (fld(inst, "Conversation", "") or "").lower()
-                        if dlg and dlg in self.dialogs:
-                            _add_caller(dlg, {
-                                "kind": kind_conv,
-                                "area": area_rr, "idx": idx, "tag": tag,
-                                "resref": bp_rr,
-                                "areas": [area_rr],
-                            })
-                    for fld_name, label in fields.items():
-                        s = (fld(inst, fld_name, "") or "").lower()
-                        if not s:
-                            continue
-                        for dlg in self._script_dialog_targets(s):
-                            _add_caller(dlg, {
-                                "kind": kind_event,
-                                "area": area_rr, "idx": idx, "tag": tag,
-                                "resref": bp_rr,
-                                "event": label, "script": s,
-                                "areas": [area_rr],
-                            })
-        _add_instance_event_callers(self.area_placeables, self.PLACEABLE_EVENT_FIELDS,
-                                    "placeable-event-instance", "placeable-instance")
-        _add_instance_event_callers(self.area_doors, self.DOOR_EVENT_FIELDS,
-                                    "door-event-instance", "door-instance")
-        _add_instance_event_callers(self.area_triggers, self.TRIGGER_EVENT_FIELDS,
-                                    "trigger-event-instance", None)
+        self._add_instance_event_callers(self.area_placeables, self.PLACEABLE_EVENT_FIELDS,
+                                         "placeable-event-instance", "placeable-instance")
+        self._add_instance_event_callers(self.area_doors, self.DOOR_EVENT_FIELDS,
+                                         "door-event-instance", "door-instance")
+        self._add_instance_event_callers(self.area_triggers, self.TRIGGER_EVENT_FIELDS,
+                                         "trigger-event-instance", None)
 
         # 3. Per-area event scripts.
         for rr, area in self.areas.items():
@@ -216,7 +219,7 @@ class DbDialogsMixin:
                 if not s:
                     continue
                 for dlg in self._script_dialog_targets(s):
-                    _add_caller(dlg, {
+                    self._add_caller(dlg, {
                         "kind": "area-event", "resref": rr,
                         "event": label, "script": s,
                         "areas": [rr],
@@ -229,10 +232,53 @@ class DbDialogsMixin:
                 if not s:
                     continue
                 for dlg in self._script_dialog_targets(s):
-                    _add_caller(dlg, {
+                    self._add_caller(dlg, {
                         "kind": "module-event", "event": label, "script": s,
                     })
 
+    def _add_blueprint_event_callers(self, blueprints: dict, fields: dict[str, str],
+                                     kind: str, areas_idx: dict[str, set[str]]):
+        for rr, bp in blueprints.items():
+            for fld_name, label in fields.items():
+                s = (fld(bp, fld_name, "") or "").lower()
+                if not s:
+                    continue
+                for dlg in self._script_dialog_targets(s):
+                    self._add_caller(dlg, {
+                        "kind": kind, "resref": rr,
+                        "event": label, "script": s,
+                        "areas": sorted(areas_idx.get(rr, set())),
+                    })
+
+    def _add_instance_event_callers(self, area_lists: dict, fields: dict[str, str],
+                                    kind_event: str, kind_conv: str | None):
+        for area_rr, items in area_lists.items():
+            for idx, inst in enumerate(items):
+                tag = fld(inst, "Tag", "") or ""
+                bp_rr = (fld(inst, "TemplateResRef", "") or "").lower()
+                if kind_conv is not None:
+                    dlg = (fld(inst, "Conversation", "") or "").lower()
+                    if dlg and dlg in self.dialogs:
+                        self._add_caller(dlg, {
+                            "kind": kind_conv,
+                            "area": area_rr, "idx": idx, "tag": tag,
+                            "resref": bp_rr,
+                            "areas": [area_rr],
+                        })
+                for fld_name, label in fields.items():
+                    s = (fld(inst, fld_name, "") or "").lower()
+                    if not s:
+                        continue
+                    for dlg in self._script_dialog_targets(s):
+                        self._add_caller(dlg, {
+                            "kind": kind_event,
+                            "area": area_rr, "idx": idx, "tag": tag,
+                            "resref": bp_rr,
+                            "event": label, "script": s,
+                            "areas": [area_rr],
+                        })
+
+    def _index_item_script_callers(self) -> None:
         # 5. Item tag-based scripting: when a script's resref equals an item's
         #    tag (or resref) and that script statically starts a conversation,
         #    treat the item as a caller. This catches the common "wand /
@@ -244,11 +290,12 @@ class DbDialogsMixin:
                 if not candidate:
                     continue
                 for dlg in self._script_dialog_targets(candidate):
-                    _add_caller(dlg, {
+                    self._add_caller(dlg, {
                         "kind": "item-script", "resref": rr,
                         "script": candidate,
                     })
 
+    def _dedupe_dialog_callers(self) -> None:
         # Dedupe caller lists (the same blueprint can match via several
         # event scripts; collapse identical descriptors).
         for dlg, callers in self.dialog_callers.items():
@@ -264,6 +311,9 @@ class DbDialogsMixin:
                 uniq.append(c)
             self.dialog_callers[dlg] = uniq
 
+    def _build_conv_transitions(self) -> int:
+        """Build the map's conversation edges; returns the count of edges
+        suppressed by --exclude-conv-option."""
         # Pseudo-nodes + conv_transitions for the area map.
         # A conversation contributes to the map if it has at least one
         # teleport destination resolvable to a real area.
@@ -332,19 +382,4 @@ class DbDialogsMixin:
                         "label": label,
                     })
 
-        n_glob = len(self.global_convo_pseudo)
-        n_conv_edges = len(self.conv_transitions)
-        n_callers = sum(len(v) for v in self.dialog_callers.values())
-        excl_msg = (f", {n_excluded_edges} edges suppressed by --exclude-conv-option"
-                    if n_excluded_edges else "")
-        print(f"  dialog xref in {time.time()-t0:.1f}s — {len(self.dialogs)} dialogs, "
-              f"{n_callers} callers, {n_glob} global pseudo-nodes, "
-              f"{n_conv_edges} conv map edges{excl_msg}")
-
-        self._build_direct_teleport_transitions()
-        self._build_store_openers()
-        self._index_script_item_sources()
-        self._index_random_treasure_containers()
-        self._index_key_items()
-        self._index_script_item_checks()
-        self._build_dialog_quest_index()
+        return n_excluded_edges
