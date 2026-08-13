@@ -137,6 +137,87 @@ def _inaccessible_reason_html(rr: str, db: "Db") -> str:
     return '<span class="reason-missing">Not found anywhere</span>'
 
 
+def _weapon_key_split(buckets: dict) -> tuple[list[str], list[str]]:
+    """Split the ``weapon_<baseitem>`` bucket keys into player and creature
+    weapons, each sorted by base item name."""
+    all_weapon_keys = sorted(
+        (k for k in buckets if k.startswith("weapon_")),
+        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
+    )
+    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
+    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
+    return player_weapon_keys, creature_weapon_keys
+
+
+def _make_expand(player_weapon_keys: list[str], creature_weapon_keys: list[str]):
+    """Build the _TOC_GROUPS category expander: the WEAPONS/CREATURE_WEAPONS
+    placeholders become the concrete per-baseitem weapon keys."""
+    def _expand(cats: list[str]) -> list[str]:
+        result: list[str] = []
+        for c in cats:
+            if c == "WEAPONS":
+                result.extend(player_weapon_keys)
+            elif c == "CREATURE_WEAPONS":
+                result.extend(creature_weapon_keys)
+            else:
+                result.append(c)
+        return result
+    return _expand
+
+
+def _items_toc_entry(cat_key: str, count: int) -> str:
+    """One sidebar TOC line linking to a category's in-page anchor."""
+    slug = cat_key.replace("_", "-")
+    return (
+        f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
+        f' <span class="muted">({count})</span></a></div>'
+    )
+
+
+def _items_toc_group_parts(buckets: dict, _expand) -> list[str]:
+    """The grouped (Weapons/Armor/Gear/Misc.) part of an items sidebar TOC."""
+    toc_parts: list[str] = []
+    for group_heading, group_cats_tmpl in _TOC_GROUPS:
+        entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
+        if not entries:
+            continue
+        toc_parts.append(f'<div class="toc-group-heading">{E(group_heading)}</div>')
+        for cat_key, cat_items in entries:
+            toc_parts.append(_items_toc_entry(cat_key, len(cat_items)))
+    return toc_parts
+
+
+def _items_special_entries(buckets: dict, creature_weapon_keys: list[str]) -> list[tuple[str, list]]:
+    """The non-empty (key, items) pairs that belong under the Special heading."""
+    special_cat_keys = creature_weapon_keys + (["creature_item"] if buckets.get("creature_item") else [])
+    return [(ck, buckets[ck]) for ck in special_cat_keys if buckets.get(ck)]
+
+
+def _items_section_html(db: "Db", ctx: PageCtx, cat_key: str,
+                        items: list[tuple[str, dict]], heading: str = "h2",
+                        show_reason: bool = False) -> str:
+    """One category section: anchored heading plus the item table under it."""
+    slug = cat_key.replace("_", "-")
+    cat_label = _item_category_label(cat_key)
+    show_base, show_stack = _items_col_flags(items)
+    show_ac = cat_key.startswith("armor_")
+    show_spell_info = cat_key == "scroll" and any(
+        v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
+    )
+    rows_html = "\n".join(
+        _items_row(rr, i, db, show_base, show_stack, ctx, show_ac=show_ac,
+                   reason=_inaccessible_reason_html(rr, db) if show_reason else None,
+                   show_spell_info=show_spell_info)
+        for rr, i in items
+    )
+    return (
+        f'<{heading} id="{E(slug)}">{E(cat_label)}'
+        f' <small class="muted">({len(items)})</small></{heading}>'
+        + _items_table_head(show_base, show_stack, show_ac, show_reason=show_reason,
+                            show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
+    )
+
+
 def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out: Path) -> None:
     """Render items/inaccessible/index.html — mirrors the main items index layout.
 
@@ -159,23 +240,8 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
     for key in buckets:
         buckets[key].sort(key=_item_cost_key, reverse=True)
 
-    all_weapon_keys = sorted(
-        (k for k in buckets if k.startswith("weapon_")),
-        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
-    )
-    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
-    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
-
-    def _expand(cats: list[str]) -> list[str]:
-        result: list[str] = []
-        for c in cats:
-            if c == "WEAPONS":
-                result.extend(player_weapon_keys)
-            elif c == "CREATURE_WEAPONS":
-                result.extend(creature_weapon_keys)
-            else:
-                result.append(c)
-        return result
+    player_weapon_keys, creature_weapon_keys = _weapon_key_split(buckets)
+    _expand = _make_expand(player_weapon_keys, creature_weapon_keys)
 
     ordered_cats: list[str] = []
     for _, group_cats in _TOC_GROUPS:
@@ -188,28 +254,13 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
         '<div><a href="../properties/index.html">Browse by Property</a></div>',
         '<div><a href="../search.html">Search Items</a></div>',
     ]
-    for group_heading, group_cats_tmpl in _TOC_GROUPS:
-        entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
-        if not entries:
-            continue
-        toc_parts.append(f'<div class="toc-group-heading">{E(group_heading)}</div>')
-        for cat_key, cat_items in entries:
-            slug = cat_key.replace("_", "-")
-            toc_parts.append(
-                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
-                f' <span class="muted">({len(cat_items)})</span></a></div>'
-            )
+    toc_parts.extend(_items_toc_group_parts(buckets, _expand))
 
-    special_cat_keys = creature_weapon_keys + (["creature_item"] if buckets.get("creature_item") else [])
-    special_entries  = [(ck, buckets[ck]) for ck in special_cat_keys if buckets.get(ck)]
+    special_entries = _items_special_entries(buckets, creature_weapon_keys)
     if special_entries:
         toc_parts.append('<div class="toc-group-heading">Special</div>')
         for cat_key, cat_items in special_entries:
-            slug = cat_key.replace("_", "-")
-            toc_parts.append(
-                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
-                f' <span class="muted">({len(cat_items)})</span></a></div>'
-            )
+            toc_parts.append(_items_toc_entry(cat_key, len(cat_items)))
 
     sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
 
@@ -225,25 +276,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
         items = buckets.get(cat_key, [])
         if not items:
             continue
-        slug = cat_key.replace("_", "-")
-        cat_label = _item_category_label(cat_key)
-        show_base, show_stack = _items_col_flags(items)
-        show_ac = cat_key.startswith("armor_")
-        show_spell_info = cat_key == "scroll" and any(
-            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
-        )
-        rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, ctx, show_ac=show_ac,
-                       reason=_inaccessible_reason_html(rr, db),
-                       show_spell_info=show_spell_info)
-            for rr, i in items
-        )
-        body += (
-            f'<h2 id="{E(slug)}">{E(cat_label)}'
-            f' <small class="muted">({len(items)})</small></h2>'
-            + _items_table_head(show_base, show_stack, show_ac, show_reason=True,
-                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
-        )
+        body += _items_section_html(db, ctx, cat_key, items, show_reason=True)
 
     layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
     write_page(out, ctx, "Inaccessible Items", layout)
@@ -311,23 +344,8 @@ def render_items_index(db: Db, out: Path) -> None:
         return item_gp_value(entry[1])
 
     # Split weapon keys into player weapons and creature-only weapons.
-    all_weapon_keys = sorted(
-        (k for k in buckets if k.startswith("weapon_")),
-        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
-    )
-    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
-    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
-
-    def _expand(cats: list[str]) -> list[str]:
-        result: list[str] = []
-        for c in cats:
-            if c == "WEAPONS":
-                result.extend(player_weapon_keys)
-            elif c == "CREATURE_WEAPONS":
-                result.extend(creature_weapon_keys)
-            else:
-                result.append(c)
-        return result
+    player_weapon_keys, creature_weapon_keys = _weapon_key_split(buckets)
+    _expand = _make_expand(player_weapon_keys, creature_weapon_keys)
 
     ordered_cats: list[str] = []
     for _, group_cats in _TOC_GROUPS:
@@ -347,28 +365,13 @@ def render_items_index(db: Db, out: Path) -> None:
         '<div><a href="properties/index.html">Browse by Property</a></div>',
         '<div><a href="search.html">Search Items</a></div>',
     ]
-    for group_heading, group_cats_tmpl in _TOC_GROUPS:
-        entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
-        if not entries:
-            continue
-        toc_parts.append(f'<div class="toc-group-heading">{E(group_heading)}</div>')
-        for cat_key, cat_items in entries:
-            slug = cat_key.replace("_", "-")
-            toc_parts.append(
-                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
-                f' <span class="muted">({len(cat_items)})</span></a></div>'
-            )
+    toc_parts.extend(_items_toc_group_parts(buckets, _expand))
 
-    special_cat_keys = creature_weapon_keys + (["creature_item"] if buckets.get("creature_item") else [])
-    special_entries  = [(ck, buckets[ck]) for ck in special_cat_keys if buckets.get(ck)]
+    special_entries = _items_special_entries(buckets, creature_weapon_keys)
     if special_entries or inaccessible or broken:
         toc_parts.append('<div class="toc-group-heading">Special</div>')
         for cat_key, cat_items in special_entries:
-            slug = cat_key.replace("_", "-")
-            toc_parts.append(
-                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
-                f' <span class="muted">({len(cat_items)})</span></a></div>'
-            )
+            toc_parts.append(_items_toc_entry(cat_key, len(cat_items)))
         if inaccessible:
             toc_parts.append(
                 f'<div><a href="inaccessible/index.html">Inaccessible'
@@ -396,24 +399,7 @@ def render_items_index(db: Db, out: Path) -> None:
         items = buckets.get(cat_key, [])
         if not items:
             continue
-        slug = cat_key.replace("_", "-")
-        cat_label = _item_category_label(cat_key)
-        show_base, show_stack = _items_col_flags(items)
-        show_ac = cat_key.startswith("armor_")
-        show_spell_info = cat_key == "scroll" and any(
-            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
-        )
-        rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, ctx, show_ac=show_ac,
-                       show_spell_info=show_spell_info)
-            for rr, i in items
-        )
-        body += (
-            f'<h2 id="{E(slug)}">{E(cat_label)}'
-            f' <small class="muted">({len(items)})</small></h2>'
-            + _items_table_head(show_base, show_stack, show_ac,
-                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
-        )
+        body += _items_section_html(db, ctx, cat_key, items)
 
     if broken:
         # Broken items: use the resref as the display name since TLK

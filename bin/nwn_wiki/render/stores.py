@@ -19,15 +19,20 @@ from nwn_wiki.htmlgen.links import (_area_link, _creature_link, _item_link,
                                     link)
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.items import (
-    _CREATURE_WEAPON_BASEITEMS,
     _TOC_GROUPS,
     _item_category,
-    _item_category_label,
     item_gp_value,
 )
-from nwn_wiki.lookups import SPELL_INFO, STOCK_BASEITEMS, baseitem_name
+from nwn_wiki.lookups import STOCK_BASEITEMS, baseitem_name
 from nwn_wiki.render.conversations import _caller_html
-from nwn_wiki.render.items import _items_col_flags, _items_row, _items_table_head
+from nwn_wiki.render.items import (
+    _items_section_html,
+    _items_special_entries,
+    _items_toc_entry,
+    _items_toc_group_parts,
+    _make_expand,
+    _weapon_key_split,
+)
 
 
 def _buy_limit_str(mbp: Any) -> str:
@@ -221,8 +226,12 @@ def _store_opener_html(db: Db, opener: dict, ctx: PageCtx) -> str:
     return _caller_html(db, opener, ctx)
 
 
-def _store_inventory_html(db: "Db", pages: list, ctx: PageCtx) -> str:
-    """Render store inventory grouped by item category (same scheme as the items index)."""
+def _store_inventory_buckets(db: "Db", pages: list) -> dict[str, list[tuple[str, dict]]]:
+    """Bucket a store's inventory pages by item category key.
+
+    Empty dict when the store stocks nothing.  Buckets are unsorted; callers
+    that render tables sort them by GP value.
+    """
     all_items: list[tuple[str, dict]] = []
     for p in pages:
         for it in list_items(p.get("ItemList")):
@@ -234,13 +243,18 @@ def _store_inventory_html(db: "Db", pages: list, ctx: PageCtx) -> str:
             enriched = db.items.get(irr, it)
             all_items.append((irr, enriched))
 
-    if not all_items:
-        return '<p class="muted">No items.</p>'
-
     buckets: dict[str, list[tuple[str, dict]]] = defaultdict(list)
     for irr, enriched in all_items:
         cat_key = _item_category(enriched, nwn_text(db.item_name(irr)))
         buckets[cat_key].append((irr, enriched))
+    return buckets
+
+
+def _store_inventory_html(db: "Db", pages: list, ctx: PageCtx) -> str:
+    """Render store inventory grouped by item category (same scheme as the items index)."""
+    buckets = _store_inventory_buckets(db, pages)
+    if not buckets:
+        return '<p class="muted">No items.</p>'
 
     def _cost_key(entry: tuple[str, dict]) -> int:
         return item_gp_value(entry[1])
@@ -248,23 +262,8 @@ def _store_inventory_html(db: "Db", pages: list, ctx: PageCtx) -> str:
     for items in buckets.values():
         items.sort(key=_cost_key, reverse=True)
 
-    all_weapon_keys = sorted(
-        (k for k in buckets if k.startswith("weapon_")),
-        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
-    )
-    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
-    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
-
-    def _expand(cats: list[str]) -> list[str]:
-        result: list[str] = []
-        for c in cats:
-            if c == "WEAPONS":
-                result.extend(player_weapon_keys)
-            elif c == "CREATURE_WEAPONS":
-                result.extend(creature_weapon_keys)
-            else:
-                result.append(c)
-        return result
+    player_weapon_keys, creature_weapon_keys = _weapon_key_split(buckets)
+    _expand = _make_expand(player_weapon_keys, creature_weapon_keys)
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -283,88 +282,27 @@ def _store_inventory_html(db: "Db", pages: list, ctx: PageCtx) -> str:
         items = buckets.get(cat_key)
         if not items:
             continue
-        slug = cat_key.replace("_", "-")
-        cat_label = _item_category_label(cat_key)
-        show_base, show_stack = _items_col_flags(items)
-        show_ac = cat_key.startswith("armor_")
-        show_spell_info = cat_key == "scroll" and any(
-            v for v in SPELL_INFO.get("iprp_spells", {}).values() if v
-        )
-        rows_html = "\n".join(
-            _items_row(rr, i, db, show_base, show_stack, ctx, show_ac=show_ac,
-                       show_spell_info=show_spell_info)
-            for rr, i in items
-        )
-        parts.append(
-            f'<h3 id="{E(slug)}">{E(cat_label)} <small class="muted">({len(items)})</small></h3>'
-            + _items_table_head(show_base, show_stack, show_ac,
-                                show_spell_info=show_spell_info) + rows_html + "</tbody></table>"
-        )
+        parts.append(_items_section_html(db, ctx, cat_key, items, heading="h3"))
 
     return "\n".join(parts)
 
 
 def _store_inventory_toc_html(db: "Db", pages: list) -> str:
     """Sidebar TOC for a store instance page. Returns empty string when store has no items."""
-    all_items: list[tuple[str, dict]] = []
-    for p in pages:
-        for it in list_items(p.get("ItemList")):
-            irr = (fld(it, "TemplateResRef", "")
-                   or fld(it, "InventoryRes", "")
-                   or fld(it, "EquippedRes", "") or "").strip()
-            if not irr:
-                continue
-            all_items.append((irr, db.items.get(irr, it)))
-
-    if not all_items:
+    buckets = _store_inventory_buckets(db, pages)
+    if not buckets:
         return ""
 
-    buckets: dict[str, list] = defaultdict(list)
-    for irr, enriched in all_items:
-        buckets[_item_category(enriched, nwn_text(db.item_name(irr)))].append(irr)
+    player_weapon_keys, creature_weapon_keys = _weapon_key_split(buckets)
+    _expand = _make_expand(player_weapon_keys, creature_weapon_keys)
 
-    all_weapon_keys = sorted(
-        (k for k in buckets if k.startswith("weapon_")),
-        key=lambda k: (baseitem_name(int(k[7:])) or "").lower(),
-    )
-    player_weapon_keys   = [k for k in all_weapon_keys if int(k[7:]) not in _CREATURE_WEAPON_BASEITEMS]
-    creature_weapon_keys = [k for k in all_weapon_keys if int(k[7:]) in _CREATURE_WEAPON_BASEITEMS]
+    toc_parts: list[str] = _items_toc_group_parts(buckets, _expand)
 
-    def _expand(cats: list[str]) -> list[str]:
-        result: list[str] = []
-        for c in cats:
-            if c == "WEAPONS":
-                result.extend(player_weapon_keys)
-            elif c == "CREATURE_WEAPONS":
-                result.extend(creature_weapon_keys)
-            else:
-                result.append(c)
-        return result
-
-    toc_parts: list[str] = []
-    for group_heading, group_cats_tmpl in _TOC_GROUPS:
-        entries = [(ck, buckets[ck]) for ck in _expand(group_cats_tmpl) if buckets.get(ck)]
-        if not entries:
-            continue
-        toc_parts.append(f'<div class="toc-group-heading">{E(group_heading)}</div>')
-        for cat_key, cat_items in entries:
-            slug = cat_key.replace("_", "-")
-            toc_parts.append(
-                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
-                f' <span class="muted">({len(cat_items)})</span></a></div>'
-            )
-
-    special_keys = creature_weapon_keys + (["creature_item"] if buckets.get("creature_item") else [])
-    if special_keys:
+    special_entries = _items_special_entries(buckets, creature_weapon_keys)
+    if special_entries:
         toc_parts.append('<div class="toc-group-heading">Special</div>')
-        for cat_key in special_keys:
-            if not buckets.get(cat_key):
-                continue
-            slug = cat_key.replace("_", "-")
-            toc_parts.append(
-                f'<div><a href="#{E(slug)}">{E(_item_category_label(cat_key))}'
-                f' <span class="muted">({len(buckets[cat_key])})</span></a></div>'
-            )
+        for cat_key, cat_items in special_entries:
+            toc_parts.append(_items_toc_entry(cat_key, len(cat_items)))
 
     if not toc_parts:
         return ""
