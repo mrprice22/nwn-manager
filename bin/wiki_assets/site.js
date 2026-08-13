@@ -35,6 +35,7 @@ function releaseNav() {
 document.addEventListener("DOMContentLoaded", () => {
   const nav = document.querySelector('header.site-header nav');
   if (nav) initNav(nav);
+  initMap();
   initFooterTimestamp();
 });
 
@@ -229,6 +230,68 @@ function initSearch(cfg) {
   });
 }
 window.initSearch = initSearch;
+
+/* ── Area map: pan/zoom + download ─────────────────────────────────────────
+ * The home index and /map embed the same SVG from render_map_svg(), always with
+ * the same two ids, at most one map per page — so this finds its own elements
+ * and is a no-op on every other page.
+ *
+ * Panning is the wrap's own overflow:auto scrolling; this only resizes the SVG
+ * (the viewBox is never touched) and keeps the point under the cursor fixed. */
+function initMap() {
+  const wrap = document.getElementById('area-map-wrap');
+  const svg = document.getElementById('area-map-svg');
+  if (!wrap || !svg) return;
+
+  // Capture the 1:1 baseline size before any resize, then default the view to
+  // 20% out (zoom=0.8); the "1:1" reset returns to baseline.
+  const baseW = parseFloat(svg.getAttribute('width'));
+  const baseH = parseFloat(svg.getAttribute('height'));
+  let zoom = 0.8;
+  svg.setAttribute('width', Math.round(baseW * zoom));
+  svg.setAttribute('height', Math.round(baseH * zoom));
+  // Center now that the SVG is at its initial (20%-out) size.
+  wrap.scrollLeft = (wrap.scrollWidth - wrap.clientWidth) / 2;
+  wrap.scrollTop = (wrap.scrollHeight - wrap.clientHeight) / 2;
+
+  function applyZoom(z, px, py) {
+    z = Math.max(0.2, Math.min(5, z));
+    if (z === zoom) return;
+    px = px !== undefined ? px : wrap.clientWidth / 2;
+    py = py !== undefined ? py : wrap.clientHeight / 2;
+    const fx = (wrap.scrollLeft + px) / (baseW * zoom);
+    const fy = (wrap.scrollTop + py) / (baseH * zoom);
+    zoom = z;
+    svg.setAttribute('width', Math.round(baseW * zoom));
+    svg.setAttribute('height', Math.round(baseH * zoom));
+    wrap.scrollLeft = fx * baseW * zoom - px;
+    wrap.scrollTop = fy * baseH * zoom - py;
+  }
+  document.getElementById('area-map-zoom-in').onclick = function () { applyZoom(zoom * 1.25); };
+  document.getElementById('area-map-zoom-out').onclick = function () { applyZoom(zoom / 1.25); };
+  document.getElementById('area-map-zoom-reset').onclick = function () { applyZoom(1); };
+  wrap.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    const r = wrap.getBoundingClientRect();
+    applyZoom(e.deltaY < 0 ? zoom * 1.12 : zoom / 1.12, e.clientX - r.left, e.clientY - r.top);
+  }, {passive: false});
+
+  // Download. Called by the toolbar button's onclick attribute, so it has to be
+  // global; serialises the live SVG, zoom-resized width/height and all.
+  window.downloadAreaMap = function () {
+    let src = new XMLSerializer().serializeToString(svg);
+    if (!src.match(/^<\?xml/)) src = '<?xml version="1.0" encoding="UTF-8"?>\n' + src;
+    const blob = new Blob([src], {type: 'image/svg+xml;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'area-map.svg';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 100);
+  };
+}
 
 function initFooterTimestamp() {
   const el = document.getElementById('wiki-generated-at');

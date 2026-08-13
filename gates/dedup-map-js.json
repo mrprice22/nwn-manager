@@ -1,0 +1,8 @@
+{
+  "reason": "render_map_svg appends a 37-line pan/zoom + download IIFE inline after the map SVG, on every page that embeds a map. The blob is byte-identical (1779 chars) on all five map-bearing pages across the three corpora, and it only ever addresses the two fixed ids #area-map-wrap / #area-map-svg, so it moves wholesale into wiki_assets/site.js as initMap(), which finds those elements itself on init the way initNav finds the nav — no inline script and no DOMContentLoaded shim in the page at all. The toolbar markup is untouched: the Download button keeps its onclick=\"downloadAreaMap()\" attribute, and initMap still assigns window.downloadAreaMap (attribute handlers resolve at click time, long after the deferred site.js has run). So the only output that may move is the single line carrying the trailing <script> on each map page, plus the copied assets/site.js. Map pages, per the recorded baselines: docs/map/index.html in all three corpora and docs/index.html in lotr2008 + lotr2009 only (homers_lotr's index is an author-supplied override with no map) — an allowlist entry that does not change in a given corpus is fine. No line_patterns: this is a wholesale relocation of arbitrary JavaScript between two files, so any regex covering every moved site.js line would be vacuous; the three-path allowlist is the real prediction.",
+  "paths": [
+    "docs/assets/site.js",
+    "docs/index.html",
+    "docs/map/index.html"
+  ]
+}
