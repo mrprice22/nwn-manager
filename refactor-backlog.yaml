@@ -3156,8 +3156,63 @@ items:
 - id: render-page-split
   phase: 4
   title: Break up render_area_page, render_item_page, render_items_by_property
-  status: pending
+  status: done
   gate: zero-diff
+  commit: af003d4
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (150s), lotr2008 IDENTICAL (97s), lotr2009 IDENTICAL (106s)"
+  impl_notes: >
+    All three done in one run; hatch 3b not needed.  Same trick as
+    creature-sections-split: section bodies keep their original indent as
+    top-level function bodies, each seeded `sections: list[str] = []` and ending
+    `return sections`, so every original append line is byte-identical and git
+    matched the moves.
+    render_area_page (areas.py) 515 -> 22 lines, eleven section functions called
+    in the original order from an orchestrator that keeps a/ctx/name and passes
+    them explicitly: _area_header_sections (33), _area_path_sections (70),
+    _area_out_transition_sections (45), _area_in_transition_sections (42),
+    _area_npc_sections (63, keeps its nested npc_table closure verbatim),
+    _area_encounter_sections (59), _area_script_spawn_sections (44),
+    _area_container_sections (44), _area_store_sections (71),
+    _area_conversation_sections (67), _area_waypoint_sections (21).  The only
+    deleted lines in the diff are the 8-line def/prologue.
+    render_item_page (items.py) 500 -> 49 lines; the orchestrator keeps the shared
+    flag prologue verbatim and passes the flags explicitly.  _item_meta_sections
+    (71), _item_notice_sections (78), _item_description_sections (12),
+    _item_dialog_sections (31), _item_property_sections (83),
+    _item_where_to_find_sections (118), _item_key_for_sections (43),
+    _item_script_check_sections (50), _item_quest_sections (39).  Only deleted
+    lines: the prologue and the final write_page.
+    render_items_by_property (itemprops_pages.py) 502 -> 9 lines, split by logical
+    pass rather than by section: _collect_item_properties (67, returns _acc,
+    _prefix_acc, _light_param; keeps the _group_subtype closure),
+    _property_index_tables (62, returns prop_index, unique_pnames, subtype_rows,
+    _index_subtype_only), _render_property_index_page (118),
+    _render_property_detail_pages (192, also builds _prefix_detail),
+    _render_combined_property_pages (88).  The nested _pname_anchor was lifted to
+    module level unchanged because all three renderers use it — the only 2
+    reindented lines in the whole item.
+    DELIBERATELY NOT LIFTED, as the depth-7 warning anticipated:
+    _item_where_to_find_sections' four sub-blocks (sold/containers/carried/script)
+    sit at indent 8 inside one if, and _render_property_detail_pages' per-page body
+    sits at indent 8 inside the for.  Extracting either means reindenting 100-180
+    lines — a rewrite, not a move — so both stayed put and their enclosing
+    loop/branch moved as a unit.
+  found:
+    - "areas.py path section: `for a, b, kind, ... in path_steps:` SHADOWS `a`, the
+       area dict, in what is now _area_path_sections.  Harmless only because the
+       header was already emitted by the time it runs; the shadowing name is still
+       there and is now structurally isolated, which makes it safe to rename."
+    - "areas.py rebuilds the tag_to_item_rr tag->item map from db.items
+       independently in both the outgoing and incoming transition sections, with
+       near-identical code.  A shared cached helper is an easy later win."
+    - "items.py _item_meta_sections needs 10 parameters because the prologue
+       computes one bag of flags for the whole page; a small dataclass would read
+       better in a later phase.  accessible / is_resref_named are single-use
+       intermediates."
+    - "One cosmetic follow-through inside this item: a now-orphaned blank line
+       between two adjacent comments in _property_index_tables (where the nested
+       _pname_anchor used to sit) was dropped."
   after: [creature-sections-split]
   plan: >
     515 (depth 6), 500 (depth 7) and 511 (depth 7) lines respectively.  Depth 7
