@@ -19,6 +19,7 @@ from pathlib import Path
 
 from nwn_wiki.gff import fld
 from nwn_wiki.htmlgen.escape import nwn_text
+from nwn_wiki.util import _try_float
 
 from nwn_wiki import state
 
@@ -77,10 +78,7 @@ def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
             cr_raw = fld(c, "ChallengeRating")
             if cr_raw is None and bp is not None:
                 cr_raw = fld(bp, "ChallengeRating")
-            try:
-                cr = float(cr_raw or 0)
-            except (TypeError, ValueError):
-                cr = 0.0
+            cr = _try_float(cr_raw or 0, 0.0)
             rows.append((can_rr, nwn_text(db.canonical_creature_name(can_rr)), cr))
         # Rebuild so newly-inaccessible creatures are pruned (catalogue is derived
         # data; kills / server_first are separate tables and untouched).

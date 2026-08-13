@@ -31,6 +31,7 @@ from pathlib import Path, PurePosixPath
 from nwn_wiki.gff import fld
 from nwn_wiki.htmlgen.escape import E, nwn_text
 from nwn_wiki.htmlgen.pagectx import PageCtx
+from nwn_wiki.util import _try_float
 
 from nwn_wiki import state
 
@@ -561,10 +562,7 @@ def _creature_cr_value(db: Db, can_rr: str) -> float:
     raw = fld(c, "ChallengeRating")
     if raw is None and bp is not None:
         raw = fld(bp, "ChallengeRating")
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return -1.0
+    return _try_float(raw, -1.0)
 
 
 def scan_creature_pics(project_root: Path, db: Db) -> None:

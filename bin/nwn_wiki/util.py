@@ -24,6 +24,17 @@ def _try_int(v: Any, default: int = 0) -> int:
         return default
 
 
+def _try_float(v: Any, default: float | None) -> float | None:
+    """float(v) with a caller-supplied fallback — for GFF fields that may be
+    blank or missing.  Unlike ``_try_int`` there is no shared sentinel: the CR
+    parsers each mean something different by "no value" (-1.0 unknown, 0.0
+    trivial, None absent, -inf sort-last), so ``default`` is required."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _fmt_commas(val: Any, blank_zero: bool = False) -> str | None:
     """Comma-grouped integer, or None when ``val`` isn't int-like.
 

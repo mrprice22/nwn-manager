@@ -20,6 +20,7 @@ from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _area_link, link
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.lookups import class_name, race_name
+from nwn_wiki.util import _try_float
 from nwn_wiki.warn import _warn_once
 
 from nwn_wiki import state
@@ -518,10 +519,7 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
         raw = _bp_field(c2, bp2)("ChallengeRating")
         if raw is None:
             return None
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return None
+        return _try_float(raw, None)
 
     # Separate known-CR from unknown-CR canonicals
     known: list[tuple[float, str]] = []
@@ -682,10 +680,7 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
             _c2 = _e2["c"]
             _bp2 = db.creatures.get(_e2["bp_rr"]) if _e2["bp_rr"] != r else None
             raw_cr = fld(_c2, "ChallengeRating") or (_bp2 and fld(_bp2, "ChallengeRating"))
-            try:
-                cr_val = float(raw_cr) if raw_cr else float("-inf")
-            except (TypeError, ValueError):
-                cr_val = float("-inf")
+            cr_val = _try_float(raw_cr, float("-inf")) if raw_cr else float("-inf")
             return (has_any, -cr_val, nwn_text(db.canonical_creature_name(r)).lower())
         can_rrs = sorted(by_race[rid], key=_race_sort_key)
         rows = []

@@ -42,7 +42,7 @@ from nwn_wiki.sim.gear import (
     build_gear_pool,
     minimum_viable_kit,
 )
-from nwn_wiki.util import _try_int, _write_json
+from nwn_wiki.util import _try_float, _try_int, _write_json
 
 
 def _module_index_url_helpers(
@@ -99,10 +99,7 @@ _ATTRITION_ROUNDS = 100
 
 def _parse_cr(cr_raw: object) -> float:
     """Numeric Challenge Rating, or 0.0 when unparseable."""
-    try:
-        return float(cr_raw)
-    except (TypeError, ValueError):
-        return 0.0
+    return _try_float(cr_raw, 0.0)
 
 
 def _fmt_gp(cost: int) -> str:
