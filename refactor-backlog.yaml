@@ -3221,8 +3221,88 @@ items:
 - id: main-split
   phase: 4
   title: Break up cli.main into argument parsing and named build stages
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 3d7dfb6
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (148s), lotr2008 IDENTICAL (89s), lotr2009 IDENTICAL (114s)"
+  impl_notes: >
+    main() 554 -> 49 lines: one arg-parsing function plus 19 named build stages,
+    all module-level and laid out in pipeline order.  _parse_args (118),
+    _load_tlks (26), _audit_wiki_data (35), _load_db (21), _compute_area_paths
+    (19), _apply_2da_overrides (42), _prepare_out_dir (29), _load_theme_and_pics
+    (20), _module_title (7), _prepare_module_index_dir (18), _generate_reports
+    (13), _compute_layout (40), _parse_activity_logs (28), _load_bestiary (27),
+    _freeze_site_chrome (24), _run_activity_subprocess (13), _render_pages (69),
+    _write_lookup_warnings (18), _write_boss_registry (26),
+    _print_module_index_summary (24).  File 787 -> 933 lines (signatures,
+    docstrings, blank lines).
+    ORDERING, which the plan flagged as load-bearing: every stage body is a
+    VERBATIM copy of the original statements at the same indent level — the diff
+    shows no changed content lines beyond def headers, docstrings, returns and the
+    Db(...) call.  Stage boundaries were only ever cut BETWEEN top-level statements
+    of the old main(), and main() calls the stages in exactly the original textual
+    sequence, so statement order across the whole build is byte-for-byte the old
+    order.  The three load-bearing comments were located and each now sits inside a
+    stage whose docstring restates the constraint (the comments themselves are
+    untouched): the 2DA overlay "Order matters — later writers win: stock / CEP /
+    --2da-dir" in _apply_2da_overrides; "set the activity-page flag BEFORE any
+    page() calls" in _parse_activity_logs; and "boss registry must load before ANY
+    page renders" plus the "every loader the page shell depends on has now run"
+    chrome comment in _freeze_site_chrome.
+    Every state access still goes through the module object; no
+    `from nwn_wiki.state import` was introduced (verified by grep of the diff).
+    All locals (args, db, src, out, graph, area_paths, path_from_name, title,
+    module_index_dir, positions, sizes, activity, warnings_path, warnings_out) are
+    threaded as parameters and returns — nothing is recomputed, including
+    warnings_path, which is returned from _write_lookup_warnings rather than
+    rebuilt in the summary stage.
+    THE FIVE DIALS (from db-init-schema's found:): three wired at construction —
+    max_character_level, max_ability_bonus and max_player_level now go in as
+    Db(src, ...) keywords, provably zero-diff because DbCore is a plain dataclass
+    with no __post_init__ and nothing ran between Db(src) and those assignments in
+    the original.  twoda_dir and run_counter_gear were deliberately LEFT as
+    post-construction assignments: not because construction is unsafe (their only
+    readers are in reports/, far downstream) but because twoda_dir's VALUE is
+    derived inside the load-bearing "Order matters" block — from --2da-dir or the
+    <src>/../hak_2da / <src>/2da probe that sits between the CEP overlay and
+    load_2da_overrides().  Moving that derivation up to construction would relocate
+    code out of the block those comments guard.  devcrit_bonus_dice stays with them.
+  found:
+    - "RESIDUAL RISK — CLI paths the gate never exercises.  wiki-golden invokes
+       nwn-wiki with --src --out --seed --2da-dir --dialog-tlk/--custom-tlk
+       (homers_lotr only) plus per-corpus --base-url --module-name
+       --exclude-conv-option --max-*-level --devcrit-bonus-dice --path-from.  NEVER
+       passed, so never covered: --log-dir / --activity-cache (so
+       _parse_activity_logs only runs its empty-log_dirs no-op path and
+       state._HAS_ACTIVITY_PAGE stays false for the whole gate), --db-dir (so
+       _load_bestiary only reaches its 'no reachable database dir' branch and
+       seed_bestiary_catalogue / backfill_server_first_player_names /
+       load_bestiary_stats are never called), _run_activity_subprocess (dead for
+       the entire gate, guarded by _HAS_ACTIVITY_PAGE), --counter-gear,
+       --nwn-install, a non-default --cr-bucket-size, the '--src not a directory'
+       error exit and the _audit_wiki_data missing-file exit.
+       Compensated by hand for the three biggest: _parse_activity_logs (with a real
+       but empty --log-dir), _load_bestiary, and _run_activity_subprocess with
+       subprocess.run stubbed and _HAS_ACTIVITY_PAGE forced true — the emitted
+       command list was [python3, nwn-wiki-activity, --src, --out, --log-dir,
+       --activity-cache, --db-dir] in exactly the original order and content.  That
+       proves scoping and NameError-freedom on those stages, NOT their full
+       semantics.  pyflakes on the file reports only the five deliberate re-export
+       imports and two pre-existing f-string warnings — no undefined names.
+       A smoke run with --log-dir/--db-dir/--counter-gear would close this."
+    - "cli._parse_args is 118 lines of add_argument and is now the largest thing in
+       the file; a _build_parser() split or an argument table would shrink it."
+    - "_module_title (7) and _run_activity_subprocess (13) are thin enough that a
+       future pass may want to fold them; kept separate so main() reads as an
+       explicit ordered pipeline."
+    - "Two whitespace-only lines before the final `done` print were dropped as a
+       byproduct of moving the tail into stages — no output effect."
+    - "Pre-existing and untouched: two f-strings with no placeholders in cli.py."
+    - "The _DATA_AUDIT pre-flight and the two report writers (lookup_warnings.json,
+       bosses.json) now have clean single-purpose homes (_audit_wiki_data,
+       _write_lookup_warnings, _write_boss_registry) and would move to reports/ as
+       three straight function moves if a later item wants them out of cli.py."
   after: [render-page-split]
   plan: >
     554 lines.  The loader ordering inside it is load-bearing — three comments in
