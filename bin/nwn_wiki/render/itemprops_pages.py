@@ -13,6 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items
+from nwn_wiki.htmlgen.blocks import items_layout, meta_dl, toc_sidebar
 from nwn_wiki.htmlgen.chrome import write, write_page
 from nwn_wiki.htmlgen.escape import E, nwn_text
 from nwn_wiki.htmlgen.links import link
@@ -211,7 +212,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 f'<div><a href="#{E(_pname_anchor(pname))}">{E(pname)}'
                 f' <span class="muted">({total})</span></a></div>'
             )
-    sidebar = '<aside class="items-toc items-toc--wide">' + "".join(sidebar_parts) + "</aside>"
+    sidebar = toc_sidebar(sidebar_parts, wide=True)
 
     total_props = len(prop_index)
     body = (
@@ -307,10 +308,7 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     f"<td>{cnt}</td></tr></tbody></table>"
                 )
 
-    layout = (
-        f'<div class="items-layout">{sidebar}'
-        f'<div class="items-content">{body}</div></div>'
-    )
+    layout = items_layout(sidebar, body)
     write_page(out, PageCtx("items/properties/index.html"),
                "Browse by Property", layout)
 
@@ -339,12 +337,10 @@ def render_items_by_property(db: "Db", out: Path) -> None:
             _dsi = _iprp_name_spell_info(_detail_spell_tbl, subtype)
             _dlvl, _dcls = _spell_level_classes(_dsi)
             if _dlvl or _dcls:
-                body += '<dl class="meta">'
-                if _dlvl:
-                    body += f"<dt>Spell Level</dt><dd>{E(_dlvl)}</dd>"
-                if _dcls:
-                    body += f"<dt>Caster Classes</dt><dd>{E(_dcls)}</dd>"
-                body += "</dl>"
+                body += meta_dl(
+                    ([f"<dt>Spell Level</dt><dd>{E(_dlvl)}</dd>"] if _dlvl else [])
+                    + ([f"<dt>Caster Classes</dt><dd>{E(_dcls)}</dd>"] if _dcls else [])
+                )
 
         detail_key = (pname, subtype)
         if detail_key in _prefix_detail:
@@ -497,8 +493,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     f' <span class="muted">({len(tier_entries)})</span></a></div>'
                 )
         back = f'<div><a href="index.html#{E(_pname_anchor(pname))}">← Browse by Property</a></div>'
-        detail_sidebar = '<aside class="items-toc">' + back + "".join(toc_parts) + '</aside>'
-        layout = f'<div class="items-layout">{detail_sidebar}<div class="items-content">{body}</div></div>'
+        detail_sidebar = toc_sidebar([back, *toc_parts])
+        layout = items_layout(detail_sidebar, body)
         write_page(out, PageCtx(f"items/properties/{slug}.html"), label, layout)
 
     # --- combined property pages (one page per property, all subtypes together) ---
@@ -554,12 +550,10 @@ def render_items_by_property(db: "Db", out: Path) -> None:
 
             body += f'<h3 id="{E(slug)}">{E(label)} <small class="muted">({cnt})</small></h3>'
             if _has_spell_info and (_dlvl or _dcls):
-                body += '<dl class="meta">'
-                if _dlvl:
-                    body += f"<dt>Spell Level</dt><dd>{E(_dlvl)}</dd>"
-                if _dcls:
-                    body += f"<dt>Caster Classes</dt><dd>{E(_dcls)}</dd>"
-                body += "</dl>"
+                body += meta_dl(
+                    ([f"<dt>Spell Level</dt><dd>{E(_dlvl)}</dd>"] if _dlvl else [])
+                    + ([f"<dt>Caster Classes</dt><dd>{E(_dcls)}</dd>"] if _dcls else [])
+                )
 
             has_qty = any(e[4] > 1 for e in entries)
             body += (
@@ -582,8 +576,8 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 )
             body += "</tbody></table>"
 
-        combined_sidebar = '<aside class="items-toc">' + "".join(toc_parts) + '</aside>'
-        layout = f'<div class="items-layout">{combined_sidebar}<div class="items-content">{body}</div></div>'
+        combined_sidebar = toc_sidebar(toc_parts)
+        layout = items_layout(combined_sidebar, body)
         write_page(out, PageCtx(f"items/properties/{combined_slug}.html"),
                    pname, layout)
 

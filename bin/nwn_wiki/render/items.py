@@ -14,6 +14,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items, loc
+from nwn_wiki.htmlgen.blocks import items_layout, meta_dl, toc_sidebar
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, colorize_damage_words, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _area_link, _creature_link, link
@@ -262,7 +263,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
         for cat_key, cat_items in special_entries:
             toc_parts.append(_items_toc_entry(cat_key, len(cat_items)))
 
-    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sidebar = toc_sidebar(toc_parts)
 
     body = "<h1>Inaccessible Items</h1>"
     body += (
@@ -278,7 +279,7 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
             continue
         body += _items_section_html(db, ctx, cat_key, items, show_reason=True)
 
-    layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
+    layout = items_layout(sidebar, body)
     write_page(out, ctx, "Inaccessible Items", layout)
 
 
@@ -383,7 +384,7 @@ def render_items_index(db: Db, out: Path) -> None:
                 f' <span class="muted">({len(broken)})</span></a></div>'
             )
 
-    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sidebar = toc_sidebar(toc_parts)
 
     body = "<h1>Accessible Items</h1>"
     body += (
@@ -442,7 +443,7 @@ def render_items_index(db: Db, out: Path) -> None:
             + _items_table_head(show_base, show_stack) + rows_html + "</tbody></table>"
         )
 
-    layout = f'<div class="items-layout">{sidebar}<div class="items-content">{body}</div></div>'
+    layout = items_layout(sidebar, body)
     write_page(out, ctx, "Accessible Items", layout)
 
     # Render the inaccessible items on their own page.
@@ -507,38 +508,38 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     )
     sections = [
         f"<h1>{nwn_html(display_name)}</h1>",
-        '<dl class="meta">',
-        f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
-        f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
-        f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
-        *(
-            [
-                f"<dt>Spell Level</dt><dd>{E(_scroll_spell_lvl)}</dd>",
-                f"<dt>Caster Classes</dt><dd>{E(_scroll_spell_cls)}</dd>",
-            ] if _is_scroll and (_scroll_spell_lvl or _scroll_spell_cls) else []
-        ),
-        f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i, nwn_text(display_name))))}</dd>",
-        *(
-            (lambda _ac: [
-                f"<dt>Base AC</dt><dd>{_ac}</dd>",
-                f"<dt>Material</dt><dd>{'Cloth' if _ac <= 0 else 'Leather' if _ac <= 3 else 'Metal'}</dd>",
-            ])(_torso_base_ac(i))
-            if _bi in _ARMOR_BASEITEMS
-            else [f"<dt>Base AC</dt><dd>{int((WEAPONS.get(_bi) or {}).get('BaseAC', 0) or 0)}</dd>"]
-            if _bi in SHIELD_BASEITEMS
-            else []
-        ),
-        f"<dt>GP Value</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
-        f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
-        *([
-            '<dt title="Plot items cannot be sold to merchants, but can be '
-            'dropped and looted normally.">Plot item</dt><dd>Yes '
-            '<small class="muted">— cannot be sold to merchants; drops/loots '
-            'normally</small></dd>'
-        ] if is_plot else []),
-        f"<dt {_drop_tt}>Drops on death</dt><dd>{_drop_label}"
-        f"{'<small class=\"muted\">' + _drop_reason + '</small>' if _drop_reason else ''}</dd>",
-        '</dl>',
+        meta_dl([
+            f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
+            f"<dt>Tag</dt><dd>{E(fld(i, 'Tag', ''))}</dd>",
+            f"<dt>Base item</dt><dd>{baseitem_label(fld(i, 'BaseItem'))}</dd>",
+            *(
+                [
+                    f"<dt>Spell Level</dt><dd>{E(_scroll_spell_lvl)}</dd>",
+                    f"<dt>Caster Classes</dt><dd>{E(_scroll_spell_cls)}</dd>",
+                ] if _is_scroll and (_scroll_spell_lvl or _scroll_spell_cls) else []
+            ),
+            f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i, nwn_text(display_name))))}</dd>",
+            *(
+                (lambda _ac: [
+                    f"<dt>Base AC</dt><dd>{_ac}</dd>",
+                    f"<dt>Material</dt><dd>{'Cloth' if _ac <= 0 else 'Leather' if _ac <= 3 else 'Metal'}</dd>",
+                ])(_torso_base_ac(i))
+                if _bi in _ARMOR_BASEITEMS
+                else [f"<dt>Base AC</dt><dd>{int((WEAPONS.get(_bi) or {}).get('BaseAC', 0) or 0)}</dd>"]
+                if _bi in SHIELD_BASEITEMS
+                else []
+            ),
+            f"<dt>GP Value</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
+            f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
+            *([
+                '<dt title="Plot items cannot be sold to merchants, but can be '
+                'dropped and looted normally.">Plot item</dt><dd>Yes '
+                '<small class="muted">— cannot be sold to merchants; drops/loots '
+                'normally</small></dd>'
+            ] if is_plot else []),
+            f"<dt {_drop_tt}>Drops on death</dt><dd>{_drop_label}"
+            f"{'<small class=\"muted\">' + _drop_reason + '</small>' if _drop_reason else ''}</dd>",
+        ], "\n"),
     ]
     # Variant notices
     _base_rr = db.item_is_variant_of.get(resref)

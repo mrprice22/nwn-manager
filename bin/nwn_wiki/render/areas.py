@@ -13,6 +13,7 @@ from typing import Any
 
 from nwn_wiki.db.index import _store_instance_slug
 from nwn_wiki.gff import fld, list_items, loc
+from nwn_wiki.htmlgen.blocks import meta_dl
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import (_area_link, _conv_link, _creature_link,
@@ -366,27 +367,27 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
 
     sections = [
         f"<h1>{nwn_html(pname)}</h1>",
-        '<dl class="meta">',
-        f"<dt>Area</dt><dd>{_area_link(db, area_resref, ctx)}</dd>",
-        f"<dt>Tag</dt><dd><code>{E(tag)}</code></dd>",
-        f"<dt>ResRef</dt><dd>{E(rr)}</dd>",
-        f"<dt>Position (X, Y, Z)</dt><dd>{x:.2f}, {y:.2f}, {z:.2f}</dd>",
-        f"<dt>Bearing</dt><dd>{E(bearing)}</dd>",
-        f"<dt>Appearance</dt><dd>{E(placeable_name(appearance))} "
-        f"<small class=\"muted\">(placeables.2da row {E(appearance) if appearance is not None else ''})</small></dd>",
-        f"<dt>HP</dt><dd>{E(cur_hp)} / {E(hp)} (hardness {E(hardness)})</dd>",
-        f"<dt>Plot / Static / Useable</dt><dd>{plot} / {static} / {useable}</dd>",
-        f"<dt>Lockable</dt><dd>{lockable}</dd>",
-        f"<dt>Locked</dt><dd>{locked}</dd>",
-        f"<dt>Open lock DC</dt><dd>{E(open_dc)}</dd>",
-        f"<dt>Close lock DC</dt><dd>{E(close_dc)}</dd>",
-        f"<dt>Key required</dt><dd>{key_required}</dd>",
-        f"<dt>Key name</dt><dd>{E(key_name)}</dd>",
-        f"<dt>Auto-remove key</dt><dd>{auto_key}</dd>",
-        f"<dt>Trap</dt><dd>{trap_flag} (detect DC {E(trap_dc)}, disarm DC {E(disarm_dc)})</dd>",
-        f"<dt>Conversation</dt><dd>{E(conv)}</dd>",
-        f"<dt>Faction ID</dt><dd>{E(faction)}</dd>",
-        '</dl>',
+        meta_dl([
+            f"<dt>Area</dt><dd>{_area_link(db, area_resref, ctx)}</dd>",
+            f"<dt>Tag</dt><dd><code>{E(tag)}</code></dd>",
+            f"<dt>ResRef</dt><dd>{E(rr)}</dd>",
+            f"<dt>Position (X, Y, Z)</dt><dd>{x:.2f}, {y:.2f}, {z:.2f}</dd>",
+            f"<dt>Bearing</dt><dd>{E(bearing)}</dd>",
+            f"<dt>Appearance</dt><dd>{E(placeable_name(appearance))} "
+            f"<small class=\"muted\">(placeables.2da row {E(appearance) if appearance is not None else ''})</small></dd>",
+            f"<dt>HP</dt><dd>{E(cur_hp)} / {E(hp)} (hardness {E(hardness)})</dd>",
+            f"<dt>Plot / Static / Useable</dt><dd>{plot} / {static} / {useable}</dd>",
+            f"<dt>Lockable</dt><dd>{lockable}</dd>",
+            f"<dt>Locked</dt><dd>{locked}</dd>",
+            f"<dt>Open lock DC</dt><dd>{E(open_dc)}</dd>",
+            f"<dt>Close lock DC</dt><dd>{E(close_dc)}</dd>",
+            f"<dt>Key required</dt><dd>{key_required}</dd>",
+            f"<dt>Key name</dt><dd>{E(key_name)}</dd>",
+            f"<dt>Auto-remove key</dt><dd>{auto_key}</dd>",
+            f"<dt>Trap</dt><dd>{trap_flag} (detect DC {E(trap_dc)}, disarm DC {E(disarm_dc)})</dd>",
+            f"<dt>Conversation</dt><dd>{E(conv)}</dd>",
+            f"<dt>Faction ID</dt><dd>{E(faction)}</dd>",
+        ], "\n"),
     ]
 
     desc = loc(p.get("Description"))
@@ -466,15 +467,13 @@ def render_area_page(db: Db, resref: str, out: Path,
         ]
         if val
     )
-    sections.append(
-        '<dl class="meta">'
-        f'<dt>ResRef</dt><dd>{E(resref)}</dd>'
-        f'<dt>Tag</dt><dd>{E(tag)}</dd>'
-        f'<dt>Tileset</dt><dd>{tileset_label(tileset)}</dd>'
-        f'<dt>Size</dt><dd>{E(width)}×{E(height)} tiles</dd>'
-        + event_rows +
-        '</dl>'
-    )
+    sections.append(meta_dl([
+        f'<dt>ResRef</dt><dd>{E(resref)}</dd>',
+        f'<dt>Tag</dt><dd>{E(tag)}</dd>',
+        f'<dt>Tileset</dt><dd>{tileset_label(tileset)}</dd>',
+        f'<dt>Size</dt><dd>{E(width)}×{E(height)} tiles</dd>',
+        event_rows,
+    ]))
 
     # Shortest path from the configured source area
     if path_steps is not _OMIT:

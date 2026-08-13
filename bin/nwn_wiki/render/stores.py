@@ -13,6 +13,7 @@ from typing import Any
 
 from nwn_wiki.db.index import _store_instance_slug
 from nwn_wiki.gff import fld, list_items, loc
+from nwn_wiki.htmlgen.blocks import items_layout, meta_dl, toc_sidebar
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import (_area_link, _creature_link, _item_link,
@@ -83,16 +84,36 @@ def _store_buy_summary(store: dict) -> tuple[str, bool]:
     return ("All types", True)
 
 
-_CREATURE_STORES_TABLE_HEAD = (
-    '<table class="data"><thead><tr>'
-    "<th>Name</th><th>Items</th><th>Area</th>"
-    '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
-    '<th title="Item types the store will buy from you">Buys</th>'
-    '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
-    '<th title="Maximum the store will pay for any single item">Max Buy</th>'
-    '<th title="Highest base item value in stock (before markup)">Max GP</th>'
-    '<th title="Average base item value in stock (before markup)">Avg GP</th>'
-    "</tr></thead><tbody>"
+# Every store table is drawn from this column set; a table names the columns
+# it shows, in order. Kept in one place so the four tables can't drift.
+_STORE_TH = {
+    "name": "<th>Name</th>",
+    "resref": "<th>ResRef</th>",
+    "tag": "<th>Tag</th>",
+    "items": "<th>Items</th>",
+    "area": "<th>Area</th>",
+    "opened_by": "<th>Opened By</th>",
+    "sells_at": '<th title="Price store charges you to buy items (% of base)">Sells At</th>',
+    "buys": '<th title="Item types the store will buy from you">Buys</th>',
+    "buys_at": '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>',
+    # Variant for a table with no "Buys" column beside it, so no N/A caveat.
+    "buys_at_plain": '<th title="Price store pays you for items (% of base)">Buys At</th>',
+    "max_buy": '<th title="Maximum the store will pay for any single item">Max Buy</th>',
+    "max_gp": '<th title="Highest base item value in stock (before markup)">Max GP</th>',
+    "avg_gp": '<th title="Average base item value in stock (before markup)">Avg GP</th>',
+}
+
+
+def _store_table_head(*cols: str) -> str:
+    """Opening markup for a store table showing ``cols`` (keys of _STORE_TH)."""
+    return ('<table class="data"><thead><tr>'
+            + "".join(_STORE_TH[c] for c in cols)
+            + "</tr></thead><tbody>")
+
+
+_CREATURE_STORES_TABLE_HEAD = _store_table_head(
+    "name", "items", "area", "sells_at", "buys", "buys_at",
+    "max_buy", "max_gp", "avg_gp",
 )
 
 
@@ -175,14 +196,9 @@ def _creature_store_section(db: "Db", creature_resref: str,
     )
 
 
-_STORE_TABLE_HEAD = (
-    '<table class="data"><thead><tr>'
-    "<th>Name</th><th>ResRef</th><th>Tag</th><th>Items</th>"
-    "<th>Area</th>"
-    '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
-    '<th title="Price store pays you for items (% of base)">Buys At</th>'
-    '<th title="Maximum the store will pay for any single item">Max Buy</th>'
-    "</tr></thead><tbody>"
+_STORE_TABLE_HEAD = _store_table_head(
+    "name", "resref", "tag", "items", "area", "sells_at", "buys_at_plain",
+    "max_buy",
 )
 
 
@@ -306,7 +322,7 @@ def _store_inventory_toc_html(db: "Db", pages: list) -> str:
 
     if not toc_parts:
         return ""
-    return '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    return toc_sidebar(toc_parts)
 
 
 def _store_item_gp_stats(db: "Db", pages: list) -> tuple[int, str, str, float]:
@@ -379,7 +395,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
                          if max_irr in db.items else E(max_name))
         meta.append(f"<dt>Most Valuable Item</dt><dd>{max_item_html} ({max_gp:,} gp)</dd>")
         meta.append(f"<dt>Avg Item Value</dt><dd>{avg_gp:,.0f} gp</dd>")
-    sections.extend(['<dl class="meta">', *meta, "</dl>"])
+    sections.append(meta_dl(meta, "\n"))
 
     # Opened By
     openers = db.store_tag_openers.get(tag.lower(), [])
@@ -408,12 +424,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
     inv_toc = _store_inventory_toc_html(db, inst_pages)
     inv_body = "<h2>Inventory</h2>" + _store_inventory_html(db, inst_pages, ctx)
     if inv_toc:
-        inv_section = (
-            '<div class="items-layout">'
-            + inv_toc
-            + f'<div class="items-content">{inv_body}</div>'
-            + '</div>'
-        )
+        inv_section = items_layout(inv_toc, inv_body)
     else:
         inv_section = inv_body
     sections.append(inv_section)
@@ -440,19 +451,11 @@ def render_stores_index(db: Db, out: Path) -> None:
     gm_slug: str = ""         # store instance slug (for link)
     gm_area_rr: str = ""      # area resref (for link)
 
-    _IDX_TABLE_HEAD = (
-        '<table class="data"><thead><tr>'
-        "<th>Name</th>"
-        # "<th>ResRef</th><th>Tag</th>"
-        "<th>Items</th>"
-        "<th>Area</th><th>Opened By</th>"
-        '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
-        '<th title="Item types the store will buy from you">Buys</th>'
-        '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
-        '<th title="Maximum the store will pay for any single item">Max Buy</th>'
-        '<th title="Highest base item value in stock (before markup)">Max GP</th>'
-        '<th title="Average base item value in stock (before markup)">Avg GP</th>'
-        "</tr></thead><tbody>"
+    _IDX_TABLE_HEAD = _store_table_head(
+        "name",
+        # "resref", "tag",
+        "items", "area", "opened_by", "sells_at", "buys", "buys_at",
+        "max_buy", "max_gp", "avg_gp",
     )
 
     for area_rr in sorted(db.area_stores.keys(),
@@ -659,13 +662,9 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
             )
         sections.append(
             "<h2>Placed Instances</h2>"
-            '<table class="data"><thead><tr>'
-            '<th>Area</th><th>Tag</th><th>Items</th>'
-            '<th title="Price store charges you to buy items (% of base)">Sells At</th>'
-            '<th title="Item types the store will buy from you">Buys</th>'
-            '<th title="Price store pays you for items (% of base); N/A if the store buys nothing">Buys At</th>'
-            '<th title="Maximum the store will pay for any single item">Max Buy</th>'
-            "</tr></thead><tbody>" + "\n".join(inst_rows) + "</tbody></table>"
+            + _store_table_head("area", "tag", "items", "sells_at", "buys",
+                                "buys_at", "max_buy")
+            + "\n".join(inst_rows) + "</tbody></table>"
         )
     else:
         sections.append(
@@ -681,8 +680,6 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
                             if bp_max_irr in db.items else E(bp_max_name))
     _bp_buy_html, _bp_buys_any = _store_buy_summary(s)
     bp_meta = [
-        "<h2>Blueprint</h2>",
-        '<dl class="meta">',
         f"<dt>ResRef</dt><dd>{E(resref)}</dd>",
         f"<dt>Tag</dt><dd>{E(fld(s, 'Tag', ''))}</dd>",
         f"<dt>Sells At (MarkUp) / Buys At (MarkDown)</dt>"
@@ -697,8 +694,8 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
     if bp_max_gp > 0:
         bp_meta.append(f"<dt>Most Valuable Item</dt><dd>{bp_max_item_html} ({bp_max_gp:,} gp)</dd>")
         bp_meta.append(f"<dt>Avg Item Value</dt><dd>{bp_avg_gp:,.0f} gp</dd>")
-    bp_meta.append('</dl>')
-    sections.extend(bp_meta)
+    sections.append("<h2>Blueprint</h2>")
+    sections.append(meta_dl(bp_meta, "\n"))
     sections.append("<h2>Blueprint Inventory</h2>" + _store_inventory_html(db, pages, ctx))
 
     write_page(out, ctx, name, "\n".join(sections))

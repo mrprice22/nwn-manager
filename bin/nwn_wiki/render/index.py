@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items, loc
+from nwn_wiki.htmlgen.blocks import meta_dl
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html
 from nwn_wiki.htmlgen.links import link
@@ -50,9 +51,7 @@ def render_index(db: Db, out: Path, module_title: str,
     xp = fld(ifo, "Mod_XPScale")
     desc = loc(ifo.get("Mod_Description")) if ifo else ""
 
-    overview = [
-        f'<h1>{nwn_html(module_title)}</h1>',
-        '<dl class="meta">',
+    meta_rows = [
         f'<dt>Areas</dt><dd>{len(db.areas)}</dd>',
         f'<dt>Creatures</dt><dd>{len(db.creatures)}</dd>',
         f'<dt>Items</dt><dd>{len(db.items)}</dd>',
@@ -61,14 +60,17 @@ def render_index(db: Db, out: Path, module_title: str,
         f'<dt>Scripts</dt><dd>{len(db.scripts)}</dd>',
     ]
     if start_area:
-        overview.append(f'<dt>Entry area</dt><dd>{link(f"areas/{start_area}.html", db.area_name(start_area))}</dd>')
+        meta_rows.append(f'<dt>Entry area</dt><dd>{link(f"areas/{start_area}.html", db.area_name(start_area))}</dd>')
     if tlk:
-        overview.append(f'<dt>Custom TLK</dt><dd>{E(tlk)}</dd>')
+        meta_rows.append(f'<dt>Custom TLK</dt><dd>{E(tlk)}</dd>')
     if xp is not None:
-        overview.append(f'<dt>XP scale</dt><dd>{E(xp)}%</dd>')
+        meta_rows.append(f'<dt>XP scale</dt><dd>{E(xp)}%</dd>')
     if hak_names:
-        overview.append(f'<dt>HAKs</dt><dd>{E(", ".join(hak_names))}</dd>')
-    overview.append('</dl>')
+        meta_rows.append(f'<dt>HAKs</dt><dd>{E(", ".join(hak_names))}</dd>')
+    overview = [
+        f'<h1>{nwn_html(module_title)}</h1>',
+        meta_dl(meta_rows, "\n"),
+    ]
     if desc:
         overview.append(f'<p class="desc">{nwn_html(desc)}</p>')
 

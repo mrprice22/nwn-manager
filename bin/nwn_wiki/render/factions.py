@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from nwn_wiki.gff import fld, list_items
+from nwn_wiki.htmlgen.blocks import items_layout, meta_dl, toc_sidebar
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _race_link, link
@@ -138,7 +139,7 @@ def render_factions(db: Db, out: Path) -> None:
             f'<div><a href="#cross-faction">&#x26A0; Cross-Faction'
             f' <span class="muted">({len(cross_faction)})</span></a></div>'
         )
-    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sidebar = toc_sidebar(toc_parts)
 
     # ---- Summary table ----
     sum_rows: list[str] = []
@@ -273,15 +274,13 @@ def render_factions(db: Db, out: Path) -> None:
         area_links = ", ".join(
             link(f"areas/{a}.html", db.area_name(a)) for a in areas_sorted
         )
-        sections.append(
-            '<dl class="meta">'
-            f"<dt>Attitude</dt><dd>{'Friendly to PC' if friendly else 'Hostile to PC'}</dd>"
-            f"<dt>Direct placements</dt><dd>{n_inst:,}</dd>"
-            f"<dt>Encounter pool slots</dt><dd>{n_spawn:,}</dd>"
-            f"<dt>Total class levels</dt><dd>{total_lvls:,}</dd>"
-            f"<dt>Areas</dt><dd>{area_links}</dd>"
-            "</dl>"
-        )
+        sections.append(meta_dl([
+            f"<dt>Attitude</dt><dd>{'Friendly to PC' if friendly else 'Hostile to PC'}</dd>",
+            f"<dt>Direct placements</dt><dd>{n_inst:,}</dd>",
+            f"<dt>Encounter pool slots</dt><dd>{n_spawn:,}</dd>",
+            f"<dt>Total class levels</dt><dd>{total_lvls:,}</dd>",
+            f"<dt>Areas</dt><dd>{area_links}</dd>",
+        ]))
 
         by_area: dict[str, list[dict]] = defaultdict(list)
         for e in entries:
@@ -358,14 +357,12 @@ def render_factions(db: Db, out: Path) -> None:
         _n_spawn_n = sum(1 for e in _none_ent if e["kind"] == "spawn")
         _areas_n = sorted({e["area"] for e in _none_ent}, key=lambda a: db.area_name(a).lower())
         _area_links_n = ", ".join(link(f"areas/{a}.html", db.area_name(a)) for a in _areas_n)
-        sections.append(
-            '<dl class="meta">'
-            f"<dt>Direct placements</dt><dd>{_n_inst_n:,}</dd>"
-            f"<dt>Encounter pool slots</dt><dd>{_n_spawn_n:,}</dd>"
-            f"<dt>Total class levels</dt><dd>{sum(e['lvls'] for e in _none_ent):,}</dd>"
-            f"<dt>Areas</dt><dd>{_area_links_n}</dd>"
-            "</dl>"
-        )
+        sections.append(meta_dl([
+            f"<dt>Direct placements</dt><dd>{_n_inst_n:,}</dd>",
+            f"<dt>Encounter pool slots</dt><dd>{_n_spawn_n:,}</dd>",
+            f"<dt>Total class levels</dt><dd>{sum(e['lvls'] for e in _none_ent):,}</dd>",
+            f"<dt>Areas</dt><dd>{_area_links_n}</dd>",
+        ]))
         _by_area_n: dict[str, list[dict]] = defaultdict(list)
         for _e in _none_ent:
             _by_area_n[_e["area"]].append(_e)
@@ -455,8 +452,5 @@ def render_factions(db: Db, out: Path) -> None:
         )
 
     body = "\n".join(sections)
-    layout = (
-        f'<div class="items-layout">{sidebar}'
-        f'<div class="items-content">{body}</div></div>'
-    )
+    layout = items_layout(sidebar, body)
     write_page(out, ctx, "Factions", layout)

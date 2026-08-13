@@ -7,6 +7,8 @@ just the piece they need:
   rendering (stdlib only).
 * :mod:`nwn_wiki.htmlgen.links` -- anchor/label builders for scripts,
   conversations, factions, races and tilesets.
+* :mod:`nwn_wiki.htmlgen.blocks` -- the repeated page-body wrappers (TOC
+  sidebar, two-column items layout, meta definition list).
 * :mod:`nwn_wiki.htmlgen.markdown` -- the minimal Markdown-to-HTML
   converter used for the module's manual pages (stdlib only).
 * :mod:`nwn_wiki.htmlgen.chrome` -- the page shell, nav dropdowns, theme

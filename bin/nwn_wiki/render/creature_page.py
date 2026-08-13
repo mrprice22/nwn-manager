@@ -26,6 +26,7 @@ from nwn_wiki.combat import (
     feat_attack_bonus,
 )
 from nwn_wiki.gff import fld, list_items, loc
+from nwn_wiki.htmlgen.blocks import meta_dl
 from nwn_wiki.htmlgen.chrome import _creature_cr_value, write, write_page
 from nwn_wiki.htmlgen.escape import E, colorize_damage_words, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import (_area_link, _conv_link, _faction_cell,
@@ -1549,9 +1550,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     conv = _meta("Conversation", "")
     _eff_hp_meta = creature_max_hp(c, bp)
 
-    sections = [
-        f"<h1>{nwn_html(name)}</h1>",
-        '<dl class="meta">',
+    meta_rows = [
         f"<dt>ResRef</dt><dd>{E(canonical_rr)}</dd>",
         f"<dt>Tag</dt><dd>{E(_meta('Tag', ''))}</dd>",
         f"<dt>Race</dt><dd>{_race_link(_meta('Race'), ctx)}</dd>",
@@ -1576,12 +1575,15 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
             diff_detail = "; ".join(diff_items)
         else:
             diff_detail = "differs in equipment, class levels, or feats"
-        sections.append(
+        meta_rows.append(
             f'<dt>Variant of</dt><dd>'
             f'{link(f"{base_rr}.html", db.canonical_creature_name(base_rr))}'
             f'<br><small class="muted">{E(diff_detail)}</small></dd>'
         )
-    sections.append('</dl>')
+    sections = [
+        f"<h1>{nwn_html(name)}</h1>",
+        meta_dl(meta_rows, "\n"),
+    ]
 
     # Creature artwork (from creature-pics/), just after the meta box.
     pics = state._CREATURE_PICS.get(canonical_rr)

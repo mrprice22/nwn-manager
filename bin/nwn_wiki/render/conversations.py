@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from nwn_wiki.gff import fld, list_items, loc
+from nwn_wiki.htmlgen.blocks import meta_dl
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import (_area_link, _creature_link, _item_link,
@@ -274,15 +275,14 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
     if zdlg_handler:
         title_html = (f"<h1>Z-dialog: <code>{E(resref)}</code> "
                       '<span class="badge">z-dialog</span></h1>')
-        meta = [
-            '<dl class="meta">',
+        meta_rows = [
             f"<dt>Handler script</dt><dd>{_script_link(db, zdlg_handler, ctx)}</dd>",
         ]
         dispatchers = sorted(db.zdlg_handler_dispatchers.get(zdlg_handler, set()))
         if dispatchers:
             disp_html = ", ".join(_script_link(db, d, ctx) for d in dispatchers)
-            meta.append(f"<dt>Opened from</dt><dd>{disp_html}</dd>")
-        meta.append('</dl>')
+            meta_rows.append(f"<dt>Opened from</dt><dd>{disp_html}</dd>")
+        meta = [meta_dl(meta_rows, "\n")]
         meta.append(
             '<p class="muted">This is a HoMERs z-dialog: the conversation is '
             "generated entirely by NWScript via the <code>StartDlg(...)</code> "
@@ -294,13 +294,13 @@ def render_conversation_page(db: Db, resref: str, out: Path) -> None:
     else:
         sections: list[str] = [
             f"<h1>Conversation: <code>{E(resref)}</code></h1>",
-            '<dl class="meta">',
-            f"<dt>NPC lines</dt><dd>{len(entries)}</dd>",
-            f"<dt>PC replies</dt><dd>{len(replies)}</dd>",
-            f"<dt>NumWords</dt><dd>{E(fld(dlg, 'NumWords', ''))}</dd>",
-            f"<dt>OnEnd</dt><dd><code>{E(fld(dlg, 'EndConversation', ''))}</code></dd>",
-            f"<dt>OnAbort</dt><dd><code>{E(fld(dlg, 'EndConverAbort', ''))}</code></dd>",
-            '</dl>',
+            meta_dl([
+                f"<dt>NPC lines</dt><dd>{len(entries)}</dd>",
+                f"<dt>PC replies</dt><dd>{len(replies)}</dd>",
+                f"<dt>NumWords</dt><dd>{E(fld(dlg, 'NumWords', ''))}</dd>",
+                f"<dt>OnEnd</dt><dd><code>{E(fld(dlg, 'EndConversation', ''))}</code></dd>",
+                f"<dt>OnAbort</dt><dd><code>{E(fld(dlg, 'EndConverAbort', ''))}</code></dd>",
+            ], "\n"),
         ]
 
     # ---- Triggered by ----

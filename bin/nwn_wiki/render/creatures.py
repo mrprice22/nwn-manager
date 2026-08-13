@@ -14,6 +14,7 @@ from pathlib import Path
 from nwn_wiki.combat import epic_toughness_hp
 from nwn_wiki.db.scripts import _strip_nss_comments
 from nwn_wiki.gff import fld, list_items
+from nwn_wiki.htmlgen.blocks import items_layout, toc_sidebar
 from nwn_wiki.htmlgen.chrome import has_creature_pics_page, write_page
 from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _area_link, link
@@ -124,6 +125,29 @@ def _creature_row(name_cell: str, c: dict | None, bp: dict | None, *,
     )
 
 
+# The four creature index pages each open their TOC with a "Views" block
+# linking to the other three plus the search page.
+_CREATURE_VIEWS = [
+    ("index.html", "All Creatures"),
+    ("by-area/index.html", "By Area"),
+    ("by-cr/index.html", "By Challenge Rating"),
+    ("by-race/index.html", "By Race"),
+]
+
+
+def _views_toc(current: str, prefix: str) -> list[str]:
+    """The 'Views' sibling nav shared by the four creature index pages.
+
+    ``current`` is the page's own href in :data:`_CREATURE_VIEWS` (omitted from
+    the list); ``prefix`` is the relative path back up to ``creatures/``.
+    """
+    parts = ['<div class="toc-group-heading">Views</div>']
+    parts += [f'<div><a href="{prefix}{href}">{label}</a></div>'
+              for href, label in _CREATURE_VIEWS if href != current]
+    parts.append(f'<div><a href="{prefix}search.html">Search</a></div>')
+    return parts
+
+
 def render_creatures_index(db: Db, out: Path) -> None:
     rows_present = []
     rows_absent = []
@@ -168,11 +192,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
         "</tr></thead><tbody>"
     )
     toc_parts = [
-        '<div class="toc-group-heading">Views</div>',
-        '<div><a href="by-area/index.html">By Area</a></div>',
-        '<div><a href="by-cr/index.html">By Challenge Rating</a></div>',
-        '<div><a href="by-race/index.html">By Race</a></div>',
-        '<div><a href="search.html">Search</a></div>',
+        *_views_toc("index.html", ""),
         '<div class="toc-group-heading">Sections</div>',
     ]
     if rows_present:
@@ -185,7 +205,7 @@ def render_creatures_index(db: Db, out: Path) -> None:
             f'<div><a href="#absent">Blueprint Only'
             f' <span class="muted">({len(rows_absent)})</span></a></div>'
         )
-    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sidebar = toc_sidebar(toc_parts)
     sections: list[str] = [
         "<h1>Creatures</h1>",
         f"<p>{n_unique} unique creature{'s' if n_unique != 1 else ''}{variant_note_str}.</p>",
@@ -202,9 +222,9 @@ def render_creatures_index(db: Db, out: Path) -> None:
             f' <small class="muted">({len(rows_absent)})</small></h2>'
             + TABLE_HEAD + "\n".join(rows_absent) + "</tbody></table>"
         )
-    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    body = items_layout(sidebar, "\n".join(sections))
     write_page(out, PageCtx("creatures/index.html"), "Creatures",
-               '<div class="items-layout">' + body + "</div>")
+               body)
 
 
 # --- Boss respawn tracker ("Roll of the Fallen") ---------------------------
@@ -360,7 +380,7 @@ def render_creature_pictures(db: Db, out: Path) -> None:
     ]
     for grp in state._CREATURE_PIC_GROUPS:
         toc_parts.append(f'<div><a href="#{E(grp["_slug"])}">{nwn_html(grp["name"])}</a></div>')
-    sidebar = '<aside class="items-toc items-toc--wide">' + "".join(toc_parts) + "</aside>"
+    sidebar = toc_sidebar(toc_parts, wide=True)
 
     sections = [
         "<h1>Creature Pictures</h1>",
@@ -385,9 +405,9 @@ def render_creature_pictures(db: Db, out: Path) -> None:
                         + _pic_figures(grp["images"], name, ctx) + "</div>")
         sections.append("</section>")
 
-    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    body = items_layout(sidebar, "\n".join(sections))
     write_page(out, ctx, "Creature Pictures",
-               '<div class="items-layout">' + body + "</div>")
+               body)
 
 
 def render_creatures_by_area(db: Db, out: Path) -> None:
@@ -420,11 +440,7 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
 
     # Build sidebar TOC
     toc_parts = [
-        '<div class="toc-group-heading">Views</div>',
-        '<div><a href="../index.html">All Creatures</a></div>',
-        '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
-        '<div><a href="../by-race/index.html">By Race</a></div>',
-        '<div><a href="../search.html">Search</a></div>',
+        *_views_toc("by-area/index.html", "../"),
         '<div class="toc-group-heading">Areas</div>',
     ]
     for area_rr in sorted(visible_areas, key=lambda r: db.area_name(r).lower()):
@@ -434,7 +450,7 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
             f'<div><a href="#{E(slug)}">{E(db.area_name(area_rr))}'
             f' <span class="muted">({cnt})</span></a></div>'
         )
-    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sidebar = toc_sidebar(toc_parts)
 
     sections: list[str] = [
         "<h1>Creatures by Area</h1>",
@@ -481,9 +497,9 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
 
-    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    body = items_layout(sidebar, "\n".join(sections))
     write_page(out, ctx, "Creatures by Area",
-               '<div class="items-layout">' + body + "</div>")
+               body)
 
 
 def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> None:
@@ -542,11 +558,7 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
 
     # Build sidebar TOC
     toc_parts = [
-        '<div class="toc-group-heading">Views</div>',
-        '<div><a href="../index.html">All Creatures</a></div>',
-        '<div><a href="../by-area/index.html">By Area</a></div>',
-        '<div><a href="../by-race/index.html">By Race</a></div>',
-        '<div><a href="../search.html">Search</a></div>',
+        *_views_toc("by-cr/index.html", "../"),
         '<div class="toc-group-heading">Challenge Rating</div>',
     ]
     for start, end, creatures in merged:
@@ -561,7 +573,7 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
             f'<div><a href="#cr-unknown">Unknown CR'
             f' <span class="muted">({len(unknown)})</span></a></div>'
         )
-    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sidebar = toc_sidebar(toc_parts)
 
     sections: list[str] = [
         "<h1>Creatures by Challenge Rating</h1>",
@@ -600,10 +612,10 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
     if unknown:
         sections.append(_render_cr_section("cr-unknown", "Unknown CR", unknown))
 
-    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    body = items_layout(sidebar, "\n".join(sections))
     write_page(out, PageCtx("creatures/by-cr/index.html"),
                "Creatures by Challenge Rating",
-               '<div class="items-layout">' + body + "</div>")
+               body)
 
 
 def render_creatures_by_race(db: Db, out: Path) -> None:
@@ -635,11 +647,7 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
         return "race-unset" if rid is None else f"race-{rid}"
 
     toc_parts = [
-        '<div class="toc-group-heading">Views</div>',
-        '<div><a href="../index.html">All Creatures</a></div>',
-        '<div><a href="../by-area/index.html">By Area</a></div>',
-        '<div><a href="../by-cr/index.html">By Challenge Rating</a></div>',
-        '<div><a href="../search.html">Search</a></div>',
+        *_views_toc("by-race/index.html", "../"),
         '<div class="toc-group-heading">Races</div>',
     ]
     for rid in sorted_races:
@@ -648,7 +656,7 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
             f'<div><a href="#{E(_race_anchor(rid))}">{E(rname)}'
             f' <span class="muted">({len(by_race[rid])})</span></a></div>'
         )
-    sidebar = '<aside class="items-toc">' + "".join(toc_parts) + "</aside>"
+    sidebar = toc_sidebar(toc_parts)
 
     TABLE_HEAD = (
         '<table class="data"><thead><tr>'
@@ -700,6 +708,6 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
             + TABLE_HEAD + "\n".join(rows) + "</tbody></table>"
         )
 
-    body = sidebar + '<div class="items-content">' + "\n".join(sections) + "</div>"
+    body = items_layout(sidebar, "\n".join(sections))
     write_page(out, PageCtx("creatures/by-race/index.html"), "Creatures by Race",
-               '<div class="items-layout">' + body + "</div>")
+               body)
