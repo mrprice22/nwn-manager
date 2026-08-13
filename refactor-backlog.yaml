@@ -3032,8 +3032,70 @@ items:
 - id: module-index-split
   phase: 4
   title: Break up generate_module_index
-  status: pending
+  status: done
   gate: zero-diff
+  commit: d03e9a7
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (151s), lotr2008 IDENTICAL (95s), lotr2009 IDENTICAL (106s); plus an independent raw byte comparison of module-index/ (see impl_notes)"
+  impl_notes: >
+    Whole 767-line function split in one run; hatch 3b not needed.
+    generate_module_index is now a 47-line orchestrator that computes the shared
+    context once (module_index_dir.mkdir, now, and _cu/_iu/_au/_su from
+    _module_index_url_helpers) and calls 15 module-level writers in the original
+    order.  Bodies moved verbatim — no renames, no reformatting, no behaviour
+    changes.  Extracted: _int_fid (7, was a nested closure), _write_area_graph
+    (37), _write_area_paths (43), _write_duplicate_destination_tags (61),
+    _write_area_tag_conflicts (54), _write_area_index (35), _write_creature_index
+    (84), _write_counter_gear (16), _write_appearance_faction_report (75),
+    _write_creature_tag_conflicts (65), _write_item_index (57),
+    _write_cross_faction_creatures (62),
+    _write_faction_bp_instance_discrepancies (54), _write_inaccessible_items (57),
+    _write_unspawned_creatures (50), _write_instance_only_conversations (63).
+    File 802 -> 954 lines; the growth is def/signature overhead only.
+    The one cross-report dependency is the creature_index list, which
+    _write_creature_index RETURNS and the orchestrator passes into
+    _write_appearance_faction_report — it is not recomputed, which would have
+    risked reordering.  _item_sources stayed a closure inside _write_item_index
+    (captures db, used only there).  Parameters kept the name module_index_dir so
+    the summary f-strings that embed the path needed no edit.
+    IMPORTANT GATE GAP FOUND AND COMPENSATED FOR: bin/wiki-golden DOES cover
+    module-index/ (build() moves it next to docs/ and compare() walks the whole
+    dest), BUT _normalise() rewrites every module-index/*.json through
+    json.dumps(sort_keys=True, indent=2) after dropping generated_at.  So the byte
+    gate does not observe key order in dict literals, indentation, or float repr
+    in that subtree — only content, list order and values.  That is exactly the
+    class of breakage this item could have caused, so an independent raw
+    comparison was run: homers_lotr built twice via wiki-golden's own build() with
+    _normalise monkeypatched off, once at HEAD and once with the refactor, same
+    --seed 1 and PYTHONHASHSEED=0.  All 21 raw module-index/ files are
+    byte-identical apart from the "generated_at" value (and the _Generated line in
+    counter_gear.md); raw docs/ differed only in assets/meta.json (build
+    timestamp).  Key order, indentation and float formatting are therefore proven
+    unchanged, not merely normalised away.
+  found:
+    - "THE GATE NORMALISES module-index/ JSON (json.dumps(sort_keys=True,
+       indent=2), generated_at dropped) before comparing, so key order,
+       indentation and float repr in that subtree are NOT covered by the byte gate.
+       Any future item that touches module-index writers needs the raw
+       double-build comparison described in impl_notes.  Worth recording in the
+       runbook itself."
+    - "_su from _module_index_url_helpers is unpacked but never used anywhere in
+       this module — a dead binding, now visible in the orchestrator."
+    - "_write_area_paths keeps its whole body under `if path_from_resref and
+       area_paths is not None:` rather than an early return; guard inversion would
+       have been a behaviour-shaped edit under a zero-diff gate."
+    - "_write_item_index and _write_inaccessible_items duplicate the same item
+       filter (the [TLK# / name == rr skip) and the identical five-term accessible
+       expression, and both re-sort db.items by name.  A shared _accessible(db, rr)
+       plus one pass would remove ~20 duplicated lines, but merging the two loops
+       changes iteration structure, so it needs its own item."
+    - "_write_creature_tag_conflicts scans all of db.canonical_creatures once per
+       blueprint (O(blueprints x canonicals)); a prebuilt bp_rr -> variants map
+       would make it linear.  Pure performance, no output change."
+    - "_write_instance_only_conversations maintains a seen_inst_conv set keyed on
+       (area_rr, idx) while iterating enumerate(insts) of a single per-area list —
+       the key can never repeat, so the dedup set is unreachable by construction.
+       Harmless but dead."
   after: [db-index-split]
   plan: 767 lines — the longest function in the program. One writer per report.
 

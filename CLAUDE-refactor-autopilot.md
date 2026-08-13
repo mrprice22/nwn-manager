@@ -124,6 +124,18 @@ Primary corpus (`homers_lotr`) per item. **Before every push**, run `--all` (add
 frozen CEP2 archives, which exercise the no-custom-TLK / no-hak_2da / no-`docs.manual`
 paths the live module never hits).
 
+**Known gate blind spots** — two things the byte gate does not actually prove:
+
+- **`module-index/` JSON is normalised before comparison.** `_normalise()` rewrites every
+  `module-index/*.json` through `json.dumps(sort_keys=True, indent=2)` with `generated_at`
+  dropped, so key order, indentation and float repr in that subtree are invisible to the
+  gate. An item touching those writers must compensate with a raw double-build comparison
+  (build at HEAD and with the change, `_normalise` patched off, diff byte-for-byte) — see
+  `module-index-split`'s `impl_notes` for the recipe.
+- **Nothing executes the JavaScript.** The gate compares emitted `<script>` text only, and
+  no JS runtime is installed on this box. A regression in `site.js` — search, nav, map
+  pan/zoom — ships silently. Reason it through by hand and say so in `impl_notes`.
+
 The gate must pass before shipping. On failure: fix and re-run. If the diff is not
 understood after two attempts, escape-hatch it — a mysterious diff is exactly the
 situation where guessing costs the most.
