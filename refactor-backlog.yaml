@@ -2769,9 +2769,45 @@ items:
 - id: cr-sentinel-fork
   phase: 3
   title: Five CR parsers, four sentinels — decide whether to unify
-  status: pending
+  status: done
   gate: zero-diff
   after: [dedup-formatting]
+  commit: d8b1d5f
+  date: 2026-08-13
+  gate_result: "check --all: homers_lotr IDENTICAL (144s), lotr2008 IDENTICAL (84s), lotr2009 IDENTICAL (102s)"
+  impl_notes: >
+    Took the admin's recommended option: factored the PARSE only.  util.py gains
+    _try_float(v, default) beside _try_int; all five CR sites route through it,
+    each passing its own existing sentinel.  No sentinel changed value, so the
+    gate came out IDENTICAL first time on all three corpora.
+    The core is a BARE float(v), deliberately NOT _try_int's float(v or 0) shape:
+    a `or 0` inside the helper would have turned raw=None into 0.0 at four of the
+    five sites, destroying -1.0 / None / -inf.  Each site therefore keeps its own
+    pre-guard verbatim outside the call — creatures.py _cr_val keeps its
+    `if raw is None: return None`, _race_sort_key keeps its `if raw_cr` truthiness
+    guard (a genuine CR of 0 must still sort as -inf there, not 0.0), and
+    bestiary.py keeps `or 0` INSIDE the argument so ""/None/0 parse to 0.0 through
+    the success path rather than the except path.
+    _creature_cr_value's canonical -> instance -> blueprint db resolution stayed
+    where it is; only its try/float/except tail moved.
+  found:
+    - "The real duplication is the CR RESOLUTION, not the parse: _creature_cr_value
+       (chrome.py), _cr_val and _race_sort_key (render/creatures.py) and
+       bestiary.py each inline their own canonical -> instance -> blueprint
+       fallback, differing only in helper (fld vs _bp_field) and sentinel.  Worth
+       its own item; the parse factoring did not touch it."
+    - "counter_gear._parse_cr's 0.0 default drops an unknown-CR creature into the
+       LOWEST progression tier (lo <= cr < hi) and can distort that tier's max()
+       benchmark.  Latent — unreachable on all three corpora (no creature has CR 0
+       and no cr field is non-numeric).  Left alone per the admin's answer; needs
+       an expected-diff item if ever fixed."
+    - "_race_sort_key's raw_cr expression can yield 0/0.0 for a genuine CR-0
+       instance value, which its truthiness guard then sorts as -inf (unknown).
+       Same latent class as above; behaviour preserved exactly."
+    - "_try_float is annotated -> float | None, so _creature_cr_value and
+       _parse_cr now return a technically-optional expression.  Unreachable (their
+       defaults are floats) and no type checker is configured in the repo; an
+       overload pair would tighten it."
   plan: >
     Split out of dedup-formatting, whose notes flagged the fork but which
     (correctly) refused to resolve it silently.  The formatting half of that item
