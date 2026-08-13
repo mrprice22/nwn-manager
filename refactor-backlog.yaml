@@ -2972,8 +2972,58 @@ items:
 - id: db-index-split
   phase: 4
   title: Break up Db.index and Db.index_dialogs
-  status: pending
+  status: done
   gate: zero-diff
+  commit: ce94565
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (149s), lotr2008 IDENTICAL (97s), lotr2009 IDENTICAL (108s)"
+  impl_notes: >
+    Both methods done in one pass; hatch 3b was available but not needed.
+    _parse_scripts and _index_script_item_checks were left alone — the plan names
+    them only as context for why the class is large.
+    db/index.py: Db.index 436 -> 18 lines (an ordered list of pass calls plus the
+    timing print).  Extracted in traversal order: _index_factions (18),
+    _index_area_objects (26), _index_transitions (48), _build_link_tag_maps (20,
+    returns the door/trigger tag->area maps), _collect_tag_objects (21, returns the
+    tag->all-objects multimap), _annotate_dup_dest_tags (19), _index_containers (7),
+    _index_encounter_spawns (21), _index_hidden_areas (5),
+    _index_canonical_creatures (33, passes 1-2), _index_canonical_locations (60,
+    passes 3-4), _index_item_sources (8, orchestrator), _index_store_items (29),
+    _index_container_items (23), _index_carried_items (86), and
+    _backfill_stock_items (13, was a nested def called once).
+    Shared-local handling, the hazard this item was warned about:
+    door_tag_area/trigger_tag_area are returned and passed to the resolve_link
+    closure that stays inside _index_transitions; _tag_all_objects is returned and
+    passed to _annotate_dup_dest_tags; _seen_carrier is deliberately kept inside
+    _index_carried_items because it spans both the per-instance and the
+    encounter-spawn loops.  Everything else crossing a pass boundary was already an
+    instance attribute.
+    db/dialogs.py: Db.index_dialogs 326 -> 31 lines (prelude calls, three pass
+    calls, the stats print, the chained tail passes).  Extracted:
+    _index_dialog_node_scripts (40), _add_caller (3, nested closure -> method),
+    _index_dialog_callers (9, orchestrator), _blueprint_area_index (28, returns the
+    four resref->areas dicts), _index_conversation_field_callers (42),
+    _index_event_script_callers (53), _add_blueprint_event_callers (13) and
+    _add_instance_event_callers (27) (both nested defs -> methods),
+    _index_item_script_callers (16), _dedupe_dialog_callers (15), and
+    _build_conv_transitions (72, returns n_excluded_edges for the print).
+    Every loop kept its original position and traversal order; no public attribute
+    renamed.
+  found:
+    - "index.py _annotate_dup_dest_tags: _referenced_tags is a set[str] and
+       self.dup_dest_tags is populated by iterating it, so that dict's insertion
+       order is hash-seed dependent.  Pre-existing, and it relies on the gate's
+       fixed PYTHONHASHSEED — if any renderer ever iterates dup_dest_tags unsorted,
+       that is latent nondeterminism.  Belongs with sort-set-iteration."
+    - "dialogs.py _index_item_script_callers: `for candidate in {rr.lower(), tag}`
+       iterates a 1-2 element set, so caller append order there is likewise
+       hash-order dependent — mostly masked by the later dedupe, but not entirely."
+    - "_add_caller kept its nested-closure name rather than becoming
+       _add_dialog_caller, to keep the change a pure move.  It now reads as a
+       generically-named mixin method; worth renaming in a later cosmetic pass."
+    - "_index_canonical_locations (60) and _index_carried_items (86) are the two
+       remaining chunky methods; each is genuinely two aggregation passes and could
+       be split further if a follow-up item wants it."
   after: [db-init-schema]
   plan: >
     436 and 326 lines, both at nesting depth 6.  With _parse_scripts (189) and
