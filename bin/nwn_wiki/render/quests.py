@@ -161,26 +161,30 @@ def _quest_start_locations(db: Db, c: dict, action_to_dlgs,
     npcs = {}     # bp_rr -> (canonical_rr, name)
     areas = {}    # area_rr -> area name
 
+    # ``scripts`` and ``dlgs_direct`` are sets, and the priority order below is
+    # deliberate (the index prints only the first three entries of each dict),
+    # so every iteration over them is sorted rather than sorting the result —
+    # that keeps the priority ordering and drops the hash-order dependence.
     # Priority 1: non-dialog sources fill areas first so they appear
     # prominently (a shrine or trigger zone is more specific than an NPC area).
 
     # Module-event grants (OnClientEnter, OnModuleLoad, etc.): area = module entry.
     if script_to_module_event:
         entry_area = fld(db.ifo or {}, "Mod_Entry_Area", "") if db.ifo else ""
-        for sref in scripts:
+        for sref in sorted(scripts):
             if sref.lower() in script_to_module_event and entry_area:
                 areas.setdefault(entry_area, db.area_name(entry_area))
 
     # Placeable-event grants: quest opened by interacting with a placeable.
     if script_to_placeable_areas:
-        for sref in scripts:
-            for ar in script_to_placeable_areas.get(sref.lower(), ()):
+        for sref in sorted(scripts):
+            for ar in sorted(script_to_placeable_areas.get(sref.lower(), ())):
                 areas.setdefault(ar, db.area_name(ar))
 
     # Trigger-event grants: quest opened by entering a trigger zone.
     if script_to_trigger_areas:
-        for sref in scripts:
-            for ar in script_to_trigger_areas.get(sref.lower(), ()):
+        for sref in sorted(scripts):
+            for ar in sorted(script_to_trigger_areas.get(sref.lower(), ())):
                 areas.setdefault(ar, db.area_name(ar))
 
     def _trace_dlg_callers(dlg_resref: str) -> None:
@@ -212,13 +216,13 @@ def _quest_start_locations(db: Db, c: dict, action_to_dlgs,
 
     # Priority 2: dialog-action tracing — scripts that run inside dialog action
     # nodes → find the owning dialog → resolve NPC callers.
-    for sref in scripts:
-        for dlg in action_to_dlgs.get(sref.lower(), ()):
+    for sref in sorted(scripts):
+        for dlg in sorted(action_to_dlgs.get(sref.lower(), ())):
             _trace_dlg_callers(dlg)
 
     # Priority 3: dialog-native quest grants (Quest/QuestEntry fields on dialog
     # nodes) — the dialog itself is already known, go straight to callers.
-    for dlg in dlgs_direct:
+    for dlg in sorted(dlgs_direct):
         _trace_dlg_callers(dlg)
 
     return list(npcs.values()), list(areas.items())
@@ -460,7 +464,9 @@ def render_quest_page(db: Db, c: dict, slug: str, out: Path) -> None:
             return '<span class="muted">&mdash;</span>'
         return ", ".join(
             _item_link(db, irr, ctx) if irr in db.items else E(db.item_name(irr))
-            for irr in sorted(item_set, key=lambda r: db.item_name(r).lower())
+            # Resref breaks display-name ties, which would otherwise fall back
+            # to the set's hash order.
+            for irr in sorted(item_set, key=lambda r: (db.item_name(r).lower(), r))
         )
 
     def _collect_entry_items(granters: list[str], granting_dlgs: list[str]

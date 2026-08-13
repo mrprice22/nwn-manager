@@ -21,13 +21,13 @@ first (near-free on btrfs) and the build runs entirely inside it.
 Determinism.  Three things have to be pinned:
 
   --seed 1            the area-layout RNG (random.Random(seed))
-  PYTHONHASHSEED=0    nwn-wiki iterates plain sets in several places, so string
-                      hash randomisation reorders the area-map SVG nodes, the
-                      faction rows and some conversation tables between runs.
-                      This is a real pre-existing quirk -- it makes every
-                      published docs/ rebuild churn spuriously -- and there is a
-                      backlog item to sort those iterations properly.  Until
-                      then the gate pins the seed so the diff means something.
+  PYTHONHASHSEED=0    nwn-wiki used to iterate plain sets in several places, so
+                      string hash randomisation reordered the area-map SVG
+                      nodes, the faction rows and some conversation tables
+                      between runs.  Those iterations are sorted at the point of
+                      emission now (backlog: sort-set-iteration) and the build
+                      is reproducible without this, but the gate keeps pinning
+                      the seed as belt and braces.
   no --log-dir/--db-dir   keeps the activity and bestiary paths (wall-clock time
                       and a live SQLite DB) out of the build entirely.
 

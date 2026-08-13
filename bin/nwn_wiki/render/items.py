@@ -619,7 +619,7 @@ def _item_dialog_sections(db: Db, i: dict, resref: str, ctx: PageCtx) -> list[st
     # ActionStartConversation with a literal dlg resref).
     item_tag = (fld(i, "Tag", "") or "").lower()
     item_dlgs: list[tuple[str, str]] = []  # (script_resref, dlg_resref)
-    for cand in {resref.lower(), item_tag}:
+    for cand in sorted({resref.lower(), item_tag}):
         if cand and cand in db.script_dialogs:
             for d in sorted(db.script_dialogs[cand]):
                 item_dlgs.append((cand, d))

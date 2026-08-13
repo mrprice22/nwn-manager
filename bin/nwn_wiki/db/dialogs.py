@@ -64,7 +64,10 @@ class DbDialogsMixin:
                         "resref": action, "kind": "action",
                         "node_kind": kind, "node_index": idx,
                     })
-                    for tag in self.script_teleport_tags.get(action, ()):
+                    # sorted: script_teleport_tags values are sets, and this
+                    # append order is the row order of the conversation page's
+                    # "Teleport destinations" table.
+                    for tag in sorted(self.script_teleport_tags.get(action, ())):
                         self.dialog_teleports[dlg_resref].append({
                             "tag": tag,
                             "area": self.tag_to_area.get(tag),
@@ -286,7 +289,7 @@ class DbDialogsMixin:
         #    Mod_OnActvtItem dispatcher's tag table.
         for rr, item in self.items.items():
             tag = (fld(item, "Tag", "") or "").lower()
-            for candidate in {rr.lower(), tag}:
+            for candidate in sorted({rr.lower(), tag}):
                 if not candidate:
                     continue
                 for dlg in self._script_dialog_targets(candidate):

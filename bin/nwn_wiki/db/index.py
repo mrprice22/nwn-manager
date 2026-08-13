@@ -203,7 +203,7 @@ class DbIndexMixin:
         # The game engine resolves to whichever object it finds first, so the
         # destination is effectively ambiguous and may surprise the builder.
         _referenced_tags: set[str] = {tr["dst_tag"] for tr in self.transitions if tr.get("dst_tag")}
-        for _tag in _referenced_tags:
+        for _tag in sorted(_referenced_tags):
             _all = _tag_all_objects.get(_tag, [])
             _unique_areas = list(dict.fromkeys(obj["area"] for obj in _all if obj["area"] in self.areas))
             if len(_unique_areas) > 1:

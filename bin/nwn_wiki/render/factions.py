@@ -206,7 +206,10 @@ def render_factions(db: Db, out: Path) -> None:
 
     all_race_ids = sorted(
         {k[0] for k in race_faction_counts},
-        key=lambda r: race_name(r).lower() if r is not None else "",
+        # Race id breaks name ties: sorting a set on a non-unique key alone
+        # leaves the tied rows in hash order.
+        key=lambda r: (race_name(r).lower() if r is not None else "",
+                       -1 if r is None else int(r)),
     )
     factions_with_creatures = sorted(
         {k[1] for k in race_faction_counts},
@@ -268,7 +271,8 @@ def render_factions(db: Db, out: Path) -> None:
         n_spawn = sum(1 for e in entries if e["kind"] == "spawn")
         areas_sorted = sorted(
             {e["area"] for e in entries},
-            key=lambda a: db.area_name(a).lower(),
+            # Resref breaks name ties (several areas share a display name).
+            key=lambda a: (db.area_name(a).lower(), a),
         )
         total_lvls = sum(e["lvls"] for e in entries)
         area_links = ", ".join(
@@ -355,7 +359,8 @@ def render_factions(db: Db, out: Path) -> None:
         sections.append(f'<h2 id="{E(_anchor_none)}">(None)</h2>')
         _n_inst_n = sum(1 for e in _none_ent if e["kind"] == "instance")
         _n_spawn_n = sum(1 for e in _none_ent if e["kind"] == "spawn")
-        _areas_n = sorted({e["area"] for e in _none_ent}, key=lambda a: db.area_name(a).lower())
+        _areas_n = sorted({e["area"] for e in _none_ent},
+                          key=lambda a: (db.area_name(a).lower(), a))
         _area_links_n = ", ".join(link(f"areas/{a}.html", db.area_name(a)) for a in _areas_n)
         sections.append(meta_dl([
             f"<dt>Direct placements</dt><dd>{_n_inst_n:,}</dd>",

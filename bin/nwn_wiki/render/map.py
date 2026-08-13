@@ -204,7 +204,7 @@ def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],
 
     layer_boxes: list[str] = []
     layer_labels: list[str] = []
-    for nid, (x, y) in positions.items():
+    for nid, (x, y) in sorted(positions.items()):
         w, h = sizes[nid]
         px = (x - w / 2) * scale
         py = (y - h / 2) * scale

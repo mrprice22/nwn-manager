@@ -138,13 +138,15 @@ def layout_areas(
     disc_seen: set[str] = set()
     disc_remaining: set[str] = set(node_ids)
     while disc_remaining:
-        root0 = max(disc_remaining, key=lambda n: len(adj[n]))
+        # sorted() first: max() returns the first maximum it sees, so an
+        # unsorted set here would pick a hash-order-dependent root.
+        root0 = max(sorted(disc_remaining), key=lambda n: len(adj[n]))
         disc_q: list[str] = [root0]; disc_comp: list[str] = [root0]
         disc_seen.add(root0); disc_remaining.discard(root0)
         dh = 0
         while dh < len(disc_q):
             u0 = disc_q[dh]; dh += 1
-            for nb0 in adj[u0]:
+            for nb0 in sorted(adj[u0]):
                 if nb0 not in disc_seen:
                     disc_seen.add(nb0); disc_remaining.discard(nb0)
                     disc_q.append(nb0); disc_comp.append(nb0)
