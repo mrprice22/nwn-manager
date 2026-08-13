@@ -2838,8 +2838,61 @@ items:
 - id: dedup-map-js
   phase: 3
   title: Move the map pan/zoom IIFE into site.js
-  status: pending
+  status: done
   gate: expected-diff
+  gate_decl: gates/dedup-map-js.json
+  commit: 2230f92
+  date: 2026-08-12
+  gate_result: "check --all --expect gates/dedup-map-js.json: homers_lotr OK — all diffs declared (152s), lotr2008 OK (91s), lotr2009 OK (119s); exactly the declared paths, including the predicted homers_lotr asymmetry.  Baselines rebaselined --all."
+  impl_notes: >
+    Took the shape the expected_diff described: NO inline script at all.  site.js
+    gained initMap() (+63 lines), which does its own getElementById lookup of
+    area-map-wrap / area-map-svg and returns early when absent, exactly like
+    initNav, and is called from the existing DOMContentLoaded handler one line
+    after initNav(nav).  render_map_svg now ends at '</svg></div>' with a two-line
+    comment pointing at initMap().
+    The toolbar markup is byte-unchanged, including onclick="downloadAreaMap()":
+    initMap still assigns window.downloadAreaMap, and inline attribute handlers
+    resolve the name at click time, long after the deferred site.js has run — so
+    no DOMContentLoaded shim was needed in the page.
+    The two inline copies turned out to be identical: extracting every such blob
+    from all HTML in the three golden trees gave five occurrences (homers_lotr
+    docs/map, lotr2008 and lotr2009 docs/index + docs/map), all the same 1779-char
+    string.  Nothing to parameterise — the per-page variation (display_w/h) lives
+    in the SVG's width/height attributes, which the script reads at runtime via
+    getAttribute, and the viewBox is never touched by the JS.  grep -c
+    'area-map-svg' is 2 per page (element + script), confirming one map per page,
+    so the id-based lookup loses nothing.
+    Non-obvious corpus asymmetry, checked before declaring rather than assumed:
+    docs/index.html carries a map in lotr2008 and lotr2009 ONLY — homers_lotr's
+    index is an author-supplied PROJECT_INPUTS override with no map — so the
+    primary corpus moves two files and the archives three.  The declaration
+    allowlisted all three paths and the gate confirmed it exactly.
+    Translation was literal: same [0.2, 5] clamp, same `if (z === zoom) return`
+    early-out, same 1.25/1.12 factors, same {passive:false} wheel handler, same
+    cursor-anchored scroll maths, same baseW/baseH captured before the initial 0.8
+    resize, same <?xml prologue test and 100 ms revokeObjectURL.  Only var ->
+    const/let and quote style changed, to match site.js's idiom.
+  found:
+    - "TIMING SHIFT — the one real behavioural delta.  The IIFE used to run at parse
+       time, immediately after the SVG element; initMap now runs on DOMContentLoaded
+       because site.js is deferred.  The map can therefore paint one frame at its
+       full 1:1 width (4x oversampled) before being shrunk to zoom=0.8 and centred —
+       a brief visual jump on slow pages.  Not a correctness regression, and the
+       scrollWidth/clientWidth centring is if anything more reliable after full
+       layout.  Fixable with a CSS-side initial width if the flash matters."
+    - "initMap inherits the one-map-per-page ceiling already recorded in render-map's
+       found: (duplicate id=\"area-map-wrap\" across pages).  A querySelectorAll
+       version would need those ids to become classes and the three zoom buttons
+       scoped to the toolbar — out of scope here, since the declaration was
+       'no markup change'."
+    - "The zoom = 4.0 (Python oversampling) / zoom = 0.8 (JS default view) split
+       flagged in render-map's found: is now split across two files in different
+       languages rather than two spots in one function.  Still one scale decision;
+       initMap's comment names the baseline but the coupling is unenforced."
+    - "render_map_svg's embedded_css still hardcodes a light-theme palette
+       hand-synced with wiki_assets/style.css (pre-existing from render-map).  It is
+       now the last copy-drift hazard left in that function."
   after: [dedup-formatting]
   plan: >
     render_map_svg inlines a 37-line pan/zoom IIFE into both index.html and
