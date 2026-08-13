@@ -1,65 +1,42 @@
 #!/usr/bin/env bash
-# Desktop-launcher target: regenerate the Homer's LotR static wiki only
-# (skips the slow .mod unpack step). Use this when only wiki-generation
-# code or templates have changed and the unpacked tree is already current.
-# Pauses at the end so failure output stays visible when launched from the
-# GNOME app grid (no parent shell to read).
-
-set -o pipefail
-
-PROJECT=/var/home/james/GIT/nwn_homers_lotr
-NWN_MANAGER_BIN=/var/home/james/GIT/nwn_manager/bin
-
-export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
-
-cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
-
-# Export TZ from server.env so nwn-wiki labels the activity charts with the
-# correct timezone (e.g. America/Chicago → "GMT-5" / "GMT-4" per DST).
-# shellcheck disable=SC1091
-[[ -f "$PROJECT/server.env" ]] && . "$PROJECT/server.env" && export TZ
-
-# The server runs in a container: --log-dir holds the host-readable logs, but the
-# campaign SQLite DBs (incl. bestiarydb.sqlite3) live under NWN_HOME_DIR/database
-# (the host path bound to the container's database/). Point --db-dir there so the
-# bestiary catalogue is seeded and kill stats are read. NWN_HOME_DIR comes from
-# server.env (sourced above); fall back to the standard NWN user dir.
-DB_DIR="${NWN_HOME_DIR:-$HOME/.local/share/Neverwinter Nights}/database"
-
-# --max-character-level stays at the engine's 40: it clamps *creature* class
-# levels when deriving BAB, and the published creature attack figures are tuned
-# against it. --max-player-level is the separate dial for how high a *player*
-# can actually go, which NWNX MaxLevel raises to NWN_MAXLEVEL (60) — it only
-# feeds the counter-gear report's reference PC.
+# SUPERSEDED. Use the copy inside the environment you mean to publish:
 #
-# --devcrit-bonus-dice 3 matches DEVCRIT_DICE in unpacked/devcrit_inc.nss. Only
-# the replacement damage needs stating: that the engine's save-or-die
-# Devastating Critical is disabled at all is DETECTED from hak_2da/baseitems.2da,
-# whose EpicWeaponDevastatingCriticalFeat column bin/gen-devcrit-map.py blanks.
-# Legendary feats are deliberately not simulated while they are in development.
+#     <repo>/bin/refresh-homers-lotr-wiki [--publish]
 #
-# The counter-gear simulation is NOT run here: it is opt-in via --counter-gear
-# (this run only fingerprints its inputs and warns if the report went stale).
-# To rebuild it, re-run this command with --counter-gear appended.
-nwn-manager wiki \
-  --base-url https://homerslotr.com/ \
-  --exclude-conv-option "[Admin Options]" \
-  --exclude-conv-option "[Options of the Homeless]" \
-  --log-dir "$HOME/.local/state/nwnxee-homer" \
-  --db-dir "$DB_DIR" \
-  --2da-dir "$PROJECT/hak_2da" \
-  --max-character-level 40 \
-  --max-ability-bonus 24 \
-  --max-player-level "${NWN_MAXLEVEL:-40}" \
-  --devcrit-bonus-dice 3 \
-  --path-from thewelloferu
-status=$?
+# This file used to be a full wiki-build runner with the season-1 values baked
+# in: --base-url https://homerslotr.com/, season 1's run dir as --log-dir,
+# --max-character-level 40, and no roadmap or --publish steps at all. It was
+# already stale when there were two environments. There are now three - a
+# permanent dev realm, the live season and an archived season - and a
+# season-blind wiki build is not merely out of date, it is a live hazard:
+#
+#   * --base-url decides the absolute URLs written into every generated page,
+#     so building the wrong one silently produces a site that links to another
+#     realm's wiki throughout;
+#   * --log-dir and --db-dir decide WHOSE kill counts, server-firsts and
+#     activity charts the pages report, so a mis-scoped build publishes one
+#     season's player statistics under another season's name;
+#   * --max-character-level 40 is simply wrong everywhere now (the cap is 60).
+#
+# There is no correct default to fall back to, which is exactly why this
+# refuses instead of guessing. Each repo's own copy derives all of it from that
+# repo's server.env and is relocatable (PROJECT comes from BASH_SOURCE), so the
+# environment is implied by the path you invoke.
+#
+# See season-cutover-guide.md, and season-cutover-prereqs.md item 4.
+set -euo pipefail
 
-echo
-if [[ $status -eq 0 ]]; then
-  echo "[done] wiki regenerated → $PROJECT/docs/index.html"
-else
-  echo "[FAILED] exit $status"
-fi
-echo
-read -rp "Press Enter to close..."
+cat >&2 <<'EOF'
+refresh-homers-lotr-wiki: this shared copy is superseded and does nothing.
+
+Run the wiki build from the environment you actually mean, e.g.
+
+    ~/GIT/nwn_homers_lotr/bin/refresh-homers-lotr-wiki              # dev realm
+    ~/GIT/nwn_homers_lotr_s2/bin/refresh-homers-lotr-wiki --publish # live season
+    ~/GIT/nwn_homers_lotr_s1/bin/refresh-homers-lotr-wiki --publish # archived
+
+Each derives its base URL, log dir, database dir and level cap from that
+repo's own server.env. This copy had season 1's values hardcoded and would
+publish one realm's statistics under another realm's URLs.
+EOF
+exit 2

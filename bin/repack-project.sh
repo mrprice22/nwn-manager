@@ -16,7 +16,10 @@
 # Project selection, highest precedence first:
 #   --project DIR   passed to the wrapper (the wrapper stores it in REPACK_PROJECT)
 #   $NWN_PROJECT    environment
-#   the default below — the unnumbered repo, which is always the NEWEST season
+#   the default below — the unnumbered repo, which is the permanent DEV realm.
+#                       Building dev by default is right: dev is the only place
+#                       development happens. Production repos are never built
+#                       directly — bin/season-promote.sh drives their repack.
 #
 # Sets, on success:
 #   PROJECT             absolute path to the module repo
@@ -25,7 +28,8 @@
 #   NWN_MOD_DIR         $NWN_HOME_DIR/modules
 #   NWN_MOD_DEST        installed module path — MUST match NWN_MODULE exactly
 #   ONEDRIVE_ROOT       OneDrive share root    (override: $REPACK_ONEDRIVE_DIR)
-#   ONEDRIVE_MOD_DIR    season subdir under it — $ONEDRIVE_ROOT/Season<N>
+#   ONEDRIVE_MOD_DIR    per-environment subdir — $ONEDRIVE_ROOT/Season<N>,
+#                       or $ONEDRIVE_ROOT/Test when SEASON_ROLE=dev
 #   ONEDRIVE_MOD_DEST   OneDrive copy path
 #   plus everything server.env exports (NWN_MODULE, NWN_HOME_DIR, SEASON_*, …)
 
@@ -61,8 +65,18 @@ repack_resolve_project() {
   # out to the Windows toolset from here and come back deliberately renamed as
   # point-in-time backups, so the unpack side can't key on a filename — but with
   # the folder season-scoped, "newest mtime in this dir" is unambiguous.
+  #
+  # The dev realm gets its OWN folder rather than Season<N>. It is permanent and
+  # is never a season, but it carries SEASON_NUM = whichever season it currently
+  # feeds — so keying purely on the number would land dev and that season's
+  # production repo in the same directory. Two environments sharing one folder
+  # breaks the unpack side outright: refresh-homers-lotr takes the newest mtime
+  # in the dir, so a dev build would be unpacked into production (and vice
+  # versa) with nothing to signal it. Scope by role first, number second.
   ONEDRIVE_ROOT=${REPACK_ONEDRIVE_DIR:-$HOME/OneDrive/Games/NWNHomersLOTR}
-  if [[ -n ${SEASON_NUM:-} ]]; then
+  if [[ ${SEASON_ROLE:-} == dev ]]; then
+    ONEDRIVE_MOD_DIR="$ONEDRIVE_ROOT/Test"
+  elif [[ -n ${SEASON_NUM:-} ]]; then
     ONEDRIVE_MOD_DIR="$ONEDRIVE_ROOT/Season$SEASON_NUM"
   else
     ONEDRIVE_MOD_DIR="$ONEDRIVE_ROOT"   # non-seasoned project: legacy flat layout
