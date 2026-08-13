@@ -2503,8 +2503,59 @@ items:
 - id: dedup-items-skeleton
   phase: 3
   title: One items-index builder for the four copies of that skeleton
-  status: pending
+  status: done
   gate: zero-diff
+  commit: b21585d
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (155s), lotr2008 IDENTICAL (95s), lotr2009 IDENTICAL (106s)"
+  impl_notes: >
+    Deliberately a PARTIAL dedup: the four functions were not collapsed into one
+    builder.  They differ in more than prefix/column/intro — the ordered-category
+    list is built three different ways (index and inaccessible append
+    creature_weapon_keys + ["creature_item"] after the group walk; the store
+    functions dedup and append every leftover bucket), the sidebar Views blocks
+    differ, the items index alone carries the scroll-specific sort, inaccessible
+    has its own Special extras plus the trailing "Potentially Broken" section, and
+    both store functions have their own empty-state returns.  A single
+    parameterised builder would have been a switch statement wearing a function's
+    clothes; what got shared is the part that was provably identical.
+    New helpers in render/items.py: _weapon_key_split(buckets) (the sorted
+    weapon_<baseitem> player/creature split, verbatim x4), _make_expand(player,
+    creature) (the WEAPONS/CREATURE_WEAPONS placeholder expander, verbatim x4),
+    _items_toc_entry(cat_key, count) (x6 call sites), _items_toc_group_parts (the
+    _TOC_GROUPS heading + entries walk, x3), _items_special_entries (x3), and
+    _items_section_html(db, ctx, cat_key, items, heading="h2", show_reason=False)
+    (the anchored heading + col-flags + table head + rows block, x3 — heading="h3"
+    and show_reason=True are the only real variations).
+    New in render/stores.py: _store_inventory_buckets(db, pages), the
+    ItemList -> resref -> db.items enrichment -> category bucketing that both store
+    functions had a copy of.  The TOC copy previously bucketed bare resref strings
+    and now shares the tuple buckets; only len() was ever read from them, so output
+    is unaffected.  stores.py shed six now-unused imports (_items_col_flags,
+    _items_row, _items_table_head, _item_category_label, SPELL_INFO,
+    _CREATURE_WEAPON_BASEITEMS).
+    No public symbol renamed and no emitted markup string altered.
+    -204/+128 across the two files; ~150 lines of duplicated body removed against
+    ~75 lines of new helper definitions.
+  found:
+    - "The CREATURE_WEAPONS branch of _expand is dead: _TOC_GROUPS (nwn_wiki/items.py)
+       contains only WEAPONS, never CREATURE_WEAPONS, so creature weapon keys reach a
+       page only via the explicit Special section and the ordered_cats appends.  Now
+       in one place (_make_expand) instead of four, so deleting it is a one-line
+       change — but it needs its own zero-diff gate."
+    - "_item_cost_key is still duplicated: the identical `return item_gp_value(entry[1])`
+       closure inside both render_inaccessible_index and render_items_index, plus
+       _cost_key in _store_inventory_html.  Trivially hoistable to module level; left
+       alone because it is not part of this item's skeleton."
+    - "render_inaccessible_index and render_items_index still share their outer shell
+       (ctx -> buckets -> sidebar -> <div class=\"items-layout\"> -> write_page).  About
+       15 more lines would go with a _items_layout_page(ctx, sidebar, body, title, out)
+       helper — a candidate for dedup-layout-wrappers."
+    - "The Special-heading condition differs subtly between the store TOC (`if
+       special_keys:` unfiltered, with a continue guard inside the loop) and the two
+       index pages (the filtered special_entries).  Provably equivalent today because
+       creature_weapon_keys is derived from buckets and so is never empty-bucketed —
+       worth knowing if anyone changes how those keys are computed."
   after: [dedup-creature-row]
   plan: >
     render_inaccessible_index, render_items_index, _store_inventory_html and
