@@ -30,6 +30,7 @@ from nwn_wiki.lookups import (
 from nwn_wiki.render.creatures import creature_max_hp
 from nwn_wiki.render.stores import (
     _buy_limit_str,
+    _gp_or_dash,
     _store_buy_summary,
     _store_item_gp_stats,
     _store_opener_html,
@@ -845,8 +846,8 @@ def render_area_page(db: Db, resref: str, out: Path,
                 opener_cell = '<em class="muted">unknown</em>'
 
             max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
-            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
-            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
+            max_gp_str = _gp_or_dash(max_gp)
+            avg_gp_str = _gp_or_dash(avg_gp, ",.0f")
             rows.append(
                 f"<tr>"
                 f"<td>{name_cell}</td>"

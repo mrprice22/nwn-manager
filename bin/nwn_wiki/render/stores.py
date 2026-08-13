@@ -36,6 +36,14 @@ from nwn_wiki.render.items import (
 )
 
 
+def _gp_or_dash(val, spec: str = ",") -> str:
+    """Format a gold figure for a store table cell, em dash when non-positive.
+
+    ``spec`` is the format spec: ',' for the exact max (an int) and ',.0f' for
+    the rounded average (a float)."""
+    return f"{val:{spec}}" if val > 0 else "—"
+
+
 def _buy_limit_str(mbp: Any) -> str:
     if mbp is None:
         return "—"
@@ -170,8 +178,8 @@ def _creature_store_section(db: "Db", creature_resref: str,
             mbp_raw = fld(inst, "MaxBuyPrice", None)
 
             max_gp, _, _, avg_gp = _store_item_gp_stats(db, pages)
-            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
-            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
+            max_gp_str = _gp_or_dash(max_gp)
+            avg_gp_str = _gp_or_dash(avg_gp, ",.0f")
             rows.append(
                 f"<tr>"
                 f"<td>{name_cell}</td>"
@@ -504,8 +512,8 @@ def render_stores_index(db: Db, out: Path) -> None:
 
             mbp_raw = fld(inst, 'MaxBuyPrice', None)
             max_gp, max_irr, max_item_name, avg_gp = _store_item_gp_stats(db, pages)
-            max_gp_str = f"{max_gp:,}" if max_gp > 0 else "—"
-            avg_gp_str = f"{avg_gp:,.0f}" if avg_gp > 0 else "—"
+            max_gp_str = _gp_or_dash(max_gp)
+            avg_gp_str = _gp_or_dash(avg_gp, ",.0f")
             row = (
                 f"<tr>"
                 f"<td>{name_cell}</td>"
@@ -568,8 +576,8 @@ def render_stores_index(db: Db, out: Path) -> None:
             f"<td>{buy_html}</td>"
             f"<td>{(f'{md_val}%' if md_val is not None else '—') if buys_any else 'N/A'}</td>"
             f"<td>{'N/A' if not buys_any else _buy_limit_str(mbp_raw)}</td>"
-            f"<td>{f'{u_max_gp:,}' if u_max_gp > 0 else '—'}</td>"
-            f"<td>{f'{u_avg_gp:,.0f}' if u_avg_gp > 0 else '—'}</td>"
+            f"<td>{_gp_or_dash(u_max_gp)}</td>"
+            f"<td>{_gp_or_dash(u_avg_gp, ',.0f')}</td>"
             f"</tr>"
         ))
     unplaced_rows.sort(key=lambda x: x[0])

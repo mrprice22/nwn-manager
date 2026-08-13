@@ -48,6 +48,7 @@ from nwn_wiki.lookups import (
     baseitem_label,
     baseitem_name,
 )
+from nwn_wiki.util import _fmt_commas
 
 from nwn_wiki import state
 
@@ -74,11 +75,10 @@ def _scroll_spell_sort_key(entry: tuple[str, dict], db: "Db | None" = None) -> t
 
 def _fmt_cost(raw) -> str:
     """Format an item Cost value with comma separators; returns '' for missing/zero."""
-    try:
-        v = int(raw)
-        return f"{v:,}" if v else ""
-    except (TypeError, ValueError):
-        return E(str(raw)) if raw not in (None, "") else ""
+    s = _fmt_commas(raw, blank_zero=True)
+    if s is not None:
+        return s
+    return E(str(raw)) if raw not in (None, "") else ""
 
 
 def _items_col_flags(items: list[tuple[str, dict]]) -> tuple[bool, bool]:

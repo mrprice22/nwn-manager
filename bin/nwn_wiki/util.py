@@ -24,6 +24,22 @@ def _try_int(v: Any, default: int = 0) -> int:
         return default
 
 
+def _fmt_commas(val: Any, blank_zero: bool = False) -> str | None:
+    """Comma-grouped integer, or None when ``val`` isn't int-like.
+
+    Shared numeric core of the display formatters (``_fmt_hp``, ``_fmt_cost``):
+    each of those handles its own non-numeric fallback, this handles the one
+    case they agree on. With ``blank_zero`` a zero renders as '' rather than
+    '0', which is what a cost column wants and an HP column does not."""
+    try:
+        v = int(val)
+    except (TypeError, ValueError):
+        return None
+    if blank_zero and not v:
+        return ""
+    return f"{v:,}"
+
+
 def _tz_label_from_env() -> str:
     """Derive a GMT±N label from the TZ environment variable.
 

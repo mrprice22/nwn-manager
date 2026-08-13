@@ -26,6 +26,7 @@ from nwn_wiki.lookups import (
     race_name,
     skill_name,
 )
+from nwn_wiki.util import _fmt_commas
 from nwn_wiki.warn import _warn_once
 
 
@@ -332,10 +333,8 @@ def _fmt_hp(val: Any) -> str:
     """Format HP with comma separators; returns '' for missing values."""
     if val in (None, ''):
         return ''
-    try:
-        return f"{int(val):,}"
-    except (TypeError, ValueError):
-        return str(val)
+    s = _fmt_commas(val)
+    return str(val) if s is None else s
 
 
 def _yn(flag: bool) -> str:

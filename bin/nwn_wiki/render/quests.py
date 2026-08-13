@@ -19,6 +19,7 @@ from nwn_wiki.htmlgen.escape import E, nwn_html
 from nwn_wiki.htmlgen.links import (_area_link, _creature_link, _item_link,
                                     _script_link, link)
 from nwn_wiki.htmlgen.pagectx import PageCtx
+from nwn_wiki.util import _try_int
 
 
 # ---------------------------------------------------------------------------
@@ -50,10 +51,7 @@ def _quest_slugs(cats: list[dict]) -> list[str]:
 
 
 def _quest_entry_id(e: dict) -> int:
-    try:
-        return int(fld(e, "ID", 0) or 0)
-    except (TypeError, ValueError):
-        return 0
+    return _try_int(fld(e, "ID", 0))
 
 
 # Builder-authored directives parsed from a quest category's Comment field —

@@ -29,6 +29,7 @@ from nwn_wiki.lookups import (
     baseitem_name,
 )
 from nwn_wiki.sim.combat import avg_roll
+from nwn_wiki.util import _try_int
 
 
 # Inventory slot bitmasks used on Equip_ItemList[*].__struct_id.
@@ -394,10 +395,7 @@ def item_ac_bonus(item: dict | None) -> tuple[int, list[str]]:
         pdef = IPROP_DEFS.get(int(pname_id), {})
         pname = (pdef.get("name") or "").lower()
         cost = fld(p, "CostValue", 0) or 0
-        try:
-            cost_int = int(cost)
-        except (TypeError, ValueError):
-            cost_int = 0
+        cost_int = _try_int(cost)
         if "ac bonus" in pname or pname == "ac":
             total += cost_int
             notes.append(f"+{cost_int} {pdef.get('name','AC')}")
@@ -420,10 +418,7 @@ def item_attack_bonus(item: dict | None) -> int:
         pname_id = fld(p, "PropertyName")
         if pname_id is None:
             continue
-        try:
-            cv = int(fld(p, "CostValue", 0) or 0)
-        except (TypeError, ValueError):
-            cv = 0
+        cv = _try_int(fld(p, "CostValue", 0))
         pid = int(pname_id)
         if pid == 6:      # Enhancement Bonus
             enh = max(enh, cv)
@@ -446,10 +441,7 @@ def item_damage_bonus(item: dict | None) -> tuple[int, list[str]]:
         pdef = IPROP_DEFS.get(int(pname_id), {})
         pname = (pdef.get("name") or "").lower()
         if "damage bonus" in pname:
-            try:
-                cost = int(fld(p, "CostValue", 0) or 0)
-            except (TypeError, ValueError):
-                cost = 0
+            cost = _try_int(fld(p, "CostValue", 0))
             line = itemprop_oneliner(p)
             # Damage Bonus w/ a "physical" or generic subtype usually flat;
             # elemental subtypes display as bonus-line extras.
@@ -475,10 +467,7 @@ def weapon_enhancement(item: dict | None) -> int:
     for p in list_items(item.get("PropertiesList")):
         if fld(p, "PropertyName") != 6:
             continue
-        try:
-            cv = int(fld(p, "CostValue", 0) or 0)
-        except (TypeError, ValueError):
-            cv = 0
+        cv = _try_int(fld(p, "CostValue", 0))
         enh = max(enh, cv)
     return enh
 
@@ -492,10 +481,7 @@ def item_gp_value(item: dict | None) -> int:
         return 0
     total = 0
     for key in ("Cost", "AddCost"):
-        try:
-            total += int(fld(item, key, 0) or 0)
-        except (TypeError, ValueError):
-            pass
+        total += _try_int(fld(item, key, 0))
     return total
 
 
