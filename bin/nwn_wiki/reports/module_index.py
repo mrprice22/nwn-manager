@@ -4,6 +4,10 @@
 writes the machine-readable snapshot of the module — areas, creatures, items,
 stores, quests, scripts and the quality reports — that tooling and LLMs read
 instead of scraping the HTML wiki.
+
+One writer function per output file; :func:`generate_module_index` is the
+orchestrator that computes the shared context (timestamp, URL helpers) once and
+calls each writer in turn.
 """
 
 from __future__ import annotations
@@ -33,47 +37,25 @@ from nwn_wiki.util import _try_int, _write_json
 # ---------------------------------------------------------------------------
 
 
-def generate_module_index(
+# ------------------------------------------------------------------ helpers
+def _int_fid(raw: Any) -> "int | None":
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------ area_graph.json
+def _write_area_graph(
     db: "Db",
     module_index_dir: Path,
     module_title: str,
+    now: str,
     graph: "dict[str, list]",
-    area_paths: "dict[str, list | None] | None",
-    path_from_resref: str,
-    path_from_name: str,
-    wiki_out: Path,
-    base_url: str,
+    _au,
 ) -> None:
-    """Write LLM-friendly JSON indexes to module_index_dir.
-
-    Files written:
-      area_graph.json                    — directed area transition graph with names
-      area_paths.json                    — BFS shortest paths (only when path_from_resref given)
-      area_index.json                    — all areas with names, stats, and connections
-      duplicate_destination_tags.json    — transitions whose LinkedTo tag matches multiple objects
-      creature_index.json                — all canonical creatures with stats and locations
-      creature_tag_conflicts.json        — creature blueprints that produced variant resrefs
-      item_index.json                    — all items with names, costs, and sources
-      cross_faction_creatures.json       — blueprints appearing in multiple factions
-      faction_bp_instance_discrepancies.json — placed instances whose FactionID differs from their blueprint
-      inaccessible_items.json            — items not reachable by players
-      unspawned_creatures.json           — creature blueprints never placed or in an encounter
-      instance_only_conversations.json   — creature instances with Conversation overrides not on the blueprint
-    """
-    module_index_dir.mkdir(parents=True, exist_ok=True)
-    now = datetime.now().isoformat(timespec="seconds")
-    _cu, _iu, _au, _su = _module_index_url_helpers(module_index_dir, wiki_out, base_url)
-
-    # ------------------------------------------------------------------ helpers
-    def _int_fid(raw: Any) -> "int | None":
-        if raw is None or raw == "":
-            return None
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return None
-
-    # ------------------------------------------------------------------ area_graph.json
     area_graph_data: dict[str, Any] = {}
     for rr in sorted(db.areas):
         area_name = db.area_name(rr)
@@ -104,7 +86,17 @@ def generate_module_index(
     })
     state._module_index_summary.append(("info", f"[nwn-wiki] module-index: area_graph.json ({len(area_graph_data)} areas)"))
 
-    # ------------------------------------------------------------------ area_paths.json
+
+# ------------------------------------------------------------------ area_paths.json
+def _write_area_paths(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    area_paths: "dict[str, list | None] | None",
+    path_from_resref: str,
+    path_from_name: str,
+) -> None:
     if path_from_resref and area_paths is not None:
         paths_out: dict[str, Any] = {}
         unreachable: list[str] = []
@@ -140,7 +132,15 @@ def generate_module_index(
         })
         state._module_index_summary.append(("info", f"[nwn-wiki] module-index: area_paths.json ({len(paths_out)} reachable, {len(unreachable)} unreachable)"))
 
-    # -------------------------------------------------------- duplicate_destination_tags.json
+
+# -------------------------------------------------------- duplicate_destination_tags.json
+def _write_duplicate_destination_tags(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _au,
+) -> None:
     dup_tag_entries: list[dict] = []
     for tag in sorted(db.dup_dest_tags, key=str.lower):
         objects = db.dup_dest_tags[tag]
@@ -196,7 +196,15 @@ def generate_module_index(
     else:
         state._module_index_summary.append(("issue", "[nwn-wiki] module-index: duplicate_destination_tags.json (none)"))
 
-    # -------------------------------------------------------- area_tag_conflicts.json
+
+# -------------------------------------------------------- area_tag_conflicts.json
+def _write_area_tag_conflicts(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _au,
+) -> None:
     area_tag_conflicts: list[dict] = []
     for tag_lower, resrefs in sorted(db.area_tag_groups.items()):
         if len(resrefs) < 2:
@@ -245,7 +253,16 @@ def generate_module_index(
     else:
         state._module_index_summary.append(("issue", "[nwn-wiki] module-index: area_tag_conflicts.json (none)"))
 
-    # ------------------------------------------------------------------ area_index.json
+
+# ------------------------------------------------------------------ area_index.json
+def _write_area_index(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    graph: "dict[str, list]",
+    _au,
+) -> None:
     area_index: list[dict] = []
     for rr in sorted(db.areas, key=lambda r: db.area_name(r).lower()):
         n_creatures = len(db.area_creature_instances.get(rr, []))
@@ -274,7 +291,16 @@ def generate_module_index(
     })
     state._module_index_summary.append(("info", f"[nwn-wiki] module-index: area_index.json ({len(area_index)} areas)"))
 
-    # ------------------------------------------------------------------ creature_index.json
+
+# ------------------------------------------------------------------ creature_index.json
+def _write_creature_index(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+) -> list[dict]:
+    """Write creature_index.json and return the rows (appearance report reuses them)."""
     creature_index: list[dict] = []
     for can_rr in sorted(db.canonical_creatures,
                          key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
@@ -350,8 +376,18 @@ def generate_module_index(
         "creatures": creature_index,
     })
     state._module_index_summary.append(("info", f"[nwn-wiki] module-index: creature_index.json ({len(creature_index)} canonical creatures)"))
+    return creature_index
 
-    # ------------------------------------------------------------------ counter_gear.json
+
+# ------------------------------------------------------------------ counter_gear.json
+def _write_counter_gear(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+    _iu,
+) -> None:
     # Opt-in: the simulation runs every creature against the whole attainable
     # item pool, which is far too slow for a routine wiki refresh. A normal run
     # only fingerprints the inputs and warns when the report on disk no longer
@@ -361,7 +397,15 @@ def generate_module_index(
     else:
         check_counter_gear_freshness(db, module_index_dir)
 
-    # ------------------------------------------------------------------ appearance_faction_report.json
+
+# ------------------------------------------------------------------ appearance_faction_report.json
+def _write_appearance_faction_report(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    creature_index: list[dict],
+) -> None:
     # Group canonical creatures by (appearance_id, faction_id) so that LLMs can
     # quickly spot appearances that span multiple factions — a common cause of
     # NPC confusion (two guards that look identical but one is hostile).
@@ -431,7 +475,15 @@ def generate_module_index(
     })
     state._module_index_summary.append(("info", f"[nwn-wiki] module-index: appearance_faction_report.json ({len(app_report)} appearances, {cross_count} cross-faction)"))
 
-    # ------------------------------------------------------------------ creature_tag_conflicts.json
+
+# ------------------------------------------------------------------ creature_tag_conflicts.json
+def _write_creature_tag_conflicts(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+) -> None:
     # Canonical entries whose resref was synthesised as bp__v2, bp__v3, …
     # indicate that the same blueprint was placed with differing overrides, giving
     # it a new synthetic canonical resref.  These are potential content issues:
@@ -491,7 +543,15 @@ def generate_module_index(
     })
     state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: creature_tag_conflicts.json ({len(ct_conflicts)} blueprint(s) with variants)"))
 
-    # ------------------------------------------------------------------ item_index.json
+
+# ------------------------------------------------------------------ item_index.json
+def _write_item_index(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _iu,
+) -> None:
     def _item_sources(rr: str) -> list[str]:
         sources: list[str] = []
         for s in db.item_sold_at.get(rr, []):
@@ -543,7 +603,15 @@ def generate_module_index(
     })
     state._module_index_summary.append(("info", f"[nwn-wiki] module-index: item_index.json ({len(item_index)} items)"))
 
-    # ------------------------------------------------------------------ cross_faction_creatures.json
+
+# ------------------------------------------------------------------ cross_faction_creatures.json
+def _write_cross_faction_creatures(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+) -> None:
     crr_fids: dict[str, set[int]] = defaultdict(set)
     for area_rr, insts in db.area_creature_instances.items():
         if area_rr in db.hidden_areas:
@@ -600,7 +668,16 @@ def generate_module_index(
     })
     state._module_index_summary.append(("issue", f"[nwn-wiki] module-index: cross_faction_creatures.json ({len(cf_creatures)} blueprint(s))"))
 
-    # ------------------------------------------------------------------ faction_bp_instance_discrepancies.json
+
+# ------------------------------------------------------------------ faction_bp_instance_discrepancies.json
+def _write_faction_bp_instance_discrepancies(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+    _au,
+) -> None:
     # Each entry: a placed GIT instance whose FactionID differs from its blueprint's FactionID.
     discrepancies: list[dict] = []
     for area_rr, insts in db.area_creature_instances.items():
@@ -648,7 +725,16 @@ def generate_module_index(
     })
     state._module_index_summary.append(("issue", f"[nwn-wiki] module-index: faction_bp_instance_discrepancies.json ({len(discrepancies)} instance(s))"))
 
-    # ------------------------------------------------------------------ inaccessible_items.json
+
+# ------------------------------------------------------------------ inaccessible_items.json
+def _write_inaccessible_items(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+    _iu,
+) -> None:
     inac_items: list[dict] = []
     for rr in sorted(db.items, key=lambda r: nwn_text(db.item_name(r)).lower()):
         i = db.items[rr]
@@ -699,7 +785,15 @@ def generate_module_index(
     })
     state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: inaccessible_items.json ({len(inac_items)} item(s))"))
 
-    # ------------------------------------------------------------------ unspawned_creatures.json
+
+# ------------------------------------------------------------------ unspawned_creatures.json
+def _write_unspawned_creatures(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+) -> None:
     placed_bps: set[str] = {
         fld(inst["c"], "TemplateResRef", "") or ""
         for insts in db.area_creature_instances.values()
@@ -744,7 +838,16 @@ def generate_module_index(
     })
     state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: unspawned_creatures.json ({len(unspawned)} blueprint(s))"))
 
-    # -------------------------------------------------------- instance_only_conversations.json
+
+# -------------------------------------------------------- instance_only_conversations.json
+def _write_instance_only_conversations(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+    _au,
+) -> None:
     # Creature instances whose Conversation field is set in the GIT placement but
     # either missing or empty on the blueprint.  The wiki reads Conversation from
     # the blueprint canonical, so these NPCs appear to have no conversation on
@@ -800,3 +903,52 @@ def generate_module_index(
         "instances": inst_conv_mismatches,
     })
     state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: instance_only_conversations.json ({len(inst_conv_mismatches)} instance(s))"))
+
+
+def generate_module_index(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    graph: "dict[str, list]",
+    area_paths: "dict[str, list | None] | None",
+    path_from_resref: str,
+    path_from_name: str,
+    wiki_out: Path,
+    base_url: str,
+) -> None:
+    """Write LLM-friendly JSON indexes to module_index_dir.
+
+    Files written:
+      area_graph.json                    — directed area transition graph with names
+      area_paths.json                    — BFS shortest paths (only when path_from_resref given)
+      area_index.json                    — all areas with names, stats, and connections
+      duplicate_destination_tags.json    — transitions whose LinkedTo tag matches multiple objects
+      creature_index.json                — all canonical creatures with stats and locations
+      creature_tag_conflicts.json        — creature blueprints that produced variant resrefs
+      item_index.json                    — all items with names, costs, and sources
+      cross_faction_creatures.json       — blueprints appearing in multiple factions
+      faction_bp_instance_discrepancies.json — placed instances whose FactionID differs from their blueprint
+      inaccessible_items.json            — items not reachable by players
+      unspawned_creatures.json           — creature blueprints never placed or in an encounter
+      instance_only_conversations.json   — creature instances with Conversation overrides not on the blueprint
+    """
+    module_index_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().isoformat(timespec="seconds")
+    _cu, _iu, _au, _su = _module_index_url_helpers(module_index_dir, wiki_out, base_url)
+
+    _write_area_graph(db, module_index_dir, module_title, now, graph, _au)
+    _write_area_paths(db, module_index_dir, module_title, now, area_paths,
+                      path_from_resref, path_from_name)
+    _write_duplicate_destination_tags(db, module_index_dir, module_title, now, _au)
+    _write_area_tag_conflicts(db, module_index_dir, module_title, now, _au)
+    _write_area_index(db, module_index_dir, module_title, now, graph, _au)
+    creature_index = _write_creature_index(db, module_index_dir, module_title, now, _cu)
+    _write_counter_gear(db, module_index_dir, module_title, now, _cu, _iu)
+    _write_appearance_faction_report(db, module_index_dir, module_title, now, creature_index)
+    _write_creature_tag_conflicts(db, module_index_dir, module_title, now, _cu)
+    _write_item_index(db, module_index_dir, module_title, now, _iu)
+    _write_cross_faction_creatures(db, module_index_dir, module_title, now, _cu)
+    _write_faction_bp_instance_discrepancies(db, module_index_dir, module_title, now, _cu, _au)
+    _write_inaccessible_items(db, module_index_dir, module_title, now, _cu, _iu)
+    _write_unspawned_creatures(db, module_index_dir, module_title, now, _cu)
+    _write_instance_only_conversations(db, module_index_dir, module_title, now, _cu, _au)
