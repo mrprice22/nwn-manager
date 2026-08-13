@@ -219,7 +219,12 @@ class Db(DbNamesMixin, DbDerivedMixin, DbDialogsMixin, DbScriptsMixin, DbIndexMi
     }
 
 
-def main() -> int:
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Build the CLI parser and parse ``argv`` (default: ``sys.argv[1:]``)."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", required=True, help="path to unpacked/ tree")
     ap.add_argument("--out", required=True, help="path to output wiki/ dir")
@@ -323,16 +328,26 @@ def main() -> int:
                          "because it simulates every creature against every "
                          "attainable item; normal runs instead compare an input "
                          "fingerprint and warn when the existing report is stale.")
-    args = ap.parse_args()
+    return ap.parse_args(argv)
 
-    state._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
 
-    src = Path(args.src).resolve()
-    out = Path(args.out).resolve()
-    if not src.is_dir():
-        print(f"error: --src not a directory: {src}", file=sys.stderr)
-        return 1
+# ---------------------------------------------------------------------------
+# Build stages
+#
+# Each stage below is one step of the pipeline main() drives, in the order
+# main() calls them.  That order is load-bearing: loaders write module globals
+# in nwn_wiki.state that later renderers read, and three of the stages carry
+# the original comments explaining exactly which ordering constraint they are
+# satisfying (_apply_2da_overrides, _parse_activity_logs, _freeze_site_chrome).
+# Values computed by one stage are passed explicitly to the next rather than
+# recomputed.
+# ---------------------------------------------------------------------------
 
+def _load_tlks(args: argparse.Namespace) -> None:
+    """Populate ``state.BASE_TLK`` / ``state.CUSTOM_TLK`` from the CLI paths.
+
+    Must run before anything resolves a StrRef (i.e. before the Db loads).
+    """
     if args.dialog_tlk:
         p = Path(args.dialog_tlk).resolve()
         if p.is_file():
@@ -355,6 +370,9 @@ def main() -> int:
               "wiki_data/stock_item_names.json (run bin/refresh-nwn-stock-items to rebuild)",
               file=sys.stderr)
 
+
+def _audit_wiki_data() -> bool:
+    """wiki_data pre-flight.  Returns False (after printing) if a file is missing."""
     # --- wiki_data pre-flight: confirm all data files are present ---
     _DATA_AUDIT: list[tuple[str, Any, str]] = [
         ("baseitems.json",        lambda: len(BASEITEMS),                              "bin/wiki_data/_build_stock.py"),
@@ -386,17 +404,23 @@ def main() -> int:
         print("error: required wiki_data files are missing:", file=sys.stderr)
         for _cmd, _files in _by_cmd.items():
             print(f"  {_cmd}  ({', '.join(_files)})", file=sys.stderr)
-        return 1
+        return False
+    return True
 
+
+def _load_db(src: Path, args: argparse.Namespace) -> Db:
+    """Construct the Db, apply the CLI dials, and run the three load passes."""
     print(f"[nwn-wiki] reading {src}")
-    db = Db(src)
+    db = Db(
+        src,
+        max_character_level=args.max_character_level,
+        max_ability_bonus=args.max_ability_bonus,
+        max_player_level=args.max_player_level or args.max_character_level or 40,
+    )
     db.exclude_option_texts = list(args.exclude_conv_option or [])
     if db.exclude_option_texts:
         print(f"[nwn-wiki] excluding map edges from dialog subtrees under: "
               + ", ".join(repr(t) for t in db.exclude_option_texts))
-    db.max_character_level = args.max_character_level
-    db.max_ability_bonus = args.max_ability_bonus
-    db.max_player_level = args.max_player_level or args.max_character_level or 40
     print(f"[nwn-wiki] combat dials: max-character-level="
           f"{db.max_character_level or 'uncapped'}, "
           f"max-ability-bonus=+{db.max_ability_bonus}, "
@@ -404,10 +428,12 @@ def main() -> int:
     db.load()
     db.index()
     db.index_dialogs()
+    return db
 
-    # Area graph is always built (used for module-index and, conditionally, shortest paths).
-    graph = build_area_graph(db)
 
+def _compute_area_paths(db: Db, args: argparse.Namespace,
+                        graph: dict) -> tuple[dict[str, list | None], str]:
+    """Shortest paths back to ``--path-from``.  Empty when the flag is absent."""
     # Shortest-path data keyed by area resref (only populated when --path-from given).
     area_paths: dict[str, list | None] = {}
     path_from_name: str = ""
@@ -423,7 +449,15 @@ def main() -> int:
                 if rr == src_rr:
                     continue
                 area_paths[rr] = bfs_shortest_path(graph, src_rr, rr)
+    return area_paths, path_from_name
 
+
+def _apply_2da_overrides(db: Db, src: Path, args: argparse.Namespace) -> None:
+    """Overlay CEP / --2da-dir labels onto the bundled stock lookups.
+
+    ORDER IS LOAD-BEARING (see the comment below): stock, then CEP, then
+    --2da-dir, and all of it after ``db.load()`` but before any rendering.
+    """
     # Apply 2DA-derived label overrides on top of the bundled stock JSON.
     # The lookup dicts (BASEITEMS, RACES, …) are module-level and only
     # consulted during rendering, so it's safe to mutate them after db.load().
@@ -461,6 +495,9 @@ def main() -> int:
             print(f"warn: --2da-dir {twoda_dir} is not a directory; ignoring",
                   file=sys.stderr)
 
+
+def _prepare_out_dir(out: Path) -> None:
+    """Wipe and re-seed the output tree (.nojekyll, assets/, assets/meta.json)."""
     # Wipe stale generated content so deleted resources don't linger in the
     # wiki. We only nuke the contents — keeping the directory itself preserves
     # any user-created tooling (CNAME, custom workflow files) co-located in
@@ -489,6 +526,13 @@ def main() -> int:
         json.dumps({"generated_at": state._GENERATED_AT}, ensure_ascii=False)
     )
 
+
+def _load_theme_and_pics(db: Db, src: Path, out: Path) -> None:
+    """Load the per-module theme and index/copy creature artwork.
+
+    Both write nwn_wiki.state globals the page shell reads, so this must run
+    before any page renders.
+    """
     # Load per-module theme from wiki-theme/ next to the unpacked/ directory.
     load_wiki_theme(src.parent, out)
 
@@ -504,12 +548,18 @@ def main() -> int:
             if f.is_file() and f.name in wanted:
                 shutil.copy2(f, pics_out / f.name)
 
+
+def _module_title(db: Db, args: argparse.Namespace) -> str:
     # Module title
     title = args.module_name
     if not title and db.ifo:
         title = loc(db.ifo.get("Mod_Name")) or "NWN Module"
     title = title or "NWN Module"
+    return title
 
+
+def _prepare_module_index_dir(src: Path) -> Path:
+    """Wipe (all but the counter-gear report) and return module-index/."""
     module_index_dir = src.parent / "module-index"
     # Wipe stale content so removed resources don't linger across refreshes.
     # The counter-gear report is exempt: it is rebuilt only on demand
@@ -525,7 +575,12 @@ def main() -> int:
             else:
                 _child.unlink()
     module_index_dir.mkdir(parents=True, exist_ok=True)
+    return module_index_dir
 
+
+def _generate_reports(db: Db, module_index_dir: Path, title: str, graph: dict,
+                      area_paths: dict[str, list | None], path_from_name: str,
+                      out: Path, args: argparse.Namespace) -> None:
     # Tag-conflict burndown list + all module-index JSON exports
     generate_tag_conflict_report(db, module_index_dir, title, out, args.base_url or "")
     generate_store_tag_conflict_report(db, module_index_dir, title, out, args.base_url or "")
@@ -537,6 +592,9 @@ def main() -> int:
         out, args.base_url or "",
     )
 
+
+def _compute_layout(db: Db, args: argparse.Namespace) -> tuple[dict, dict]:
+    """Force-directed placement of the visible areas.  Returns (positions, sizes)."""
     # Layout
     print("[nwn-wiki] computing area layout")
     t0 = time.time()
@@ -574,7 +632,14 @@ def main() -> int:
         seed=args.seed,
     )
     print(f"  layout in {time.time() - t0:.1f}s")
+    return positions, sizes
 
+
+def _parse_activity_logs(args: argparse.Namespace) -> dict | None:
+    """Parse --log-dir server logs and raise ``state._HAS_ACTIVITY_PAGE``.
+
+    ORDER IS LOAD-BEARING (see the comment below): before any page() call.
+    """
     # Parse server logs and set the activity-page flag BEFORE any page() calls
     # so the Activity nav link appears on every rendered page.
     activity: dict | None = None
@@ -597,7 +662,11 @@ def main() -> int:
         else:
             print("[nwn-wiki] log-dir specified but no player sessions found; "
                   "skipping activity page", file=sys.stderr)
+    return activity
 
+
+def _load_bestiary(db: Db, args: argparse.Namespace, activity: dict | None) -> None:
+    """Seed the bestiary catalogue and read kill stats from the live campaign DB."""
     # Bestiary kill stats: only when this module ships the bestiary system
     # (detected by the book item). Locate the live campaign-DB dir from --db-dir,
     # falling back to <log-dir>/database when that is a real directory (it is a
@@ -624,6 +693,14 @@ def main() -> int:
             print("[nwn-wiki] bestiary: no reachable database dir "
                   "(set --db-dir); skipping kill stats", file=sys.stderr)
 
+
+def _freeze_site_chrome(db: Db, src: Path, out: Path) -> None:
+    """Load the boss registry, render the manual, then freeze ``state.CHROME``.
+
+    ORDER IS LOAD-BEARING (see the two comments below): the boss registry must
+    be loaded before ANY page renders, and the chrome can only be frozen once
+    every loader the page shell depends on has run.
+    """
     # Boss respawn tracker registry — must load before ANY page renders (manual
     # pages here, the activity subprocess below, and the main pages) so the
     # conditional "Bosses" nav link appears consistently on every page.
@@ -642,6 +719,10 @@ def main() -> int:
     )
     state.CHROME.save(out)
 
+
+def _run_activity_subprocess(db: Db, src: Path, out: Path,
+                             args: argparse.Namespace) -> None:
+    """Hand the frozen chrome to nwn-wiki-activity, which renders its own page."""
     if state._HAS_ACTIVITY_PAGE:
         _act_cmd = [sys.executable, str(SCRIPT_DIR / "nwn-wiki-activity"),
                     "--src", str(src), "--out", str(out)]
@@ -653,6 +734,12 @@ def main() -> int:
             _act_cmd += ["--db-dir", str(Path(args.db_dir).expanduser())]
         subprocess.run(_act_cmd, check=True)
 
+
+def _render_pages(db: Db, src: Path, out: Path, title: str,
+                  positions: dict, sizes: dict,
+                  area_paths: dict[str, list | None], path_from_name: str,
+                  args: argparse.Namespace) -> None:
+    """Render every wiki page.  Runs after every loader stage above."""
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
     render_index(db, out, title, positions, sizes, base_url=args.base_url,
@@ -718,6 +805,9 @@ def main() -> int:
         render_quest_page(db, qcat, qslug, out)
     print(f"  rendered in {time.time() - t0:.1f}s")
 
+
+def _write_lookup_warnings(module_index_dir: Path) -> tuple[Path, list[dict]]:
+    """Dump the lookup failures accumulated in ``state._warned`` during rendering."""
     # Write lookup warnings to module-index so they're visible outside the build log.
     warnings_path = module_index_dir / "lookup_warnings.json"
     sorted_warnings = sorted(state._warned.keys())
@@ -733,7 +823,10 @@ def main() -> int:
         "count": len(warnings_out),
         "warnings": warnings_out,
     })
+    return warnings_path, warnings_out
 
+
+def _write_boss_registry(db: Db, module_index_dir: Path) -> None:
     # Boss respawn tracker registry (parsed from brd_db.nss BRD_SeedBoss rows —
     # the same list the game seeds into respawndb, and the creatures/bosses.html
     # page renders). Written for LLM-assist consumers.
@@ -759,6 +852,10 @@ def main() -> int:
                 for b in sorted(state._BOSS_REGISTRY, key=lambda b: -b["cr"])
             ],
         })
+
+
+def _print_module_index_summary(warnings_path: Path, warnings_out: list[dict]) -> None:
+    """Fold the lookup-warning line into the summary and print it."""
     if warnings_out:
         state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: lookup_warnings.json ({len(warnings_out)} lookup failure(s)) — {warnings_path}"))
     else:
@@ -777,8 +874,56 @@ def main() -> int:
                 print(f"  {color}{label}:{_C_RESET}")
                 for m in msgs:
                     print(f"    {color}{m}{_C_RESET}")
-    
-    
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    args = _parse_args()
+
+    state._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
+
+    src = Path(args.src).resolve()
+    out = Path(args.out).resolve()
+    if not src.is_dir():
+        print(f"error: --src not a directory: {src}", file=sys.stderr)
+        return 1
+
+    _load_tlks(args)
+    if not _audit_wiki_data():
+        return 1
+
+    db = _load_db(src, args)
+
+    # Area graph is always built (used for module-index and, conditionally, shortest paths).
+    graph = build_area_graph(db)
+    area_paths, path_from_name = _compute_area_paths(db, args, graph)
+
+    _apply_2da_overrides(db, src, args)
+    _prepare_out_dir(out)
+    _load_theme_and_pics(db, src, out)
+
+    title = _module_title(db, args)
+    module_index_dir = _prepare_module_index_dir(src)
+    _generate_reports(db, module_index_dir, title, graph, area_paths,
+                      path_from_name, out, args)
+
+    positions, sizes = _compute_layout(db, args)
+
+    activity = _parse_activity_logs(args)
+    _load_bestiary(db, args, activity)
+    _freeze_site_chrome(db, src, out)
+    _run_activity_subprocess(db, src, out, args)
+
+    _render_pages(db, src, out, title, positions, sizes,
+                  area_paths, path_from_name, args)
+
+    warnings_path, warnings_out = _write_lookup_warnings(module_index_dir)
+    _write_boss_registry(db, module_index_dir)
+    _print_module_index_summary(warnings_path, warnings_out)
+
     print(f"[nwn-wiki] done — {out}/index.html")
     return 0
 
