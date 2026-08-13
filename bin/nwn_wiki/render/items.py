@@ -450,35 +450,12 @@ def render_items_index(db: Db, out: Path) -> None:
     render_inaccessible_index(db, inaccessible, out)
 
 
-def render_item_page(db: Db, resref: str, out: Path) -> None:
-    i = db.items.get(resref)
-    if not i:
-        return
-    ctx = PageCtx(f"items/{resref}.html")
-    name = db.item_name(resref)
-    # TLK-placeholder names mean the item's name is not available without the
-    # base game TLK file; show the resref as the page title instead.
-    is_tlk_broken    = name.startswith("[TLK#")
-    is_resref_named  = (not is_tlk_broken) and (name == resref)
-    is_broken        = is_tlk_broken or is_resref_named
-    display_name     = resref if is_broken else name
-    accessible = (
-        resref in db.item_sold_at
-        or resref in db.item_in_container
-        or any(e.get("dropable") or e.get("pickpocketable")
-               for e in db.item_carried_by.get(resref, []))
-        or resref in db.item_from_script
-    )
-    is_inaccessible = not is_broken and not accessible
-    props = list_items(i.get("PropertiesList"))
-    is_cursed = bool(int(fld(i, "Cursed", 0) or 0))
-    is_plot   = bool(int(fld(i, "Plot",   0) or 0))
-    _bi_raw = fld(i, "BaseItem", None)
-    _bi = -1 if _bi_raw is None else int(_bi_raw)
-    is_creature_item = _bi in _CREATURE_WEAPON_BASEITEMS or _bi in _CREATURE_ITEM_BASEITEMS
-    _carriers = db.item_carried_by.get(resref, [])
-    _any_droppable = any(e.get("dropable") for e in _carriers)
-    _any_pickpocketable = any(e.get("pickpocketable") for e in _carriers)
+def _item_meta_sections(i: dict, resref: str, display_name: str, _bi: int,
+                        _carriers: list[dict], _any_droppable: bool, *,
+                        is_broken: bool, is_inaccessible: bool,
+                        is_cursed: bool, is_plot: bool) -> list[str]:
+    """Page title and the header definition list (resref, tag, base item, type,
+    base AC, value, stack size, plot flag, drops-on-death)."""
     if is_cursed:
         _drop_label = "No"
         _drop_reason = " — cursed"
@@ -541,6 +518,17 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             f"{'<small class=\"muted\">' + _drop_reason + '</small>' if _drop_reason else ''}</dd>",
         ], "\n"),
     ]
+    return sections
+
+
+def _item_notice_sections(db: Db, resref: str, *, is_cursed: bool,
+                          is_broken: bool, is_tlk_broken: bool,
+                          is_creature_item: bool, _carriers: list[dict],
+                          _any_droppable: bool,
+                          _any_pickpocketable: bool) -> list[str]:
+    """Banner paragraphs above the description: property-variant cross links,
+    cursed / broken-name / creature-only / does-not-drop warnings."""
+    sections: list[str] = []
     # Variant notices
     _base_rr = db.item_is_variant_of.get(resref)
     if _base_rr:
@@ -608,14 +596,24 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 "It is carried by creatures, but none of them have it flagged as droppable "
                 "(Dropable=1 on the item instance). It will not appear in any loot bag.</p>"
             )
+    return sections
 
+
+def _item_description_sections(i: dict) -> list[str]:
+    """The item's in-game description paragraph."""
+    sections: list[str] = []
     # Prefer the identified description (what players see in-game for identified
     # items, which is nearly all module content); fall back to the unidentified
     # Description only when there is no DescIdentified.
     desc = loc(i.get("DescIdentified")) or loc(i.get("Description"))
     if desc:
         sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
+    return sections
 
+
+def _item_dialog_sections(db: Db, i: dict, resref: str, ctx: PageCtx) -> list[str]:
+    """Conversations this item triggers via tag-based scripting."""
+    sections: list[str] = []
     # Conversations this item triggers via tag-based scripting (a script
     # whose resref equals this item's resref or tag, calling
     # ActionStartConversation with a literal dlg resref).
@@ -641,7 +639,12 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
                 f"<code>{E(d)}</code> via script <code>{E(s)}</code>{tp_note}</li>"
             )
         sections.append("</ul>")
+    return sections
 
+
+def _item_property_sections(props: list[dict]) -> list[str]:
+    """Item-properties table plus the collapsed raw-values table."""
+    sections: list[str] = []
     if props:
         sections.append("<h2>Properties</h2>")
         rows = []
@@ -719,7 +722,13 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "</tr></thead><tbody>" + "\n".join(debug_rows) + "</tbody></table>"
             "</details>"
         )
+    return sections
 
+
+def _item_where_to_find_sections(db: Db, resref: str, ctx: PageCtx,
+                                 is_broken: bool) -> list[str]:
+    """Where to find: sold at, in containers, carried by, script rewards."""
+    sections: list[str] = []
     # Where to find this item
     sold_at = db.item_sold_at.get(resref, [])
     in_containers = db.item_in_container.get(resref, [])
@@ -831,7 +840,12 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             '<p class="muted">Not found in any store, container, creature inventory, '
             "or script reward — this item may be inaccessible to players.</p>"
         )
+    return sections
 
+
+def _item_key_for_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
+    """Doors and containers this item unlocks."""
+    sections: list[str] = []
     key_for = db.item_is_key_for.get(resref, [])
     if key_for:
         has_dst = any(kf.get("dst_area") for kf in key_for)
@@ -869,7 +883,12 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             f'<table class="data"><thead><tr>{headers}'
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _item_script_check_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
+    """Scripts that test for possession of this item's tag."""
+    sections: list[str] = []
     script_checks = db.item_script_checks.get(resref, [])
     if script_checks:
         rows = []
@@ -914,7 +933,12 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "<th>Script</th><th>Event</th><th>Context</th><th>Area(s)</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _item_quest_sections(db: Db, resref: str) -> list[str]:
+    """Quests whose entries are granted by scripts that check this item."""
+    sections: list[str] = []
     # ---- Related quests ----
     # Collect quests from every dialog and script that checks this item's tag.
     item_quest_map: dict[str, set[int]] = defaultdict(set)  # q_tag → entry_ids
@@ -948,5 +972,55 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
             "<th>Quest</th><th>Tag</th><th>Step(s)</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
+
+
+def render_item_page(db: Db, resref: str, out: Path) -> None:
+    i = db.items.get(resref)
+    if not i:
+        return
+    ctx = PageCtx(f"items/{resref}.html")
+    name = db.item_name(resref)
+    # TLK-placeholder names mean the item's name is not available without the
+    # base game TLK file; show the resref as the page title instead.
+    is_tlk_broken    = name.startswith("[TLK#")
+    is_resref_named  = (not is_tlk_broken) and (name == resref)
+    is_broken        = is_tlk_broken or is_resref_named
+    display_name     = resref if is_broken else name
+    accessible = (
+        resref in db.item_sold_at
+        or resref in db.item_in_container
+        or any(e.get("dropable") or e.get("pickpocketable")
+               for e in db.item_carried_by.get(resref, []))
+        or resref in db.item_from_script
+    )
+    is_inaccessible = not is_broken and not accessible
+    props = list_items(i.get("PropertiesList"))
+    is_cursed = bool(int(fld(i, "Cursed", 0) or 0))
+    is_plot   = bool(int(fld(i, "Plot",   0) or 0))
+    _bi_raw = fld(i, "BaseItem", None)
+    _bi = -1 if _bi_raw is None else int(_bi_raw)
+    is_creature_item = _bi in _CREATURE_WEAPON_BASEITEMS or _bi in _CREATURE_ITEM_BASEITEMS
+    _carriers = db.item_carried_by.get(resref, [])
+    _any_droppable = any(e.get("dropable") for e in _carriers)
+    _any_pickpocketable = any(e.get("pickpocketable") for e in _carriers)
+    sections = _item_meta_sections(
+        i, resref, display_name, _bi, _carriers, _any_droppable,
+        is_broken=is_broken, is_inaccessible=is_inaccessible,
+        is_cursed=is_cursed, is_plot=is_plot,
+    )
+    sections += _item_notice_sections(
+        db, resref, is_cursed=is_cursed, is_broken=is_broken,
+        is_tlk_broken=is_tlk_broken, is_creature_item=is_creature_item,
+        _carriers=_carriers, _any_droppable=_any_droppable,
+        _any_pickpocketable=_any_pickpocketable,
+    )
+    sections += _item_description_sections(i)
+    sections += _item_dialog_sections(db, i, resref, ctx)
+    sections += _item_property_sections(props)
+    sections += _item_where_to_find_sections(db, resref, ctx, is_broken)
+    sections += _item_key_for_sections(db, resref, ctx)
+    sections += _item_script_check_sections(db, resref, ctx)
+    sections += _item_quest_sections(db, resref)
 
     write_page(out, ctx, name, "\n".join(sections))

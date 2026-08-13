@@ -440,15 +440,10 @@ def render_container_page(db: Db, area_resref: str, c: dict, out: Path) -> None:
 _OMIT: object = object()  # sentinel: "no path-from section on this page"
 
 
-def render_area_page(db: Db, resref: str, out: Path,
-                     path_from_name: str = "", path_steps: Any = _OMIT) -> None:
-    a = db.areas.get(resref)
-    if not a:
-        return
-    ctx = PageCtx(f"areas/{resref}.html")
-    name = db.area_name(resref)
+def _area_header_sections(a: dict, resref: str, name: str) -> list[str]:
+    """Page title and the header definition list (resref, tag, tileset, size,
+    area event scripts)."""
     sections: list[str] = []
-
     # Header dl
     width = fld(a, "Width", "")
     height = fld(a, "Height", "")
@@ -475,7 +470,13 @@ def render_area_page(db: Db, resref: str, out: Path,
         f'<dt>Size</dt><dd>{E(width)}×{E(height)} tiles</dd>',
         event_rows,
     ]))
+    return sections
 
+
+def _area_path_sections(db: Db, path_from_name: str, path_steps: Any) -> list[str]:
+    """Shortest walking path from the configured source area, with the
+    fallback-waypoint and duplicate-tag warnings its steps may carry."""
+    sections: list[str] = []
     # Shortest path from the configured source area
     if path_steps is not _OMIT:
         sections.append(f"<h2>Path from {nwn_html(path_from_name)}</h2>")
@@ -539,7 +540,12 @@ def render_area_page(db: Db, resref: str, out: Path,
                 + dup_tag_note
                 + f"<ol>{''.join(items)}</ol>"
             )
+    return sections
 
+
+def _area_out_transition_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
+    """Outgoing transitions table (doors/triggers/script teleports leaving here)."""
+    sections: list[str] = []
     # Transitions (out)
     out_trans = ([t for t in db.transitions if t["src_area"] == resref]
                  + [t for t in db.script_transitions if t["src_area"] == resref])
@@ -579,7 +585,12 @@ def render_area_page(db: Db, resref: str, out: Path,
             f"<th>Kind</th><th>Label</th><th>Destination</th><th>Waypoint tag</th>{key_th}"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _area_in_transition_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
+    """Incoming transitions table (everything that leads into this area)."""
+    sections: list[str] = []
     # Transitions (in)
     in_trans = ([t for t in db.transitions if t["dst_area"] == resref]
                 + [t for t in db.script_transitions if t["dst_area"] == resref])
@@ -616,7 +627,12 @@ def render_area_page(db: Db, resref: str, out: Path,
             f"<th>Kind</th><th>From</th><th>Label</th>{key_th}"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _area_npc_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
+    """NPC and hostile-resident tables, one row per creature placement."""
+    sections: list[str] = []
     # NPCs / hostile residents — split by friendliness. Each row is one
     # placement (instance), so we link the name to the per-instance page and
     # separately surface the blueprint it was spawned from.
@@ -674,7 +690,12 @@ def render_area_page(db: Db, resref: str, out: Path,
 
     npc_table(friendly, "NPCs")
     npc_table(hostile, "Hostile residents")
+    return sections
 
+
+def _area_encounter_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
+    """Encounter table, grouped by encounter blueprint resref."""
+    sections: list[str] = []
     # Encounters
     encs = db.area_encounters.get(resref, [])
     if encs:
@@ -728,7 +749,12 @@ def render_area_page(db: Db, resref: str, out: Path,
             "<th>Name</th><th>ResRef</th><th>Tag</th><th>Max</th><th>Diff</th><th>Spawn pool</th><th>Count</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _area_script_spawn_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
+    """Creatures spawned into this area by script rather than placed in the GIT."""
+    sections: list[str] = []
     # Script-spawned NPCs (creatures created by OnModuleLoad/OnEnter scripts
     # at waypoint locations rather than placed as instances in the GIT).
     script_spawns = db.area_script_spawns.get(resref, [])
@@ -767,7 +793,12 @@ def render_area_page(db: Db, resref: str, out: Path,
             "<th>HP</th><th>CR</th><th>Conversation</th>"
             "</tr></thead><tbody>" + "\n".join(ss_rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _area_container_sections(db: Db, resref: str) -> list[str]:
+    """Container (placeable with inventory) table."""
+    sections: list[str] = []
     # Containers (placeables with non-empty inventory). Detail lives on a
     # per-container page so this row can stay scannable.
     containers = db.area_containers.get(resref, [])
@@ -806,7 +837,12 @@ def render_area_page(db: Db, resref: str, out: Path,
             "<th>X, Y, Z</th><th>Locked</th><th>Open DC</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _area_store_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
+    """Store table (stock size, opener, markup/markdown, gp stats)."""
+    sections: list[str] = []
     # Stores in the area
     stores = db.area_stores.get(resref, [])
     if stores:
@@ -872,7 +908,12 @@ def render_area_page(db: Db, resref: str, out: Path,
             '<th title="Average base item value in stock (before markup)">Avg GP</th>'
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _area_conversation_sections(db: Db, resref: str) -> list[str]:
+    """Conversations reachable from this area and where they teleport to."""
+    sections: list[str] = []
     # Conversations reachable from this area — every dlg whose callers
     # include an entity (NPC, placeable, door, trigger, area-event) bound
     # to this area. Useful as a jump-off point when chasing a quest hook.
@@ -934,7 +975,12 @@ def render_area_page(db: Db, resref: str, out: Path,
             "<th>Teleports to</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _area_waypoint_sections(db: Db, resref: str) -> list[str]:
+    """Waypoint tag/resref table."""
+    sections: list[str] = []
     # Waypoints (just for completeness — useful for checking spawn-walk paths
     # and trigger destinations)
     wps = db.area_waypoints.get(resref, [])
@@ -950,5 +996,27 @@ def render_area_page(db: Db, resref: str, out: Path,
             "<th>Tag</th><th>ResRef</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
+
+
+def render_area_page(db: Db, resref: str, out: Path,
+                     path_from_name: str = "", path_steps: Any = _OMIT) -> None:
+    a = db.areas.get(resref)
+    if not a:
+        return
+    ctx = PageCtx(f"areas/{resref}.html")
+    name = db.area_name(resref)
+    sections: list[str] = []
+    sections += _area_header_sections(a, resref, name)
+    sections += _area_path_sections(db, path_from_name, path_steps)
+    sections += _area_out_transition_sections(db, resref, ctx)
+    sections += _area_in_transition_sections(db, resref, ctx)
+    sections += _area_npc_sections(db, resref, ctx)
+    sections += _area_encounter_sections(db, resref, ctx)
+    sections += _area_script_spawn_sections(db, resref, ctx)
+    sections += _area_container_sections(db, resref)
+    sections += _area_store_sections(db, resref, ctx)
+    sections += _area_conversation_sections(db, resref)
+    sections += _area_waypoint_sections(db, resref)
 
     write_page(out, ctx, name, "\n".join(sections))

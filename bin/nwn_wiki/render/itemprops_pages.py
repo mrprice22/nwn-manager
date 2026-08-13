@@ -79,7 +79,15 @@ _PROP_GROUP_ORDER = [
 ]
 
 
-def render_items_by_property(db: "Db", out: Path) -> None:
+# _pname_anchor: stable anchor for each property name (no subtype suffix).
+def _pname_anchor(pname: str) -> str:
+    return "pn-" + _prop_slug(pname, "")
+
+
+def _collect_item_properties(db: "Db") -> tuple[dict, dict, dict]:
+    """Single pass over the accessible items, accumulating every item
+    property occurrence into (_acc, _prefix_acc, _light_param).
+    """
     # Map from property name → list of subtype prefix groups.
     # Subtypes matching a prefix (e.g. "Sneak Attack (+1d6)") are grouped under
     # the prefix key on the index page and shown as sub-sections on the detail page.
@@ -140,7 +148,14 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                     _prefix_acc[p_key] = (n2, v2, c2 + 1)
                 else:
                     _prefix_acc[p_key] = (name, _prop_value_num(cost_str), 1)
+    return _acc, _prefix_acc, _light_param
 
+
+def _property_index_tables(_acc: dict) -> tuple[dict, dict, dict, set]:
+    """Turn the raw accumulator into the ordered lookup tables the pages
+    render from: prop_index, unique_pnames, subtype_rows and the set of
+    properties that want subtype-only index rows.
+    """
     prop_index: dict[tuple[str, str], list[tuple[str, str, str, int, int]]] = defaultdict(list)
     for (pname, key_subtype, resref, cost_str), (name, value_num, qty) in _acc.items():
         prop_index[(pname, key_subtype)].append((resref, name, cost_str, value_num, qty))
@@ -162,10 +177,6 @@ def render_items_by_property(db: "Db", out: Path) -> None:
     }
 
     # Build ordered lists of unique property names per group and their subtypes.
-    # _pname_anchor: stable anchor for each property name (no subtype suffix).
-    def _pname_anchor(pname: str) -> str:
-        return "pn-" + _prop_slug(pname, "")
-
     # unique_pnames[g] = ordered list of property names, preserving first appearance order
     unique_pnames: dict[str, list[str]] = {}
     for g in _PROP_GROUP_ORDER:
@@ -199,7 +210,13 @@ def render_items_by_property(db: "Db", out: Path) -> None:
                 return (-(lvl) if lvl is not None else 999, subtype.lower())
             return key
         subtype_rows[pname].sort(key=_make_spell_sort_key(tbl_name))
+    return prop_index, unique_pnames, subtype_rows, _index_subtype_only
 
+
+def _render_property_index_page(out: Path, prop_index: dict, unique_pnames: dict,
+                                subtype_rows: dict,
+                                _index_subtype_only: set) -> None:
+    """The Browse by Property index page."""
     # --- property index page ---
     # Sidebar: one link per property name (not per subtype).
     sidebar_parts: list[str] = []
@@ -313,6 +330,13 @@ def render_items_by_property(db: "Db", out: Path) -> None:
     write_page(out, PageCtx("items/properties/index.html"),
                "Browse by Property", layout)
 
+
+def _render_property_detail_pages(db: "Db", out: Path, prop_index: dict,
+                                  subtype_rows: dict, _prefix_acc: dict,
+                                  _light_param: dict) -> None:
+    """One detail page per (property, subtype), except the properties that
+    get a combined page.
+    """
     # Build prefix-group detail structure:
     # (pname, group_key) → [(actual_subtype, resref, name, cost_str, value_num, qty)]
     _prefix_detail: dict[tuple[str, str], list] = defaultdict(list)
@@ -498,6 +522,10 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         layout = items_layout(detail_sidebar, body)
         write_page(out, PageCtx(f"items/properties/{slug}.html"), label, layout)
 
+
+def _render_combined_property_pages(db: "Db", out: Path, prop_index: dict,
+                                    subtype_rows: dict) -> None:
+    """One page per property in _COMBINED_PROP_PAGES, all subtypes together."""
     # --- combined property pages (one page per property, all subtypes together) ---
     for pname, combined_slug in _COMBINED_PROP_PAGES.items():
         if pname not in subtype_rows:
@@ -581,6 +609,17 @@ def render_items_by_property(db: "Db", out: Path) -> None:
         layout = items_layout(combined_sidebar, body)
         write_page(out, PageCtx(f"items/properties/{combined_slug}.html"),
                    pname, layout)
+
+
+def render_items_by_property(db: "Db", out: Path) -> None:
+    _acc, _prefix_acc, _light_param = _collect_item_properties(db)
+    prop_index, unique_pnames, subtype_rows, _index_subtype_only = (
+        _property_index_tables(_acc))
+    _render_property_index_page(out, prop_index, unique_pnames, subtype_rows,
+                                _index_subtype_only)
+    _render_property_detail_pages(db, out, prop_index, subtype_rows, _prefix_acc,
+                                  _light_param)
+    _render_combined_property_pages(db, out, prop_index, subtype_rows)
 
 
 # ---------------------------------------------------------------------------
