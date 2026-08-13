@@ -2704,8 +2704,55 @@ items:
 - id: dedup-formatting
   phase: 3
   title: Consolidate the numeric formatting helpers
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 35c874c
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (151s), lotr2008 IDENTICAL (90s), lotr2009 IDENTICAL (115s)"
+  impl_notes: >
+    The formatting half is done; the CR fork this item's notes warned about was
+    NOT unified — it was investigated and split out as its own design item,
+    cr-sentinel-fork.  The CR functions are byte-for-byte untouched.
+    New _fmt_commas(val, blank_zero=False) -> str | None in nwn_wiki/util.py does
+    the one thing _fmt_hp and _fmt_cost agree on (int() + comma grouping, None
+    when not int-like).  Each keeps its own fallback, which genuinely differ and
+    were not normalised: _fmt_hp (itemprops.py) returns str(val) UNESCAPED on a
+    non-numeric value and renders 0 as "0"; _fmt_cost (render/items.py) returns
+    E(str(raw)) escaped and renders 0 as "" — hence the blank_zero flag.
+    New _gp_or_dash(val, spec=",") in render/stores.py replaced 8 hand-written
+    copies of the `f"{max_gp:,}" if max_gp > 0 else "—"` idiom (4 max_gp + 4
+    avg_gp) across stores.py and areas.py, including the nested-quote variant in
+    the unplaced-stores row; areas.py imports it from render.stores, which it
+    already imports from.
+    _try_int replaced 6 byte-equivalent inline try/int(x or 0)/except blocks
+    (items.py x5: item_ac_bonus, item_attack_bonus, item_damage_bonus,
+    weapon_enhancement, item_gp_value; plus _quest_entry_id in render/quests.py).
+    Only sites where _try_int's semantics are provably identical were touched —
+    the -> None / -> "" / -> [] variants were left alone.
+    The 25 bare f"{x:,}" sites that format known ints inline (mostly the
+    render/factions.py count cells) were deliberately left: wrapping them buys
+    nothing and only risks the gate.
+  found:
+    - "_int_fid is defined as a byte-identical nested function twice:
+       render/factions.py and reports/module_index.py.  Cross-module, so
+       consolidating means promoting it to util.py."
+    - "Four more 'int or None/\"\"/[] on failure' inline parses that _try_int cannot
+       express (its int(v or 0) maps \"\" -> 0 and it returns an int default):
+       render/creatures.py, htmlgen/links.py, lookups.py, db/names.py.  A
+       _try_int_opt returning int | None would cover them, but each has a different
+       pre-guard — worth its own item."
+    - "Inconsistent guarding of the same expression: factions.py has
+       `sum(int(fld(cl, \"ClassLevel\", 0) or 0) ...)` unguarded while
+       creature_page.py wraps the identical expression in try/except.  Both left
+       alone — swapping in _try_int at the unguarded site would convert a raise
+       into a silent 0."
+    - "_gp_or_dash does not cover a third gp shape: stores.py has `f\"{mbp:,} gp\"`
+       and `({max_gp:,} gp)` forms that append a literal unit and have no dash
+       branch."
+    - "Escaping asymmetry preserved deliberately: _fmt_hp emits str(val) UNESCAPED
+       into HTML on a non-numeric value where _fmt_cost emits E(str(raw)).  Both
+       fields come from GFF, so _fmt_hp is the weaker of the two.  Fixing it is an
+       output change on data that does not currently exist — needs its own item."
   after: [dedup-search-js]
   plan: >
     _fmt_hp and _fmt_cost are ~90% identical.  f"{x:,}" is written by hand at 25
@@ -2718,6 +2765,75 @@ items:
     _parse_cr rather than calling it.  Those sentinels sort differently.  Resolve
     it deliberately — if which one is correct isn't obvious, take the
     design-question hatch.  Do NOT silently unify them.
+
+- id: cr-sentinel-fork
+  phase: 3
+  title: Five CR parsers, four sentinels — decide whether to unify
+  status: design
+  gate: zero-diff
+  after: [dedup-formatting]
+  plan: >
+    Split out of dedup-formatting, whose notes flagged the fork but which
+    (correctly) refused to resolve it silently.  The formatting half of that item
+    shipped in 35c874c; the CR functions are untouched.
+  investigation: >
+    _creature_cr_value and _parse_cr are NOT two versions of one function.
+    _creature_cr_value(db, can_rr) (htmlgen/chrome.py) is a DB RESOLUTION —
+    canonical entry -> instance ChallengeRating, falling back to the blueprint's —
+    with a float parse on the end.  _parse_cr(cr_raw) (reports/counter_gear.py) is
+    a PURE PARSE of a value the caller already resolved (counter_gear.py does its
+    own instance -> blueprint fallback).  Only the 4-line try/float/except tail is
+    duplicated, so "re-implements" overstates it: the sentinel choice is the only
+    real fork.
+    Each sentinel is load-bearing for its own callers, and they want opposite
+    things.  -1.0 (_creature_cr_value), 2 callers: the creature-pics group sort in
+    chrome.py, whose own comment says "unmatched (cr < 0) sink to the bottom" and
+    whose no-match branch hard-codes -1.0; and creature_page.py's
+    `"cr": None if _cr < 0 else _cr` into creatures/search-index.json, where -1 is
+    a TRI-STATE MARKER that becomes JSON null, i.e. "unknown", distinct from a
+    numeric CR.  0.0 (_parse_cr), 3 callers, all counter-gear: _pc_level_for_cr
+    (unknown CR yields the level-1 kit), tier membership `lo <= cr < hi` (0.0
+    lands the creature in the LOWEST tier, where -1.0 would fall outside every
+    [lo, hi) band and drop it out of the ladder entirely), and a max() over a
+    tier's members.
+    So 0.0 means "treat as trivial" and -1.0 means "unknown — sort last, render
+    null".  Unifying on either breaks the other side: -1 would silently delete
+    creatures from the counter-gear ladder; 0.0 would publish "cr": 0 in the
+    search index (a wrong fact rather than a missing one) and mis-sort Pictures.
+    It is a FIVE-way fan, not a two-way fork.  Three more independent CR parses
+    exist with three more sentinels: render/creatures.py _cr_val -> None (the
+    by-CR page's known/unknown split), render/creatures.py _race_sort_key ->
+    float("-inf"), and bestiary.py -> 0.0 (float(cr_raw or 0)).
+    THE GATE CANNOT DECIDE THIS.  Across all three golden corpora (2463 canonical
+    creatures: homers_lotr 1009, lotr2008 661, lotr2009 793) search-index.json has
+    ZERO "cr": null entries and counter_gear.json has ZERO non-numeric cr strings.
+    Minimum CR observed is 0.125 and no creature has CR 0, so neither sentinel
+    collides with real data.  Both branches are unreachable today — structurally
+    expected, since a real .utc always carries ChallengeRating and the synthetic
+    stock-creature canonicals built in db/index.py force float(cr_val or 0).  Any
+    unification would therefore be provably output-identical AND provably
+    untested.
+  design_questions:
+    - question: >
+        Five CR parsers with four sentinels (0.0, -1.0, None, -inf).  All the
+        divergent branches are unreachable on today's data, so the zero-diff gate
+        cannot tell any choice apart.  RECOMMENDED: do not unify the sentinels.
+        Factor the PARSE only — add _try_float(v, default) to nwn_wiki/util.py
+        alongside _try_int and let all five sites pass their own default, so the
+        sentinel stays an explicit per-caller decision rather than a hidden
+        default; keep _creature_cr_value's db resolution where it is.  That is a
+        zero-diff change and can be done immediately on a yes.
+        A stronger option, if you want the hygiene: a core that returns None for
+        "no CR" and forces every caller to map it.  That would surface the one
+        site I would actually call suspect — counter_gear's 0.0 silently drops an
+        unknown-CR creature into the LOWEST progression tier and can distort that
+        tier's "hardest creature" benchmark.  Latent only (it cannot fire on
+        today's data), it is a behaviour change, and it would need its own
+        expected-diff item.
+        Take the recommended _try_float factoring, the None-core rewrite, or
+        leave all five as they are?
+      status: open
+      answer: null
 
 - id: dedup-map-js
   phase: 3
