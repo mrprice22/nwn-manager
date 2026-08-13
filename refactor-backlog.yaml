@@ -2566,8 +2566,53 @@ items:
 - id: dedup-layout-wrappers
   phase: 3
   title: Add _toc_sidebar / _items_layout / _meta_dl wrappers
-  status: pending
+  status: done
   gate: zero-diff
+  commit: 9a98e40
+  date: 2026-08-12
+  gate_result: "check --all: homers_lotr IDENTICAL (151s), lotr2008 IDENTICAL (102s), lotr2009 IDENTICAL (104s)"
+  impl_notes: >
+    New module htmlgen/blocks.py (~45 LOC) holding three pure string builders,
+    plus a bullet in the htmlgen package docstring.
+    toc_sidebar(parts, *, wide=False) replaced all 12 hand-written
+    <aside class="items-toc"> / items-toc--wide sites: creatures.py x5 (one wide),
+    items.py x2, itemprops_pages.py x3 (one wide; one passes the
+    "Browse by Property" back-link as [back, *toc_parts]), factions.py, stores.py.
+    items_layout(sidebar, content) replaced all 12 <div class="items-layout"> /
+    <div class="items-content"> sites (same files).
+    meta_dl(rows, sep="") replaced 13 of the 15 <dl class="meta"> sites: areas.py
+    x2, conversations.py x2, index.py, items.py, itemprops_pages.py x2,
+    factions.py x2, stores.py x2, creature_page.py.  sep joins INCLUDING the open
+    and close tags, so sites that used to push '<dl class="meta">', the rows and
+    '</dl>' as separate elements of a newline-joined sections list pass sep="\n"
+    and get identical bytes, while sites that concatenated with no separator take
+    the default "".
+    _views_toc(current, prefix) + _CREATURE_VIEWS in render/creatures.py collapsed
+    the four-link "Views" sibling nav from 4 copies (index, by-area, by-cr,
+    by-race); each page omits its own href and prefixes the rest with "" or "../".
+    _STORE_TH + _store_table_head(*cols) in render/stores.py folded the four store
+    table heads (_CREATURE_STORES_TABLE_HEAD, _STORE_TABLE_HEAD, _IDX_TABLE_HEAD
+    and the inline "Placed Instances" head) into named column lists.  The real
+    difference was parameterised rather than normalised: _STORE_TABLE_HEAD uses a
+    distinct buys_at_plain <th> whose tooltip lacks the "; N/A if the store buys
+    nothing" caveat, kept as its own key.  The commented-out ResRef/Tag columns of
+    _IDX_TABLE_HEAD survive as a comment in the call.
+    10 files changed, +217/-218, plus the new blocks.py.
+  found:
+    - "_STORE_TABLE_HEAD in render/stores.py is dead code — defined but referenced
+       nowhere under bin/.  It was folded through the new builder rather than
+       deleted, since deleting it is a separate behaviour-neutral cleanup."
+    - "Two <dl class=\"meta\"> sites were left alone as byte traps: render/scripts.py
+       joins its rows with a newline but has no newline adjacent to the open/close
+       tags, and render/activity.py indents every row two spaces, ends each with a
+       newline and emits a trailing newline after </dl>.  Neither fits the
+       uniform-separator shape, so folding them in would change bytes."
+    - "itemprops_pages.py still duplicates the Spell Level / Caster Classes meta
+       block (detail page and combined page).  Both now call meta_dl, but the
+       surrounding 5-line conditional is identical at both sites."
+    - "Confirms the earlier dedup-creature-row finding: the creatures index emits a
+       literal em-dash in the zero-count cell where render_creatures_by_race emits
+       &#x2014;.  Still untouched; normalising it needs an expected-diff item."
   after: [dedup-items-skeleton]
   plan: >
     The sidebar open/close is hand-written at 10 sites, the items-layout div at
