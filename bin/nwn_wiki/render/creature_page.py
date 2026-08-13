@@ -589,54 +589,8 @@ def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> d
     }
 
 
-def _creature_detail_sections(
-    db: Db,
-    c: dict,
-    *,
-    bp: dict | None = None,
-    ctx: PageCtx,
-) -> list[str]:
-    """Body sections (abilities, combat, weapons, equipment, inventory,
-    feats, skills, spells, scripts) shared by blueprint and instance pages.
-    When `bp` is provided, fields missing from the instance struct fall
-    back to the blueprint — most GIT placements keep the UTC defaults."""
-    items_dir = ctx.url("items")
-
-    def _f(key: str, default: Any = None) -> Any:
-        v = fld(c, key, None)
-        if v is None and bp is not None:
-            v = fld(bp, key, default)
-        return default if v is None else v
-
-    def _list(key: str) -> list[dict]:
-        items = list_items(c.get(key))
-        if not items and bp is not None:
-            items = list_items(bp.get(key))
-        return items
-
-    classes = _list("ClassList")
-    feats = _list("FeatList")
-    skills = _list("SkillList")
-    equip = _list("Equip_ItemList")
-    inv = list_items(c.get("ItemList"))
-
-    def _equip_resref(e: dict) -> str:
-        # Blueprint equip entries reference an external UTI via EquippedRes;
-        # GIT instances inline the item but still carry TemplateResRef.
-        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
-
-    def _equip_item(e: dict) -> dict | None:
-        irr = _equip_resref(e)
-        if irr and irr in db.items:
-            return db.items[irr]
-        # GIT instances embed the full item struct (BaseItem, PropertiesList,
-        # LocalizedName, …) directly into the equip entry.
-        return e if "BaseItem" in e else None
-
-    # Combat defenses (AC, saves, SR, HP, resistances, damage gate) are computed
-    # once by extract_creature_defenses() so this page and the counter-gear
-    # analysis stay in lockstep; see that function for the NWN rule details.
-    D = extract_creature_defenses(db, c, bp)
+def _section_abilities(D: dict) -> list[str]:
+    """Ability score table (Str..Cha) with racial/item adjustment notes."""
     race_adj = D["race_adj"]
     item_abil = D["item_abil"]
     ability_scores = D["ability_scores"]
@@ -666,7 +620,12 @@ def _creature_detail_sections(
         f"<th>Cha</th><td>{_abil_cell('Cha')}</td>"
         "</tr></table>",
     ]
+    return sections
 
+
+def _section_classes(classes: list[dict]) -> list[str]:
+    """Class / level table."""
+    sections: list[str] = []
     if classes:
         cls_rows = "".join(
             f"<tr><td>{E(class_name(fld(cl, 'Class')))}</td>"
@@ -678,25 +637,26 @@ def _creature_detail_sections(
             '<table class="data"><thead><tr><th>Class</th><th>Level</th></tr></thead>'
             f"<tbody>{cls_rows}</tbody></table>"
         )
+    return sections
 
+
+def _section_description(c: dict, bp: dict | None) -> list[str]:
+    """The creature's in-game description paragraph."""
+    sections: list[str] = []
     desc = loc(c.get("Description"))
     if not desc and bp is not None:
         desc = loc(bp.get("Description"))
     if desc:
         sections.append(f'<p class="desc">{nwn_html(desc)}</p>')
+    return sections
 
+
+def _section_combat(db: Db, D: dict, items_dir: str, _f) -> list[str]:
+    """Core combat table (HP/AC/BAB/saves/SR), the saves caveat, and the
+    custom-damage-script and retaliation banners."""
+    sections: list[str] = []
     # ----- Combat: read the precomputed defenses (see extract_creature_defenses) -----
-    str_mod = D["str_mod"]
-    dex_mod = D["dex_mod"]
     bab = D["bab"]
-    feat_ids = D["feat_ids"]
-    equip_by_slot = D["equip_by_slot"]
-    _monk_levels = D["monk_levels"]
-    _monk_bab = D["monk_bab"]
-    cprop_by_pid = D["cprop_by_pid"]
-    cprop_dodge_ac = D["cprop_dodge_ac"]
-    race_immunities = D["race_immunities"]
-    misc_immunities = D["misc_immunities"]
     ac_total = D["ac"]
     ac_breakdown = D["ac_breakdown"]
     ac_extra = D["ac_extra"]
@@ -784,7 +744,16 @@ def _creature_detail_sections(
             f"{E(_retaliation_sentence(ret_info))} "
             f'<span class="muted">(<code>OnDamaged</code>: <code>{E(dmg_script)}</code>)</span></p>'
         )
+    return sections
 
+
+def _section_combat_properties(D: dict) -> list[str]:
+    """Combined abilities & combat-properties table built from equipped item
+    properties plus racial immunities."""
+    sections: list[str] = []
+    cprop_by_pid = D["cprop_by_pid"]
+    cprop_dodge_ac = D["cprop_dodge_ac"]
+    misc_immunities = D["misc_immunities"]
     # ----- Combined abilities / combat properties display --------------------
     # (cprop_by_pid and cprop_dodge_ac are built earlier, before ac_total.)
     # Racial immunities have no gear behind them, so this section renders even
@@ -939,7 +908,21 @@ def _creature_detail_sections(
             'Regeneration stacks without limit. Immunities marked <em>(racial)</em> are '
             'granted by the creature\'s racial type by the engine, not by its equipment.</p>'
         )
+    return sections
 
+
+def _section_weapons(db: Db, D: dict, items_dir: str,
+                     _equip_resref, _equip_item) -> list[str]:
+    """Per-slot weapon table (attack schedule, damage, crit), or the unarmed
+    fallback line when nothing is wielded."""
+    sections: list[str] = []
+    str_mod = D["str_mod"]
+    dex_mod = D["dex_mod"]
+    bab = D["bab"]
+    feat_ids = D["feat_ids"]
+    equip_by_slot = D["equip_by_slot"]
+    _monk_levels = D["monk_levels"]
+    _monk_bab = D["monk_bab"]
     # ----- Weapons / attack schedule ----------------------------------------
     weapon_rows: list[str] = []
     for slot in (SLOT_RIGHT, SLOT_LEFT, SLOT_CWEAP_R, SLOT_CWEAP_L, SLOT_CWEAP_B):
@@ -1021,7 +1004,12 @@ def _creature_detail_sections(
             f"{('+' + str(str_mod)) if str_mod > 0 else (str(str_mod) if str_mod < 0 else '')}"
             "</p>"
         )
+    return sections
 
+
+def _section_spells(c: dict, bp: dict | None, classes: list[dict]) -> list[str]:
+    """Memorized/known spell lists per class, plus innate special abilities."""
+    sections: list[str] = []
     # ----- Spells (memorized + known) ---------------------------------------
     spell_blocks: list[str] = []
     for cl in classes:
@@ -1103,7 +1091,13 @@ def _creature_detail_sections(
     if spell_blocks:
         sections.append("<h2>Spells</h2>")
         sections.extend(spell_blocks)
+    return sections
 
+
+def _section_equipment(db: Db, equip: list[dict], items_dir: str,
+                       _equip_resref) -> list[str]:
+    """Equipped-item table (slot, item, lootable)."""
+    sections: list[str] = []
     # Equipment
     if equip:
         sections.append("<h2>Equipment</h2>")
@@ -1123,7 +1117,12 @@ def _creature_detail_sections(
             '<table class="data"><thead><tr><th>Slot</th><th>Item</th><th>Lootable</th></tr></thead>'
             "<tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _section_inventory(db: Db, inv: list[dict], items_dir: str) -> list[str]:
+    """Carried-inventory table (item, type, lootable, pickpocketable)."""
+    sections: list[str] = []
     # Inventory
     if inv:
         sections.append(f"<h2>Inventory <small class=\"muted\">({len(inv)})</small></h2>")
@@ -1156,7 +1155,12 @@ def _creature_detail_sections(
             '</tr></thead>'
             "<tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+    return sections
 
+
+def _section_feats(feats: list[dict], feat_ids: list) -> list[str]:
+    """Feat list, with repeated feats collapsed to a xN count."""
+    sections: list[str] = []
     # ----- Feats ------------------------------------------------------------
     if feats:
         # Group identical feat ids (some appear multiple times for stacking
@@ -1171,7 +1175,12 @@ def _creature_detail_sections(
             f"<h2>Feats <small class=\"muted\">({len(feats)})</small></h2>"
             f'<ul class="featlist">{"".join(feat_cells)}</ul>'
         )
+    return sections
 
+
+def _section_skills(skills: list[dict]) -> list[str]:
+    """Skill ranks table (zero-rank skills omitted)."""
+    sections: list[str] = []
     # ----- Skills (skip zero ranks) -----------------------------------------
     if skills:
         skill_rows: list[str] = []
@@ -1189,7 +1198,12 @@ def _creature_detail_sections(
                 "<th>Skill</th><th>Ranks</th>"
                 "</tr></thead><tbody>" + "\n".join(skill_rows) + "</tbody></table>"
             )
+    return sections
 
+
+def _section_scripts(_f) -> list[str]:
+    """Event-script table."""
+    sections: list[str] = []
     # Scripts
     sections.append("<h2>Scripts</h2>")
     script_fields = [
@@ -1206,7 +1220,71 @@ def _creature_detail_sections(
         '<table class="data"><thead><tr><th>Event</th><th>Script</th></tr></thead>'
         "<tbody>" + "\n".join(rows) + "</tbody></table>"
     )
+    return sections
 
+
+def _creature_detail_sections(
+    db: Db,
+    c: dict,
+    *,
+    bp: dict | None = None,
+    ctx: PageCtx,
+) -> list[str]:
+    """Body sections (abilities, combat, weapons, equipment, inventory,
+    feats, skills, spells, scripts) shared by blueprint and instance pages.
+    When `bp` is provided, fields missing from the instance struct fall
+    back to the blueprint — most GIT placements keep the UTC defaults."""
+    items_dir = ctx.url("items")
+
+    def _f(key: str, default: Any = None) -> Any:
+        v = fld(c, key, None)
+        if v is None and bp is not None:
+            v = fld(bp, key, default)
+        return default if v is None else v
+
+    def _list(key: str) -> list[dict]:
+        items = list_items(c.get(key))
+        if not items and bp is not None:
+            items = list_items(bp.get(key))
+        return items
+
+    classes = _list("ClassList")
+    feats = _list("FeatList")
+    skills = _list("SkillList")
+    equip = _list("Equip_ItemList")
+    inv = list_items(c.get("ItemList"))
+
+    def _equip_resref(e: dict) -> str:
+        # Blueprint equip entries reference an external UTI via EquippedRes;
+        # GIT instances inline the item but still carry TemplateResRef.
+        return fld(e, "EquippedRes", "") or fld(e, "TemplateResRef", "") or ""
+
+    def _equip_item(e: dict) -> dict | None:
+        irr = _equip_resref(e)
+        if irr and irr in db.items:
+            return db.items[irr]
+        # GIT instances embed the full item struct (BaseItem, PropertiesList,
+        # LocalizedName, …) directly into the equip entry.
+        return e if "BaseItem" in e else None
+
+    # Combat defenses (AC, saves, SR, HP, resistances, damage gate) are computed
+    # once by extract_creature_defenses() so this page and the counter-gear
+    # analysis stay in lockstep; see that function for the NWN rule details.
+    D = extract_creature_defenses(db, c, bp)
+
+    sections: list[str] = []
+    sections.extend(_section_abilities(D))
+    sections.extend(_section_classes(classes))
+    sections.extend(_section_description(c, bp))
+    sections.extend(_section_combat(db, D, items_dir, _f))
+    sections.extend(_section_combat_properties(D))
+    sections.extend(_section_weapons(db, D, items_dir, _equip_resref, _equip_item))
+    sections.extend(_section_spells(c, bp, classes))
+    sections.extend(_section_equipment(db, equip, items_dir, _equip_resref))
+    sections.extend(_section_inventory(db, inv, items_dir))
+    sections.extend(_section_feats(feats, D["feat_ids"]))
+    sections.extend(_section_skills(skills))
+    sections.extend(_section_scripts(_f))
     return sections
 
 
