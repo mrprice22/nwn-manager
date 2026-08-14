@@ -73,20 +73,31 @@ REPO = BIN_DIR.parent
 GOLDEN = REPO / ".golden"
 GIT_ROOT = Path("/var/home/james/GIT")
 
-# Corpora are frozen module checkouts.  The primary one is the live module; the
-# two archives are deliberately never-changing CEP2 modules that exercise
-# different code paths (no custom TLK, no hak_2da overrides, no docs.manual).
+# Corpora are module checkouts.  The primary one is the dev/TEST realm, which is
+# where module content is authored and therefore the richest input; the two
+# archives are deliberately never-changing CEP2 modules that exercise different
+# code paths (no custom TLK, no hak_2da overrides, no docs.manual).
+#
+# The args mirror that realm's own bin/refresh-homers-lotr-wiki, which derives
+# them from its server.env, with two deliberate exceptions: --max-player-level
+# and --devcrit-bonus-dice.  No per-repo runner passes those, so production
+# takes their defaults of 0 — but at 0 the counter-gear simulation is inert and
+# the whole sim/ package goes unexercised.  The gate passes the module's real
+# values so that code is covered.  Everything else here must track server.env.
 CORPORA: dict[str, dict] = {
     "homers_lotr": {
+        # SEASON_ROLE=dev.  Note the repo directory kept its historical name
+        # while the realm was rebranded TEST for players; only the .mod and the
+        # OneDrive build folder moved to "test".
         "root": GIT_ROOT / "nwn_homers_lotr",
         "args": [
-            "--base-url", "https://homerslotr.com/",
+            "--base-url", "https://dev.homerslotr.com/",   # SEASON_WIKI_URL
             "--exclude-conv-option", "[Admin Options]",
             "--exclude-conv-option", "[Options of the Homeless]",
-            "--max-character-level", "40",
-            "--max-ability-bonus", "24",
-            "--max-player-level", "60",
-            "--devcrit-bonus-dice", "3",
+            "--max-character-level", "60",                 # NWN_MAXLEVEL
+            "--max-ability-bonus", "24",                   # NWN_MAX_ABILITY_BONUS
+            "--max-player-level", "60",                    # see note above
+            "--devcrit-bonus-dice", "3",                   # see note above
             "--path-from", "thewelloferu",
         ],
         # relative to the corpus root; passed as an absolute path
