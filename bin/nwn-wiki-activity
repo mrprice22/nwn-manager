@@ -11,21 +11,21 @@ Exit codes for check modes:
 from __future__ import annotations
 
 import argparse
-import importlib.machinery
-import importlib.util
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 
 def _load_nwn_wiki():
-    """Load nwn-wiki as a Python module via importlib."""
-    path = Path(__file__).resolve().parent / "nwn-wiki"
-    loader = importlib.machinery.SourceFileLoader("nwn_wiki", str(path))
-    spec = importlib.util.spec_from_loader("nwn_wiki", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    """Import the module that owns the wiki generator's globals.
+
+    Returns nwn_wiki.cli, not the nwn_wiki package: this script sets module
+    attributes on the result (see main()), and those writes are only visible to
+    the code that reads them if they land on the module that defines them.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from nwn_wiki import cli
+    return cli
 
 
 def _should_refresh(activity: dict, within_seconds: int) -> bool:
@@ -155,10 +155,41 @@ def main() -> int:
               file=sys.stderr)
         return 0
 
-    # Set globals required by page() and render_activity_page().
-    wiki._HAS_ACTIVITY_PAGE = True
-    wiki._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
-    wiki._MANUAL_PAGES = []
+    # Set the state required by page() and render_activity_page().  These must
+    # land on nwn_wiki.state, the module that defines them -- setting them on
+    # any other module object would leave the readers seeing the defaults.
+    from nwn_wiki import state
+    from nwn_wiki.htmlgen.chrome import SiteChrome
+    state._GENERATED_AT = datetime.now().strftime("%b %-d, %Y %H:%M")
+
+    # The nav bar is NOT recomputed here. This process rewrites activity.html
+    # and every manual/**.html, but the rest of the wiki was written by another
+    # interpreter; anything derived independently here could disagree with it.
+    # So the main build serialises its resolved nav facts to <out>/.chrome.json
+    # and we render from exactly those.
+    chrome = SiteChrome.load(out)
+    if chrome is not None:
+        state.CHROME = chrome
+        if not chrome.has_activity:
+            # The last full build saw no player sessions, so no page links to
+            # activity.html. Write it anyway (it is now non-empty) but leave
+            # the nav alone -- the next full wiki build turns the link on
+            # everywhere at once.
+            print("[nwn-wiki-activity] .chrome.json has no activity page yet; "
+                  "rendering activity.html without adding the nav link",
+                  file=sys.stderr)
+    else:
+        # Older wiki tree (or an unreadable chrome file): fall back to deriving
+        # the nav facts the way this script used to, which can drift from the
+        # rest of the tree but is better than rendering a nav-less shell.
+        print(f"[nwn-wiki-activity] no readable {out}/.chrome.json; deriving "
+              "nav state locally (run a full nwn-wiki build to fix)",
+              file=sys.stderr)
+        state._HAS_ACTIVITY_PAGE = True
+        wiki.load_boss_registry_from_src(src)
+
+    # Re-copy the module theme assets into out/assets/ (idempotent). The nav
+    # and page-shell theme facts come from the chrome file when we have one.
     wiki.load_wiki_theme(src.parent, out)
 
     if args.db_dir:
@@ -166,15 +197,12 @@ def main() -> int:
         wiki.backfill_server_first_player_names(db_dir, activity["sessions"])
         wiki.load_bestiary_stats(db_dir)
 
-    # Populate the boss registry (no full Db here) so the conditional "Bosses"
-    # nav link matches the main build on the pages this subprocess (re)writes.
-    wiki.load_boss_registry_from_src(src)
-
-    # Populate _MANUAL_PAGES so the Documents nav dropdown matches the rest of
-    # the wiki. render_manual_pages is idempotent; re-writing existing pages is
-    # harmless, and the call is skipped entirely when docs.manual/ is absent.
-    # When --db-dir was provided and _BESTIARY_ACTIVE is True, this also
-    # regenerates ServerFirsts.html with up-to-date data.
+    # Re-render the manual pages so their content is current (and, when
+    # --db-dir was given and _BESTIARY_ACTIVE is True, so ServerFirsts.html
+    # picks up the new data). render_manual_pages is idempotent; re-writing
+    # existing pages is harmless, and with no docs.manual/ it writes only that
+    # generated page. Their nav comes from the chrome file, not from the menus
+    # this call rebuilds.
     wiki.render_manual_pages(src.parent, out)
 
     wiki.render_activity_page(activity, out, tz_label=wiki._tz_label_from_env())
