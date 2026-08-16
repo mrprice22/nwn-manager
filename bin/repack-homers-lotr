@@ -62,6 +62,9 @@ pause_if_interactive() {
 
 NWN_MANAGER_BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# shellcheck disable=SC1091
+. "$NWN_MANAGER_BIN/build-error-re.sh"
+
 export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 
 # Resolve PROJECT / MODFILE / NWN_MOD_DEST / ONEDRIVE_MOD_DEST from the target
@@ -162,7 +165,17 @@ fi
 compile_err_count=$(grep -cE "^Compile Error:" "$tmpout" 2>/dev/null) || compile_err_count=0
 fatal_lines=$(grep -E "^Error:" "$tmpout" 2>/dev/null || true)
 
-if [[ $nasher_status -ne 0 || -n "$fatal_lines" || $compile_err_count -gt 0 ]]; then
+# The same full error set nwn-manager gates on (NWNMGR_BUILD_ERROR_RE). This
+# used to check only "^Compile Error:" and "^Error:", which let three real
+# failure modes through -- a resref longer than 16 characters, an invalid
+# target name, and the compiler's own "Results: N errored" / "Compiled only"
+# tallies whose wording matches neither. Any of those packed, installed and
+# exited 0. nwn-manager now refuses to install on them, so this is the second
+# line of defence rather than the only one.
+build_err_lines=$(grep -nE "$NWNMGR_BUILD_ERROR_RE" "$tmpout" 2>/dev/null || true)
+
+if [[ $nasher_status -ne 0 || -n "$fatal_lines" || $compile_err_count -gt 0 \
+      || -n "$build_err_lines" ]]; then
   if [[ $VERBOSE -eq 0 ]]; then
     echo
     grep -E "^Compile Error:" "$tmpout" | head -40 \

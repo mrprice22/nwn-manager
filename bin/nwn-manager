@@ -9,6 +9,9 @@ trap 'echo "[nwn-manager] ERROR at line $LINENO in ${FUNCNAME[0]:-main}: $BASH_C
 PROG=$(basename "$0")
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/build-error-re.sh"
+
 usage() {
   cat <<EOF
 $PROG — multi-module manager for NWN1 .mod files.
@@ -463,11 +466,13 @@ cmd_repack() {
   # are forwarded to nasher.
   local no_smoke=0
   local no_install=0
+  local allow_errors=0
   local pass_through=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-smoke)   no_smoke=1 ;;
       --no-install) no_install=1 ;;
+      --allow-compile-errors) allow_errors=1 ;;
       *)            pass_through+=("$1") ;;
     esac
     shift
@@ -586,7 +591,43 @@ EOF
     echo "[$PROG] build stamp: $stamp"
   fi
 
-  nasher pack "${pack_args[@]}" "$@"
+  # THE BUILD GATE. nasher is invoked with --yes (force-answer its
+  # overwrite/continue prompts) and --nssFlags:-y (keep compiling past a bad
+  # script so one failure does not mask the rest). Both are wanted, but together
+  # they mean nasher will happily pack a module containing scripts that did not
+  # compile AND exit 0. Its status alone therefore proves nothing, so read the
+  # compiler's own words.
+  #
+  # A module with failed compiles must NEVER reach a server folder: the missing
+  # .ncs does not announce itself, it just silently does nothing in game.
+  local packlog pack_rc=0
+  packlog=$(mktemp)
+  nasher pack "${pack_args[@]}" "$@" 2>&1 | tee "$packlog"
+  pack_rc=${PIPESTATUS[0]}
+
+  local build_errs
+  build_errs=$(grep -nE "$NWNMGR_BUILD_ERROR_RE" "$packlog" 2>/dev/null || true)
+  rm -f "$packlog"
+
+  if [[ -n $build_errs || $pack_rc -ne 0 ]]; then
+    echo
+    if [[ -n $build_errs ]]; then
+      echo "[$PROG] BUILD ERRORS:" >&2
+      printf '%s\n' "$build_errs" | head -40 | sed 's/^/    /' >&2
+      local n; n=$(printf '%s\n' "$build_errs" | wc -l)
+      (( n > 40 )) && echo "    ... ($((n - 40)) more)" >&2
+    fi
+    [[ $pack_rc -ne 0 ]] && echo "[$PROG] nasher exited $pack_rc" >&2
+    echo
+    if [[ $allow_errors -eq 1 ]]; then
+      echo "[$PROG] WARNING: --allow-compile-errors given; installing anyway." >&2
+    else
+      echo "[$PROG] refusing to install a module built with errors." >&2
+      echo "[$PROG] the previously installed module is untouched." >&2
+      echo "[$PROG] override with --allow-compile-errors if you truly mean to." >&2
+      return 1
+    fi
+  fi
 
   # nasher's default output location is the project root, named per the
   # target's `file = ...`. Older configs that route through dist/ still work
