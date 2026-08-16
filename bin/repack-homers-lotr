@@ -40,6 +40,26 @@ else
   C_RED=''; C_GREEN=''; C_BOLD=''; C_RESET=''
 fi
 
+# Hold the window open so a human can read the output -- but ONLY when a human
+# is actually there. This script is launched two ways:
+#
+#   from the app-grid / desktop shortcut, where the terminal closes the instant
+#   the process exits and the output would be lost without a pause; and
+#
+#   programmatically, from season-promote.sh and any other deploy path, where
+#   stdin is not a terminal and an unconditional `read` blocks FOREVER -- after
+#   the module has already been built and installed. That is how a season-2
+#   promotion once wedged with a freshly installed module sitting on the live
+#   server and season-promote's own compile-error gate never reached, which is
+#   the exact state that gate exists to prevent (2026-08-15).
+#
+# Set REPACK_NO_PAUSE=1 to suppress it even on a terminal.
+pause_if_interactive() {
+  [[ -n ${REPACK_NO_PAUSE:-} ]] && return 0
+  [[ -t 0 && -t 1 ]] && read -rp "${1:-Press Enter to close...}"
+  return 0
+}
+
 NWN_MANAGER_BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
@@ -48,7 +68,7 @@ export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 # repo's nasher.cfg + server.env, so one wrapper serves every season.
 # shellcheck disable=SC1091
 . "$NWN_MANAGER_BIN/repack-project.sh"
-repack_resolve_project || { read -rp "Press Enter..."; exit 1; }
+repack_resolve_project || { pause_if_interactive "Press Enter..."; exit 1; }
 
 if [[ $SHOW_CONFIG -eq 1 ]]; then
   echo "[repack] resolved configuration:"
@@ -64,7 +84,7 @@ if [[ $PROJECT != "$REPACK_DEFAULT_PROJECT" ]]; then
   echo
 fi
 
-cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
+cd "$PROJECT" || { echo "missing project: $PROJECT"; pause_if_interactive "Press Enter..."; exit 1; }
 
 rm -f "$MODFILE"
 
@@ -135,7 +155,7 @@ if grep -qE "dialog-integrity check FAILED|smoke tests FAILED" "$tmpout"; then
   echo
   printf '  %s(bypass the gates with --no-smoke if you must build anyway)%s\n' "$C_RED" "$C_RESET"
   echo
-  read -rp "Press Enter to close..."
+  pause_if_interactive
   exit 1
 fi
 
@@ -158,7 +178,7 @@ if [[ $nasher_status -ne 0 || -n "$fatal_lines" || $compile_err_count -gt 0 ]]; 
     echo "${C_RED}${C_BOLD}[ERROR] $compile_err_count compile error(s) — aborting.${C_RESET}"
     echo "        Re-run with --force to proceed despite errors."
     echo
-    read -rp "Press Enter to close..."
+    pause_if_interactive
     exit 1
   fi
 fi
@@ -224,5 +244,5 @@ else
   status=1
 fi
 echo
-read -rp "Press Enter to close..."
+pause_if_interactive
 exit $status
