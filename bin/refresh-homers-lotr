@@ -4,6 +4,11 @@
 # folder ($ONEDRIVE_ROOT/Season<N>) — the same directory the repack wrappers
 # write copy 1 into, so the round-trip is symmetric.
 #
+# On the DEV realm two folders are scanned: $ONEDRIVE_ROOT/Test (where repack
+# writes) and $ONEDRIVE_ROOT/Dev (where toolset round-trips have also been
+# landing). Newest across both wins. Seasons scan only their own folder — see
+# ONEDRIVE_MOD_DIRS in repack-project.sh for why dev is the only exception.
+#
 # Newest mtime wins; among files tied for newest, the season's canonical artifact
 # name ($MODFILE, from nasher.cfg) wins over any manually-renamed build —
 # otherwise .nasher/source, and thus a bare `nwn-manager repack`'s install
@@ -53,16 +58,34 @@ export PATH="$HOME/.nimble/bin:$NWN_MANAGER_BIN:$PATH"
 . "$NWN_MANAGER_BIN/repack-project.sh"
 repack_resolve_project || { read -rp "Press Enter..."; exit 1; }
 
-CANDIDATE_DIRS=( "$ONEDRIVE_MOD_DIR" )
+# Read locations come from the resolver (ONEDRIVE_MOD_DIRS): the season's own
+# folder, plus $ONEDRIVE_ROOT/Dev on the dev realm only. Drop any that do not
+# exist -- find would error on a missing path, and Dev/ is optional.
+CANDIDATE_DIRS=()
+for d in "${ONEDRIVE_MOD_DIRS[@]:-$ONEDRIVE_MOD_DIR}"; do
+  [[ -d $d ]] && CANDIDATE_DIRS+=( "$d" )
+done
 
 if [[ $SHOW_CONFIG -eq 1 ]]; then
   echo "[unpack] resolved configuration:"
   repack_print_project
-  echo "  scanning:  ${CANDIDATE_DIRS[*]}"
+  echo "  scanning:"
+  printf '    %s\n' "${CANDIDATE_DIRS[@]}"
   exit 0
 fi
 
 cd "$PROJECT" || { echo "missing project: $PROJECT"; read -rp "Press Enter..."; exit 1; }
+
+# Bail before the find: with an empty argument list find scans the CWD, which is
+# now $PROJECT -- and the project root is full of repack archives that would
+# shadow any OneDrive build by mtime. Exactly what this script must never pick.
+if [[ ${#CANDIDATE_DIRS[@]} -eq 0 ]]; then
+  echo "error: none of this project's OneDrive folders exist:"
+  printf "  %s\n" "${ONEDRIVE_MOD_DIRS[@]:-$ONEDRIVE_MOD_DIR}"
+  echo
+  echo "Is OneDrive mounted? Run with --show-config to check the resolved paths."
+  read -rp "Press Enter..."; exit 1
+fi
 
 # Newest mtime wins; among files tied for newest, prefer the canonical artifact.
 mapfile -t MOD_ENTRIES < <(

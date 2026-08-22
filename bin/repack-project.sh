@@ -82,6 +82,21 @@ repack_resolve_project() {
     ONEDRIVE_MOD_DIR="$ONEDRIVE_ROOT"   # non-seasoned project: legacy flat layout
   fi
   ONEDRIVE_MOD_DEST="$ONEDRIVE_MOD_DIR/$MODFILE"
+
+  # Directories the UNPACK side scans, in preference order. WRITING stays
+  # single-target ($ONEDRIVE_MOD_DEST above) -- only reading widens, so a build
+  # still lands in exactly one folder and the round-trip has one canonical home.
+  #
+  # The dev realm gets a second read location: builds sent out to the Windows
+  # toolset have been coming back into $ONEDRIVE_ROOT/Dev as well as Test/, and
+  # an unpack that scans only Test/ silently ignores the newer one -- you get a
+  # stale unpacked/ with nothing saying so. Seasons deliberately do NOT scan Dev/:
+  # pulling a dev build into a production repo is the exact cross-contamination
+  # the per-role folder split exists to prevent.
+  ONEDRIVE_MOD_DIRS=( "$ONEDRIVE_MOD_DIR" )
+  if [[ ${SEASON_ROLE:-} == dev ]]; then
+    ONEDRIVE_MOD_DIRS+=( "$ONEDRIVE_ROOT/Dev" )
+  fi
 }
 
 # Print the resolved configuration — used by --show-config and worth echoing in
