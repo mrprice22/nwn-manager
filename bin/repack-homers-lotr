@@ -222,6 +222,9 @@ if [[ -f $MODFILE ]]; then
       mkdir -p "$ONEDRIVE_MOD_DIR"
       cp "$MODFILE" "$ONEDRIVE_MOD_DEST"
       echo "[install] → $ONEDRIVE_MOD_DEST"
+      # The copy above is only a LOCAL mirror -- kick off the cloud upload now
+      # rather than leaving it to the once-per-boot backup sync.
+      repack_onedrive_upload
     else
       echo "[install] WARNING: $ONEDRIVE_ROOT not found, skipping OneDrive copy"
     fi

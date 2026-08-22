@@ -94,3 +94,47 @@ repack_print_project() {
   echo "  installed: $NWN_MOD_DEST"
   echo "  onedrive:  $ONEDRIVE_MOD_DEST"
 }
+
+# ---------------------------------------------------------------------------
+# Push the OneDrive copy to the cloud NOW, instead of waiting for the next boot.
+#
+# The copy under $ONEDRIVE_MOD_DIR is only a LOCAL mirror. Nothing uploads it on
+# its own: the only `onedrive --sync` on this host is the one at the end of
+# bin/backup-homers-lotr, which runs once per boot behind a 24h sentinel. So a
+# build made at midday did not reach the cloud (or any other machine) until the
+# 03:00 reboot -- 12+ hours later, and not at all on a day with no reboot. From
+# the OneDrive web view or a second PC that looks exactly like "the repack never
+# copied anything", which is the confusion this exists to end (2026-08-22).
+#
+# Detached on purpose: a full sync walks the whole synced tree and takes minutes,
+# and repack must not sit there holding the build window open. The upload keeps
+# running after the terminal closes; check $REPACK_ONEDRIVE_LOG for the outcome.
+#
+# flock -n: the boot backup runs the same command, and two concurrent syncs on
+# one item DB is the way to corrupt it. If the lock is held we simply skip --
+# the run that holds it scans the whole tree, so it picks this file up anyway.
+#
+#   REPACK_ONEDRIVE_SYNC=0   skip the upload (leave it to the daily backup)
+#   ONEDRIVE_BIN=/path       override binary discovery
+: "${REPACK_ONEDRIVE_SYNC:=1}"
+: "${REPACK_ONEDRIVE_LOG:=$HOME/.cache/repack-onedrive-sync.log}"
+: "${REPACK_ONEDRIVE_LOCK:=$HOME/.cache/onedrive-sync.lock}"
+
+repack_onedrive_upload() {
+  [[ ${REPACK_ONEDRIVE_SYNC:-1} -eq 1 ]] || { echo "[onedrive] (REPACK_ONEDRIVE_SYNC=0: skipped)"; return 0; }
+
+  local od=${ONEDRIVE_BIN:-}
+  if [[ -z $od ]]; then
+    od=$(command -v onedrive || true)
+    [[ -z $od && -x /home/linuxbrew/.linuxbrew/opt/onedrive-cli/bin/onedrive ]] \
+      && od=/home/linuxbrew/.linuxbrew/opt/onedrive-cli/bin/onedrive
+  fi
+  [[ -n $od ]] || { echo "[onedrive] WARNING: onedrive binary not found — cloud copy waits for the daily backup"; return 0; }
+
+  mkdir -p "$(dirname "$REPACK_ONEDRIVE_LOG")" "$(dirname "$REPACK_ONEDRIVE_LOCK")"
+  setsid nohup flock -n "$REPACK_ONEDRIVE_LOCK" \
+    "$od" --sync --threads 1 >>"$REPACK_ONEDRIVE_LOG" 2>&1 &
+  disown 2>/dev/null || true
+  echo "[onedrive] upload started in the background → $REPACK_ONEDRIVE_LOG"
+  echo "[onedrive] (a full sync takes a few minutes; it survives closing this window)"
+}
