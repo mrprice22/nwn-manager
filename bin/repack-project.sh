@@ -107,7 +107,11 @@ repack_print_project() {
   echo "  season:    num='${SEASON_NUM:-unset}' role='${SEASON_ROLE:-unset}'"
   echo "  artifact:  $MODFILE"
   echo "  installed: $NWN_MOD_DEST"
-  echo "  onedrive:  $ONEDRIVE_MOD_DEST"
+  # The plain ONEDRIVE_MOD_DEST name is no longer written -- each build gets its
+  # own timestamped file -- so report the folder and the pattern instead of a
+  # path that will not exist.
+  echo "  onedrive:  $ONEDRIVE_MOD_DIR/${MODBASE}_<YYYYmmdd_HHMMSS>.mod"
+  echo "  retention: ${REPACK_KEEP_BUILDS:-5} builds in the OneDrive folder and in the repo root"
 }
 
 # ---------------------------------------------------------------------------
@@ -152,4 +156,96 @@ repack_onedrive_upload() {
   disown 2>/dev/null || true
   echo "[onedrive] upload started in the background → $REPACK_ONEDRIVE_LOG"
   echo "[onedrive] (a full sync takes a few minutes; it survives closing this window)"
+}
+
+# ---------------------------------------------------------------------------
+# Timestamped build names + retention.
+#
+# The OneDrive copy used to reuse ONE filename per season and be overwritten on
+# every build. That overwrite stopped propagating to the Windows PC: it showed
+# homers_lotr_test.mod at 8/14 and homers_lotr_s2.mod at 7/25 while this host's
+# copies were current and the sync client reported them uploaded (2026-08-23).
+# The Windows-side cause is not diagnosable from here, so we stop overwriting:
+# a per-build filename is a CREATE, not a MODIFY, and the build date is legible
+# in the name. Retention then keeps the folder from growing without bound.
+#
+#   REPACK_KEEP_BUILDS=N   how many builds to keep per location (default 5)
+: "${REPACK_KEEP_BUILDS:=5}"
+
+# One stamp per build, shared by the OneDrive copy and the repo-root archive so
+# the two are correlatable by name. Idempotent: later calls reuse the first.
+repack_build_stamp() {
+  [[ -n ${BUILD_STAMP:-} ]] || BUILD_STAMP=$(date +%Y%m%d_%H%M%S)
+  printf '%s\n' "$BUILD_STAMP"
+}
+
+# Where THIS build's OneDrive copy goes. ONEDRIVE_MOD_DEST (the plain artifact
+# name) stays as the reporting/reference value in repack_print_project -- it is
+# no longer written.
+repack_onedrive_dest() {
+  printf '%s\n' "$ONEDRIVE_MOD_DIR/${MODBASE}_$(repack_build_stamp).mod"
+}
+
+# repack_prune_builds <dir> <keep> <mode>
+#
+# Delete tool-generated builds in <dir> past the <keep> newest. What counts as
+# tool-generated is deliberately DIFFERENT per location:
+#
+#   onedrive  <MODBASE>_YYYYmmdd_HHMMSS.mod, or exactly <MODFILE>. Anchored to
+#             the CURRENT nasher.cfg artifact name, because these folders also
+#             hold builds the admin renamed by hand as point-in-time backups
+#             ("Homer's LOTR TEST ruins scribe update.mod") and those must never
+#             be touched. Including the plain <MODFILE> is what retires the
+#             stale single-name file now that nothing writes it any more.
+#
+#   archive   any *_YYYYmmdd_HHMMSS.mod, whatever the prefix; <MODFILE> itself
+#             is the live nasher build output and is never pruned. The repo root
+#             only ever receives wrapper-written archives, and MODBASE has
+#             changed across seasons (homers_lotr_v3 -> _s2 / _test), so
+#             anchoring to the current one would strand ~33 GB of older-named
+#             archives.
+#
+# The trailing '$' in both patterns is load-bearing: it protects every
+# hand-annotated milestone, which carries a description after the timestamp
+# (homers_lotr_v3_20260616_082050_aragorn quest.mod).
+repack_prune_builds() {
+  local dir=$1 keep=${2:-$REPACK_KEEP_BUILDS} mode=${3:-archive}
+
+  [[ -d $dir ]] || return 0
+
+  # Defence in depth. $ONEDRIVE_ROOT/Dev is the Windows -> Linux direction: it
+  # holds builds modified in the toolset and waiting to be unpacked, which exist
+  # nowhere else. Nothing here should ever pass it, but ONEDRIVE_MOD_DIRS lists
+  # it for READING and one careless edit could wire it in.
+  if [[ $(basename "$dir") == Dev ]]; then
+    echo "[prune] REFUSING to prune $dir — the Dev folder is never pruned" >&2
+    return 1
+  fi
+
+  local re
+  case "$mode" in
+    onedrive) re="^(${MODBASE}_[0-9]{8}_[0-9]{6}|${MODBASE})\.mod$" ;;
+    archive)  re="^.*_[0-9]{8}_[0-9]{6}\.mod$" ;;
+    *) echo "[prune] unknown mode: $mode" >&2; return 2 ;;
+  esac
+
+  # Filter on the BASENAME (%f), not the path: the patterns are ^-anchored and a
+  # full path would never match them. Newest mtime first, so tail -n +keep+1 is
+  # everything past the retained window.
+  local -a victims=()
+  mapfile -t victims < <(
+    find "$dir" -maxdepth 1 -name '*.mod' -type f -printf '%T@ %f\n' 2>/dev/null \
+      | sort -rn \
+      | sed 's/^[^ ]* //' \
+      | grep -E "$re" \
+      | tail -n +$((keep + 1))
+  )
+
+  [[ ${#victims[@]} -gt 0 ]] || return 0
+
+  local f
+  for f in "${victims[@]}"; do
+    rm -f -- "$dir/$f" && echo "[prune] removed $f"
+  done
+  echo "[prune] $dir: kept the $keep newest build(s), removed ${#victims[@]}"
 }

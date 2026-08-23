@@ -10,7 +10,11 @@
 # ONEDRIVE_MOD_DIRS in repack-project.sh for why dev is the only exception.
 #
 # Newest mtime wins; among files tied for newest, the season's canonical artifact
-# name ($MODFILE, from nasher.cfg) wins over any manually-renamed build —
+# name ($MODFILE, from nasher.cfg) wins over any manually-renamed build. Since
+# 2026-08-23 repack writes a timestamped name per build and never the plain
+# $MODFILE, so that tie-break is inert for the OneDrive folders and now only
+# decides between same-second candidates. It is kept because Dev/ and the
+# renamed backups can still carry the canonical name —
 # otherwise .nasher/source, and thus a bare `nwn-manager repack`'s install
 # target, can drift to whatever alt-named .mod happens to sort first. Builds go
 # out to the Windows toolset via OneDrive and come back renamed by hand as

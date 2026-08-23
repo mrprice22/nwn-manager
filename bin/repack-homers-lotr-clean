@@ -200,13 +200,26 @@ if [[ -f $MODFILE ]]; then
     dlg_sum=$(grep -E "^check-dlg-integrity: scanned " "$tmpout" | tail -1)
     [[ -n $dlg_sum ]] && echo "${C_GREEN}✓ ${dlg_sum}${C_RESET}"
     echo
+    # One stamp for copies 1 and 3. Must be set HERE, in the parent shell:
+    # repack_build_stamp memoises into BUILD_STAMP, but a $(...) call runs in a
+    # subshell, so letting copy 1's command substitution be the first caller
+    # left the parent unset and copy 3 minted a second, later stamp.
+    repack_build_stamp >/dev/null
+
     # Copy 1: OneDrive season dir (primary — used by the Unpack pipeline).
     # Created on demand: a brand-new season's subfolder won't exist yet, so only
     # a missing/unmounted OneDrive *root* is worth warning about.
     if [[ -d $ONEDRIVE_ROOT ]]; then
       mkdir -p "$ONEDRIVE_MOD_DIR"
-      cp "$MODFILE" "$ONEDRIVE_MOD_DEST"
-      echo "[install] → $ONEDRIVE_MOD_DEST"
+      # Per-build filename, never the plain artifact name. Overwriting one fixed
+      # name stopped propagating to the Windows toolset PC; a new name each build
+      # is a create rather than a modify, and carries its date on its face.
+      ONEDRIVE_BUILD_DEST=$(repack_onedrive_dest)
+      cp "$MODFILE" "$ONEDRIVE_BUILD_DEST"
+      echo "[install] → $ONEDRIVE_BUILD_DEST"
+      # Prune BEFORE the upload so one sync run carries the new file and the
+      # deletions together.
+      repack_prune_builds "$ONEDRIVE_MOD_DIR" "$REPACK_KEEP_BUILDS" onedrive
       # The copy above is only a LOCAL mirror -- kick off the cloud upload now
       # rather than leaving it to the once-per-boot backup sync.
       repack_onedrive_upload
@@ -227,10 +240,12 @@ if [[ -f $MODFILE ]]; then
       echo "[install] (--no-prod: skipped local NWN modules dir)"
     fi
     echo
-    # Copy 3: timestamped archive in project root
-    ARCHIVE_DEST="$PROJECT/${MODBASE}_$(date +%Y%m%d_%H%M%S).mod"
+    # Copy 3: timestamped archive in project root. Same stamp as the OneDrive
+    # copy above, so a build and its local twin are correlatable by name.
+    ARCHIVE_DEST="$PROJECT/${MODBASE}_$(repack_build_stamp).mod"
     cp "$MODFILE" "$ARCHIVE_DEST"
     echo "[archive] → $ARCHIVE_DEST"
+    repack_prune_builds "$PROJECT" "$REPACK_KEEP_BUILDS" archive
     echo
     # NOTE: nwsync is intentionally NOT refreshed here. Use the dedicated
     # 'Refresh Homer's LotR NWSync' app-grid shortcut, which rebuilds the
