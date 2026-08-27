@@ -1761,7 +1761,7 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     else:
         sections.append("<h2>Where to find</h2><p>Not placed in any area.</p>")
 
-    store_section = _creature_store_section(db, bp_rr, filter_area=None, ctx=ctx)
+    store_section = _creature_store_section(db, canonical_rr, filter_area=None, ctx=ctx)
     if store_section:
         sections.append(store_section)
 

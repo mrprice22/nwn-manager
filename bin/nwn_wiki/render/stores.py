@@ -125,11 +125,47 @@ _CREATURE_STORES_TABLE_HEAD = _store_table_head(
 )
 
 
-def _creature_store_section(db: "Db", creature_resref: str,
+def _opener_canonical_rr(db: "Db", opener: dict) -> str:
+    """Canonical creature resref for an opener, or "" if it isn't a creature.
+
+    Openers carry whatever resref their source knew: a creature-instance
+    caller carries the placement's TemplateResRef, a blueprint caller carries
+    the blueprint. Both have to be normalised through the canonical index
+    before they can be compared with a creature page's identity.
+    """
+    kind = opener.get("kind", "")
+    if kind not in ("creature", "creature-instance", "creature-event"):
+        return ""
+    rr = (opener.get("resref", "") or "").lower()
+    if kind == "creature-instance":
+        return db.canonical_for_inst.get(
+            (opener.get("area", ""), opener.get("idx", 0)), rr)
+    if rr in db.canonical_creatures:
+        return rr
+    return db.canonical_for_bp.get(rr, "")
+
+
+def _openers_in_area(db: "Db", tag: str, area_rr: str) -> list[dict]:
+    """Openers for store `tag` that stand in `area_rr`.
+
+    Store-opening scripts resolve the store with GetNearestObjectByTag, which
+    is area-local, so an NPC elsewhere sharing the tag is opening a different
+    instance -- never this one.
+    """
+    out: list[dict] = []
+    for o in db.store_tag_openers.get(tag.lower(), []):
+        areas = o.get("areas") or ([o["area"]] if "area" in o else [])
+        if area_rr in areas:
+            out.append(o)
+    return out
+
+
+def _creature_store_section(db: "Db", canonical_rr: str,
                              filter_area: str | None, ctx: PageCtx) -> str:
     """Return an HTML <h2>Stores</h2> + table for stores this creature opens,
-    or empty string if none found. filter_area restricts to one area (instance
-    pages); None returns all areas (blueprint pages)."""
+    or empty string if none found. `canonical_rr` is the canonical creature the
+    page is for. filter_area restricts to one area (instance pages); None
+    returns all areas (blueprint pages)."""
     rows: list[str] = []
     seen_slugs: set[str] = set()
 
@@ -145,15 +181,8 @@ def _creature_store_section(db: "Db", creature_resref: str,
             tag = fld(inst, "Tag", "")
             if not tag:
                 continue
-            openers = db.store_tag_openers.get(tag.lower(), [])
-            matched = any(
-                o.get("resref", "").lower() == creature_resref.lower()
-                and area_rr in (o.get("areas") or (
-                    [o["area"]] if "area" in o else []
-                ))
-                for o in openers
-            )
-            if not matched:
+            if not any(_opener_canonical_rr(db, o) == canonical_rr
+                       for o in _openers_in_area(db, tag, area_rr)):
                 continue
 
             slug = _store_instance_slug(area_rr, inst)
@@ -217,18 +246,12 @@ def _store_opener_html(db: Db, opener: dict, ctx: PageCtx) -> str:
     via_dlg = opener.get("via_dialog", "")
 
     if kind in ("creature", "creature-instance", "creature-event"):
-        if kind == "creature-instance":
-            area_rr = opener.get("area", "")
-            idx = opener.get("idx", 0)
-            can_rr = db.canonical_for_inst.get((area_rr, idx), rr)
-            name = db.canonical_creature_name(can_rr) if can_rr else (rr or "(NPC)")
-            url = ctx.url(f"creatures/{can_rr}.html") if can_rr else "#"
-            npc_html = f'<a href="{E(url)}">{nwn_html(name)}</a>'
+        can_rr = _opener_canonical_rr(db, opener)
+        if can_rr in db.canonical_creatures:
+            npc_html = _creature_link(db, can_rr, ctx,
+                                      db.canonical_creature_name(can_rr))
         else:
-            can_rr = db.canonical_for_bp.get(rr, rr) if rr else rr
-            name = db.canonical_creature_name(can_rr) if can_rr in db.canonical_creatures else (rr or "NPC")
-            npc_html = (_creature_link(db, can_rr, ctx, name)
-                        if can_rr in db.canonical_creatures else nwn_html(name))
+            npc_html = nwn_html(rr or "NPC")
         if via_dlg and via_dlg in db.dialogs:
             conv = link(ctx.url(f"conversations/{via_dlg}.html"), "conversation")
             return f"NPC {npc_html} (via {conv})"
@@ -406,12 +429,7 @@ def render_store_instance_page(db: Db, area_rr: str, inst: dict, out: Path) -> N
     sections.append(meta_dl(meta, "\n"))
 
     # Opened By
-    openers = db.store_tag_openers.get(tag.lower(), [])
-    # Only show openers whose area matches this store instance. All store-opening
-    # scripts use GetNearestObjectByTag (area-local), so cross-area openers with
-    # the same tag are opening a different instance, not this one.
-    display_openers = [o for o in openers if area_rr in o.get("areas", []) or
-                       o.get("area") == area_rr]
+    display_openers = _openers_in_area(db, tag, area_rr)
     if display_openers:
         sections.append("<h2>Opened by</h2><ul>")
         seen_html: set[str] = set()
@@ -490,12 +508,7 @@ def render_stores_index(db: Db, out: Path) -> None:
 
             area_cell = _area_link(db, area_rr, ctx)
 
-            # Only show openers in the same area. All store-opening scripts use
-            # GetNearestObjectByTag (area-local), so a cross-area NPC with the
-            # same tag is opening a different instance, not this one.
-            all_openers = db.store_tag_openers.get(tag.lower(), [])
-            display_openers = [o for o in all_openers
-                               if area_rr in o.get("areas", []) or o.get("area") == area_rr]
+            display_openers = _openers_in_area(db, tag, area_rr)
             if display_openers:
                 seen_html: set[str] = set()
                 opener_parts = []
@@ -678,6 +691,31 @@ def render_store_page(db: Db, resref: str, out: Path) -> None:
         sections.append(
             '<p><strong>Warning:</strong> This blueprint is not placed in any area '
             '— it is not accessible to players.</p>'
+        )
+
+    # Opened by — one bullet per placement, so the blueprint page reaches the
+    # NPC and the area the same way the per-instance page does.
+    opener_items: list[str] = []
+    for area_rr, inst in instances:
+        inst_tag = fld(inst, "Tag", "") or ""
+        if not inst_tag:
+            continue
+        seen_html: set[str] = set()
+        for o in _openers_in_area(db, inst_tag, area_rr):
+            h = _store_opener_html(db, o, ctx)
+            if h in seen_html:
+                continue
+            seen_html.add(h)
+            opener_items.append(
+                f"<li>{h} — in {_area_link(db, area_rr, ctx)}</li>")
+    if opener_items:
+        sections.append("<h2>Opened by</h2><ul>"
+                        + "\n".join(opener_items) + "</ul>")
+    elif instances:
+        sections.append(
+            "<h2>Opened by</h2>"
+            '<p class="muted">No opener found in static analysis — '
+            "may be opened from a runtime-only code path, or may be inaccessible.</p>"
         )
 
     pages = list_items(s.get("StoreList"))

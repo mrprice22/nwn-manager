@@ -620,3 +620,24 @@ class DbDerivedMixin:
                 uniq.append(o)
             self.store_tag_openers[tag] = uniq
 
+        # Tripwire. When the module renamed its opener function to a wrapper
+        # (OpenStoreAppr) the resolved-opener count fell from all-but-one to
+        # about a third and nobody noticed for ten weeks. Print it every build.
+        n_tags = sum(1 for v in self.store_tag_openers.values() if v)
+        n_placed = n_blind = 0
+        for area_rr, store_list in self.area_stores.items():
+            if area_rr in self.hidden_areas:
+                continue
+            for inst in store_list:
+                n_placed += 1
+                tag = (fld(inst, "Tag", "") or "").lower()
+                areas_ok = any(
+                    area_rr in (o.get("areas") or
+                                ([o["area"]] if "area" in o else []))
+                    for o in self.store_tag_openers.get(tag, [])
+                )
+                if not areas_ok:
+                    n_blind += 1
+        print(f"  store openers — {n_tags} tags resolved, "
+              f"{n_blind}/{n_placed} placed stores with no opener")
+

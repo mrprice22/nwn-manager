@@ -31,6 +31,7 @@ from nwn_wiki.render.creatures import creature_max_hp
 from nwn_wiki.render.stores import (
     _buy_limit_str,
     _gp_or_dash,
+    _openers_in_area,
     _store_buy_summary,
     _store_item_gp_stats,
     _store_opener_html,
@@ -865,8 +866,7 @@ def _area_store_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
             md_str = (f"{md_val}%" if md_val is not None else "—") if buys_any else "N/A"
             mbp_raw = fld(inst, "MaxBuyPrice", None)
 
-            area_openers = [o for o in db.store_tag_openers.get(tag.lower(), [])
-                            if resref in o.get("areas", []) or o.get("area") == resref]
+            area_openers = _openers_in_area(db, tag, resref)
             if area_openers:
                 seen_html: set[str] = set()
                 opener_parts = []

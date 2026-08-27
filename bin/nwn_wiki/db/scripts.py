@@ -139,8 +139,14 @@ class DbScriptsMixin:
     _RE_JUMP = re.compile(
         r"\b(?:Action)?(?:JumpToLocation|JumpToObject)\s*\("
     )
+    # Any function whose name contains OpenStore opens a store: stock
+    # OpenStore / gplotAppraiseOpenStore, and module wrappers around them --
+    # HoMERs routes every merchant through OpenStoreAppr (store_appr_inc.nss),
+    # which opens a per-PC Appraise-scaled copy. Matching the name literally
+    # meant 109 opener scripts went unrecognised the day that wrapper landed.
+    # The "Get" guard keeps readers like NWNX_Player_GetOpenStore out.
     _RE_OPEN_STORE = re.compile(
-        r"\b(?:OpenStore|gplotAppraiseOpenStore)\s*\("
+        r"\b(?!\w*Get)[A-Za-z0-9_]*OpenStore[A-Za-z0-9_]*\s*\("
     )
     _RE_CREATE_ITEM = re.compile(
         r'\bCreateItemOnObject\s*\(\s*"([A-Za-z0-9_]+)"'
