@@ -63,6 +63,10 @@ WEAPON_COLS = [
     "WeaponType", "WeaponSize", "RangedWeapon", "MinRange", "MaxRange",
     "NumDice", "DieToRoll", "CritThreat", "CritHitMult", "WeaponWield",
     "AmmunitionType", "BaseAC", "ArmorCheckPen", "AC_Enchant",
+    # Arcane spell failure % the base item imposes on its own. Only shields
+    # carry a value here (5 / 15 / 50); body armour is blank because the
+    # engine reads its failure out of armor.2da by base AC — see armor.json.
+    "ArcaneSpellFailure",
     # Hex bitmask over nwn-wiki's SLOT_* constants — the authoritative
     # "what can wear this" answer, used by the counter-gear slot model.
     "EquipableSlots",
@@ -226,6 +230,40 @@ def build(nwn_dir: Path, out_dir: Path) -> None:
                 encoding="utf-8",
             )
             print(f"    wrote {apath.name}: {len(adjusts)} rows")
+
+        # Arcane spell failure for body armour. baseitems.2da leaves the
+        # column blank for armour (row 16) because the engine indexes
+        # armor.2da by the armour's base AC (0-8) instead. Keyed by base AC,
+        # which is what _torso_base_ac() returns from parts_chest.2da.
+        try:
+            twoda = extract_stock_2da(nwn_dir, "armor.2da", tmp)
+        except Exception as e:
+            print(f"    warn: armor ASF: could not extract armor.2da: {e}",
+                  file=sys.stderr)
+        else:
+            headers, rows = parse_2da(twoda)
+            asf_i = col_index(headers, "ARCANEFAILURE%")
+            if asf_i is None:
+                print("    warn: armor.2da has no ARCANEFAILURE% column",
+                      file=sys.stderr)
+            else:
+                asf: dict[str, int] = {}
+                for row in rows:
+                    if not row or asf_i >= len(row):
+                        continue
+                    try:
+                        ridx = int(row[0])
+                        asf[str(ridx)] = int(row[asf_i])
+                    except ValueError:
+                        continue
+                arpath = out_dir / "armor.json"
+                arpath.write_text(
+                    json.dumps({"_source": "stock NWN :: armor.2da (ARCANEFAILURE%)",
+                                **asf},
+                               indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                print(f"    wrote {arpath.name}: {len(asf)} rows")
 
 
 def main() -> None:

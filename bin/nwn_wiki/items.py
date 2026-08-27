@@ -18,10 +18,13 @@ Depends on stdlib, gff, lookups, itemprops, ``htmlgen.escape`` and
 
 from __future__ import annotations
 
+import re
+
 from nwn_wiki.gff import fld, list_items
 from nwn_wiki.htmlgen.escape import nwn_text
 from nwn_wiki.itemprops import _prop_value_num, itemprop_format, itemprop_oneliner
 from nwn_wiki.lookups import (
+    ARMOR_ASF,
     IPROP_DEFS,
     WEAPONS,
     _DAMAGE_TYPE_LABELS,
@@ -400,6 +403,53 @@ def item_ac_bonus(item: dict | None) -> tuple[int, list[str]]:
             total += cost_int
             notes.append(f"+{cost_int} {pdef.get('name','AC')}")
     return total, notes
+
+
+# Item property #84, "Arcane Spell Failure" — a signed percentage-point
+# modifier on the wearer's total failure chance (negative rows reduce it).
+_ASF_PROP_ID = 84
+
+
+def item_spell_failure(item: dict | None) -> tuple[int, int, int]:
+    """Arcane spell failure for a single item, as (base, modifier, effective)
+    percentages.
+
+    `base` is what the base item imposes on its own: body armour reads
+    armor.2da by its base AC (ARMOR_ASF), shields read the ArcaneSpellFailure
+    column of baseitems.2da (5 / 15 / 50). `modifier` is the sum of any
+    "Arcane Spell Failure" item properties, signed — the common case is a
+    negative row cancelling the armour's own failure. `effective` is the pair
+    combined and clamped to 0-100, which is the number an arcane caster
+    actually rolls against while wearing it.
+
+    Items in no armour slot can still carry the property (it modifies whatever
+    else the wearer has on); for those `base` is 0 and only `modifier` means
+    anything."""
+    if not item:
+        return 0, 0, 0
+    _raw = fld(item, "BaseItem", None)
+    bi = -1 if _raw is None else int(_raw)
+
+    base = 0
+    if bi in _ARMOR_BASEITEMS:
+        # _torso_base_ac truncates CEP's fractional ACBONUS; armor.2da only
+        # defines rows 0-8, so clamp rather than silently reading 0.
+        base = ARMOR_ASF.get(min(max(_torso_base_ac(item), 0), 8), 0)
+    elif bi in SHIELD_BASEITEMS:
+        base = _try_int((WEAPONS.get(bi) or {}).get("ArcaneSpellFailure", 0) or 0)
+
+    modifier = 0
+    for p in list_items(item.get("PropertiesList")):
+        pname_id = fld(p, "PropertyName")
+        if pname_id is None or int(pname_id) != _ASF_PROP_ID:
+            continue
+        # Signed: _prop_value_num() deliberately ignores the sign, and here
+        # the sign is the whole point ("-30%" reduces, "+30%" adds).
+        m = re.search(r"-?\d+", itemprop_format(p)["cost"])
+        if m:
+            modifier += int(m.group())
+
+    return base, modifier, max(0, min(100, base + modifier))
 
 
 def item_attack_bonus(item: dict | None) -> int:

@@ -118,6 +118,9 @@ _WEAPON_2DA_COLS = (
     "WeaponType", "WeaponSize", "RangedWeapon", "MinRange", "MaxRange",
     "NumDice", "DieToRoll", "CritThreat", "CritHitMult", "WeaponWield",
     "AmmunitionType", "BaseAC", "ArmorCheckPen", "AC_Enchant",
+    # Base-item arcane spell failure %. Shields only (5 / 15 / 50); body
+    # armour is blank because the engine reads armor.2da by base AC instead.
+    "ArcaneSpellFailure",
     "WeaponFocusFeat", "EpicWeaponFocusFeat",
     "WeaponSpecializationFeat", "EpicWeaponSpecializationFeat",
     "WeaponImprovedCriticalFeat", "EpicWeaponOverwhelmingCriticalFeat",
@@ -212,6 +215,29 @@ def _load_parts_chest() -> dict[int, int]:
 
 
 PARTS_CHEST_AC: dict[int, int] = _load_parts_chest()
+
+
+def _load_armor_asf() -> dict[int, int]:
+    """Load armor.json → {base_ac: arcane_spell_failure_pct}.
+    Stock armor.2da, whose row index *is* the armour's base AC (0-8). This is
+    where body armour's spell failure lives — baseitems.2da leaves the column
+    blank for row 16 and the engine looks it up here instead."""
+    p = DATA_DIR / "armor.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    out: dict[int, int] = {}
+    for k, v in raw.items():
+        if k.startswith("_"):
+            continue
+        try:
+            out[int(k)] = int(v)
+        except (ValueError, TypeError):
+            pass
+    return out
+
+
+ARMOR_ASF: dict[int, int] = _load_armor_asf()
 
 
 def _torso_base_ac(item: dict | None) -> int:

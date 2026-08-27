@@ -383,7 +383,8 @@
       "subtype": "iprp_visualfx"
     },
     "84": {
-      "name": "Arcane Spell Failure"
+      "name": "Arcane Spell Failure",
+      "cost_table": "iprp_arcspell"
     },
     "85": {
       "name": "Material"
@@ -1800,6 +1801,28 @@
       "238": "Captivating Song",
       "239": "Psionic Mind Blast 10m Radius",
       "240": "Bigby's Interposing Hand"
+    },
+    "iprp_arcspell": {
+      "0": "-50%",
+      "1": "-45%",
+      "2": "-40%",
+      "3": "-35%",
+      "4": "-30%",
+      "5": "-25%",
+      "6": "-20%",
+      "7": "-15%",
+      "8": "-10%",
+      "9": "-05%",
+      "10": "+05%",
+      "11": "+10%",
+      "12": "+15%",
+      "13": "+20%",
+      "14": "+25%",
+      "15": "+30%",
+      "16": "+35%",
+      "17": "+40%",
+      "18": "+45%",
+      "19": "+50%"
     }
   }
 }

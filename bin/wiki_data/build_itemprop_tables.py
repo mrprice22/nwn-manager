@@ -11,7 +11,14 @@ names). The authoritative tables are, per stock `itempropdef.2da`:
   prop 22  SubTypeResRef = IPRP_PROTECTION   CostTableResRef = 6 (IPRP_SOAKCOST)
   prop 53  SubTypeResRef = ****              CostTableResRef = 16 (IPRP_SPELLCOST)
 
-This script extracts those three 2DAs, builds display tables, and writes them
+Property 84 (Arcane Spell Failure) had no cost table at all, so
+`itemprop_format` dropped the amount silently and every prop-84 line rendered
+with a blank Value ("Arcane Spell Failure" with no percentage). Per
+itempropdef.2da:
+
+  prop 84  SubTypeResRef = ****              CostTableResRef = 27 (IPRP_ARCSPELL)
+
+This script extracts those four 2DAs, builds display tables, and writes them
 (plus the corrected property mappings) into itemprops.json. Re-run after an NWN
 patch. Other tables in itemprops.json are left untouched.
 
@@ -107,6 +114,36 @@ def build_spellcost(nwn: Path, tmp: Path, dialog: dict[int, str]) -> dict[str, s
     return tbl
 
 
+def build_arcspell(nwn: Path, tmp: Path, dialog: dict[int, str]) -> dict[str, str]:
+    """iprp_arcspell.2da → {row: '-30%'} (Name strref via TLK).
+
+    Row-indexed, not value-indexed: row 0 is -50%, row 9 is -5%, row 10 is
+    +05%, row 19 is +50%. No `_format` fallback is possible, so every row is
+    listed. The TLK strings are the labels the game itself shows on the item,
+    leading zero and all ("+05%"), so the wiki reads the same as the tooltip.
+    """
+    hdrs, rows = parse_2da(extract_stock_2da(nwn, "iprp_arcspell.2da", tmp))
+    name_i = col_index(hdrs, "Name")
+    val_i = col_index(hdrs, "Value")
+    tbl: dict[str, str] = {}
+    for rid, row in sorted(_rows_by_id(hdrs, rows).items()):
+        label = ""
+        if name_i is not None and name_i < len(row) and row[name_i]:
+            try:
+                label = dialog.get(int(row[name_i]), "")
+            except ValueError:
+                label = ""
+        if not label and val_i is not None and val_i < len(row) and row[val_i]:
+            # Fall back to the raw Value column if the strref is missing.
+            try:
+                label = f"{int(row[val_i]):+d}%"
+            except ValueError:
+                label = ""
+        if label:
+            tbl[str(rid)] = label
+    return tbl
+
+
 def build(nwn: Path, out_dir: Path) -> None:
     require_tools()
     ip_path = out_dir / "itemprops.json"
@@ -121,20 +158,23 @@ def build(nwn: Path, out_dir: Path) -> None:
         print("converting dialog.tlk → json")
         dialog = load_tlk_entries(tlk_to_json(dialog_tlk, tmp))
 
-        print("building iprp_soakcost / iprp_protection / iprp_spellcost")
+        print("building iprp_soakcost / iprp_protection / iprp_spellcost / iprp_arcspell")
         tables = ip.setdefault("tables", {})
         tables["iprp_soakcost"] = build_soakcost(nwn, tmp)
         tables["iprp_protection"] = build_protection(nwn, tmp)
         tables["iprp_spellcost"] = build_spellcost(nwn, tmp, dialog)
+        tables["iprp_arcspell"] = build_arcspell(nwn, tmp, dialog)
         print(f"  soakcost={len(tables['iprp_soakcost'])} "
               f"protection={len(tables['iprp_protection'])} "
-              f"spellcost={len(tables['iprp_spellcost'])}")
+              f"spellcost={len(tables['iprp_spellcost'])} "
+              f"arcspell={len(tables['iprp_arcspell'])}")
 
-    # Correct the two mis-pointed property mappings.
+    # Correct the mis-pointed / missing property mappings.
     props = ip["properties"]
     props["22"]["subtype"] = "iprp_protection"
     props["22"]["cost_table"] = "iprp_soakcost"
     props["53"]["cost_table"] = "iprp_spellcost"
+    props["84"]["cost_table"] = "iprp_arcspell"
 
     ip_path.write_text(
         json.dumps(ip, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"

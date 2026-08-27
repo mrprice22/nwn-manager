@@ -11,7 +11,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "103",
+    "EpicWeaponFocusFeat": "633",
+    "WeaponSpecializationFeat": "141",
+    "EpicWeaponSpecializationFeat": "671",
+    "WeaponImprovedCriticalFeat": "65",
+    "EpicWeaponOverwhelmingCriticalFeat": "723",
+    "EpicWeaponDevastatingCriticalFeat": "509"
   },
   "1": {
     "WeaponType": "3",
@@ -24,7 +32,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "106",
+    "EpicWeaponFocusFeat": "636",
+    "WeaponSpecializationFeat": "144",
+    "EpicWeaponSpecializationFeat": "674",
+    "WeaponImprovedCriticalFeat": "68",
+    "EpicWeaponOverwhelmingCriticalFeat": "726",
+    "EpicWeaponDevastatingCriticalFeat": "512"
   },
   "2": {
     "WeaponType": "3",
@@ -37,7 +53,15 @@
     "CritHitMult": "3",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "110",
+    "EpicWeaponFocusFeat": "640",
+    "WeaponSpecializationFeat": "148",
+    "EpicWeaponSpecializationFeat": "678",
+    "WeaponImprovedCriticalFeat": "72",
+    "EpicWeaponOverwhelmingCriticalFeat": "730",
+    "EpicWeaponDevastatingCriticalFeat": "516"
   },
   "3": {
     "WeaponType": "3",
@@ -50,7 +74,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "123",
+    "EpicWeaponFocusFeat": "652",
+    "WeaponSpecializationFeat": "161",
+    "EpicWeaponSpecializationFeat": "690",
+    "WeaponImprovedCriticalFeat": "85",
+    "EpicWeaponOverwhelmingCriticalFeat": "742",
+    "EpicWeaponDevastatingCriticalFeat": "528"
   },
   "4": {
     "WeaponType": "2",
@@ -63,7 +95,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "114",
+    "EpicWeaponFocusFeat": "644",
+    "WeaponSpecializationFeat": "152",
+    "EpicWeaponSpecializationFeat": "682",
+    "WeaponImprovedCriticalFeat": "76",
+    "EpicWeaponOverwhelmingCriticalFeat": "734",
+    "EpicWeaponDevastatingCriticalFeat": "520"
   },
   "5": {
     "WeaponType": "2",
@@ -76,7 +116,15 @@
     "CritHitMult": "3",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "115",
+    "EpicWeaponFocusFeat": "645",
+    "WeaponSpecializationFeat": "153",
+    "EpicWeaponSpecializationFeat": "683",
+    "WeaponImprovedCriticalFeat": "77",
+    "EpicWeaponOverwhelmingCriticalFeat": "735",
+    "EpicWeaponDevastatingCriticalFeat": "521"
   },
   "6": {
     "WeaponType": "1",
@@ -92,7 +140,15 @@
     "AmmunitionType": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00030",
+    "WeaponFocusFeat": "92",
+    "EpicWeaponFocusFeat": "622",
+    "WeaponSpecializationFeat": "130",
+    "EpicWeaponSpecializationFeat": "660",
+    "WeaponImprovedCriticalFeat": "54",
+    "EpicWeaponOverwhelmingCriticalFeat": "712",
+    "EpicWeaponDevastatingCriticalFeat": "498"
   },
   "7": {
     "WeaponType": "1",
@@ -108,7 +164,15 @@
     "AmmunitionType": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00030",
+    "WeaponFocusFeat": "93",
+    "EpicWeaponFocusFeat": "623",
+    "WeaponSpecializationFeat": "131",
+    "EpicWeaponSpecializationFeat": "661",
+    "WeaponImprovedCriticalFeat": "55",
+    "EpicWeaponOverwhelmingCriticalFeat": "713",
+    "EpicWeaponDevastatingCriticalFeat": "499"
   },
   "8": {
     "WeaponType": "1",
@@ -124,7 +188,15 @@
     "AmmunitionType": "1",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00030",
+    "WeaponFocusFeat": "101",
+    "EpicWeaponFocusFeat": "631",
+    "WeaponSpecializationFeat": "139",
+    "EpicWeaponSpecializationFeat": "669",
+    "WeaponImprovedCriticalFeat": "63",
+    "EpicWeaponOverwhelmingCriticalFeat": "721",
+    "EpicWeaponDevastatingCriticalFeat": "507"
   },
   "9": {
     "WeaponType": "2",
@@ -137,7 +209,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "94",
+    "EpicWeaponFocusFeat": "624",
+    "WeaponSpecializationFeat": "132",
+    "EpicWeaponSpecializationFeat": "662",
+    "WeaponImprovedCriticalFeat": "56",
+    "EpicWeaponOverwhelmingCriticalFeat": "714",
+    "EpicWeaponDevastatingCriticalFeat": "500"
   },
   "10": {
     "WeaponType": "4",
@@ -151,7 +231,15 @@
     "WeaponWield": "4",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "112",
+    "EpicWeaponFocusFeat": "642",
+    "WeaponSpecializationFeat": "150",
+    "EpicWeaponSpecializationFeat": "680",
+    "WeaponImprovedCriticalFeat": "74",
+    "EpicWeaponOverwhelmingCriticalFeat": "732",
+    "EpicWeaponDevastatingCriticalFeat": "518"
   },
   "11": {
     "WeaponType": "1",
@@ -167,7 +255,15 @@
     "AmmunitionType": "1",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00030",
+    "WeaponFocusFeat": "102",
+    "EpicWeaponFocusFeat": "632",
+    "WeaponSpecializationFeat": "140",
+    "EpicWeaponSpecializationFeat": "670",
+    "WeaponImprovedCriticalFeat": "64",
+    "EpicWeaponOverwhelmingCriticalFeat": "722",
+    "EpicWeaponDevastatingCriticalFeat": "508"
   },
   "12": {
     "WeaponType": "3",
@@ -181,7 +277,15 @@
     "WeaponWield": "8",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "127",
+    "EpicWeaponFocusFeat": "655",
+    "WeaponSpecializationFeat": "165",
+    "EpicWeaponSpecializationFeat": "693",
+    "WeaponImprovedCriticalFeat": "89",
+    "EpicWeaponOverwhelmingCriticalFeat": "745",
+    "EpicWeaponDevastatingCriticalFeat": "531"
   },
   "13": {
     "WeaponType": "3",
@@ -194,7 +298,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "107",
+    "EpicWeaponFocusFeat": "637",
+    "WeaponSpecializationFeat": "145",
+    "EpicWeaponSpecializationFeat": "675",
+    "WeaponImprovedCriticalFeat": "69",
+    "EpicWeaponOverwhelmingCriticalFeat": "727",
+    "EpicWeaponDevastatingCriticalFeat": "513"
   },
   "14": {
     "WeaponType": "0",
@@ -203,7 +315,9 @@
     "WeaponWield": "7",
     "BaseAC": "1",
     "ArmorCheckPen": "-1",
-    "AC_Enchant": "3"
+    "AC_Enchant": "3",
+    "ArcaneSpellFailure": "5",
+    "EquipableSlots": "0x00020"
   },
   "15": {
     "WeaponType": "0",
@@ -212,7 +326,8 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00020"
   },
   "16": {
     "WeaponType": "0",
@@ -220,7 +335,8 @@
     "MaxRange": "100",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "2"
+    "AC_Enchant": "2",
+    "EquipableSlots": "0x00002"
   },
   "17": {
     "WeaponType": "0",
@@ -228,7 +344,8 @@
     "MaxRange": "50",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00001"
   },
   "18": {
     "WeaponType": "3",
@@ -241,7 +358,15 @@
     "CritHitMult": "3",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "111",
+    "EpicWeaponFocusFeat": "641",
+    "WeaponSpecializationFeat": "149",
+    "EpicWeaponSpecializationFeat": "679",
+    "WeaponImprovedCriticalFeat": "73",
+    "EpicWeaponOverwhelmingCriticalFeat": "731",
+    "EpicWeaponDevastatingCriticalFeat": "517"
   },
   "19": {
     "WeaponType": "0",
@@ -249,14 +374,16 @@
     "MaxRange": "50",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "1"
+    "AC_Enchant": "1",
+    "EquipableSlots": "0x00200"
   },
   "20": {
     "WeaponType": "0",
     "MinRange": "10",
     "MaxRange": "40",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00800"
   },
   "21": {
     "WeaponType": "0",
@@ -264,7 +391,8 @@
     "MaxRange": "50",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00400"
   },
   "22": {
     "WeaponType": "1",
@@ -277,14 +405,23 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "90",
+    "EpicWeaponFocusFeat": "620",
+    "WeaponSpecializationFeat": "128",
+    "EpicWeaponSpecializationFeat": "658",
+    "WeaponImprovedCriticalFeat": "52",
+    "EpicWeaponOverwhelmingCriticalFeat": "710",
+    "EpicWeaponDevastatingCriticalFeat": "496"
   },
   "23": {
     "WeaponType": "0",
     "MinRange": "0",
     "MaxRange": "50",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "24": {
     "WeaponType": "0",
@@ -292,14 +429,16 @@
     "MaxRange": "200",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "25": {
     "WeaponType": "0",
     "MinRange": "0",
     "MaxRange": "50",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x02000"
   },
   "26": {
     "WeaponType": "0",
@@ -307,14 +446,16 @@
     "MaxRange": "50",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "0"
+    "AC_Enchant": "0",
+    "EquipableSlots": "0x00004"
   },
   "27": {
     "WeaponType": "0",
     "MinRange": "0",
     "MaxRange": "50",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x01000"
   },
   "28": {
     "WeaponType": "2",
@@ -327,7 +468,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "43",
+    "EpicWeaponFocusFeat": "619",
+    "WeaponSpecializationFeat": "47",
+    "EpicWeaponSpecializationFeat": "657",
+    "WeaponImprovedCriticalFeat": "15",
+    "EpicWeaponOverwhelmingCriticalFeat": "709",
+    "EpicWeaponDevastatingCriticalFeat": "495"
   },
   "29": {
     "WeaponType": "0",
@@ -335,7 +484,8 @@
     "MaxRange": "200",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "30": {
     "WeaponType": "1",
@@ -349,7 +499,8 @@
     "WeaponWield": "6",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00030"
   },
   "31": {
     "WeaponType": "1",
@@ -364,7 +515,15 @@
     "WeaponWield": "11",
     "AmmunitionType": "4",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00010",
+    "WeaponFocusFeat": "91",
+    "EpicWeaponFocusFeat": "621",
+    "WeaponSpecializationFeat": "129",
+    "EpicWeaponSpecializationFeat": "659",
+    "WeaponImprovedCriticalFeat": "53",
+    "EpicWeaponOverwhelmingCriticalFeat": "711",
+    "EpicWeaponDevastatingCriticalFeat": "497"
   },
   "32": {
     "WeaponType": "2",
@@ -378,7 +537,15 @@
     "WeaponWield": "8",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "125",
+    "EpicWeaponFocusFeat": "653",
+    "WeaponSpecializationFeat": "163",
+    "EpicWeaponSpecializationFeat": "691",
+    "WeaponImprovedCriticalFeat": "87",
+    "EpicWeaponOverwhelmingCriticalFeat": "743",
+    "EpicWeaponDevastatingCriticalFeat": "529"
   },
   "33": {
     "WeaponType": "3",
@@ -392,7 +559,15 @@
     "WeaponWield": "8",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "126",
+    "EpicWeaponFocusFeat": "654",
+    "WeaponSpecializationFeat": "164",
+    "EpicWeaponSpecializationFeat": "692",
+    "WeaponImprovedCriticalFeat": "88",
+    "EpicWeaponOverwhelmingCriticalFeat": "744",
+    "EpicWeaponDevastatingCriticalFeat": "530"
   },
   "34": {
     "WeaponType": "0",
@@ -400,7 +575,8 @@
     "MaxRange": "200",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "35": {
     "WeaponType": "2",
@@ -413,7 +589,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "116",
+    "EpicWeaponFocusFeat": "646",
+    "WeaponSpecializationFeat": "154",
+    "EpicWeaponSpecializationFeat": "684",
+    "WeaponImprovedCriticalFeat": "78",
+    "EpicWeaponOverwhelmingCriticalFeat": "736",
+    "EpicWeaponDevastatingCriticalFeat": "522"
   },
   "36": {
     "WeaponType": "2",
@@ -421,7 +605,15 @@
     "MaxRange": "50",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00008",
+    "WeaponFocusFeat": "100",
+    "EpicWeaponFocusFeat": "630",
+    "WeaponSpecializationFeat": "138",
+    "EpicWeaponSpecializationFeat": "668",
+    "WeaponImprovedCriticalFeat": "62",
+    "EpicWeaponOverwhelmingCriticalFeat": "720",
+    "EpicWeaponDevastatingCriticalFeat": "506"
   },
   "37": {
     "WeaponType": "2",
@@ -434,7 +626,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "113",
+    "EpicWeaponFocusFeat": "643",
+    "WeaponSpecializationFeat": "151",
+    "EpicWeaponSpecializationFeat": "681",
+    "WeaponImprovedCriticalFeat": "75",
+    "EpicWeaponOverwhelmingCriticalFeat": "733",
+    "EpicWeaponDevastatingCriticalFeat": "519"
   },
   "38": {
     "WeaponType": "3",
@@ -447,14 +647,23 @@
     "CritHitMult": "3",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "108",
+    "EpicWeaponFocusFeat": "638",
+    "WeaponSpecializationFeat": "146",
+    "EpicWeaponSpecializationFeat": "676",
+    "WeaponImprovedCriticalFeat": "70",
+    "EpicWeaponOverwhelmingCriticalFeat": "728",
+    "EpicWeaponDevastatingCriticalFeat": "514"
   },
   "39": {
     "WeaponType": "0",
     "MinRange": "0",
     "MaxRange": "50",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "40": {
     "WeaponType": "3",
@@ -467,7 +676,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "117",
+    "EpicWeaponFocusFeat": "647",
+    "WeaponSpecializationFeat": "155",
+    "EpicWeaponSpecializationFeat": "685",
+    "WeaponImprovedCriticalFeat": "79",
+    "EpicWeaponOverwhelmingCriticalFeat": "737",
+    "EpicWeaponDevastatingCriticalFeat": "523"
   },
   "41": {
     "WeaponType": "3",
@@ -480,7 +697,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "122",
+    "EpicWeaponFocusFeat": "651",
+    "WeaponSpecializationFeat": "160",
+    "EpicWeaponSpecializationFeat": "689",
+    "WeaponImprovedCriticalFeat": "84",
+    "EpicWeaponOverwhelmingCriticalFeat": "741",
+    "EpicWeaponDevastatingCriticalFeat": "527"
   },
   "42": {
     "WeaponType": "3",
@@ -493,7 +718,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "118",
+    "EpicWeaponFocusFeat": "648",
+    "WeaponSpecializationFeat": "156",
+    "EpicWeaponSpecializationFeat": "686",
+    "WeaponImprovedCriticalFeat": "80",
+    "EpicWeaponOverwhelmingCriticalFeat": "738",
+    "EpicWeaponDevastatingCriticalFeat": "524"
   },
   "43": {
     "WeaponType": "*",
@@ -501,13 +734,15 @@
     "MaxRange": "*",
     "WeaponWield": "*",
     "BaseAC": "*",
-    "ArmorCheckPen": "*"
+    "ArmorCheckPen": "*",
+    "EquipableSlots": "0x00000"
   },
   "44": {
     "MinRange": "10",
     "MaxRange": "100",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "45": {
     "WeaponType": "2",
@@ -521,13 +756,15 @@
     "WeaponWield": "4",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010"
   },
   "46": {
     "MinRange": "10",
     "MaxRange": "100",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "47": {
     "WeaponType": "5",
@@ -540,7 +777,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "95",
+    "EpicWeaponFocusFeat": "625",
+    "WeaponSpecializationFeat": "133",
+    "EpicWeaponSpecializationFeat": "663",
+    "WeaponImprovedCriticalFeat": "57",
+    "EpicWeaponOverwhelmingCriticalFeat": "715",
+    "EpicWeaponDevastatingCriticalFeat": "501"
   },
   "48": {
     "WeaponType": "2",
@@ -553,7 +798,8 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030"
   },
   "49": {
     "WeaponType": "0",
@@ -561,7 +807,8 @@
     "MaxRange": "100",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "50": {
     "WeaponType": "2",
@@ -575,7 +822,15 @@
     "WeaponWield": "4",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "96",
+    "EpicWeaponFocusFeat": "626",
+    "WeaponSpecializationFeat": "134",
+    "EpicWeaponSpecializationFeat": "664",
+    "WeaponImprovedCriticalFeat": "58",
+    "EpicWeaponOverwhelmingCriticalFeat": "716",
+    "EpicWeaponDevastatingCriticalFeat": "502"
   },
   "51": {
     "WeaponType": "1",
@@ -588,7 +843,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "104",
+    "EpicWeaponFocusFeat": "634",
+    "WeaponSpecializationFeat": "142",
+    "EpicWeaponSpecializationFeat": "672",
+    "WeaponImprovedCriticalFeat": "66",
+    "EpicWeaponOverwhelmingCriticalFeat": "724",
+    "EpicWeaponDevastatingCriticalFeat": "510"
   },
   "52": {
     "WeaponType": "0",
@@ -596,7 +859,8 @@
     "MaxRange": "50",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00180"
   },
   "53": {
     "WeaponType": "3",
@@ -609,7 +873,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "105",
+    "EpicWeaponFocusFeat": "635",
+    "WeaponSpecializationFeat": "143",
+    "EpicWeaponSpecializationFeat": "673",
+    "WeaponImprovedCriticalFeat": "67",
+    "EpicWeaponOverwhelmingCriticalFeat": "725",
+    "EpicWeaponDevastatingCriticalFeat": "511"
   },
   "54": {
     "WeaponType": "0",
@@ -617,7 +889,8 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "55": {
     "WeaponType": "4",
@@ -631,7 +904,15 @@
     "WeaponWield": "4",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "121",
+    "EpicWeaponFocusFeat": "650",
+    "WeaponSpecializationFeat": "159",
+    "EpicWeaponSpecializationFeat": "688",
+    "WeaponImprovedCriticalFeat": "83",
+    "EpicWeaponOverwhelmingCriticalFeat": "740",
+    "EpicWeaponDevastatingCriticalFeat": "526"
   },
   "56": {
     "WeaponType": "0",
@@ -640,7 +921,9 @@
     "WeaponWield": "7",
     "BaseAC": "2",
     "ArmorCheckPen": "-2",
-    "AC_Enchant": "3"
+    "AC_Enchant": "3",
+    "ArcaneSpellFailure": "15",
+    "EquipableSlots": "0x00020"
   },
   "57": {
     "WeaponType": "0",
@@ -649,7 +932,9 @@
     "WeaponWield": "7",
     "BaseAC": "3",
     "ArmorCheckPen": "-10",
-    "AC_Enchant": "3"
+    "AC_Enchant": "3",
+    "ArcaneSpellFailure": "50",
+    "EquipableSlots": "0x00020"
   },
   "58": {
     "WeaponType": "1",
@@ -663,7 +948,15 @@
     "WeaponWield": "4",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "97",
+    "EpicWeaponFocusFeat": "627",
+    "WeaponSpecializationFeat": "135",
+    "EpicWeaponSpecializationFeat": "665",
+    "WeaponImprovedCriticalFeat": "59",
+    "EpicWeaponOverwhelmingCriticalFeat": "717",
+    "EpicWeaponDevastatingCriticalFeat": "503"
   },
   "59": {
     "WeaponType": "1",
@@ -678,7 +971,15 @@
     "WeaponWield": "11",
     "AmmunitionType": "5",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00010",
+    "WeaponFocusFeat": "120",
+    "EpicWeaponFocusFeat": "649",
+    "WeaponSpecializationFeat": "158",
+    "EpicWeaponSpecializationFeat": "687",
+    "WeaponImprovedCriticalFeat": "82",
+    "EpicWeaponOverwhelmingCriticalFeat": "739",
+    "EpicWeaponDevastatingCriticalFeat": "525"
   },
   "60": {
     "WeaponType": "3",
@@ -691,7 +992,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "98",
+    "EpicWeaponFocusFeat": "628",
+    "WeaponSpecializationFeat": "136",
+    "EpicWeaponSpecializationFeat": "666",
+    "WeaponImprovedCriticalFeat": "60",
+    "EpicWeaponOverwhelmingCriticalFeat": "718",
+    "EpicWeaponDevastatingCriticalFeat": "504"
   },
   "61": {
     "WeaponType": "2",
@@ -707,7 +1016,15 @@
     "AmmunitionType": "3",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00030",
+    "WeaponFocusFeat": "99",
+    "EpicWeaponFocusFeat": "629",
+    "WeaponSpecializationFeat": "137",
+    "EpicWeaponSpecializationFeat": "667",
+    "WeaponImprovedCriticalFeat": "61",
+    "EpicWeaponOverwhelmingCriticalFeat": "719",
+    "EpicWeaponDevastatingCriticalFeat": "505"
   },
   "62": {
     "WeaponType": "0",
@@ -715,7 +1032,8 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "63": {
     "WeaponType": "3",
@@ -730,7 +1048,15 @@
     "WeaponWield": "11",
     "AmmunitionType": "6",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00010",
+    "WeaponFocusFeat": "109",
+    "EpicWeaponFocusFeat": "639",
+    "WeaponSpecializationFeat": "147",
+    "EpicWeaponSpecializationFeat": "677",
+    "WeaponImprovedCriticalFeat": "71",
+    "EpicWeaponOverwhelmingCriticalFeat": "729",
+    "EpicWeaponDevastatingCriticalFeat": "515"
   },
   "64": {
     "WeaponType": "0",
@@ -738,28 +1064,32 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "65": {
     "WeaponType": "0",
     "MinRange": "10",
     "MaxRange": "100",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "66": {
     "WeaponType": "0",
     "MinRange": "0",
     "MaxRange": "50",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "67": {
     "WeaponType": "0",
     "MinRange": "0",
     "MaxRange": "50",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "68": {
     "WeaponType": "*",
@@ -767,7 +1097,8 @@
     "MaxRange": "*",
     "WeaponWield": "*",
     "BaseAC": "*",
-    "ArmorCheckPen": "*"
+    "ArmorCheckPen": "*",
+    "EquipableSlots": "0x00000"
   },
   "69": {
     "WeaponType": "3",
@@ -780,7 +1111,15 @@
     "CritHitMult": "2",
     "WeaponWield": "9",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x1C000",
+    "WeaponFocusFeat": "291",
+    "EpicWeaponFocusFeat": "656",
+    "WeaponSpecializationFeat": "290",
+    "EpicWeaponSpecializationFeat": "694",
+    "WeaponImprovedCriticalFeat": "292",
+    "EpicWeaponOverwhelmingCriticalFeat": "746",
+    "EpicWeaponDevastatingCriticalFeat": "532"
   },
   "70": {
     "WeaponType": "1",
@@ -793,7 +1132,15 @@
     "CritHitMult": "2",
     "WeaponWield": "9",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x1C000",
+    "WeaponFocusFeat": "291",
+    "EpicWeaponFocusFeat": "656",
+    "WeaponSpecializationFeat": "290",
+    "EpicWeaponSpecializationFeat": "694",
+    "WeaponImprovedCriticalFeat": "292",
+    "EpicWeaponOverwhelmingCriticalFeat": "746",
+    "EpicWeaponDevastatingCriticalFeat": "532"
   },
   "71": {
     "WeaponType": "2",
@@ -806,7 +1153,15 @@
     "CritHitMult": "2",
     "WeaponWield": "9",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x1C000",
+    "WeaponFocusFeat": "291",
+    "EpicWeaponFocusFeat": "656",
+    "WeaponSpecializationFeat": "290",
+    "EpicWeaponSpecializationFeat": "694",
+    "WeaponImprovedCriticalFeat": "292",
+    "EpicWeaponOverwhelmingCriticalFeat": "746",
+    "EpicWeaponDevastatingCriticalFeat": "532"
   },
   "72": {
     "WeaponType": "4",
@@ -819,7 +1174,15 @@
     "CritHitMult": "2",
     "WeaponWield": "9",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x1C000",
+    "WeaponFocusFeat": "291",
+    "EpicWeaponFocusFeat": "656",
+    "WeaponSpecializationFeat": "290",
+    "EpicWeaponSpecializationFeat": "694",
+    "WeaponImprovedCriticalFeat": "292",
+    "EpicWeaponOverwhelmingCriticalFeat": "746",
+    "EpicWeaponDevastatingCriticalFeat": "532"
   },
   "73": {
     "WeaponType": "0",
@@ -828,7 +1191,8 @@
     "WeaponWield": "1",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x20000"
   },
   "74": {
     "WeaponType": "0",
@@ -836,7 +1200,8 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "75": {
     "WeaponType": "0",
@@ -844,14 +1209,16 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "76": {
     "WeaponType": "0",
     "MinRange": "0",
     "MaxRange": "50",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "77": {
     "WeaponType": "0",
@@ -859,7 +1226,8 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "78": {
     "WeaponType": "2",
@@ -867,7 +1235,15 @@
     "MaxRange": "50",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "2"
+    "AC_Enchant": "2",
+    "EquipableSlots": "0x00008",
+    "WeaponFocusFeat": "100",
+    "EpicWeaponFocusFeat": "630",
+    "WeaponSpecializationFeat": "138",
+    "EpicWeaponSpecializationFeat": "668",
+    "WeaponImprovedCriticalFeat": "62",
+    "EpicWeaponOverwhelmingCriticalFeat": "720",
+    "EpicWeaponDevastatingCriticalFeat": "506"
   },
   "79": {
     "WeaponType": "0",
@@ -875,7 +1251,8 @@
     "MaxRange": "200",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "80": {
     "WeaponType": "0",
@@ -883,7 +1260,8 @@
     "MaxRange": "100",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x00040"
   },
   "81": {
     "WeaponType": "0",
@@ -891,7 +1269,8 @@
     "MaxRange": "100",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "82": {
     "WeaponType": "0",
@@ -899,7 +1278,8 @@
     "MaxRange": "200",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "92": {
     "WeaponType": "1",
@@ -913,7 +1293,8 @@
     "WeaponWield": "4",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030"
   },
   "93": {
     "WeaponType": "2",
@@ -925,7 +1306,8 @@
     "CritThreat": "1",
     "CritHitMult": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x1C030"
   },
   "94": {
     "WeaponType": "2",
@@ -933,7 +1315,8 @@
     "MinRange": "0",
     "MaxRange": "50",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x1C030"
   },
   "95": {
     "WeaponType": "1",
@@ -946,7 +1329,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "1072",
+    "EpicWeaponFocusFeat": "1076",
+    "WeaponSpecializationFeat": "1073",
+    "EpicWeaponSpecializationFeat": "1077",
+    "WeaponImprovedCriticalFeat": "1074",
+    "EpicWeaponOverwhelmingCriticalFeat": "1078",
+    "EpicWeaponDevastatingCriticalFeat": "1075"
   },
   "101": {
     "WeaponType": "0",
@@ -954,7 +1345,8 @@
     "MaxRange": "100",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "102": {
     "WeaponType": "0",
@@ -962,13 +1354,15 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "103": {
     "MinRange": "10",
     "MaxRange": "100",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "104": {
     "WeaponType": "0",
@@ -976,7 +1370,8 @@
     "MaxRange": "100",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "105": {
     "WeaponType": "0",
@@ -984,13 +1379,15 @@
     "MaxRange": "50",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "106": {
     "MinRange": "10",
     "MaxRange": "100",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "108": {
     "WeaponType": "3",
@@ -1003,7 +1400,15 @@
     "CritHitMult": "3",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C030",
+    "WeaponFocusFeat": "952",
+    "EpicWeaponFocusFeat": "956",
+    "WeaponSpecializationFeat": "953",
+    "EpicWeaponSpecializationFeat": "957",
+    "WeaponImprovedCriticalFeat": "954",
+    "EpicWeaponOverwhelmingCriticalFeat": "958",
+    "EpicWeaponDevastatingCriticalFeat": "955"
   },
   "109": {
     "WeaponType": "0",
@@ -1011,7 +1416,8 @@
     "MaxRange": "200",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "110": {
     "WeaponType": "0",
@@ -1019,7 +1425,8 @@
     "MaxRange": "200",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   },
   "111": {
     "WeaponType": "3",
@@ -1032,7 +1439,15 @@
     "CritHitMult": "2",
     "BaseAC": "0",
     "ArmorCheckPen": "0",
-    "AC_Enchant": "4"
+    "AC_Enchant": "4",
+    "EquipableSlots": "0x1C010",
+    "WeaponFocusFeat": "993",
+    "EpicWeaponFocusFeat": "997",
+    "WeaponSpecializationFeat": "994",
+    "EpicWeaponSpecializationFeat": "998",
+    "WeaponImprovedCriticalFeat": "995",
+    "EpicWeaponOverwhelmingCriticalFeat": "999",
+    "EpicWeaponDevastatingCriticalFeat": "996"
   },
   "112": {
     "WeaponType": "0",
@@ -1040,6 +1455,7 @@
     "MaxRange": "200",
     "WeaponWield": "1",
     "BaseAC": "0",
-    "ArmorCheckPen": "0"
+    "ArmorCheckPen": "0",
+    "EquipableSlots": "0x00000"
   }
 }

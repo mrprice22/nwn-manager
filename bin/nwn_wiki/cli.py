@@ -53,6 +53,7 @@ from nwn_wiki.htmlgen.chrome import (
 from nwn_wiki.layout import layout_areas
 from nwn_wiki.lookups import (
     APPEARANCE,
+    ARMOR_ASF,
     BASEITEMS,
     CLASSES,
     FEATS,
@@ -386,6 +387,7 @@ def _audit_wiki_data() -> bool:
         ("weapons.json",          lambda: len(WEAPONS),                               "bin/wiki_data/_build_stock.py"),
         ("itemprops.json",        lambda: len(IPROP_DEFS),                            "committed — restore from git"),
         ("parts_chest.2da",       lambda: len(PARTS_CHEST_AC),                        "committed — restore from git"),
+        ("armor.json",            lambda: len(ARMOR_ASF),                             "bin/wiki_data/_build_stock.py"),
         ("stock_item_names.json", lambda: len(STOCK_ITEM_NAMES),                      "bin/refresh-nwn-stock-items"),
         ("spell_info.json",       lambda: sum(len(v) for v in SPELL_INFO.values()),   "bin/refresh-nwn-spell-info"),
     ]

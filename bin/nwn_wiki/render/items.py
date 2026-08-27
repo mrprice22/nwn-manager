@@ -36,6 +36,7 @@ from nwn_wiki.items import (
     _item_category,
     _item_category_label,
     item_gp_value,
+    item_spell_failure,
 )
 from nwn_wiki.lookups import (
     SPELL_INFO,
@@ -450,6 +451,42 @@ def render_items_index(db: Db, out: Path) -> None:
     render_inaccessible_index(db, inaccessible, out)
 
 
+_SPELL_FAILURE_TT = (
+    'title="Chance an arcane caster fails each spell while wearing this. '
+    "Armour and shields impose it; the &#39;Arcane Spell Failure&#39; item "
+    'property adjusts it."'
+)
+
+
+def _spell_failure_row(i: dict, _bi: int) -> list[str]:
+    """The header-dl "Spell failure" row, or [] when the item has nothing to
+    say about spell failure.
+
+    Three readings, because an item outside the armour/shield slots can still
+    carry the property — there it modifies whatever else the wearer has on
+    rather than having a failure chance of its own."""
+    base, modifier, effective = item_spell_failure(i)
+    is_armour = _bi in _ARMOR_BASEITEMS or _bi in SHIELD_BASEITEMS
+    if not is_armour:
+        if not modifier:
+            return []
+        return [
+            f"<dt {_SPELL_FAILURE_TT}>Spell failure</dt>"
+            f"<dd>{modifier:+d}%"
+            f'<small class="muted"> — modifies the wearer&#39;s total</small></dd>'
+        ]
+    if not base and not modifier:
+        return [f"<dt {_SPELL_FAILURE_TT}>Spell failure</dt><dd>0%</dd>"]
+    _detail = (
+        f'<small class="muted"> — {base}% base, {modifier:+d}% from item '
+        f"property</small>" if modifier else ""
+    )
+    return [
+        f"<dt {_SPELL_FAILURE_TT}>Spell failure</dt>"
+        f"<dd>{effective}%{_detail}</dd>"
+    ]
+
+
 def _item_meta_sections(i: dict, resref: str, display_name: str, _bi: int,
                         _carriers: list[dict], _any_droppable: bool, *,
                         is_broken: bool, is_inaccessible: bool,
@@ -506,6 +543,7 @@ def _item_meta_sections(i: dict, resref: str, display_name: str, _bi: int,
                 if _bi in SHIELD_BASEITEMS
                 else []
             ),
+            *_spell_failure_row(i, _bi),
             f"<dt>GP Value</dt><dd>{_fmt_cost(fld(i, 'Cost', ''))}</dd>",
             f"<dt>Stack size</dt><dd>{E(fld(i, 'StackSize', ''))}</dd>",
             *([
