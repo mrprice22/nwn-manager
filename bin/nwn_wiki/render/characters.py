@@ -33,6 +33,11 @@ def _date(dt) -> str:
     return dt.strftime("%Y-%m-%d") if dt else "—"
 
 
+def _dpr(v) -> str:
+    """Damage per round, or an em dash when this character never hit the dummy."""
+    return f"{v:,.1f}" if v else "—"
+
+
 def _player_cell(rec: dict) -> str:
     """The account name, or an em dash when the roster never saw it log in.
 
@@ -67,6 +72,7 @@ def render_character_index(out) -> None:
             f"<td>{E(r['class_line'])}</td>"
             f"<td>{E(r['race'])}</td>"
             f"<td>{r['kills_total']:,}</td>"
+            f"<td>{_dpr(r.get('best_dpr'))}</td>"
             f"<td>{_date(r['last_seen'])}</td>"
             "</tr>"
         )
@@ -78,7 +84,10 @@ def render_character_index(out) -> None:
         f"vault, across {n_players} known player{'s' if n_players != 1 else ''}.</p>",
         '<table class="data"><thead><tr>'
         "<th>Character</th><th>Player</th><th>Level</th><th>Classes</th>"
-        "<th>Race</th><th>Kills</th><th>Last Seen</th>"
+        "<th>Race</th><th>Kills</th>"
+        '<th title="Best damage per round measured on the combat dummy">'
+        "Best DPR</th>"
+        "<th>Last Seen</th>"
         "</tr></thead><tbody>",
         "\n".join(rows),
         "</tbody></table>",
@@ -365,6 +374,17 @@ def render_character_pages(out) -> None:
             ((skill_name(i), rank) for i, rank in enumerate(rec["skills"]) if rank),
             key=lambda p: -p[1])
 
+        dummy = rec.get("best_dpr")
+        dummy_html = ""
+        if dummy:
+            dummy_html = (
+                '<div class="card"><h2>Combat Dummy</h2>'
+                f'<dl class="kv"><div><dt>Best damage/round</dt>'
+                f"<dd>{dummy:,.1f}</dd></div></dl>"
+                '<p class="muted">The best of this character\u2019s 10-round '
+                "trials on the combat dummy, not an average: a trial can be cut "
+                "short or spent testing a gear swap.</p></div>")
+
         body_parts = [
             *head,
             '<div class="card"><h2>Character</h2>'
@@ -372,6 +392,7 @@ def render_character_pages(out) -> None:
             '<div class="card"><h2>Abilities</h2>' + _stat_block(rec) + "</div>",
             '<div class="card"><h2>Bestiary</h2>'
             f'<dl class="kv">{kill_html}</dl></div>',
+            dummy_html,
             "<h2>Equipped</h2>" + _equipped_list(rec, ctx),
         ]
         abilities = _ability_summary(rec)

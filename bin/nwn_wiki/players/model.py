@@ -106,7 +106,8 @@ def _parse_ts(v):
 
 def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
                   roster, catalogue: dict | None = None,
-                  exclude_cdkeys: "set[str] | None" = None) -> list[dict]:
+                  exclude_cdkeys: "set[str] | None" = None,
+                  dummy_best: dict | None = None) -> list[dict]:
     """One record per character in the vault, enriched with kills and play data.
 
     ``catalogue`` maps resref -> creature row (from ``sources.load_catalogue``)
@@ -126,6 +127,7 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
     own character; with the admin accounts gone, no UUID appears twice.
     """
     catalogue = catalogue or {}
+    dummy_best = dummy_best or {}
     if exclude_cdkeys:
         chars = [c for c in chars if c["cdkey"] not in exclude_cdkeys]
 
@@ -201,6 +203,13 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
             # Internal: the actual resrefs, so a player's bestiary progress can
             # be a real union across their characters rather than a max.
             "_resrefs": sorted({r["resref"] for r in rows}),
+            # Best combat-dummy run, when this character ever hit the dummy.
+            "best_dpr": (dummy_best.get(c.get("uuid") or "") or {}).get("dpr"),
+            # Character-sheet totals, for the player averages on the Hall of
+            # Fame. Ability scores here are the stored (pre-racial, pre-gear)
+            # values -- what the sheet calls the character's own scores.
+            "ability_total": sum(c["abilities"].values()),
+            "skill_total": sum(c["skills"]),
             "top_kill": top_kill,
             "last_kill": last_kill,
             "last_seen": acct_last.get(ck),
@@ -297,6 +306,17 @@ def build_players(records: list[dict]) -> list[dict]:
             # it once rather than summing it per character.
             "play_hours": chars[0]["play_hours"] if chars else 0.0,
             "kills_total": sum(c["kills_total"] for c in chars),
+            # Best single character's bestiary progress, next to the union
+            # above: one shows the account's total coverage, the other how far
+            # any one character got on its own.
+            "best_bestiary": max((c["unique_creatures"] for c in chars),
+                                 default=0),
+            "best_dpr": max((c["best_dpr"] for c in chars
+                             if c.get("best_dpr")), default=None),
+            "avg_ability_total": (sum(c["ability_total"] for c in chars) / len(chars)
+                                  if chars else 0.0),
+            "avg_skill_total": (sum(c["skill_total"] for c in chars) / len(chars)
+                                if chars else 0.0),
             "unique_creatures": len(set().union(
                 *(c.get("_resrefs") or [] for c in chars))) if chars else 0,
             "top_level": max((c["level"] for c in chars), default=0),

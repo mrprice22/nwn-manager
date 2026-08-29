@@ -205,3 +205,25 @@ def load_admin_cdkeys(conn) -> set[str]:
     """
     return {r[0] for r in _rows(conn, "SELECT cdkey FROM admins") if r[0]}
 
+
+def load_combat_dummy_best(conn) -> dict[str, dict]:
+    """Character UUID -> that character's best combat-dummy run.
+
+    The dummy records one row per 10-round trial (see the combat-dummy roadmap
+    item), so a character has as many rows as times they hit it. The best run is
+    the meaningful figure: a trial can be cut short or spent testing a gear swap,
+    and averaging those in would understate what the build can actually do.
+
+    Returns {"dpr", "rounds", "at"} per uuid; empty when the module has no
+    combat dummy.
+    """
+    best: dict[str, dict] = {}
+    for uuid, dpr, rounds, at in _rows(
+            conn, "SELECT uuid, dpr, rounds, at FROM sessions"):
+        if not uuid:
+            continue
+        cur = best.get(uuid)
+        if cur is None or (dpr or 0) > cur["dpr"]:
+            best[uuid] = {"dpr": dpr or 0.0, "rounds": rounds or 0, "at": at or ""}
+    return best
+

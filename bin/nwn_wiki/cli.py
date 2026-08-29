@@ -86,7 +86,9 @@ from nwn_wiki.render.conversations import (
     render_conversation_page,
     render_conversations_index,
 )
-from nwn_wiki.render.achievements import render_achievements
+from nwn_wiki.render.achievements import (achievement_counts,
+                                          compute_achievements,
+                                          render_achievements)
 from nwn_wiki.render.characters import (
     render_character_index,
     render_character_pages,
@@ -793,6 +795,7 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     kills: list[dict] = []
     catalogue: dict = {}
     admin_cdkeys: set[str] = set()
+    dummy_best: dict = {}
     if args.db_dir:
         db_dir = Path(args.db_dir).expanduser()
         bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
@@ -807,6 +810,9 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
         adm = sources.open_ro(db_dir / "admindb.sqlite3")
         if adm is not None:
             admin_cdkeys = sources.load_admin_cdkeys(adm)
+        dummy = sources.open_ro(db_dir / "combatdummydb.sqlite3")
+        if dummy is not None:
+            dummy_best = sources.load_combat_dummy_best(dummy)
 
     sessions = (activity or {}).get("sessions") or []
 
@@ -821,9 +827,12 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
 
     state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
                                             catalogue,
-                                            exclude_cdkeys=admin_cdkeys)
+                                            exclude_cdkeys=admin_cdkeys,
+                                            dummy_best=dummy_best)
     state._PLAYERS = model.build_players(state._CHARACTERS)
     state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
+    state._ACHIEVEMENTS = compute_achievements()
+    state._PLAYER_ACHIEVEMENTS = achievement_counts(state._ACHIEVEMENTS)
 
     named = sum(1 for r in state._CHARACTERS if r["player"])
     dropped = len(chars) - len(state._CHARACTERS)

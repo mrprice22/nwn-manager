@@ -71,6 +71,12 @@ _CHARACTERS: list[dict] = []
 _PLAYERS: list[dict] = []
 _PLAYER_SLUGS: dict[str, str] = {}
 
+# Hall of Fame results, resolved once by render.achievements.compute_achievements
+# so the players index can rank by medals without recomputing them (and so the
+# two can never disagree about who won what).
+_ACHIEVEMENTS: list[dict] = []
+_PLAYER_ACHIEVEMENTS: dict[str, int] = {}   # player name -> awards held
+
 # Blueprint resrefs that actually have an item page in this build, so a
 # character's equipped gear links only where the target exists -- crafted or
 # renamed gear can name a blueprint the wiki does not ship.

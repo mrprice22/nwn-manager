@@ -68,7 +68,9 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
     """
     from nwn_wiki import state
     from nwn_wiki.players import bicreader, identity, model, sources
-    from nwn_wiki.render.achievements import render_achievements
+    from nwn_wiki.render.achievements import (achievement_counts,
+                                              compute_achievements,
+                                              render_achievements)
     from nwn_wiki.render.characters import (render_character_index,
                                             render_character_pages)
     from nwn_wiki.render.leaderboards import render_leaderboards
@@ -93,7 +95,7 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
     if not chars:
         return
 
-    kills, catalogue, admin_cdkeys = [], {}, set()
+    kills, catalogue, admin_cdkeys, dummy_best = [], {}, set(), {}
     if args.db_dir:
         db_dir = Path(args.db_dir).resolve()
         bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
@@ -103,15 +105,21 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
         adm = sources.open_ro(db_dir / "admindb.sqlite3")
         if adm is not None:
             admin_cdkeys = sources.load_admin_cdkeys(adm)
+        dummy = sources.open_ro(db_dir / "combatdummydb.sqlite3")
+        if dummy is not None:
+            dummy_best = sources.load_combat_dummy_best(dummy)
 
     sessions = activity["sessions"]
     identity.configure()
     roster = identity.build_roster(sessions, kills, chars)
     state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
                                             catalogue,
-                                            exclude_cdkeys=admin_cdkeys)
+                                            exclude_cdkeys=admin_cdkeys,
+                                            dummy_best=dummy_best)
     state._PLAYERS = model.build_players(state._CHARACTERS)
     state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
+    state._ACHIEVEMENTS = compute_achievements()
+    state._PLAYER_ACHIEVEMENTS = achievement_counts(state._ACHIEVEMENTS)
     # This pass has no module database, so item pages cannot be enumerated from
     # blueprints. Read the ones the last full build wrote instead, so equipped
     # gear keeps its links here too.
