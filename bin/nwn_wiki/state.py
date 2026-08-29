@@ -83,6 +83,12 @@ _ITEM_PAGES: set[str] = set()
 # same way .chrome.json shares the nav -- so both paths render the same page.
 _ITEM_NAMES: dict[str, str] = {}
 
+# The module's cap on the TOTAL ability bonus an character may take from items
+# (settings.tml max-ability-bonus; NWN's default is 12, this module runs 24).
+# Bonuses from different items stack and are then clamped to this -- see
+# nwn_wiki/sim/pc.py, which documents the same rule.
+_MAX_ABILITY_BONUS: int = 12
+
 # URL the Who's Online page polls for the live roster, from --online-api. Empty
 # on every realm that does not run the status pusher (archived seasons, the
 # forks, and the dev realm until it is switched on for testing), which is what

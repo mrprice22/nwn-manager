@@ -117,9 +117,16 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
     # gear keeps its links here too.
     state._ITEM_PAGES = {f.stem for f in (out / "items").glob("*.html")}
     try:
-        state._ITEM_NAMES = json.loads(
-            (out / ".item-names.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        _pd = json.loads((out / ".players-data.json").read_text(encoding="utf-8"))
+        state._ITEM_NAMES = _pd.get("item_names") or {}
+        state._MAX_ABILITY_BONUS = int(_pd.get("max_ability_bonus") or 12)
+    except (OSError, ValueError, TypeError):
+        # Names and the ability cap both come from the module DB, which this
+        # pass does not have. Rendering without them would silently disagree
+        # with the last full build, so say so rather than quietly differ.
+        print("[nwn-wiki-activity] warn: no readable .players-data.json; "
+              "gear names and the ability cap may differ from the full build",
+              file=sys.stderr)
         state._ITEM_NAMES = {}
 
     render_character_index(out)

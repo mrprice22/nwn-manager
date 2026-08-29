@@ -20,7 +20,7 @@ from nwn_wiki.htmlgen.blocks import items_layout, toc_sidebar
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E
 from nwn_wiki.htmlgen.pagectx import PageCtx
-from nwn_wiki.itemprops import itemprop_format
+from nwn_wiki.itemprops import _prop_value_num, itemprop_format
 from nwn_wiki.lookups import baseitem_name, feat_name, skill_name
 from nwn_wiki.render.players import player_link
 
@@ -209,6 +209,65 @@ def _equipped_list(rec: dict, ctx: PageCtx) -> str:
             + "</ul>")
 
 
+# Ability Bonus is item property 0; its subtype names the ability.
+_ABILITY_PROP = 0
+_ABILITY_BY_SUBTYPE = {"Strength": "Str", "Dexterity": "Dex",
+                       "Constitution": "Con", "Intelligence": "Int",
+                       "Wisdom": "Wis", "Charisma": "Cha"}
+
+
+def _ability_totals(rec: dict) -> dict[str, tuple[int, int]]:
+    """Ability -> (raw total from items, total after the module's cap).
+
+    Ability bonuses from DIFFERENT items stack, and the engine then clamps the
+    total per ability to settings.tml's max-ability-bonus -- NWN's default is
+    +12, this module runs +24. So two +12 rings reach a +24 cap where one
+    cannot, which is why this sums and then clamps rather than taking the
+    largest single item. Same rule, and the same reasoning, as nwn_wiki/sim/pc.py.
+    """
+    raw: dict[str, int] = {}
+    for item in rec["equipped"]:
+        if not _is_gear(item):
+            continue
+        for prop in item.get("properties") or []:
+            f = itemprop_format(prop)
+            if f.get("property") != "Ability Bonus":
+                continue
+            ab = _ABILITY_BY_SUBTYPE.get(f.get("subtype", ""))
+            if not ab:
+                continue
+            raw[ab] = raw.get(ab, 0) + (_prop_value_num(f["cost"]) if f["cost"] else 0)
+
+    cap = state._MAX_ABILITY_BONUS
+    return {ab: (v, min(v, cap) if cap and cap > 0 else v)
+            for ab, v in raw.items()}
+
+
+def _ability_summary(rec: dict) -> str:
+    totals = _ability_totals(rec)
+    if not totals:
+        return ""
+    cap = state._MAX_ABILITY_BONUS
+    cells, capped = [], False
+    for ab in ABILITY_ORDER:
+        if ab not in totals:
+            continue
+        rawv, eff = totals[ab]
+        note = ""
+        if rawv != eff:
+            capped = True
+            note = f' <span class="muted">(+{rawv} before the cap)</span>'
+        cells.append(f"<div><dt>{ab}</dt><dd>+{eff}{note}</dd></div>")
+    foot = (f"Bonuses from different items stack, then cap at +{cap} per "
+            "ability on this module.") if cap and cap > 0 else (
+            "Bonuses from different items stack; this module sets no cap.")
+    if capped:
+        foot += " Values above the cap are shown as granted and as applied."
+    return ('<div class="card"><h2>Ability Bonuses from Gear</h2>'
+            f'<dl class="kv abilities">{"".join(cells)}</dl>'
+            f'<p class="muted">{E(foot)}</p></div>')
+
+
 def _combined_properties(rec: dict, ctx: PageCtx) -> str:
     """Every item property across the character's equipped gear, in one table.
 
@@ -315,6 +374,9 @@ def render_character_pages(out) -> None:
             f'<dl class="kv">{kill_html}</dl></div>',
             "<h2>Equipped</h2>" + _equipped_list(rec, ctx),
         ]
+        abilities = _ability_summary(rec)
+        if abilities:
+            body_parts.append(abilities)
         combined = _combined_properties(rec, ctx)
         if combined:
             body_parts.append(combined)

@@ -917,11 +917,15 @@ def _render_pages(db: Db, src: Path, out: Path, title: str,
     # its own; without it a character's stock gear would lose its name on every
     # incremental refresh and regain it on the next full build.
     state._ITEM_NAMES = {rr: db.item_name(rr) for rr in db.items}
+    state._MAX_ABILITY_BONUS = db.max_ability_bonus
     try:
-        (out / ".item-names.json").write_text(
-            json.dumps(state._ITEM_NAMES), encoding="utf-8")
+        (out / ".players-data.json").write_text(json.dumps({
+            "version": 1,
+            "item_names": state._ITEM_NAMES,
+            "max_ability_bonus": state._MAX_ABILITY_BONUS,
+        }), encoding="utf-8")
     except OSError as exc:
-        print(f"[nwn-wiki] warn: could not write .item-names.json: {exc}",
+        print(f"[nwn-wiki] warn: could not write .players-data.json: {exc}",
               file=sys.stderr)
     render_online_page(out)
     render_character_index(out)
