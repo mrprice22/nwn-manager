@@ -230,3 +230,34 @@ def load_combat_dummy_runs(conn) -> dict[str, list[dict]]:
     for rows in runs.values():
         rows.sort(key=lambda r: r["at"], reverse=True)
     return runs
+
+
+def load_playtime(conn) -> tuple[dict[str, dict], str]:
+    """Per-CHARACTER play time, and the date tracking began.
+
+    Returns ({uuid: {"minutes", "sessions"}}, tracking_started).
+
+    Only completed sessions count: a row with NULL minutes was abandoned (the
+    server went down without firing Mod_OnClientLeav) and its length is
+    genuinely unknown, so ptm_db.nss records it as unknown rather than guessing.
+    Summing it as zero would be just as wrong as summing it as "until now".
+
+    ``tracking_started`` matters as much as the figures. The module stamps it on
+    the first load after the table ships, and every season predates it -- a
+    character with 3 hours here may have been played for months. Any page
+    showing these numbers must show this date too, or it is quietly lying.
+    """
+    totals: dict[str, dict] = {}
+    for row in _rows(conn,
+                     "SELECT uuid, SUM(minutes) AS m, COUNT(*) AS n "
+                     "FROM sessions WHERE minutes IS NOT NULL GROUP BY uuid"):
+        uuid, mins, n = row[0], row[1] or 0.0, row[2] or 0
+        if uuid:
+            totals[uuid] = {"minutes": mins, "sessions": n}
+
+    started = ""
+    rows = _rows(conn, "SELECT value FROM meta WHERE key = 'tracking_started'")
+    if rows:
+        started = rows[0][0] or ""
+    return totals, started
+

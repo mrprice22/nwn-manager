@@ -18,6 +18,7 @@ from nwn_wiki.htmlgen.blocks import items_layout, toc_sidebar
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E
 from nwn_wiki.htmlgen.pagectx import PageCtx
+from nwn_wiki.render.players import tracking_note
 
 from nwn_wiki import state
 
@@ -75,10 +76,15 @@ def render_leaderboards(out) -> None:
         _board("Bestiary Completion", "Distinct creature types killed.",
                top("unique_creatures", lambda r: f"{r['unique_creatures']:,}"),
                ctx, "bestiary"),
-        _board("Most Played", "Hours logged by this character's account.",
-               top("play_hours", lambda r: f"{r['play_hours']:g} h"), ctx, "played"),
         _board("Deepest Pockets", "Gold carried.",
                top("gold", lambda r: f"{r['gold']:,}"), ctx, "gold"),
+        # Genuinely per-character, unlike the account figure this board used to
+        # show -- which ranked one player's four characters 1-4 on the same
+        # number, because the server log names the account and never the
+        # character. See ptm_db.nss.
+        _board("Most Played", "Hours played on this character.",
+               top("char_hours", lambda r: f"{r['char_hours']:g} h"),
+               ctx, "played"),
     ]
     boards = [b for b in boards if b]
 
@@ -88,12 +94,15 @@ def render_leaderboards(out) -> None:
         '<div class="toc-group-heading">Boards</div>',
         '<div><a href="#kills">Most Kills</a></div>',
         '<div><a href="#bestiary">Bestiary Completion</a></div>',
-        '<div><a href="#played">Most Played</a></div>',
         '<div><a href="#gold">Deepest Pockets</a></div>',
+        '<div><a href="#played">Most Played</a></div>',
     ])
     sections = [
         "<h1>Leaderboards</h1>",
-        f'<p>Top {TOP_N} of {len(recs):,} characters.</p>',
+        f'<p>Top {TOP_N} of {len(recs):,} characters. Every board here ranks a '
+        'single character; per-player figures live on the '
+        f'<a href="{E(ctx.url("players/index.html"))}">players</a> page.</p>',
         *boards,
+        tracking_note() if any("Most Played" in b for b in boards) else "",
     ]
     write_page(out, ctx, "Leaderboards", items_layout(sidebar, "\n".join(sections)))

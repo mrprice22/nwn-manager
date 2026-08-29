@@ -131,7 +131,8 @@ def _parse_ts(v):
 def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
                   roster, catalogue: dict | None = None,
                   exclude_cdkeys: "set[str] | None" = None,
-                  dummy_runs: dict | None = None) -> list[dict]:
+                  dummy_runs: dict | None = None,
+                  playtime: dict | None = None) -> list[dict]:
     """One record per character in the vault, enriched with kills and play data.
 
     ``catalogue`` maps resref -> creature row (from ``sources.load_catalogue``)
@@ -152,6 +153,7 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
     """
     catalogue = catalogue or {}
     dummy_runs = dummy_runs or {}
+    playtime = playtime or {}
     if exclude_cdkeys:
         chars = [c for c in chars if c["cdkey"] not in exclude_cdkeys]
 
@@ -237,6 +239,13 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
             "best_dpr": _best_dpr(dummy_runs.get(c.get("uuid") or "")),
             "best_dpr_at": _best_dpr_at(dummy_runs.get(c.get("uuid") or "")),
             "recent_dpr": _recent_dpr(dummy_runs.get(c.get("uuid") or "")),
+            # Per-CHARACTER hours, from ptm_db. None (not 0) when tracking has
+            # never seen this character: "not measured" and "measured as zero"
+            # are different claims, and only the page can decide how to say so.
+            "char_hours": (
+                round(playtime[c["uuid"]]["minutes"] / 60.0, 1)
+                if c.get("uuid") in playtime else None),
+            "char_sessions": (playtime.get(c.get("uuid") or "") or {}).get("sessions"),
             # Character-sheet totals, for the player averages on the Hall of
             # Fame. Ability scores here are the stored (pre-racial, pre-gear)
             # values -- what the sheet calls the character's own scores.
@@ -345,6 +354,10 @@ def build_players(records: list[dict]) -> list[dict]:
                                  default=0),
             "best_dpr": max((c["best_dpr"] for c in chars
                              if c.get("best_dpr")), default=None),
+            "char_hours": (
+                round(sum(c["char_hours"] for c in chars
+                          if c.get("char_hours")), 1)
+                if any(c.get("char_hours") for c in chars) else None),
             "avg_ability_total": (sum(c["ability_total"] for c in chars) / len(chars)
                                   if chars else 0.0),
             "avg_skill_total": (sum(c["skill_total"] for c in chars) / len(chars)

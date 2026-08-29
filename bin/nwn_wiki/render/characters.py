@@ -24,7 +24,7 @@ from nwn_wiki.htmlgen.escape import E
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.itemprops import _prop_value_num, itemprop_format
 from nwn_wiki.lookups import baseitem_name, feat_name, skill_name
-from nwn_wiki.render.players import player_link
+from nwn_wiki.render.players import player_link, tracking_note
 
 from nwn_wiki import state
 
@@ -409,7 +409,14 @@ def render_character_pages(out) -> None:
             ("Gold", f"{rec['gold']:,}"),
             ("Deity", rec["deity"]),
             ("Last seen", _date(rec["last_seen"])),
-            ("Play time", f"{rec['play_hours']:g} h" if rec["play_hours"] else ""),
+            # Two different facts, labelled so they cannot be confused. The
+            # per-CHARACTER figure comes from ptm_db and only exists from the
+            # date tracking started; the account figure comes from the server
+            # log, which names the account but never the character.
+            ("Time on this character",
+             f"{rec['char_hours']:g} h" if rec.get("char_hours") else ""),
+            ("Player's time on server",
+             f"{rec['play_hours']:g} h" if rec["play_hours"] else ""),
         ]
         fact_html = "".join(
             f"<div><dt>{E(k)}</dt><dd>{E(v)}</dd></div>"
@@ -439,7 +446,9 @@ def render_character_pages(out) -> None:
         body_parts = [
             *head,
             '<div class="card"><h2>Character</h2>'
-            f'<dl class="kv">{fact_html}</dl></div>',
+            f'<dl class="kv">{fact_html}</dl>'
+            + (tracking_note() if rec.get("char_hours") else "")
+            + "</div>",
             '<div class="card"><h2>Abilities</h2>' + _stat_block(rec) + "</div>",
             '<div class="card"><h2>Bestiary</h2>'
             f'<dl class="kv">{kill_html}</dl></div>',

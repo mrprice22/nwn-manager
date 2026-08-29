@@ -25,6 +25,23 @@ def _date(dt) -> str:
     return dt.strftime("%Y-%m-%d") if dt else "—"
 
 
+def tracking_note(prefix: str = "Play time per character is counted from") -> str:
+    """The "counted since" caveat, for any page showing per-character hours.
+
+    Tracking began when ptm_db shipped, long after the season did, so a
+    character's hours are not its history -- they are its history *since then*.
+    Every page showing the figure carries this, because the number is
+    misleading without it.
+    """
+    if not state._PLAYTIME_SINCE:
+        return ""
+    return (f'<p class="muted">{E(prefix)} '
+            f"<b>{E(state._PLAYTIME_SINCE)}</b>, when tracking was switched on. "
+            "Time played before that date was never recorded and is not "
+            "included, so these totals are lower than a character\u2019s real "
+            "history.</p>")
+
+
 def _dpr(v) -> str:
     """Damage per round, or an em dash when this character never hit the dummy."""
     return f"{v:,.1f}" if v else "—"

@@ -95,6 +95,12 @@ _ITEM_NAMES: dict[str, str] = {}
 # nwn_wiki/sim/pc.py, which documents the same rule.
 _MAX_ABILITY_BONUS: int = 12
 
+# When per-character play-time tracking began (ptm_db.nss stamps it on the first
+# module load after it ships). Every season predates it, so any page showing
+# per-character hours must show this date too or it is quietly lying about a
+# character's history. Empty when the module has no tracking.
+_PLAYTIME_SINCE: str = ""
+
 # URL the Who's Online page polls for the live roster, from --online-api. Empty
 # on every realm that does not run the status pusher (archived seasons, the
 # forks, and the dev realm until it is switched on for testing), which is what

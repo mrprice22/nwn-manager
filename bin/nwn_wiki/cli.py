@@ -796,6 +796,7 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     catalogue: dict = {}
     admin_cdkeys: set[str] = set()
     dummy_runs: dict = {}
+    playtime: dict = {}
     if args.db_dir:
         db_dir = Path(args.db_dir).expanduser()
         bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
@@ -813,6 +814,11 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
         dummy = sources.open_ro(db_dir / "combatdummydb.sqlite3")
         if dummy is not None:
             dummy_runs = sources.load_combat_dummy_runs(dummy)
+        # Per-character play time. Absent until ptm_db.nss ships with the
+        # module, so every page reading it degrades to the account figure.
+        ptm = sources.open_ro(db_dir / "playtimedb.sqlite3")
+        if ptm is not None:
+            playtime, state._PLAYTIME_SINCE = sources.load_playtime(ptm)
 
     sessions = (activity or {}).get("sessions") or []
 
@@ -828,7 +834,8 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
                                             catalogue,
                                             exclude_cdkeys=admin_cdkeys,
-                                            dummy_runs=dummy_runs)
+                                            dummy_runs=dummy_runs,
+                                            playtime=playtime)
     state._PLAYERS = model.build_players(state._CHARACTERS)
     state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
     state._ACHIEVEMENTS = compute_achievements()

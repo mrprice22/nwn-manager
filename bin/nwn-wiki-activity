@@ -96,6 +96,7 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
         return
 
     kills, catalogue, admin_cdkeys, dummy_runs = [], {}, set(), {}
+    playtime: dict = {}
     if args.db_dir:
         db_dir = Path(args.db_dir).resolve()
         bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
@@ -108,6 +109,11 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
         dummy = sources.open_ro(db_dir / "combatdummydb.sqlite3")
         if dummy is not None:
             dummy_runs = sources.load_combat_dummy_runs(dummy)
+        # Per-character play time. Absent until ptm_db.nss ships with the
+        # module, so every page reading it degrades to the account figure.
+        ptm = sources.open_ro(db_dir / "playtimedb.sqlite3")
+        if ptm is not None:
+            playtime, state._PLAYTIME_SINCE = sources.load_playtime(ptm)
 
     sessions = activity["sessions"]
     identity.configure()
@@ -115,7 +121,8 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
     state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
                                             catalogue,
                                             exclude_cdkeys=admin_cdkeys,
-                                            dummy_runs=dummy_runs)
+                                            dummy_runs=dummy_runs,
+                                            playtime=playtime)
     state._PLAYERS = model.build_players(state._CHARACTERS)
     state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
     state._ACHIEVEMENTS = compute_achievements()

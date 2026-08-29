@@ -56,6 +56,10 @@ PLAYER_AWARDS: list[tuple] = [
     ("well-rounded", "Well-Rounded",
      "Highest ability scores, averaged across all of this player's characters.",
      "avg_ability_total", lambda v: f"{v:,.1f} avg. total ability score"),
+    ("dedicated", "Dedicated",
+     "Most hours logged on the server. This is an account figure -- the server "
+     "log records who logged in, never which character they chose.",
+     "play_hours", lambda v: f"{v:g} hours"),
     ("polymath", "Polymath",
      "Most skill ranks, averaged across all of this player's characters.",
      "avg_skill_total", lambda v: f"{v:,.1f} avg. skill ranks"),
