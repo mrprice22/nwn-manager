@@ -86,11 +86,13 @@ from nwn_wiki.render.conversations import (
     render_conversation_page,
     render_conversations_index,
 )
+from nwn_wiki.render.achievements import render_achievements
 from nwn_wiki.render.characters import (
     render_character_index,
     render_character_pages,
     render_online_page,
 )
+from nwn_wiki.render.players import render_player_pages, render_players_index
 from nwn_wiki.render.creature_page import (
     render_creature_page,
     render_creatures_search,
@@ -820,12 +822,16 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
                                             catalogue,
                                             exclude_cdkeys=admin_cdkeys)
+    state._PLAYERS = model.build_players(state._CHARACTERS)
+    state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
+
     named = sum(1 for r in state._CHARACTERS if r["player"])
     dropped = len(chars) - len(state._CHARACTERS)
     admin_note = (f", {dropped} admin-owned character(s) excluded"
                   if dropped else "")
     print(f"[nwn-wiki] players: {len(state._CHARACTERS)} character(s), "
-          f"{named} with a resolved player name{admin_note} "
+          f"{named} with a resolved player name{admin_note}, "
+          f"{len(state._PLAYERS)} player page(s) "
           f"(cache: {cache_path})")
 
     if snapshot:
@@ -906,10 +912,24 @@ def _render_pages(db: Db, src: Path, out: Path, title: str,
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
     render_creatures_by_race(db, out)
     render_creatures_search(db, out)
+    state._ITEM_PAGES = set(db.items)
+    # Shared with the nwn-wiki-activity subprocess, which has no module DB of
+    # its own; without it a character's stock gear would lose its name on every
+    # incremental refresh and regain it on the next full build.
+    state._ITEM_NAMES = {rr: db.item_name(rr) for rr in db.items}
+    try:
+        (out / ".item-names.json").write_text(
+            json.dumps(state._ITEM_NAMES), encoding="utf-8")
+    except OSError as exc:
+        print(f"[nwn-wiki] warn: could not write .item-names.json: {exc}",
+              file=sys.stderr)
     render_online_page(out)
     render_character_index(out)
     render_character_pages(out)
     render_leaderboards(out)
+    render_players_index(out)
+    render_player_pages(out)
+    render_achievements(out)
     state._current_context = ""
     for can_rr in db.canonical_creatures:
         state._current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"

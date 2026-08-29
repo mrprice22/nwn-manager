@@ -336,8 +336,8 @@ function initOnlineStatus() {
       const who = p.character || p.player || '';
       const by = p.character && p.player ? p.player : '';
       const lvl = p.level ? 'Level ' + p.level : '';
-      return '<tr><td>' + esc(who) + '</td><td>' + esc(by) +
-             '</td><td>' + esc(lvl) + '</td></tr>';
+      return '<tr><td>' + linkTo('characters', who) + '</td><td>' +
+             linkTo('players', by) + '</td><td>' + esc(lvl) + '</td></tr>';
     }).join('');
     roster.innerHTML =
       '<p>' + data.count + (data.count === 1 ? ' player' : ' players') +
@@ -351,6 +351,26 @@ function initOnlineStatus() {
     const d = document.createElement('span');
     d.textContent = s == null ? '' : String(s);
     return d.innerHTML;
+  }
+
+  /* The roster can describe a different realm than the wiki showing it -- the
+   * TEST wiki deliberately shows who is on the live server. The page ships an
+   * index of the names THIS wiki has pages for, so a name links only when the
+   * target actually exists here and renders as plain text otherwise. That is
+   * why names are not clickable on the TEST wiki and are on the live one. */
+  const linkIndex = (() => {
+    const el = document.getElementById('online-link-index');
+    if (!el) return {characters: {}, players: {}};
+    try {
+      const d = JSON.parse(el.textContent);
+      return {characters: d.characters || {}, players: d.players || {}};
+    } catch { return {characters: {}, players: {}}; }
+  })();
+
+  function linkTo(kind, name) {
+    if (!name) return '';
+    const href = linkIndex[kind][name];
+    return href ? '<a href="' + esc(href) + '">' + esc(name) + '</a>' : esc(name);
   }
 
   function tick() {

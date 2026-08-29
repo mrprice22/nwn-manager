@@ -276,9 +276,12 @@ def _activity_dropdown(chrome: SiteChrome, ctx: PageCtx) -> str:
     if chrome.has_online:
         rows.append(_nav_link(ctx, "characters/online.html", "Who's Online"))
     if chrome.has_characters:
+        rows.append(_nav_link(ctx, "players/index.html", "Players"))
         rows.append(_nav_link(ctx, "characters/index.html", "Characters"))
         rows.append(
             _nav_link(ctx, "characters/leaderboards.html", "Leaderboards"))
+        rows.append(
+            _nav_link(ctx, "players/achievements.html", "Hall of Fame"))
     if chrome.has_activity:
         rows.append(_nav_link(ctx, "activity.html", "Player Activity"))
     if chrome.has_server_firsts:

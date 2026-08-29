@@ -11,6 +11,7 @@ Exit codes for check modes:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -67,9 +68,12 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
     """
     from nwn_wiki import state
     from nwn_wiki.players import bicreader, identity, model, sources
+    from nwn_wiki.render.achievements import render_achievements
     from nwn_wiki.render.characters import (render_character_index,
                                             render_character_pages)
     from nwn_wiki.render.leaderboards import render_leaderboards
+    from nwn_wiki.render.players import (render_player_pages,
+                                         render_players_index)
 
     vault = Path(args.vault_dir).expanduser()
     if not vault.is_dir():
@@ -106,10 +110,24 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
     state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
                                             catalogue,
                                             exclude_cdkeys=admin_cdkeys)
+    state._PLAYERS = model.build_players(state._CHARACTERS)
+    state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
+    # This pass has no module database, so item pages cannot be enumerated from
+    # blueprints. Read the ones the last full build wrote instead, so equipped
+    # gear keeps its links here too.
+    state._ITEM_PAGES = {f.stem for f in (out / "items").glob("*.html")}
+    try:
+        state._ITEM_NAMES = json.loads(
+            (out / ".item-names.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state._ITEM_NAMES = {}
 
     render_character_index(out)
     render_character_pages(out)
     render_leaderboards(out)
+    render_players_index(out)
+    render_player_pages(out)
+    render_achievements(out)
     print(f"[nwn-wiki-activity] players: refreshed "
           f"{len(state._CHARACTERS)} character page(s)")
 

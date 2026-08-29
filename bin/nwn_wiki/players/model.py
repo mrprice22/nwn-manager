@@ -198,6 +198,9 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
             "kills_party": party,
             "kills_total": solo + party,
             "unique_creatures": len({r["resref"] for r in rows}),
+            # Internal: the actual resrefs, so a player's bestiary progress can
+            # be a real union across their characters rather than a max.
+            "_resrefs": sorted({r["resref"] for r in rows}),
             "top_kill": top_kill,
             "last_kill": last_kill,
             "last_seen": acct_last.get(ck),
@@ -258,3 +261,59 @@ def load_snapshot(path: "Path") -> list[dict]:
         # key that was deliberately stripped.
         r.setdefault("_cdkey", "")
     return records
+
+
+# --------------------------------------------------------------------------- #
+# Players (accounts)
+# --------------------------------------------------------------------------- #
+
+def build_players(records: list[dict]) -> list[dict]:
+    """Group published characters by account, newest-active first.
+
+    Only accounts the roster could actually name get a page: the account name is
+    the page's whole identity, and a CD key is never a substitute for it (it is
+    account credentials). Characters whose owner could not be resolved still get
+    their own pages -- they just belong to no player page, which is the honest
+    representation of "we do not know who played this".
+    """
+    by_name: dict[str, list[dict]] = defaultdict(list)
+    for rec in records:
+        if rec["player"]:
+            by_name[rec["player"]].append(rec)
+
+    players: list[dict] = []
+    for name, chars in by_name.items():
+        chars = sorted(chars, key=lambda r: (-r["level"], r["name"].lower()))
+        last_seen = max((c["last_seen"] for c in chars if c["last_seen"]),
+                        default=None)
+        players.append({
+            "name": name,
+            "slug": _slug(name, ""),
+            "characters": chars,
+            "character_count": len(chars),
+            # Playtime is per-ACCOUNT, not per-character: the session log knows
+            # only who logged in, never which character they picked. Every one of
+            # this account's records therefore carries the same figure, so take
+            # it once rather than summing it per character.
+            "play_hours": chars[0]["play_hours"] if chars else 0.0,
+            "kills_total": sum(c["kills_total"] for c in chars),
+            "unique_creatures": len(set().union(
+                *(c.get("_resrefs") or [] for c in chars))) if chars else 0,
+            "top_level": max((c["level"] for c in chars), default=0),
+            "last_seen": last_seen,
+        })
+
+    # Distinct account names can still collide once slugged (case, punctuation).
+    by_slug: dict[str, list[dict]] = defaultdict(list)
+    for p in sorted(players, key=lambda p: p["name"].lower()):
+        by_slug[p["slug"]].append(p)
+    for slug, group in by_slug.items():
+        if len(group) > 1:
+            for n, p in enumerate(group, 1):
+                p["slug"] = f"{slug}-{n}"
+
+    players.sort(key=lambda p: (p["last_seen"] is None,
+                                -(p["last_seen"].timestamp() if p["last_seen"] else 0),
+                                p["name"].lower()))
+    return players
+

@@ -65,6 +65,24 @@ _SERVER_FIRSTS: list[dict] = []        # [{"resref","cr","name","cname","at"}]
 # is account credentials and must never be rendered into HTML.
 _CHARACTERS: list[dict] = []
 
+# Accounts with at least one published character (players/model.build_players),
+# and a name -> slug map for linking one from a character or award.
+#   [{"name","slug","characters",...}]
+_PLAYERS: list[dict] = []
+_PLAYER_SLUGS: dict[str, str] = {}
+
+# Blueprint resrefs that actually have an item page in this build, so a
+# character's equipped gear links only where the target exists -- crafted or
+# renamed gear can name a blueprint the wiki does not ship.
+_ITEM_PAGES: set[str] = set()
+
+# Blueprint resref -> display name, for gear whose .bic carries no
+# LocalizedName. A stock item's name lives in the TLK, not on the instance, so
+# without this a character's stock ring renders as "(unnamed item)". Written to
+# <out>/.item-names.json by the full build and re-read by nwn-wiki-activity, the
+# same way .chrome.json shares the nav -- so both paths render the same page.
+_ITEM_NAMES: dict[str, str] = {}
+
 # URL the Who's Online page polls for the live roster, from --online-api. Empty
 # on every realm that does not run the status pusher (archived seasons, the
 # forks, and the dev realm until it is switched on for testing), which is what

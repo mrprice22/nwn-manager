@@ -27,6 +27,14 @@ from pathlib import Path
 _NIMBLE_GFF = Path.home() / ".nimble" / "bin" / "nwn_gff"
 NWN_GFF = Path(shutil.which("nwn_gff") or _NIMBLE_GFF)
 
+# Bump whenever parse_bic() changes the SHAPE of a record. The cache is keyed by
+# path+mtime+size, which only notices a changed .bic -- without a version, adding
+# a field would serve stale records with that field missing until every character
+# happened to be re-saved in game.
+#   1: initial (ported from the season 1 Hall of Fame)
+#   2: equipped items carry "properties" and "display"
+_CACHE_VERSION = 2
+
 # Ability fields, in the order the page prints them.
 ABILITIES = ("Str", "Dex", "Con", "Int", "Wis", "Cha")
 
@@ -89,18 +97,29 @@ def parse_bic(path: Path, cdkey: str) -> dict | None:
     # TemplateResRef (an .utc blueprint's inventory would use InventoryRes instead).
     # Keep tag and name too: the collector awards match on all three, because a
     # resref alone rarely says "this is a gem" or "this is a bottle of wine".
-    def _item(i: dict) -> dict:
-        return {
+    def _item(i: dict, keep_props: bool = False) -> dict:
+        out = {
             "resref": (_val(i.get("TemplateResRef")) or "").lower(),
             "tag": (_val(i.get("Tag")) or "").lower(),
             "name": (_val(i.get("LocalizedName")) or "").lower(),
+            # Display name, case intact. "name" above is lowercased because the
+            # award matchers compare against it; a page must not print that.
+            "display": _val(i.get("LocalizedName")) or "",
             "base": int(_val(i.get("BaseItem", 0)) or 0),
             "stack": int(_val(i.get("StackSize", 1)) or 1),
             "cost": int(_val(i.get("Cost", 0)) or 0),
         }
+        if keep_props:
+            # Left as raw GFF-as-JSON cells so nwn_wiki.itemprops.itemprop_format
+            # can read them with fld() -- the same path the item pages use. Only
+            # equipped gear keeps these: a full inventory would multiply the
+            # vault cache many times over for properties nothing renders.
+            out["properties"] = list(_get(i, "PropertiesList", []) or [])
+        return out
 
     items = [_item(i) for i in (_get(d, "ItemList", []) or [])]
-    equipped = [_item(i) for i in (_get(d, "Equip_ItemList", []) or [])]
+    equipped = [_item(i, keep_props=True)
+                for i in (_get(d, "Equip_ItemList", []) or [])]
 
     return {
         "cdkey": cdkey,
@@ -141,7 +160,12 @@ def load_vault(vault: Path, cache_path: Path | None = None) -> list[dict]:
     cache: dict[str, dict] = {}
     if cache_path and cache_path.is_file():
         try:
-            cache = json.loads(cache_path.read_text(encoding="utf-8")).get("chars", {})
+            blob = json.loads(cache_path.read_text(encoding="utf-8"))
+            if blob.get("version") == _CACHE_VERSION:
+                cache = blob.get("chars", {})
+            else:
+                print(f"[vault] cache is v{blob.get('version')}, need "
+                      f"v{_CACHE_VERSION} — reparsing", file=sys.stderr)
         except (OSError, json.JSONDecodeError):
             cache = {}
 
@@ -166,11 +190,12 @@ def load_vault(vault: Path, cache_path: Path | None = None) -> list[dict]:
             fresh[ck] = rec
             chars.append(rec)
 
-    if cache_path is not None and parsed:
+    if cache_path is not None and (parsed or fresh != cache):
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(
-                json.dumps({"chars": fresh}, indent=1), encoding="utf-8"
+                json.dumps({"version": _CACHE_VERSION, "chars": fresh},
+                           indent=1), encoding="utf-8"
             )
         except OSError as exc:
             print(f"[warn] could not write bic cache: {exc}", file=sys.stderr)
