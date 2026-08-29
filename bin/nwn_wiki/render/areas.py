@@ -36,6 +36,10 @@ from nwn_wiki.render.stores import (
     _store_item_gp_stats,
     _store_opener_html,
 )
+from nwn_wiki.respawn import (STANDARD, encounter_respawn,
+                             encounter_respawn_label,
+                             module_has_se_respawn, placed_respawn,
+                             placed_respawn_label)
 
 
 def build_area_graph(db: "Db") -> dict[str, list[tuple[str, str, str, bool, bool]]]:
@@ -632,11 +636,11 @@ def _area_in_transition_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]
 
 
 def _area_npc_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
-    """NPC and hostile-resident tables, one row per creature placement."""
+    """NPC and hostile-resident tables, one row per distinct placement."""
     sections: list[str] = []
-    # NPCs / hostile residents — split by friendliness. Each row is one
-    # placement (instance), so we link the name to the per-instance page and
-    # separately surface the blueprint it was spawned from.
+    # NPCs / hostile residents — split by friendliness. Rows are placements
+    # (instances) rather than blueprints, so instance name and ScriptDeath
+    # overrides are what distinguish one row from the next.
     insts = db.area_creature_instances.get(resref, [])
     friendly, hostile = [], []
     for inst in insts:
@@ -644,11 +648,21 @@ def _area_npc_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
         fid = fld(c, "FactionID")
         (friendly if db.is_friendly(fid) else hostile).append(inst)
 
+    # Dropped entirely on the archive modules that have no SE respawn
+    # include -- the same gate the creature pages use.
+    show_respawn = module_has_se_respawn(db)
+
     def npc_table(rows_data: list[dict], heading: str) -> None:
         if not rows_data:
             return
         sections.append(f"<h2>{heading}</h2>")
-        rows = []
+        # Group placements that are identical in every displayed column,
+        # including respawn behaviour: an area holding twelve identical orcs
+        # is one row with a Count, but an instance that was renamed or that
+        # carries its own ScriptDeath override keeps its own row. The key
+        # includes can_rr and the display name, so every grouped row still
+        # shares one creature page and one label -- no link is lost.
+        groups: dict[tuple, int] = {}
         for inst in rows_data:
             c = inst["c"]
             idx = inst["idx"]
@@ -667,27 +681,42 @@ def _area_npc_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
             if not conv and bp:
                 conv = fld(bp, "Conversation", "") or ""
             can_rr = db.canonical_for_inst.get((resref, idx), rr)
-            name_cell = _creature_link(db, can_rr, ctx, disp)
-            bp_cell = (_creature_link(db, can_rr, ctx)
-                       if can_rr in db.canonical_creatures else
-                       (f"<code>{E(rr)}</code>" if rr else ""))
+            kind, secs = placed_respawn(db, c, bp, rr)
+            key = (can_rr, disp, rr, race_name(fld(c, "Race")), cls_str, hp, cr,
+                   db.faction_name(fld(c, "FactionID", "")), conv, kind, secs)
+            groups[key] = groups.get(key, 0) + 1
+        rows = []
+        for key, count in groups.items():
+            (can_rr, disp, rr, race, cls_str, hp, cr, faction, conv,
+             kind, secs) = key
+            respawn_cell = (f"<td>{E(placed_respawn_label(kind, secs))}</td>"
+                            if show_respawn else "")
             rows.append(
-                f"<tr><td>{name_cell}</td>"
+                f"<tr><td>{_creature_link(db, can_rr, ctx, disp)}</td>"
                 f"<td>{E(rr)}</td>"
-                f"<td>{E(race_name(fld(c, 'Race')))}</td>"
+                f"<td>{E(race)}</td>"
                 f"<td>{E(cls_str)}</td>"
                 f"<td>{E(hp)}</td>"
                 f"<td>{E(cr)}</td>"
-                f"<td>{E(db.faction_name(fld(c, 'FactionID', '')))}</td>"
-                f"<td>{_conv_link(db, conv, ctx)}</td></tr>"
+                f"<td>{E(faction)}</td>"
+                f"<td>{_conv_link(db, conv, ctx)}</td>"
+                f"{respawn_cell}<td>{count}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
             "<th>Name</th><th>ResRef</th>"
             "<th>Race</th><th>Class</th><th>HP</th><th>CR</th>"
             "<th>Faction</th><th>Conversation</th>"
-            "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
+            + ("<th>Respawn</th>" if show_respawn else "")
+            + "<th>Count</th>"
+            + "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
+        if show_respawn and any(k[9] == STANDARD for k in groups):
+            sections.append(
+                '<p class="muted">Respawned placements are re-created from the '
+                "blueprint, so any per-placement tweaks made in the area are "
+                "lost when they come back.</p>"
+            )
 
     npc_table(friendly, "NPCs")
     npc_table(hostile, "Hostile residents")
@@ -697,6 +726,13 @@ def _area_npc_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
 def _area_encounter_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
     """Encounter table, grouped by encounter blueprint resref."""
     sections: list[str] = []
+
+    def _enc_audience(e: dict, blueprint: dict) -> str:
+        """Who this placement spawns for — instance Faction wins, .ute is the
+        fallback (same precedence as MaxCreatures/DifficultyIndex below)."""
+        fid = fld(e, "Faction", fld(blueprint, "Faction", ""))
+        return db.encounter_trigger_audience(fid)
+
     # Encounters
     encs = db.area_encounters.get(resref, [])
     if encs:
@@ -726,28 +762,48 @@ def _area_encounter_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
                     "ename": ename, "max_c": max_c, "diff": diff,
                     "spawn_cells": spawn_cells,
                     "tags": [tag] if tag else [], "count": 1,
+                    # Faction is per placement (and can differ from the
+                    # blueprint's), and it is what decides who the encounter
+                    # spawns for at all — collect the distinct values.
+                    "audiences": [_enc_audience(e, blueprint)],
+                    # Grouped placements can disagree on ResetTime, so collect
+                    # the distinct values rather than showing only the first.
+                    "respawns": [encounter_respawn(e, blueprint)],
                 }
                 enc_order.append(rr)
             else:
                 enc_groups[rr]["count"] += 1
+                enc_groups[rr]["respawns"].append(
+                    encounter_respawn(e, db.encounters.get(rr, {})))
+                enc_groups[rr]["audiences"].append(
+                    _enc_audience(e, db.encounters.get(rr, {})))
                 if tag:
                     enc_groups[rr]["tags"].append(tag)
         rows = []
         for rr in enc_order:
             g = enc_groups[rr]
             tags_str = ", ".join(E(t) for t in g["tags"]) if g["tags"] else ""
+            audience_str = ", ".join(sorted(set(g["audiences"])))
+            respawn_str = ", ".join(
+                encounter_respawn_label(v)
+                for v in sorted(set(g["respawns"]),
+                                key=lambda v: -(v or 0))
+            )
             rows.append(
                 f"<tr><td>{nwn_html(g['ename'])}</td>"
                 f"<td>{E(rr)}</td>"
                 f"<td>{tags_str}</td>"
                 f"<td>{E(g['max_c'])}</td>"
                 f"<td>{E(g['diff'])}</td>"
+                f"<td>{E(audience_str)}</td>"
+                f"<td>{E(respawn_str)}</td>"
                 f"<td>{', '.join(g['spawn_cells']) if g['spawn_cells'] else '—'}</td>"
                 f"<td>{g['count']}</td></tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
-            "<th>Name</th><th>ResRef</th><th>Tag</th><th>Max</th><th>Diff</th><th>Spawn pool</th><th>Count</th>"
+            "<th>Name</th><th>ResRef</th><th>Tag</th><th>Max</th><th>Diff</th>"
+            "<th>Triggers for</th><th>Respawn</th><th>Spawn pool</th><th>Count</th>"
             "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
         )
     return sections
@@ -761,6 +817,9 @@ def _area_script_spawn_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
     script_spawns = db.area_script_spawns.get(resref, [])
     if script_spawns:
         sections.append("<h2>Script-spawned NPCs</h2>")
+        # There is no GIT instance to override anything, so respawn is read
+        # from the blueprint alone.
+        show_respawn = module_has_se_respawn(db)
         ss_rows = []
         seen_ss: set[str] = set()
         for sp in script_spawns:
@@ -779,6 +838,12 @@ def _area_script_spawn_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
             hp2 = _eff_hp2 if _eff_hp2 is not None else ""
             cr2 = fld(bp2, "ChallengeRating", "")
             conv2 = fld(bp2, "Conversation", "")
+            # `bp2 or None`: placed_respawn guards its blueprint reads with
+            # `if bp`, so a falsy {} would skip the Tag read that drives the
+            # "NSP" never-respawns short-circuit.
+            kind2, secs2 = placed_respawn(db, {}, bp2 or None, sp["bp_rr"])
+            respawn_cell2 = (f"<td>{E(placed_respawn_label(kind2, secs2))}</td>"
+                             if show_respawn else "")
             ss_rows.append(
                 f"<tr><td>{_creature_link(db, can_rr2, ctx, name2)}</td>"
                 f"<td><code>{E(sp['bp_rr'])}</code></td>"
@@ -786,13 +851,15 @@ def _area_script_spawn_sections(db: Db, resref: str, ctx: PageCtx) -> list[str]:
                 f"<td>{E(cls_str2)}</td>"
                 f"<td>{E(hp2)}</td>"
                 f"<td>{E(cr2)}</td>"
-                f"<td>{_conv_link(db, conv2, ctx)}</td></tr>"
+                f"<td>{_conv_link(db, conv2, ctx)}</td>"
+                f"{respawn_cell2}</tr>"
             )
         sections.append(
             '<table class="data"><thead><tr>'
             "<th>Name</th><th>ResRef</th><th>Race</th><th>Class</th>"
             "<th>HP</th><th>CR</th><th>Conversation</th>"
-            "</tr></thead><tbody>" + "\n".join(ss_rows) + "</tbody></table>"
+            + ("<th>Respawn</th>" if show_respawn else "")
+            + "</tr></thead><tbody>" + "\n".join(ss_rows) + "</tbody></table>"
         )
     return sections
 

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from nwn_wiki import state
-from nwn_wiki.gff import fld
+from nwn_wiki.gff import fld, list_items
 from nwn_wiki.htmlgen.escape import nwn_text
 from nwn_wiki.items import item_gp_value
 from nwn_wiki.lookups import appearance_name, baseitem_name, race_name
@@ -328,6 +328,10 @@ def _write_creature_index(
                 "kind": l["kind"],
                 "count": l["count"],
                 **({"encounter_resref": l["enc_rr"]} if l.get("enc_rr") else {}),
+                **({"respawn_kind": l["respawn_kind"]}
+                   if l.get("respawn_kind") else {}),
+                **({"respawn_seconds": l["respawn_seconds"]}
+                   if l.get("respawn_seconds") else {}),
             }
             for l in locs
         ]
@@ -839,6 +843,107 @@ def _write_unspawned_creatures(
     state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: unspawned_creatures.json ({len(unspawned)} blueprint(s))"))
 
 
+# ---------------------------------------------------- allegiance_gated_encounters.json
+def _write_allegiance_gated_encounters(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+    _au,
+) -> None:
+    """Encounter placements that do NOT spawn for every player.
+
+    A NWN encounter only fires for creatures its own faction treats as enemies,
+    so an encounter tagged with one of the module's allegiance factions
+    (Good/Evil) stops spawning for players who took that side at the Well of Eru
+    orbs — those orbs make the chosen side friendly to you (faction_db.nss ::
+    Faction_ApplyLive). Nothing in the encounter's scripts says so; it is the
+    FactionID alone.
+    """
+    gated: list[dict] = []
+    gated_creatures: dict[str, set] = defaultdict(set)   # bp resref → area resrefs (gated)
+    open_creatures: set = set()                          # bp resrefs from ungated encounters
+    for area_rr in sorted(db.area_encounters):
+        for e in db.area_encounters[area_rr]:
+            rr = fld(e, "TemplateResRef", "") or ""
+            blueprint = db.encounters.get(rr, {})
+            fid = fld(e, "Faction", fld(blueprint, "Faction", ""))
+            audience = db.encounter_trigger_audience(fid)
+            spawns = list_items(e.get("CreatureList")) or list_items(blueprint.get("CreatureList"))
+            bp_rrs = [fld(s, "ResRef", "") or "" for s in spawns]
+            if audience == "Everyone":
+                open_creatures.update(r for r in bp_rrs if r)
+                continue
+            for r in bp_rrs:
+                if r:
+                    gated_creatures[r].add(area_rr)
+            gated.append({
+                "area": area_rr,
+                "area_name": nwn_text(db.area_name(area_rr)),
+                "area_url": _au(area_rr),
+                "hidden": area_rr in db.hidden_areas,
+                "encounter_resref": rr,
+                "tag": fld(e, "Tag", "") or "",
+                "faction_id": _try_int(fid),
+                "faction": db.faction_name(fid),
+                "triggers_for": audience,
+                "spawn_pool": [
+                    {
+                        "resref": r,
+                        "name": nwn_text(db.creature_name(r)),
+                        "wiki_url": (_cu(db.canonical_for_bp.get(r, r))
+                                     if db.canonical_for_bp.get(r, r) in db.canonical_creatures
+                                     else ""),
+                    }
+                    for r in bp_rrs if r
+                ],
+            })
+
+    # Creatures that only ever appear in gated encounters — i.e. a player on the
+    # matching allegiance never meets them at all.
+    placed_bps = {
+        fld(inst["c"], "TemplateResRef", "") or ""
+        for insts in db.area_creature_instances.values()
+        for inst in insts
+    }
+    only_gated = sorted(
+        (
+            {
+                "resref": r,
+                "name": nwn_text(db.creature_name(r)),
+                "areas": sorted(areas),
+            }
+            for r, areas in gated_creatures.items()
+            if r not in open_creatures and r not in placed_bps
+        ),
+        key=lambda c: c["name"].lower(),
+    )
+    by_audience: dict[str, int] = defaultdict(int)
+    for g in gated:
+        by_audience[g["triggers_for"]] += 1
+
+    _write_json(module_index_dir / "allegiance_gated_encounters.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(gated),
+        "summary": (
+            f"{len(gated)} encounter placement(s) do not spawn for every player: a NWN "
+            f"encounter only fires for creatures its own FactionID treats as enemies, so "
+            f"an encounter tagged with an allegiance faction (Good/Evil) stops spawning "
+            f"for players who took that side at the Well of Eru orbs. "
+            f"{len(only_gated)} creature blueprint(s) appear ONLY in these encounters, so "
+            f"a player on the matching allegiance never meets them."
+            if gated else
+            "Every encounter placement spawns for every player."
+        ),
+        "placements_by_audience": dict(sorted(by_audience.items())),
+        "creatures_only_behind_gated_encounters": only_gated,
+        "placements": gated,
+    })
+    state._module_index_summary.append(("info", f"[nwn-wiki] module-index: allegiance_gated_encounters.json ({len(gated)} placement(s))"))
+
+
 # -------------------------------------------------------- instance_only_conversations.json
 def _write_instance_only_conversations(
     db: "Db",
@@ -931,6 +1036,7 @@ def generate_module_index(
       inaccessible_items.json            — items not reachable by players
       unspawned_creatures.json           — creature blueprints never placed or in an encounter
       instance_only_conversations.json   — creature instances with Conversation overrides not on the blueprint
+      allegiance_gated_encounters.json   — encounters suppressed by a Well-of-Eru allegiance
     """
     module_index_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now().isoformat(timespec="seconds")
@@ -951,4 +1057,5 @@ def generate_module_index(
     _write_faction_bp_instance_discrepancies(db, module_index_dir, module_title, now, _cu, _au)
     _write_inaccessible_items(db, module_index_dir, module_title, now, _cu, _iu)
     _write_unspawned_creatures(db, module_index_dir, module_title, now, _cu)
+    _write_allegiance_gated_encounters(db, module_index_dir, module_title, now, _cu, _au)
     _write_instance_only_conversations(db, module_index_dir, module_title, now, _cu, _au)

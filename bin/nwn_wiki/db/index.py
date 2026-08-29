@@ -30,6 +30,7 @@ from nwn_wiki.gff import (
     loc,
 )
 from nwn_wiki.itemprops import _creature_key
+from nwn_wiki.respawn import encounter_respawn, placed_respawn
 
 
 def _store_instance_slug(area_rr: str, inst: dict) -> str:
@@ -78,6 +79,45 @@ class DbIndexMixin:
                     self.faction_friendly[f2] = (v >= 50)
                 elif f2 == 0 and isinstance(f1, int):
                     self.faction_friendly[f1] = (v >= 50)
+
+        # Reputation TOWARD the PC faction, which is what decides whether a
+        # faction's creatures (and its encounters) treat a player as an enemy.
+        # RepList rows are directional: row (FactionID1=A, FactionID2=B, v)
+        # records B's reputation toward A, so the rows to read here are the ones
+        # with FactionID1 == 0. In stock and module repute.fac alike, Hostile's
+        # rep toward the PC is 0 — which is what makes ordinary Hostile-faction
+        # encounters fire for everybody.
+        self.faction_rep_toward_pc = {}
+        for rep in list_items((self.fac or {}).get("RepList")):
+            if fld(rep, "FactionID1") == 0:
+                f2 = fld(rep, "FactionID2")
+                if isinstance(f2, int):
+                    self.faction_rep_toward_pc[f2] = fld(rep, "FactionRep", 0) or 0
+
+        # Allegiance sides. The module runs a Good-vs-Evil player allegiance
+        # (faction_db.nss): the Well of Eru orbs AdjustReputation the PC against
+        # invisible anchor placeables tagged Goodfaction / Evilfaction /
+        # Neutralfaction — AdjustReputation moves how the ANCHOR's faction feels
+        # about that player, so taking a side makes that side friendly to you
+        # (+1000) and leaves the other hostile. Both sides start hostile to
+        # everyone, so an encounter tagged Good or Evil fires for every player
+        # EXCEPT those who took its side.
+        for i, f in enumerate(list_items((self.fac or {}).get("FactionList"))):
+            name = (fld(f, "FactionName", "") or "").strip()
+            if name.lower() in ("good", "evil", "neutral"):
+                self.allegiance_sides[i] = name.capitalize()
+        anchor_tags = {"goodfaction": "Good", "evilfaction": "Evil",
+                       "neutralfaction": "Neutral"}
+        for git in self.gits.values():
+            for p in list_items(git.get("Placeable List")):
+                side = anchor_tags.get((fld(p, "Tag", "") or "").lower())
+                if not side:
+                    continue
+                fid = fld(p, "Faction")
+                try:
+                    self.allegiance_anchored.add(int(fid))
+                except (TypeError, ValueError):
+                    continue
 
     def _index_area_objects(self) -> None:
         # Waypoint tag → area resref. Walk every git's WaypointList.
@@ -240,12 +280,17 @@ class DbIndexMixin:
                 blueprint = self.encounters.get(rr, {})
                 spawns = (list_items(e.get("CreatureList"))
                           or list_items(blueprint.get("CreatureList")))
+                # Respawn period is a property of this placement, not of the
+                # encounter blueprint: two placements of the same .ute in one
+                # area routinely carry different ResetTimes.
+                respawn = encounter_respawn(e, blueprint)
                 for s in spawns:
                     crr = fld(s, "ResRef", "") or ""
                     if crr:
                         self.creature_encounter_spawns[crr].append(
                             {"area": area_resref, "encounter_resref": rr,
-                             "cr": fld(s, "CR"), "appearance": fld(s, "Appearance")}
+                             "cr": fld(s, "CR"), "appearance": fld(s, "Appearance"),
+                             "respawn_seconds": respawn}
                         )
 
     def _index_hidden_areas(self) -> None:
@@ -321,11 +366,16 @@ class DbIndexMixin:
                 if area_rr in self.hidden_areas:
                     continue
                 enc_rr = sp["encounter_resref"]
-                agg_key = (can_rr, area_rr, enc_rr)
+                # Respawn is part of the key: placements of the same encounter
+                # in one area with different ResetTimes are different answers
+                # to "how long until it's back" and must not collapse together.
+                agg_key = (can_rr, area_rr, enc_rr, sp.get("respawn_seconds"))
                 _enc_agg[agg_key] = _enc_agg.get(agg_key, 0) + 1
-        for (can_rr, area_rr, enc_rr), count in _enc_agg.items():
+        for (can_rr, area_rr, enc_rr, respawn), count in _enc_agg.items():
             self.canonical_locations[can_rr].append(
-                {"area": area_rr, "kind": "encounter", "enc_rr": enc_rr, "count": count}
+                {"area": area_rr, "kind": "encounter", "enc_rr": enc_rr,
+                 "count": count, "respawn_kind": "encounter",
+                 "respawn_seconds": respawn}
             )
 
         # Pass 4: canonical_locations from direct placements.
@@ -336,7 +386,14 @@ class DbIndexMixin:
             for inst in insts:
                 can_rr = self.canonical_for_inst.get((area_rr, inst["idx"]))
                 if can_rr:
-                    agg_key = (can_rr, area_rr)
+                    # Placements in one area can disagree (one blueprint's
+                    # instances may carry different ScriptDeath overrides), so
+                    # respawn is part of the key and each behaviour gets a row.
+                    # db.creatures is keyed by the lower-cased file stem.
+                    bp_rr = (fld(inst["c"], "TemplateResRef", "") or "").lower()
+                    kind, secs = placed_respawn(
+                        self, inst["c"], self.creatures.get(bp_rr), bp_rr)
+                    agg_key = (can_rr, area_rr, kind, secs)
                     _placed_agg[agg_key] = _placed_agg.get(agg_key, 0) + 1
                     raw_fid = fld(inst["c"], "FactionID")
                     if raw_fid is not None and raw_fid != "":
@@ -344,9 +401,10 @@ class DbIndexMixin:
                             self.canonical_inst_factions[can_rr].add(int(raw_fid))
                         except (TypeError, ValueError):
                             pass
-        for (can_rr, area_rr), count in _placed_agg.items():
+        for (can_rr, area_rr, kind, secs), count in _placed_agg.items():
             self.canonical_locations[can_rr].append(
-                {"area": area_rr, "kind": "placed", "enc_rr": None, "count": count}
+                {"area": area_rr, "kind": "placed", "enc_rr": None, "count": count,
+                 "respawn_kind": kind, "respawn_seconds": secs}
             )
         # ---- End canonical creature index ----------------------------------
 

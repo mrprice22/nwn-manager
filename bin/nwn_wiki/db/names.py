@@ -81,6 +81,34 @@ class DbNamesMixin:
             return nwn_text(name) if name else str(i)
         return str(i)
 
+    def encounter_trigger_audience(self, faction_id) -> str:
+        """Which players an encounter with this faction actually spawns for.
+
+        A NWN encounter only fires for creatures its own faction treats as
+        enemies, so the encounter's FactionID — not any script — decides who
+        sees it. Most encounters are faction Hostile, which is hostile to every
+        player, so they fire for everyone. The module also tags encounters with
+        its Good and Evil allegiance factions: those start hostile to everyone
+        too, but taking that side at the Well of Eru orbs makes them friendly to
+        you (faction_db.nss :: Faction_ApplyLive), so they stop spawning for
+        their own side. Returns "" when the faction can't be resolved.
+        """
+        if faction_id is None or faction_id == "":
+            return ""
+        try:
+            fid = int(faction_id)
+        except (TypeError, ValueError):
+            return ""
+        # Reputation band: 0-10 hostile (an encounter fires), 11+ not an enemy.
+        rep = self.faction_rep_toward_pc.get(fid)
+        hostile_by_default = (rep is not None and rep <= 10) or fid == 1
+        side = self.allegiance_sides.get(fid)
+        if side and fid in self.allegiance_anchored and hostile_by_default:
+            return f"Everyone except {side}-allegiance players"
+        if hostile_by_default:
+            return "Everyone"
+        return f"No one ({self.faction_name(fid)} is not hostile to players)"
+
     def creature_instance_name(self, area: str, idx: int) -> str:
         """Display name for a creature INSTANCE (uses overridden FirstName/
         LastName on the placement, falling back to the blueprint's name)."""

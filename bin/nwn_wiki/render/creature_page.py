@@ -76,6 +76,8 @@ from nwn_wiki.lookups import (
 )
 from nwn_wiki.render.creatures import _bp_field, _pic_figures, creature_max_hp
 from nwn_wiki.render.stores import _creature_store_section
+from nwn_wiki.respawn import (NONE, STANDARD, encounter_respawn_label,
+                              module_has_se_respawn, placed_respawn_label)
 from nwn_wiki.sim.combat import attack_profile
 from nwn_wiki.util import _try_int
 
@@ -1694,46 +1696,65 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
     if placed_locs or enc_locs or script_locs:
         sections.append("<h2>Where to find</h2>")
         if placed_locs:
-            # Aggregate by area
-            placed_by_area: dict[str, int] = {}
+            # One row per (area, respawn behaviour): instances of one blueprint
+            # in a single area can carry different ScriptDeath overrides, and
+            # "3 of these 5 come back" is the answer players actually need.
+            show_respawn = module_has_se_respawn(db)
+            placed_by_key: dict[tuple, int] = {}
             for l in placed_locs:
-                placed_by_area[l["area"]] = placed_by_area.get(l["area"], 0) + l["count"]
+                k = (l["area"], l.get("respawn_kind", NONE), l.get("respawn_seconds"))
+                placed_by_key[k] = placed_by_key.get(k, 0) + l["count"]
             place_rows = []
-            for area_rr in sorted(placed_by_area.keys(),
-                                  key=lambda r: db.area_name(r).lower()):
-                cnt = placed_by_area[area_rr]
+            # Live timers first within an area, longest-lived answer last.
+            for (area_rr, kind, secs) in sorted(
+                placed_by_key.keys(),
+                key=lambda k: (db.area_name(k[0]).lower(), -(k[2] or 0), k[1]),
+            ):
+                cnt = placed_by_key[(area_rr, kind, secs)]
+                respawn_cell = (f"<td>{E(placed_respawn_label(kind, secs))}</td>"
+                                if show_respawn else "")
                 place_rows.append(
                     f"<tr><td>{_area_link(db, area_rr, ctx)}</td>"
-                    f"<td>{cnt}</td></tr>"
+                    f"<td>{cnt}</td>{respawn_cell}</tr>"
                 )
             sections.append(
                 "<h3>Placed directly</h3>"
                 '<table class="data"><thead><tr>'
                 "<th>Area</th><th>Count</th>"
-                "</tr></thead><tbody>" + "\n".join(place_rows) + "</tbody></table>"
+                + ("<th>Respawn</th>" if show_respawn else "")
+                + "</tr></thead><tbody>" + "\n".join(place_rows) + "</tbody></table>"
             )
+            if show_respawn and any(k[1] == STANDARD for k in placed_by_key):
+                sections.append(
+                    '<p class="muted">Respawned placements are re-created from the '
+                    "blueprint, so any per-placement tweaks made in the area are "
+                    "lost when they come back.</p>"
+                )
         if enc_locs:
-            # Aggregate by (area, enc_rr)
-            enc_by_key: dict[tuple[str, str], int] = {}
+            # Aggregate by (area, enc_rr, respawn) — two placements of
+            # one encounter in an area may reset on different timers.
+            enc_by_key: dict[tuple[str, str, object], int] = {}
             for l in enc_locs:
-                k = (l["area"], l["enc_rr"] or "")
+                k = (l["area"], l["enc_rr"] or "", l.get("respawn_seconds"))
                 enc_by_key[k] = enc_by_key.get(k, 0) + l["count"]
             enc_rows = []
-            for (area_rr, enc_rr) in sorted(
+            for (area_rr, enc_rr, secs) in sorted(
                 enc_by_key.keys(),
-                key=lambda k: (db.area_name(k[0]).lower(), k[1]),
+                key=lambda k: (db.area_name(k[0]).lower(), k[1], -(k[2] or 0)),
             ):
                 blueprint = db.encounters.get(enc_rr, {})
                 ename = loc(blueprint.get("LocalizedName")) or enc_rr or "(unnamed)"
                 enc_rows.append(
                     f"<tr><td>{_area_link(db, area_rr, ctx)}</td>"
                     f"<td>{nwn_html(ename)}</td>"
-                    f"<td><code>{E(enc_rr)}</code></td></tr>"
+                    f"<td><code>{E(enc_rr)}</code></td>"
+                    f"<td>{E(encounter_respawn_label(secs))}</td></tr>"
                 )
             sections.append(
                 "<h3>Encounter pools</h3>"
                 '<table class="data"><thead><tr>'
                 "<th>Area</th><th>Encounter</th><th>Encounter ResRef</th>"
+                "<th>Respawn</th>"
                 "</tr></thead><tbody>" + "\n".join(enc_rows) + "</tbody></table>"
             )
         if script_locs:

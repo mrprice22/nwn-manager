@@ -20,7 +20,9 @@ from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _area_link, link
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.lookups import class_name, race_name
-from nwn_wiki.util import _try_float
+from nwn_wiki.respawn import (boss_reset_seconds, boss_respawn_seconds,
+                               format_respawn)
+from nwn_wiki.util import _try_float, _try_int
 from nwn_wiki.warn import _warn_once
 
 from nwn_wiki import state
@@ -276,12 +278,54 @@ def load_boss_registry_from_src(src: Path) -> None:
     _load_boss_registry_from_path(Path(src) / "brd_db.nss")
 
 
+def _boss_timing_note(db: Db) -> str:
+    """The "every boss respawns in N" paragraph that replaces the per-row
+    Respawn column — or "" when the module cannot make that promise.
+
+    Returned empty (and the column kept) unless the module has a boss_tune.nss
+    naming BOSS_RESPAWN_SECONDS *and* every seeded registry row agrees with it.
+    The archive forks have neither; a module mid-retune has the constant but
+    stale rows, and would otherwise advertise a number its board contradicts.
+    """
+    want = boss_respawn_seconds(db)
+    if not want:
+        return ""
+    seeded = {_try_int(b.get("respawn")) for b in state._BOSS_REGISTRY}
+    if seeded != {want}:
+        return ""
+
+    reset = boss_reset_seconds(db)
+    reset_txt = ""
+    if reset:
+        reset_txt = (
+            " Damage a boss and then walk away and it does not simply stay "
+            f"wounded: after <strong>{E(format_respawn(reset))}</strong> with "
+            "nobody fighting it, it fully resets — every "
+            '<a href="../manual/Customizations.html#boss-enrage">enrage</a> '
+            "stack stripped, back to full health, back at its lair, and "
+            "anything taken from it restored. Landing a hit restarts that "
+            "clock."
+        )
+    return (
+        f"<p><strong>Every boss on this list respawns "
+        f"{E(format_respawn(want))} after it is killed</strong> — the same "
+        "timer for all of them, shown as a live countdown on the in-game "
+        "board. (A boss whose lair is an encounter becomes eligible then and "
+        f"returns when the lair next triggers.){reset_txt}</p>"
+    )
+
+
 def render_bosses_index(db: Db, out: Path) -> None:
     """creatures/bosses.html — every boss tracked by the in-game Roll of the
-    Fallen board, same columns as the creatures index, sorted by CR desc."""
+    Fallen board, same columns as the creatures index, sorted by CR desc.
+
+    Respawn is stated once above the table rather than per row: the module puts
+    every boss on one timer (boss_tune.nss). See _boss_timing_note."""
     if not state._BOSS_REGISTRY:
         return
     ctx = PageCtx("creatures/bosses.html")
+    timing_note = _boss_timing_note(db)
+    per_boss_respawn = not timing_note   # one shared timer -> no Respawn column
     rows = []
     for boss in sorted(state._BOSS_REGISTRY, key=lambda b: (-b["cr"], b["name"].lower())):
         rr = boss["resref"]
@@ -307,11 +351,23 @@ def render_bosses_index(db: Db, out: Path) -> None:
         # leveled Xanith .utcs all count as one boss on the board).
         variant_rrs = [rr] + [v for v, canon in state._BOSS_ALIASES.items()
                               if canon == rr]
+        # No per-boss Respawn column: every tracked boss shares one timer, so
+        # it is stated once above the table (see _boss_timing_note). A module
+        # whose bosses DON'T all share a timer keeps the column.
+        tail = _faction_cell(db, c, bp)
+        if per_boss_respawn:
+            respawn_txt = format_respawn(_try_int(boss.get("respawn")))
+            # spawn_type decides what the number means: a placed boss returns
+            # exactly this long after death, an encounter boss only becomes
+            # eligible then and returns when its lair encounter next triggers.
+            if boss.get("type") == "encounter" and respawn_txt != "—":
+                respawn_txt += " (then on next trigger)"
+            tail += f"<td>{E(respawn_txt)}</td>"
         rows.append(_creature_row(
             name_cell, c, bp,
             after_name=f"<td>{lair_cell}</td>",
             cr_default=boss["cr"],
-            tail=_faction_cell(db, c, bp) + _kills_cells(variant_rrs),
+            tail=tail + _kills_cells(variant_rrs),
         ))
     n = len(state._BOSS_REGISTRY)
     body = (
@@ -320,12 +376,14 @@ def render_bosses_index(db: Db, out: Path) -> None:
         '<a href="../manual/Customizations.html#boss-respawn-tracker">Roll of the '
         "Fallen</a> board in the Well of Eru. This list is generated from the same "
         "registry the game loads, so it always matches the in-game board.</p>"
+        + timing_note +
         "<p>Think a boss is missing and should be tracked? Suggest it on Discord "
         "or via the roadmap so it can be considered for the list.</p>"
         '<table class="data"><thead><tr>'
         "<th>Name</th><th>Lair</th><th>Race</th><th>Class</th>"
         "<th>HP</th><th>CR</th><th>Faction</th>"
-        f"{_kills_head()}"
+        + ("<th>Respawn</th>" if per_boss_respawn else "")
+        + f"{_kills_head()}"
         "</tr></thead><tbody>" + "\n".join(rows) + "</tbody></table>"
     )
     write_page(out, ctx, "Bosses", body)

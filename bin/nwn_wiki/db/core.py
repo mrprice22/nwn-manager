@@ -135,6 +135,18 @@ class DbCore:
     # alongside direct GIT placements.
     creature_encounter_spawns: dict[str, list[dict]] = _index(list)
     faction_friendly: dict[int, bool] = _new(dict)  # FactionID → friendly to PC?
+    # FactionID → that faction's reputation TOWARD the PC faction (0-100, from
+    # repute.fac's RepList). <= 10 means its creatures and encounters treat an
+    # untouched player as an enemy.
+    faction_rep_toward_pc: dict[int, int] = _new(dict)
+    # Good/Evil allegiance sides (the Well of Eru orbs). FactionID → side name
+    # ("Good"/"Evil"/"Neutral") for every faction the module treats as a player
+    # allegiance, and the subset of those that actually have an invisible anchor
+    # placeable (tagged Goodfaction/Evilfaction/Neutralfaction) placed in a GIT.
+    # Taking a side at an anchor makes that side friendly to you, which is what
+    # suppresses its encounters. See encounter_trigger_audience().
+    allegiance_sides: dict[int, str] = _new(dict)
+    allegiance_anchored: set = field(default_factory=set)
 
     # nss script index (resref → relative path) — used for "this script
     # exists" checks; not deep parsed.
@@ -307,7 +319,11 @@ class DbCore:
     canonical_bp_of: dict[str, str] = _new(dict)
     # internal: blueprint_rr → {creature_key_tuple → canonical_rr}
     _creature_key_registry: dict[str, dict[tuple, str]] = _new(dict)
-    # canonical_rr → [{"area", "kind": "placed"|"encounter"|"script", "enc_rr", "count"}]
+    # canonical_rr → [{"area", "kind": "placed"|"encounter"|"script", "enc_rr",
+    #                  "count", "respawn_kind", "respawn_seconds"}]
+    # Respawn is per-location, not per-creature: the same blueprint can be a
+    # never-respawning placement in one area and a 60s encounter spawn in the
+    # next, so it is part of the aggregation key (see _index_canonical_locations).
     canonical_locations: dict[str, list[dict]] = _index(list)
     # canonical_rr → set of FactionIDs seen across its placed GIT instances
     canonical_inst_factions: dict[str, set[int]] = _index(set)
