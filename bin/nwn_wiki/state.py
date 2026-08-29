@@ -56,6 +56,21 @@ _BESTIARY_KILLS: dict[str, dict] = {}  # canonical resref -> {"total","solo","pa
 _BESTIARY_TOP: dict[str, list[dict]] = {}
 _SERVER_FIRSTS: list[dict] = []        # [{"resref","cr","name","cname","at"}]
 
+# Player characters, from the servervault + kill ledger + session history (see
+# nwn_wiki.players.model.build_records). Empty unless the build was given a
+# --vault-dir, which is what keeps the Players section out of the archived
+# forks that never had a server behind them.
+#   [{"name","player","slug","level","class_line","kills_total", ...}]
+# Records carry a "_cdkey" join key that is INTERNAL ONLY -- like uuid above, it
+# is account credentials and must never be rendered into HTML.
+_CHARACTERS: list[dict] = []
+
+# URL the Who's Online page polls for the live roster, from --online-api. Empty
+# on every realm that does not run the status pusher (archived seasons, the
+# forks, and the dev realm until it is switched on for testing), which is what
+# keeps the page and its nav entry from existing there at all.
+_ONLINE_API: str = ""
+
 # Boss respawn tracker ("Roll of the Fallen") registry, parsed from the module's
 # brd_db.nss BRD_SeedBoss(...) seed rows by load_boss_registry(). Single source
 # of truth shared with the in-game Well of Eru board — the wiki Bosses page is

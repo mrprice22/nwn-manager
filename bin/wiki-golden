@@ -103,6 +103,27 @@ CORPORA: dict[str, dict] = {
         # relative to the corpus root; passed as an absolute path
         "twoda_dir": "hak_2da",
     },
+    "homers_lotr_s2": {
+        # SEASON_ROLE=live -- the season players are actually on. Its args mirror
+        # bin/refresh-homers-lotr-wiki in that repo, NOT the dev corpus above:
+        # the dev realm carries --max-player-level / --devcrit-bonus-dice that
+        # the live season does not, and a different base URL.
+        #
+        # Safe to point at a live realm: the gate reflink-copies the corpus into
+        # .golden/work and builds entirely in there, and it passes no --log-dir
+        # or --db-dir -- so players logging in while a build runs cannot move the
+        # output. What DOES move it is ordinary module development in unpacked/.
+        "root": GIT_ROOT / "nwn_homers_lotr_s2",
+        "args": [
+            "--base-url", "https://homerslotr.com/",       # SEASON_WIKI_URL
+            "--exclude-conv-option", "[Admin Options]",
+            "--exclude-conv-option", "[Options of the Homeless]",
+            "--max-character-level", "60",                 # NWN_MAXLEVEL
+            "--max-ability-bonus", "24",                   # NWN_MAX_ABILITY_BONUS
+            "--path-from", "thewelloferu",
+        ],
+        "twoda_dir": "hak_2da",
+    },
     "lotr2008": {
         "root": GIT_ROOT / "nwn_lordoftherings",
         "args": [

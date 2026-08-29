@@ -86,10 +86,16 @@ from nwn_wiki.render.conversations import (
     render_conversation_page,
     render_conversations_index,
 )
+from nwn_wiki.render.characters import (
+    render_character_index,
+    render_character_pages,
+    render_online_page,
+)
 from nwn_wiki.render.creature_page import (
     render_creature_page,
     render_creatures_search,
 )
+from nwn_wiki.render.leaderboards import render_leaderboards
 from nwn_wiki.render.creatures import (
     load_boss_registry,
     load_boss_registry_from_src,  # re-export: poked as wiki.load_boss_registry_from_src
@@ -277,6 +283,31 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "the server's database/ dir, which usually differs from "
                          "--log-dir. If omitted, falls back to <log-dir>/database "
                          "when that is a real directory.")
+    ap.add_argument("--vault-dir", default=None, dest="vault_dir", metavar="DIR",
+                    help="Server vault directory (servervault/<CDKEY>/*.bic). When "
+                         "given, the build renders the Players section: the "
+                         "character index, a page per character and the "
+                         "leaderboards. Omit for modules with no server behind "
+                         "them -- the whole section, including its nav entry, is "
+                         "then absent rather than empty.")
+    ap.add_argument("--vault-cache", default=None, dest="vault_cache", metavar="PATH",
+                    help="JSON cache of parsed .bic files, keyed by path+mtime+size. "
+                         "Defaults to vault-characters.json beside --activity-cache. "
+                         "Parsing a full vault costs ~18s cold and ~0.3s warm, so "
+                         "this is what keeps the on-empty refresh cheap.")
+    ap.add_argument("--players-snapshot", default=None, dest="players_snapshot",
+                    metavar="PATH",
+                    help="Frozen character records, for archived seasons. After a "
+                         "build with a live vault this file is (re)written; when "
+                         "the vault is gone it is read INSTEAD, so a finished "
+                         "season's pages stay rebuildable after its NWN_HOME_DIR "
+                         "is cleaned. Commit it: CD keys are stripped on write.")
+    ap.add_argument("--online-api", default="", dest="online_api", metavar="URL",
+                    help="URL the Who's Online page polls for the live roster "
+                         "(e.g. /api/online). Set only on the realm whose worker "
+                         "serves that route; without it the page and its nav "
+                         "entry are not rendered at all, which is how archived "
+                         "seasons and the forks stay fully static.")
     ap.add_argument("--activity-cache", default=None, dest="activity_cache",
                     metavar="PATH",
                     help="JSON file for persisting player-session data across log "
@@ -696,6 +727,112 @@ def _load_bestiary(db: Db, args: argparse.Namespace, activity: dict | None) -> N
                   "(set --db-dir); skipping kill stats", file=sys.stderr)
 
 
+def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
+    """Parse the server vault and build the character records.
+
+    No vault means no Players section: modules with no server behind them (the
+    2009 and lordoftherings forks) pass no --vault-dir, and every page and nav
+    entry below is gated on state._CHARACTERS being non-empty.
+
+    Kills and the creature catalogue come from the same campaign DB the bestiary
+    already reads, and sessions from the same cache the activity page maintains,
+    so the Players pages can never disagree with Top Killers or Player Activity.
+    """
+    # Independent of the vault: a realm can serve a live roster without having
+    # its character pages built, and vice versa.
+    state._ONLINE_API = args.online_api or ""
+
+    from nwn_wiki.players import bicreader, identity, model, sources
+
+    snapshot = (Path(args.players_snapshot).expanduser()
+                if args.players_snapshot else None)
+
+    if not args.vault_dir:
+        # No live vault. An archived season still has pages to render if a
+        # previous build froze its records; anything else genuinely has no
+        # Players section.
+        if snapshot and snapshot.is_file():
+            state._CHARACTERS = model.load_snapshot(snapshot)
+            print(f"[nwn-wiki] players: {len(state._CHARACTERS)} character(s) "
+                  f"from the frozen snapshot {snapshot}")
+        return
+
+    vault = Path(args.vault_dir).expanduser()
+    if not vault.is_dir():
+        if snapshot and snapshot.is_file():
+            state._CHARACTERS = model.load_snapshot(snapshot)
+            print(f"[nwn-wiki] players: --vault-dir {vault} is gone; rendering "
+                  f"{len(state._CHARACTERS)} character(s) from {snapshot}",
+                  file=sys.stderr)
+        else:
+            print(f"[nwn-wiki] warn: --vault-dir {vault} is not a directory; "
+                  "skipping the Players section", file=sys.stderr)
+        return
+
+    # Must resolve to the SAME file nwn-wiki-activity picks, or the full build
+    # and the on-empty refresh each pay the ~18s cold parse instead of sharing
+    # one warm cache. Both derive it from the activity cache, whose own default
+    # is <first log-dir>/activity-sessions.json.
+    if args.vault_cache:
+        cache_path = Path(args.vault_cache).expanduser()
+    elif args.activity_cache:
+        cache_path = Path(args.activity_cache).expanduser().with_name(
+            "vault-characters.json")
+    elif args.log_dirs:
+        cache_path = Path(args.log_dirs[0]).expanduser() / "vault-characters.json"
+    else:
+        cache_path = vault.parent / "vault-characters.json"
+
+    chars = bicreader.load_vault(vault, cache_path=cache_path)
+    if not chars:
+        print(f"[nwn-wiki] warn: no characters parsed from {vault}", file=sys.stderr)
+        return
+
+    kills: list[dict] = []
+    catalogue: dict = {}
+    admin_cdkeys: set[str] = set()
+    if args.db_dir:
+        db_dir = Path(args.db_dir).expanduser()
+        bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
+        if bes is not None:
+            kills = sources.load_kills(bes)
+            catalogue = sources.load_catalogue(bes)
+        # Admin/DM accounts are never published. NOTE: admindb is symlinked to
+        # ~/.local/share/nwn-shared and is therefore SHARED across seasons, so
+        # this is always the current admin list, not the one in force when an
+        # archived season was played. Freeze an archived season with
+        # --players-snapshot to pin its pages against later admin changes.
+        adm = sources.open_ro(db_dir / "admindb.sqlite3")
+        if adm is not None:
+            admin_cdkeys = sources.load_admin_cdkeys(adm)
+
+    sessions = (activity or {}).get("sessions") or []
+
+    # Curated identity tables are per-project; none are wired up yet, so the
+    # roster merges nothing and resolves no roadmap names -- the documented
+    # "report, never guess" default.
+    identity.configure()
+    roster = identity.build_roster(sessions, kills, chars)
+    if roster.unmatched:
+        print(f"[nwn-wiki] players: {len(roster.unmatched)} playerid(s) could not "
+              f"be matched to an account", file=sys.stderr)
+
+    state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
+                                            catalogue,
+                                            exclude_cdkeys=admin_cdkeys)
+    named = sum(1 for r in state._CHARACTERS if r["player"])
+    dropped = len(chars) - len(state._CHARACTERS)
+    admin_note = (f", {dropped} admin-owned character(s) excluded"
+                  if dropped else "")
+    print(f"[nwn-wiki] players: {len(state._CHARACTERS)} character(s), "
+          f"{named} with a resolved player name{admin_note} "
+          f"(cache: {cache_path})")
+
+    if snapshot:
+        model.save_snapshot(state._CHARACTERS, snapshot)
+        print(f"[nwn-wiki] players: froze records to {snapshot}")
+
+
 def _freeze_site_chrome(db: Db, src: Path, out: Path) -> None:
     """Load the boss registry, render the manual, then freeze ``state.CHROME``.
 
@@ -769,6 +906,10 @@ def _render_pages(db: Db, src: Path, out: Path, title: str,
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
     render_creatures_by_race(db, out)
     render_creatures_search(db, out)
+    render_online_page(out)
+    render_character_index(out)
+    render_character_pages(out)
+    render_leaderboards(out)
     state._current_context = ""
     for can_rr in db.canonical_creatures:
         state._current_context = f"creature:{can_rr} ({db.canonical_creature_name(can_rr)})"
@@ -916,6 +1057,7 @@ def main() -> int:
 
     activity = _parse_activity_logs(args)
     _load_bestiary(db, args, activity)
+    _load_players(args, activity)
     _freeze_site_chrome(db, src, out)
     _run_activity_subprocess(db, src, out, args)
 

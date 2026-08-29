@@ -37,6 +37,7 @@ document.addEventListener("DOMContentLoaded", () => {
   if (nav) initNav(nav);
   initMap();
   initFooterTimestamp();
+  initOnlineStatus();
 });
 
 function graceMs() {
@@ -291,6 +292,76 @@ function initMap() {
     document.body.removeChild(a);
     setTimeout(function () { URL.revokeObjectURL(url); }, 100);
   };
+}
+
+/* ── Who's Online ──────────────────────────────────────────────────────────
+ * The only live data on the site. Everything else is static HTML built by
+ * nwn-wiki and shipped by a git push; this polls the wiki worker's /api/online,
+ * which serves a roster the game server's host pushes every few minutes. The
+ * game itself is never contacted, by this page or by anything else.
+ *
+ * Renders into [data-online-roster] (the Who's Online page body) and updates
+ * every [data-online-count] badge. Both are optional: on a realm with no status
+ * endpoint the elements are absent and this does nothing, and the fetch failing
+ * is a normal offline state, not an error -- the server-rendered fallback text
+ * already in the element is left exactly as it is. */
+const ONLINE_POLL_MS = 60000;
+
+function initOnlineStatus() {
+  const roster = document.querySelector('[data-online-roster]');
+  const badges = document.querySelectorAll('[data-online-count]');
+  if (!roster && !badges.length) return;
+
+  const url = (roster && roster.dataset.onlineUrl) || '/api/online';
+
+  function paint(data) {
+    const count = (data && !data.stale && data.count) || 0;
+    badges.forEach(b => {
+      b.textContent = count ? String(count) : '';
+      b.hidden = !count;
+    });
+    if (!roster) return;
+
+    if (!data || data.stale) {
+      /* Deliberately not "0 players online": a stale blob means the pusher or
+       * the network is down, and we do not know who is on. */
+      roster.innerHTML = '<p class="muted">Live status is unavailable right now.</p>';
+      return;
+    }
+    if (!data.count) {
+      roster.innerHTML = '<p class="muted">Nobody is online right now.</p>';
+      return;
+    }
+    const rows = data.players.map(p => {
+      const who = p.character || p.player || '';
+      const by = p.character && p.player ? p.player : '';
+      const lvl = p.level ? 'Level ' + p.level : '';
+      return '<tr><td>' + esc(who) + '</td><td>' + esc(by) +
+             '</td><td>' + esc(lvl) + '</td></tr>';
+    }).join('');
+    roster.innerHTML =
+      '<p>' + data.count + (data.count === 1 ? ' player' : ' players') +
+      ' online' + (data.updated_at ? ' <span class="muted">(as of ' +
+        esc(new Date(data.updated_at).toLocaleTimeString()) + ')</span>' : '') +
+      '</p><table class="data"><thead><tr><th>Character</th><th>Player</th>' +
+      '<th>Level</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }
+
+  function esc(s) {
+    const d = document.createElement('span');
+    d.textContent = s == null ? '' : String(s);
+    return d.innerHTML;
+  }
+
+  function tick() {
+    fetch(url, { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(paint)
+      .catch(() => paint(null));
+  }
+
+  tick();
+  setInterval(tick, ONLINE_POLL_MS);
 }
 
 function initFooterTimestamp() {

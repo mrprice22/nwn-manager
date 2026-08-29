@@ -36,7 +36,7 @@ from nwn_wiki.util import _try_float
 from nwn_wiki import state
 
 CHROME_FILE = ".chrome.json"
-_CHROME_FORMAT = 1
+_CHROME_FORMAT = 2
 
 
 def has_creature_pics_page() -> bool:
@@ -70,6 +70,8 @@ class SiteChrome:
 
     has_activity: bool = False
     has_server_firsts: bool = False
+    has_characters: bool = False
+    has_online: bool = False
     has_bosses: bool = False
     manual_menus: dict[str, list[dict]] = field(default_factory=dict)
     manual_menu_order: dict[str, int] = field(default_factory=dict)
@@ -91,6 +93,8 @@ class SiteChrome:
         return cls(
             has_activity=bool(state._HAS_ACTIVITY_PAGE),
             has_server_firsts=bool(state._HAS_SERVER_FIRSTS),
+            has_characters=bool(state._CHARACTERS),
+            has_online=bool(state._ONLINE_API),
             has_bosses=bool(state._BOSS_REGISTRY),
             manual_menus=state._MANUAL_MENUS,
             manual_menu_order=state._MANUAL_MENU_ORDER,
@@ -107,6 +111,8 @@ class SiteChrome:
             "format": _CHROME_FORMAT,
             "has_activity": self.has_activity,
             "has_server_firsts": self.has_server_firsts,
+            "has_characters": self.has_characters,
+            "has_online": self.has_online,
             "has_bosses": self.has_bosses,
             "manual_menus": self.manual_menus,
             "manual_menu_order": self.manual_menu_order,
@@ -124,6 +130,8 @@ class SiteChrome:
         return cls(
             has_activity=bool(d.get("has_activity")),
             has_server_firsts=bool(d.get("has_server_firsts")),
+            has_characters=bool(d.get("has_characters")),
+            has_online=bool(d.get("has_online")),
             has_bosses=bool(d.get("has_bosses")),
             manual_menus=d.get("manual_menus") or {},
             manual_menu_order=d.get("manual_menu_order") or {},
@@ -246,25 +254,42 @@ def _quests_nav(chrome: SiteChrome, ctx: PageCtx) -> str:
 
 
 def _activity_dropdown(chrome: SiteChrome, ctx: PageCtx) -> str:
-    """Return the Activity nav dropdown HTML (manual pages targeting @menu
-    'Activity', then Player Activity + Server Firsts).
+    """Return the Players nav dropdown HTML.
+
+    Everything player-facing lives under one menu: Who's Online (live, and only
+    where a status endpoint is configured), the character index and
+    leaderboards, then Player Activity and Server Firsts -- which used to be a
+    separate 'Activity' menu and moved here when the section was introduced.
+    Manual pages still target @menu 'Activity'; the key is the authored one and
+    is left alone so existing Comment directives keep working.
 
     Player Activity / Server Firsts are refreshed more often than the rest of
-    the wiki (via nwn-wiki-activity). Shown only when at least one entry exists.
+    the wiki (via nwn-wiki-activity). Every entry is gated on its own data, and
+    the whole menu disappears when none of it exists -- which is what keeps the
+    archived forks, who have no server vault, free of an empty Players menu.
     """
     manual_rows = _manual_menu_rows(chrome.manual_menus.get("Activity", []), ctx)
-    if not (chrome.has_activity or chrome.has_server_firsts or manual_rows):
+    if not (chrome.has_activity or chrome.has_server_firsts
+            or chrome.has_characters or chrome.has_online or manual_rows):
         return ""
     rows: list[str] = list(manual_rows)
+    if chrome.has_online:
+        rows.append(_nav_link(ctx, "characters/online.html", "Who's Online"))
+    if chrome.has_characters:
+        rows.append(_nav_link(ctx, "characters/index.html", "Characters"))
+        rows.append(
+            _nav_link(ctx, "characters/leaderboards.html", "Leaderboards"))
     if chrome.has_activity:
         rows.append(_nav_link(ctx, "activity.html", "Player Activity"))
     if chrome.has_server_firsts:
         rows.append(
             _nav_link(ctx, "manual/ServerFirsts.html", "Server Firsts"))
     inner = "\n".join(rows)
+    label = ("Players" if (chrome.has_characters or chrome.has_online)
+             else "Activity")
     return (
         '<div class="nav-dropdown">'
-        '<span class="nav-dropdown-label">Activity &#9660;</span>'
+        f'<span class="nav-dropdown-label">{label} &#9660;</span>'
         f'<div class="nav-dropdown-menu">{inner}</div>'
         '</div>'
     )

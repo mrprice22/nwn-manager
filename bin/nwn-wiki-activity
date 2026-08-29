@@ -56,6 +56,64 @@ def _should_refresh(activity: dict, within_seconds: int) -> bool:
     return recent_logout
 
 
+def _render_player_pages(wiki, args, activity: dict, out: "Path",
+                         activity_cache: "Path") -> None:
+    """Refresh the character index, character pages and leaderboards.
+
+    Mirrors nwn_wiki.cli._load_players so the two entry points cannot disagree
+    about how a character record is built. Best-effort: a vault that cannot be
+    read must never take the activity refresh down with it, because this runs
+    unattended from the serve loop.
+    """
+    from nwn_wiki import state
+    from nwn_wiki.players import bicreader, identity, model, sources
+    from nwn_wiki.render.characters import (render_character_index,
+                                            render_character_pages)
+    from nwn_wiki.render.leaderboards import render_leaderboards
+
+    vault = Path(args.vault_dir).expanduser()
+    if not vault.is_dir():
+        print(f"[nwn-wiki-activity] warn: --vault-dir {vault} is not a directory; "
+              "skipping the player pages", file=sys.stderr)
+        return
+
+    cache_path = (Path(args.vault_cache).expanduser() if args.vault_cache
+                  else activity_cache.with_name("vault-characters.json"))
+
+    try:
+        chars = bicreader.load_vault(vault, cache_path=cache_path)
+    except OSError as exc:
+        print(f"[nwn-wiki-activity] warn: could not read the vault: {exc}",
+              file=sys.stderr)
+        return
+    if not chars:
+        return
+
+    kills, catalogue, admin_cdkeys = [], {}, set()
+    if args.db_dir:
+        db_dir = Path(args.db_dir).resolve()
+        bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
+        if bes is not None:
+            kills = sources.load_kills(bes)
+            catalogue = sources.load_catalogue(bes)
+        adm = sources.open_ro(db_dir / "admindb.sqlite3")
+        if adm is not None:
+            admin_cdkeys = sources.load_admin_cdkeys(adm)
+
+    sessions = activity["sessions"]
+    identity.configure()
+    roster = identity.build_roster(sessions, kills, chars)
+    state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
+                                            catalogue,
+                                            exclude_cdkeys=admin_cdkeys)
+
+    render_character_index(out)
+    render_character_pages(out)
+    render_leaderboards(out)
+    print(f"[nwn-wiki-activity] players: refreshed "
+          f"{len(state._CHARACTERS)} character page(s)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
@@ -84,6 +142,20 @@ def main() -> int:
              "When provided, the Server Firsts page is also refreshed alongside "
              "activity.html and existing server-first records are back-filled with "
              "player names derived from the log sessions.",
+    )
+    ap.add_argument(
+        "--vault-dir", default=None, dest="vault_dir", metavar="DIR",
+        help="Server vault directory (servervault/<CDKEY>/*.bic). When provided "
+             "alongside --db-dir, the character index, the per-character pages and "
+             "the leaderboards are refreshed too, so they stay in step with the "
+             "kill counts the same pass writes into Server Firsts.",
+    )
+    ap.add_argument(
+        "--vault-cache", default=None, dest="vault_cache", metavar="PATH",
+        help="JSON cache of parsed .bic files. Defaults to vault-characters.json "
+             "beside the activity cache. Parsing a full vault costs ~18s cold and "
+             "~0.3s warm; without this the on-empty refresh pays the cold cost "
+             "every time.",
     )
     ap.add_argument(
         "--online-since", type=int, default=None, dest="online_since", metavar="EPOCH",
@@ -206,6 +278,13 @@ def main() -> int:
     wiki.render_manual_pages(src.parent, out)
 
     wiki.render_activity_page(activity, out, tz_label=wiki._tz_label_from_env())
+
+    # Player pages, when this realm has a vault. Gated on --vault-dir exactly
+    # like the main build, so a module with no server behind it never grows a
+    # Players section here either. The nav still comes from .chrome.json: this
+    # pass rewrites existing pages, and only a full build can add the nav entry.
+    if args.vault_dir:
+        _render_player_pages(wiki, args, activity, out, cache_path)
     return 0
 
 
