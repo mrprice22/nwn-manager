@@ -206,24 +206,27 @@ def load_admin_cdkeys(conn) -> set[str]:
     return {r[0] for r in _rows(conn, "SELECT cdkey FROM admins") if r[0]}
 
 
-def load_combat_dummy_best(conn) -> dict[str, dict]:
-    """Character UUID -> that character's best combat-dummy run.
+def load_combat_dummy_runs(conn) -> dict[str, list[dict]]:
+    """Character UUID -> its combat-dummy trials, newest first.
 
     The dummy records one row per 10-round trial (see the combat-dummy roadmap
-    item), so a character has as many rows as times they hit it. The best run is
-    the meaningful figure: a trial can be cut short or spent testing a gear swap,
-    and averaging those in would understate what the build can actually do.
+    item), so a character has as many rows as times they hit it. The whole
+    history is returned rather than a single figure: the character page shows
+    the best run, the average of the recent ones, and when each happened, and
+    those answer different questions -- "what can this build do" versus "what
+    is it doing lately".
 
-    Returns {"dpr", "rounds", "at"} per uuid; empty when the module has no
-    combat dummy.
+    Empty when the module has no combat dummy.
     """
-    best: dict[str, dict] = {}
+    runs: dict[str, list[dict]] = {}
     for uuid, dpr, rounds, at in _rows(
             conn, "SELECT uuid, dpr, rounds, at FROM sessions"):
         if not uuid:
             continue
-        cur = best.get(uuid)
-        if cur is None or (dpr or 0) > cur["dpr"]:
-            best[uuid] = {"dpr": dpr or 0.0, "rounds": rounds or 0, "at": at or ""}
-    return best
-
+        runs.setdefault(uuid, []).append(
+            {"dpr": dpr or 0.0, "rounds": rounds or 0, "at": at or ""})
+    # Newest first. `at` is "YYYY-MM-DD HH:MM:SS" from SQLite's datetime('now'),
+    # which sorts correctly as a string.
+    for rows in runs.values():
+        rows.sort(key=lambda r: r["at"], reverse=True)
+    return runs

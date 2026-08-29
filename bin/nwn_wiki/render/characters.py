@@ -16,6 +16,8 @@ CD keys and character UUIDs are internal join keys and are never rendered.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from nwn_wiki.htmlgen.blocks import items_layout, toc_sidebar
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.escape import E
@@ -158,6 +160,64 @@ def render_online_page(out) -> None:
 # --------------------------------------------------------------------------- #
 # Detail
 # --------------------------------------------------------------------------- #
+
+def _stamp(at: str) -> str:
+    """SQLite's "YYYY-MM-DD HH:MM:SS" as a readable date and time."""
+    if not at:
+        return "—"
+    try:
+        return datetime.strptime(at[:19], "%Y-%m-%d %H:%M:%S").strftime(
+            "%Y-%m-%d %H:%M")
+    except ValueError:
+        return at
+
+
+def _combat_dummy(rec: dict) -> str:
+    """The character's combat-dummy record: best ever, recent form, and when.
+
+    Two figures, because they answer different questions. The BEST run is what
+    the build can do at its peak, so it is a max -- a trial cut short or spent
+    testing a gear swap should not drag it down. The RECENT average is what it
+    is doing lately, so a bad run counts against it exactly as it should.
+    """
+    runs = rec.get("dummy_runs") or []
+    if not rec.get("best_dpr"):
+        return ""
+
+    total = rec.get("dummy_run_count") or len(runs)
+    facts = [
+        ("Best damage/round", f"{rec['best_dpr']:,.1f}"),
+        ("Best run", _stamp(rec.get("best_dpr_at", ""))),
+    ]
+    if rec.get("recent_dpr") is not None:
+        n = len(runs)
+        facts.append((f"Average over last {n} run{'s' if n != 1 else ''}",
+                      f"{rec['recent_dpr']:,.1f}"))
+    facts.append(("Trials recorded", f"{total:,}"))
+    fact_html = "".join(f"<div><dt>{E(k)}</dt><dd>{E(v)}</dd></div>"
+                        for k, v in facts)
+
+    rows = "".join(
+        f"<tr><td>{E(_stamp(r['at']))}</td><td>{r['dpr']:,.1f}</td>"
+        f"<td>{r['rounds']}</td></tr>"
+        for r in runs
+    )
+    table = (
+        f"<h3>Last {len(runs)} trial{'s' if len(runs) != 1 else ''}</h3>"
+        '<table class="data"><thead><tr>'
+        "<th>When</th><th>Damage/round</th><th>Rounds</th>"
+        "</tr></thead><tbody>" + rows + "</tbody></table>"
+    ) if rows else ""
+
+    return (
+        '<div class="card"><h2>Combat Dummy</h2>'
+        f'<dl class="kv">{fact_html}</dl>'
+        f"{table}"
+        '<p class="muted">Each trial is 10 rounds against the dummy. The best '
+        "run is a peak, not an average \u2014 a trial can be cut short or spent "
+        "testing a gear swap.</p></div>"
+    )
+
 
 def _stat_block(rec: dict) -> str:
     ab = rec["abilities"]
@@ -374,16 +434,7 @@ def render_character_pages(out) -> None:
             ((skill_name(i), rank) for i, rank in enumerate(rec["skills"]) if rank),
             key=lambda p: -p[1])
 
-        dummy = rec.get("best_dpr")
-        dummy_html = ""
-        if dummy:
-            dummy_html = (
-                '<div class="card"><h2>Combat Dummy</h2>'
-                f'<dl class="kv"><div><dt>Best damage/round</dt>'
-                f"<dd>{dummy:,.1f}</dd></div></dl>"
-                '<p class="muted">The best of this character\u2019s 10-round '
-                "trials on the combat dummy, not an average: a trial can be cut "
-                "short or spent testing a gear swap.</p></div>")
+        dummy_html = _combat_dummy(rec)
 
         body_parts = [
             *head,

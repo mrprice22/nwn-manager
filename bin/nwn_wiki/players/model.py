@@ -28,6 +28,30 @@ from datetime import datetime
 
 from nwn_wiki.lookups import class_name, race_name
 
+# How many recent combat-dummy trials the character page averages and lists.
+RECENT_DUMMY_RUNS = 5
+
+
+def _best_dpr(runs: "list[dict] | None") -> float | None:
+    return max((r["dpr"] for r in runs), default=None) if runs else None
+
+
+def _best_dpr_at(runs: "list[dict] | None") -> str:
+    if not runs:
+        return ""
+    return max(runs, key=lambda r: r["dpr"])["at"]
+
+
+def _recent_dpr(runs: "list[dict] | None") -> float | None:
+    """Mean damage/round over the most recent trials, or None when there are
+    none. Averaged deliberately: this is the "lately" figure, so a bad run
+    counts against it exactly as it should."""
+    if not runs:
+        return None
+    recent = runs[:RECENT_DUMMY_RUNS]
+    return sum(r["dpr"] for r in recent) / len(recent)
+
+
 # Alignment thresholds match NWN's own bands (0-30 / 31-69 / 70-100).
 _LOW, _HIGH = 30, 69
 
@@ -107,7 +131,7 @@ def _parse_ts(v):
 def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
                   roster, catalogue: dict | None = None,
                   exclude_cdkeys: "set[str] | None" = None,
-                  dummy_best: dict | None = None) -> list[dict]:
+                  dummy_runs: dict | None = None) -> list[dict]:
     """One record per character in the vault, enriched with kills and play data.
 
     ``catalogue`` maps resref -> creature row (from ``sources.load_catalogue``)
@@ -127,7 +151,7 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
     own character; with the admin accounts gone, no UUID appears twice.
     """
     catalogue = catalogue or {}
-    dummy_best = dummy_best or {}
+    dummy_runs = dummy_runs or {}
     if exclude_cdkeys:
         chars = [c for c in chars if c["cdkey"] not in exclude_cdkeys]
 
@@ -203,8 +227,16 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
             # Internal: the actual resrefs, so a player's bestiary progress can
             # be a real union across their characters rather than a max.
             "_resrefs": sorted({r["resref"] for r in rows}),
-            # Best combat-dummy run, when this character ever hit the dummy.
-            "best_dpr": (dummy_best.get(c.get("uuid") or "") or {}).get("dpr"),
+            # Combat-dummy trials, newest first, plus the two figures the
+            # pages actually show. RECENT_DUMMY_RUNS is an average because the
+            # question there is "what is this build doing lately"; the best run
+            # stays a max because a trial can be cut short or spent testing a
+            # gear swap, and averaging those in understates what it can do.
+            "dummy_runs": (dummy_runs.get(c.get("uuid") or "") or [])[:RECENT_DUMMY_RUNS],
+            "dummy_run_count": len(dummy_runs.get(c.get("uuid") or "") or []),
+            "best_dpr": _best_dpr(dummy_runs.get(c.get("uuid") or "")),
+            "best_dpr_at": _best_dpr_at(dummy_runs.get(c.get("uuid") or "")),
+            "recent_dpr": _recent_dpr(dummy_runs.get(c.get("uuid") or "")),
             # Character-sheet totals, for the player averages on the Hall of
             # Fame. Ability scores here are the stored (pre-racial, pre-gear)
             # values -- what the sheet calls the character's own scores.

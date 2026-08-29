@@ -795,7 +795,7 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     kills: list[dict] = []
     catalogue: dict = {}
     admin_cdkeys: set[str] = set()
-    dummy_best: dict = {}
+    dummy_runs: dict = {}
     if args.db_dir:
         db_dir = Path(args.db_dir).expanduser()
         bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
@@ -812,7 +812,7 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
             admin_cdkeys = sources.load_admin_cdkeys(adm)
         dummy = sources.open_ro(db_dir / "combatdummydb.sqlite3")
         if dummy is not None:
-            dummy_best = sources.load_combat_dummy_best(dummy)
+            dummy_runs = sources.load_combat_dummy_runs(dummy)
 
     sessions = (activity or {}).get("sessions") or []
 
@@ -828,7 +828,7 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
                                             catalogue,
                                             exclude_cdkeys=admin_cdkeys,
-                                            dummy_best=dummy_best)
+                                            dummy_runs=dummy_runs)
     state._PLAYERS = model.build_players(state._CHARACTERS)
     state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
     state._ACHIEVEMENTS = compute_achievements()
