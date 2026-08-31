@@ -13,6 +13,22 @@
 
 set -o pipefail
 
+# Yield to the live game server. A repack compiles ~2340 scripts and runs 30+
+# smoke tests on a 4-core box that is ALSO hosting the live season, on one
+# spinning disk -- this is the job players most often feel as lag.
+#
+# Done in-process rather than via nwn_manager/bin/lowprio because this wrapper
+# is interactive (progress spinner, stdin): re-exec'ing it under systemd-run
+# would disturb the terminal. renice/ionice are inherited by nasher, the script
+# compiler and the smoke tests alike, which is all we need. Idle I/O class is
+# the important half -- the disk is the bottleneck, not the CPU.
+#
+# REPACK_NICE=0 opts out (e.g. when nothing is running and you want it fast).
+if [[ ${REPACK_NICE:-1} != 0 ]]; then
+  renice -n 19 -p $$ >/dev/null 2>&1 || true
+  ionice -c 3 -p $$  >/dev/null 2>&1 || true
+fi
+
 VERBOSE=0
 FORCE=0
 NO_PROD=0

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# lowprio — run a heavy job where it cannot lag the game server.
+#
+#   lowprio nwn-manager wiki
+#   lowprio bin/refresh-nwsync
+#   lowprio --gate bin/refresh-homers-lotr-wiki      # also refuse while players are on
+#
+# WHY
+# ---
+# This box hosts the live season AND builds it: 4 cores of 2014 AMD A10 and ONE
+# 7200rpm spindle. A repack, a wiki build or an NWSync rehash competes directly
+# with nwserver, whose main loop is single-threaded -- a stalled frame is not
+# "slower", it IS in-game lag.
+#
+# So heavy work runs in background.slice (cpu.weight 30 by default, further
+# reduced here) with idle I/O scheduling, while the live season carries
+# CPUWeight=10000 from its own drop-in. Both are proportional: on an idle box
+# this costs the build nothing at all.
+#
+# HONEST LIMIT: btrfs has incomplete cgroup-writeback support, so IOWeight and
+# ionice govern reads and direct writes well but BUFFERED WRITES poorly. A job
+# that dirties gigabytes will still cause some stall on a single HDD. That is a
+# hardware problem (see the SSD plan), not something a scheduler flag fixes --
+# which is exactly why --gate exists.
+
+set -euo pipefail
+
+GATE=0
+case "${1:-}" in
+  --gate) GATE=1; shift ;;
+  --help|-h)
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+esac
+
+[[ $# -gt 0 ]] || { echo "lowprio: nothing to run (see --help)" >&2; exit 2; }
+
+if [[ $GATE == 1 ]]; then
+  # Look for prod-busy next to the season repo we are building, then on PATH.
+  BUSY=""
+  for c in "$PWD/bin/prod-busy" "$HOME/GIT/nwn_homers_lotr/bin/prod-busy"; do
+    [[ -x $c ]] && { BUSY=$c; break; }
+  done
+  if [[ -n $BUSY ]]; then
+    # exit 0 = players online. Unknown counts as busy (prod-busy's default).
+    if "$BUSY" --who; then
+      echo "lowprio: players are online -- refusing to start heavy work." >&2
+      echo "         Re-run without --gate to override, or wait for the 03:00 window." >&2
+      exit 3
+    fi
+  else
+    echo "lowprio: warning -- prod-busy not found, running ungated" >&2
+  fi
+fi
+
+# Already inside a systemd unit? Do NOT systemd-run. A transient unit would be
+# created in background.slice, ESCAPING this service's own cgroup -- so its
+# limits would stop applying, and killing the service could orphan the job.
+# The units that run heavy work (nwn-season-wiki-publish@) already carry their
+# own CPUWeight/Nice drop-ins, so plain nice/ionice is the right tool here.
+if [[ -n ${INVOCATION_ID:-} ]]; then
+  exec nice -n 19 ionice -c 3 -- "$@"
+fi
+
+# systemd-run gives real cgroup placement; the fallback keeps the tool usable
+# in a container or over a bare ssh session with no user manager.
+if command -v systemd-run >/dev/null 2>&1 && [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+  exec systemd-run --user --pipe --wait --collect --quiet \
+    --slice=background.slice \
+    --unit="lowprio-$$" \
+    -p Nice=19 \
+    -p CPUWeight=10 \
+    -p IOWeight=10 \
+    -p IOSchedulingClass=idle \
+    -p WorkingDirectory="$PWD" \
+    -- "$@"
+else
+  echo "lowprio: no user systemd manager; falling back to nice/ionice" >&2
+  exec nice -n 19 ionice -c 3 -- "$@"
+fi
