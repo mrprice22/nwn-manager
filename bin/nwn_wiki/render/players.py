@@ -201,13 +201,38 @@ def _idea_pivot(rec: dict) -> str:
             f'<tbody>{"".join(rows)}</tbody></table>')
 
 
+# How a player's own ideas are ordered on their page -- live work first, the
+# finished tail last. This deliberately does NOT reuse the roadmap's `rank`:
+# that is ranked per BOARD, so `awarded` and `confirmed` are both rank 0 and the
+# shipped pile sorted to the top, which reads as an archive rather than as what
+# this player has going on. Here the question is "what is happening with the
+# things I asked for", so the answer starts with the work in flight.
+#
+# The tail is the settled end: shipped-and-in-testing, then the admin chore of
+# finishing one off, then shipped-and-paid. A status the roadmap adds later and
+# this list has not caught up with sorts with the ACTIVE block, not the tail --
+# a new workflow stage is far more likely to be live work than a done state, and
+# appearing in the wrong half of a short list is cheaper than being buried.
+IDEA_STATUS_ORDER = ("confirmed", "design", "wip", "soon", "later",
+                     "planned", "unlikely")
+IDEA_STATUS_TAIL = ("implemented", "manual", "awarded")
+
+
 def _idea_group_list(ctx: PageCtx, ideas: list[dict]) -> str:
-    """Ideas grouped under their status heading, in the roadmap's own order."""
+    """Ideas grouped under their status heading, live work first."""
     meta = (state._ROADMAP or {}).get("statuses") or {}
     groups: dict[str, list[dict]] = {}
     for i in ideas:
         groups.setdefault(i.get("status") or "", []).append(i)
-    order = sorted(groups, key=lambda st: (meta.get(st, {}).get("rank", 99), st))
+
+    def sort_key(st: str) -> tuple:
+        if st in IDEA_STATUS_TAIL:
+            return (2, IDEA_STATUS_TAIL.index(st), st)
+        if st in IDEA_STATUS_ORDER:
+            return (0, IDEA_STATUS_ORDER.index(st), st)
+        return (1, meta.get(st, {}).get("rank", 99), st)
+
+    order = sorted(groups, key=sort_key)
 
     out = []
     for st in order:
