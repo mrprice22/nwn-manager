@@ -246,6 +246,13 @@ def load_playtime(conn) -> tuple[dict[str, dict], str]:
     the first load after the table ships, and every season predates it -- a
     character with 3 hours here may have been played for months. Any page
     showing these numbers must show this date too, or it is quietly lying.
+
+    It lives in ``ptm_meta``, NOT ``meta``: ``meta`` is one of three tables
+    (``migrations``, ``db``, ``meta``) NWN:EE pre-seeds into every campaign DB,
+    and its SQL authorizer denies script statements against them, so the module
+    could never write there. A DB from before that fix has no ``ptm_meta`` and
+    returns "" -- the caller must already handle an unknown start date, since
+    that is also what a realm that has never loaded the module returns.
     """
     totals: dict[str, dict] = {}
     for row in _rows(conn,
@@ -256,9 +263,12 @@ def load_playtime(conn) -> tuple[dict[str, dict], str]:
             totals[uuid] = {"minutes": mins, "sessions": n}
 
     started = ""
-    rows = _rows(conn, "SELECT value FROM meta WHERE key = 'tracking_started'")
-    if rows:
-        started = rows[0][0] or ""
+    if _rows(conn, "SELECT 1 FROM sqlite_master "
+                   "WHERE type = 'table' AND name = 'ptm_meta'"):
+        rows = _rows(conn,
+                     "SELECT value FROM ptm_meta WHERE key = 'tracking_started'")
+        if rows:
+            started = rows[0][0] or ""
     return totals, started
 
 
