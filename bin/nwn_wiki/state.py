@@ -101,6 +101,22 @@ _MAX_ABILITY_BONUS: int = 12
 # character's history. Empty when the module has no tracking.
 _PLAYTIME_SINCE: str = ""
 
+# Login sessions grouped by account display name, from
+# players.model.player_sessions(). The activity page charts all of them
+# together; a player page charts its own. Empty without --log-dir.
+_PLAYER_SESSIONS: dict = {}          # {account name: [session, ...]}
+
+# Timezone label for the hour-of-day charts, from the TZ the build ran under.
+# The activity page and the player pages must agree about what "20:00" means.
+_TZ_LABEL: str = "GMT+0"
+
+# The project's roadmap credit sidecar (--roadmap-credits) and the per-player
+# view of it built by players.roadmap.attribute(). The ideas belong to the
+# project repo, not to this engine: without the sidecar both stay empty and the
+# players index and player pages render exactly as they did before.
+_ROADMAP: dict = {}                  # the sidecar itself (types, columns, statuses)
+_PLAYER_IDEAS: dict = {}             # {account name: {submitted, tested, counts, pivot}}
+
 # URL the Who's Online page polls for the live roster, from --online-api. Empty
 # on every realm that does not run the status pusher (archived seasons, the
 # forks, and the dev realm until it is switched on for testing), which is what

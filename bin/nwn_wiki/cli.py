@@ -299,6 +299,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "Defaults to vault-characters.json beside --activity-cache. "
                          "Parsing a full vault costs ~18s cold and ~0.3s warm, so "
                          "this is what keeps the on-empty refresh cheap.")
+    ap.add_argument("--roadmap-credits", default=None, dest="roadmap_credits",
+                    metavar="PATH",
+                    help="JSON credit sidecar written by the project's roadmap "
+                         "generator (roadmap-credits.json): who reported, "
+                         "requested and tested each idea. Adds the idea columns "
+                         "to the players index and an idea list to each player "
+                         "page. Omit it and neither exists.")
+    ap.add_argument("--player-aliases", default=None, dest="player_aliases",
+                    metavar="PATH",
+                    help="JSON map of roadmap `player:` label -> account name or "
+                         "CD key, for submitters whose roadmap name cannot be "
+                         "matched to a login. Unmatched labels are reported, "
+                         "never guessed at.")
     ap.add_argument("--players-snapshot", default=None, dest="players_snapshot",
                     metavar="PATH",
                     help="Frozen character records, for archived seasons. After a "
@@ -746,7 +759,8 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     # its character pages built, and vice versa.
     state._ONLINE_API = args.online_api or ""
 
-    from nwn_wiki.players import bicreader, identity, model, sources
+    from nwn_wiki.players import (bicreader, identity, model, roadmap,
+                                  sources)
 
     snapshot = (Path(args.players_snapshot).expanduser()
                 if args.players_snapshot else None)
@@ -797,6 +811,7 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     admin_cdkeys: set[str] = set()
     dummy_runs: dict = {}
     playtime: dict = {}
+    playtime_daily: dict = {}
     if args.db_dir:
         db_dir = Path(args.db_dir).expanduser()
         bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
@@ -819,13 +834,15 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
         ptm = sources.open_ro(db_dir / "playtimedb.sqlite3")
         if ptm is not None:
             playtime, state._PLAYTIME_SINCE = sources.load_playtime(ptm)
+            playtime_daily = sources.load_playtime_daily(ptm)
 
     sessions = (activity or {}).get("sessions") or []
 
-    # Curated identity tables are per-project; none are wired up yet, so the
-    # roster merges nothing and resolves no roadmap names -- the documented
-    # "report, never guess" default.
-    identity.configure()
+    # Account merges stay per-project and unwired (the roster merges nothing by
+    # default); the roadmap aliases are the one curated table a project can now
+    # hand us, because a roadmap name is hand-typed and often unresolvable
+    # without a human saying who it is.
+    identity.configure(roadmap_aliases=roadmap.load_aliases(args.player_aliases))
     roster = identity.build_roster(sessions, kills, chars)
     if roster.unmatched:
         print(f"[nwn-wiki] players: {len(roster.unmatched)} playerid(s) could not "
@@ -835,9 +852,14 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
                                             catalogue,
                                             exclude_cdkeys=admin_cdkeys,
                                             dummy_runs=dummy_runs,
-                                            playtime=playtime)
+                                            playtime=playtime,
+                                            playtime_daily=playtime_daily)
     state._PLAYERS = model.build_players(state._CHARACTERS)
     state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
+    state._PLAYER_SESSIONS = model.player_sessions(sessions, roster,
+                                                   exclude_cdkeys=admin_cdkeys)
+    state._TZ_LABEL = _tz_label_from_env()
+    _load_roadmap_credits(args, roster)
     state._ACHIEVEMENTS = compute_achievements()
     state._PLAYER_ACHIEVEMENTS = achievement_counts(state._ACHIEVEMENTS)
 
@@ -853,6 +875,28 @@ def _load_players(args: argparse.Namespace, activity: dict | None) -> None:
     if snapshot:
         model.save_snapshot(state._CHARACTERS, snapshot)
         print(f"[nwn-wiki] players: froze records to {snapshot}")
+
+
+def _load_roadmap_credits(args: argparse.Namespace, roster) -> None:
+    """Attribute the project's roadmap ideas to accounts, or leave it all empty.
+
+    An unresolvable submitter is named on stderr rather than dropped in silence:
+    the fix is one line in the --player-aliases file, and nobody will write it
+    if the build never says who is missing.
+    """
+    from nwn_wiki.players import roadmap
+
+    credits = roadmap.load_credits(getattr(args, "roadmap_credits", None))
+    if not credits:
+        return
+    state._ROADMAP = credits
+    state._PLAYER_IDEAS, unresolved = roadmap.attribute(credits, roster)
+    print(f"[nwn-wiki] players: {len(credits['ideas'])} roadmap idea(s) "
+          f"credited to {len(state._PLAYER_IDEAS)} player(s)")
+    if unresolved:
+        print(f"[nwn-wiki] warn: {len(unresolved)} roadmap name(s) match no "
+              f"account and are uncredited: {', '.join(unresolved)}",
+              file=sys.stderr)
 
 
 def _freeze_site_chrome(db: Db, src: Path, out: Path) -> None:
@@ -893,6 +937,10 @@ def _run_activity_subprocess(db: Db, src: Path, out: Path,
             _act_cmd += ["--activity-cache", str(args.activity_cache)]
         if "bestiarybook" in db.items and args.db_dir:
             _act_cmd += ["--db-dir", str(Path(args.db_dir).expanduser())]
+        if args.roadmap_credits:
+            _act_cmd += ["--roadmap-credits", str(args.roadmap_credits)]
+        if args.player_aliases:
+            _act_cmd += ["--player-aliases", str(args.player_aliases)]
         subprocess.run(_act_cmd, check=True)
 
 

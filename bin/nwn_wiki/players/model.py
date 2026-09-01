@@ -132,7 +132,8 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
                   roster, catalogue: dict | None = None,
                   exclude_cdkeys: "set[str] | None" = None,
                   dummy_runs: dict | None = None,
-                  playtime: dict | None = None) -> list[dict]:
+                  playtime: dict | None = None,
+                  playtime_daily: dict | None = None) -> list[dict]:
     """One record per character in the vault, enriched with kills and play data.
 
     ``catalogue`` maps resref -> creature row (from ``sources.load_catalogue``)
@@ -154,6 +155,7 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
     catalogue = catalogue or {}
     dummy_runs = dummy_runs or {}
     playtime = playtime or {}
+    playtime_daily = playtime_daily or {}
     if exclude_cdkeys:
         chars = [c for c in chars if c["cdkey"] not in exclude_cdkeys]
 
@@ -246,6 +248,10 @@ def build_records(chars: list[dict], kills: list[dict], sessions: list[dict],
                 round(playtime[c["uuid"]]["minutes"] / 60.0, 1)
                 if c.get("uuid") in playtime else None),
             "char_sessions": (playtime.get(c.get("uuid") or "") or {}).get("sessions"),
+            # The same hours again, kept per day so a page can draw the shape
+            # of them. Empty (not zero-filled) when tracking has never seen this
+            # character, for the same reason char_hours is None there.
+            "char_daily": dict(playtime_daily.get(c.get("uuid") or "") or {}),
             # Character-sheet totals, for the player averages on the Hall of
             # Fame. Ability scores here are the stored (pre-racial, pre-gear)
             # values -- what the sheet calls the character's own scores.
@@ -317,6 +323,48 @@ def load_snapshot(path: "Path") -> list[dict]:
 # Players (accounts)
 # --------------------------------------------------------------------------- #
 
+def player_sessions(sessions: list[dict], roster,
+                    exclude_cdkeys: "set[str] | None" = None) -> dict[str, list[dict]]:
+    """Login sessions grouped by account display name.
+
+    The activity page charts every player's sessions together; a player page
+    charts one player's. Both must agree about whose session is whose, so this
+    resolves an account exactly the way :func:`build_records` does -- through
+    ``roster.key_for_session``, which folds merged CD keys and backfills the old
+    keyless cache rows by name.
+
+    Game Master sessions are dropped, as they are everywhere else: a DM is
+    working, not playing, and their hours are not comparable.
+    """
+    exclude_cdkeys = exclude_cdkeys or set()
+    out: dict[str, list[dict]] = defaultdict(list)
+    for s in sessions:
+        if s.get("role") != "Player" or s.get("join") is None:
+            continue
+        ck = roster.key_for_session(s)
+        if not ck or ck in exclude_cdkeys:
+            continue
+        name = roster.name.get(ck)
+        if not name:
+            # No display name means no player page to put the chart on.
+            continue
+        out[name].append(s)
+    return dict(out)
+
+
+def _merge_daily(chars: list[dict]) -> dict[str, float]:
+    """Union a player's characters' per-day hours, summing the shared days.
+
+    A player who spent an evening on two characters played that evening once,
+    and the sum is what the account-level session log would have recorded.
+    """
+    out: dict[str, float] = {}
+    for c in chars:
+        for day, hrs in (c.get("char_daily") or {}).items():
+            out[day] = out.get(day, 0.0) + hrs
+    return out
+
+
 def build_players(records: list[dict]) -> list[dict]:
     """Group published characters by account, newest-active first.
 
@@ -358,6 +406,7 @@ def build_players(records: list[dict]) -> list[dict]:
                 round(sum(c["char_hours"] for c in chars
                           if c.get("char_hours")), 1)
                 if any(c.get("char_hours") for c in chars) else None),
+            "char_daily": _merge_daily(chars),
             "avg_ability_total": (sum(c["ability_total"] for c in chars) / len(chars)
                                   if chars else 0.0),
             "avg_skill_total": (sum(c["skill_total"] for c in chars) / len(chars)

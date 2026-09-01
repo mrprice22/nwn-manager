@@ -261,3 +261,34 @@ def load_playtime(conn) -> tuple[dict[str, dict], str]:
         started = rows[0][0] or ""
     return totals, started
 
+
+def load_playtime_daily(conn) -> dict[str, dict[str, float]]:
+    """Per-CHARACTER play time broken out by day: ``{uuid: {"YYYY-MM-DD": hours}}``.
+
+    The same rows :func:`load_playtime` totals, kept in their days so a page can
+    draw the shape of a character's history rather than one number. Summing a
+    character's days therefore reproduces its total exactly, and the two figures
+    on a character page cannot disagree.
+
+    A session is credited to the day it BEGAN, even when it ran past midnight.
+    That is the convention ``render_activity_page`` already uses for the
+    server-log charts (``s["join"].date()``), and the two sets of charts sit on
+    pages that link to each other -- splitting a session across midnight in one
+    place and not the other would make the same evening look like two different
+    evenings depending on which page you were reading.
+
+    Abandoned sessions (NULL minutes -- the server went down without firing
+    Mod_OnClientLeav) are excluded here exactly as they are from the totals.
+    """
+    daily: dict[str, dict[str, float]] = {}
+    for uuid, day, mins in _rows(
+            conn,
+            "SELECT uuid, date(entered_at) AS d, SUM(minutes) "
+            "FROM sessions "
+            "WHERE minutes IS NOT NULL AND entered_at IS NOT NULL "
+            "GROUP BY uuid, d"):
+        if not uuid or not day:
+            continue
+        daily.setdefault(uuid, {})[day] = (mins or 0.0) / 60.0
+    return daily
+

@@ -71,6 +71,12 @@ Usage:
                                                    the character pages and
                                                    leaderboards. Omit for
                                                    modules with no server
+                            --roadmap-credits <path> Roadmap credit sidecar
+                                                   (roadmap-credits.json), so
+                                                   refreshed player pages keep
+                                                   their Ideas sections
+                            --player-aliases <path> JSON roadmap name -> account
+                                                   map for the above
                             --backup-cmd <cmd>     Command to run at each idle
                                                    moment (no players online).
                                                    Expected to self-gate (e.g.
@@ -737,6 +743,8 @@ cmd_serve() {
   local activity_cache=""
   local db_dir=""
   local vault_dir=""
+  local roadmap_credits=""
+  local player_aliases=""
   local backup_cmd=""
 
   while [[ $# -gt 0 ]]; do
@@ -763,6 +771,14 @@ cmd_serve() {
       --vault-dir)
         [[ -n ${2:-} ]] || { echo "error: --vault-dir requires a directory" >&2; exit 2; }
         vault_dir=$2; shift 2
+        ;;
+      --roadmap-credits)
+        [[ -n ${2:-} ]] || { echo "error: --roadmap-credits requires a path" >&2; exit 2; }
+        roadmap_credits=$2; shift 2
+        ;;
+      --player-aliases)
+        [[ -n ${2:-} ]] || { echo "error: --player-aliases requires a path" >&2; exit 2; }
+        player_aliases=$2; shift 2
         ;;
       --backup-cmd)
         [[ -n ${2:-} ]] || { echo "error: --backup-cmd requires a command" >&2; exit 2; }
@@ -796,6 +812,12 @@ cmd_serve() {
   # rewrites activity.html exactly as it always did and writes no player pages.
   local vault_args=()
   [[ -n $vault_dir ]] && vault_args+=(--vault-dir "$vault_dir")
+  # Roadmap credit, if the project publishes it. Without these the on-empty
+  # refresh would rewrite the player pages without their Ideas sections, and
+  # they would silently vanish between full wiki builds.
+  local roadmap_args=()
+  [[ -n $roadmap_credits ]] && roadmap_args+=(--roadmap-credits "$roadmap_credits")
+  [[ -n $player_aliases ]] && roadmap_args+=(--player-aliases "$player_aliases")
 
   # The server container is (re)started together with this monitor, so at this
   # moment no player can be online yet — the module hasn't even loaded.  Pass our
@@ -827,7 +849,7 @@ cmd_serve() {
       if python3 "$wiki_activity" \
           --src unpacked --out docs \
           "${log_dir_args[@]}" "${cache_args[@]}" "${since_args[@]}" \
-          "${db_dir_args[@]}" "${vault_args[@]}"; then
+          "${db_dir_args[@]}" "${vault_args[@]}" "${roadmap_args[@]}"; then
         echo "[$PROG] serve: activity page refreshed"
         if [[ $auto_publish -eq 1 ]]; then
           local ts

@@ -16,7 +16,7 @@ CD keys and character UUIDs are internal join keys and are never rendered.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from nwn_wiki.htmlgen.blocks import items_layout, toc_sidebar
 from nwn_wiki.htmlgen.chrome import write_page
@@ -24,7 +24,8 @@ from nwn_wiki.htmlgen.escape import E
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.itemprops import _prop_value_num, itemprop_format
 from nwn_wiki.lookups import baseitem_name, feat_name, skill_name
-from nwn_wiki.render.players import player_link, tracking_note
+from nwn_wiki.render.players import (daily_hours_charts, player_link,
+                                     tracking_note)
 
 from nwn_wiki import state
 
@@ -389,6 +390,33 @@ def _combined_properties(rec: dict, ctx: PageCtx) -> str:
     )
 
 
+def _playtime_chart(rec: dict) -> str:
+    """This character's play-hours per day, or "" when it was never tracked.
+
+    Nothing is invented for a character ptm_db has no rows for: an untracked
+    character gets no chart at all, rather than a flat line at zero that would
+    claim it was never played. tracking_note() repeats the "counted since"
+    caveat here because a chart whose left edge is the day tracking started
+    looks exactly like a character that started playing that day.
+    """
+    daily = rec.get("char_daily") or {}
+    if not daily:
+        return ""
+    by_date: dict = {}
+    for day, hrs in daily.items():
+        try:
+            by_date[date.fromisoformat(day)] = hrs
+        except ValueError:
+            continue
+    charts = daily_hours_charts(by_date, "Play-hours per day on this character",
+                                "Play-hours per week (week beginning)")
+    if not charts:
+        return ""
+    return ('<div class="card"><h2>Play Time</h2>' + charts
+            + tracking_note("This character\u2019s play time is counted from")
+            + "</div>")
+
+
 def render_character_pages(out) -> None:
     """characters/<slug>.html — one page per character."""
     for rec in state._CHARACTERS:
@@ -449,6 +477,7 @@ def render_character_pages(out) -> None:
             f'<dl class="kv">{fact_html}</dl>'
             + (tracking_note() if rec.get("char_hours") else "")
             + "</div>",
+            _playtime_chart(rec),
             '<div class="card"><h2>Abilities</h2>' + _stat_block(rec) + "</div>",
             '<div class="card"><h2>Bestiary</h2>'
             f'<dl class="kv">{kill_html}</dl></div>',

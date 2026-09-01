@@ -2,7 +2,7 @@
 
 The season's data does not agree with itself about what a "player" is:
 
-1. **CD key** (``QR69DAFR``) — the vault directory name, and the key in
+1. **CD key** (``AB12CD34``) — the vault directory name, and the key in
    ``bestiarydb.kills``, ``meritdb``, ``admindb.houses``, ``fam_*_<CDKEY>`` bank
    entries and ``activity-sessions.json``. This is the real account identity, and
    the one everything is normalised onto.
@@ -186,9 +186,9 @@ def build_roster(sessions: list[dict], kills: list[dict], chars: list[dict]) -> 
 
     Two wrinkles the raw data forces on us:
 
-    * **One CD key can log in under several account names** (``QRK76UEN`` appears
-      as both "Xil" and "Zam"). The canonical name is whichever the account used
-      for the most sessions, not whichever was seen first.
+    * **One CD key can log in under several account names** (one key on this
+      server appears as both "Xil" and "Zam"). The canonical name is whichever
+      the account used for the most sessions, not whichever was seen first.
     * **Older sessions have no CD key at all** — the pre-v2 activity cache stored
       only the account name. Those are backfilled by name once the named sessions
       have established a name -> key mapping, and dropped if the name is ambiguous.

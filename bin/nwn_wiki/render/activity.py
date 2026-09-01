@@ -2,8 +2,9 @@
 
 Collects and caches the server log files (``nwserverLog*.txt`` / ``anvil.log``),
 turns them into player sessions that survive log rotation, and renders
-``activity.html`` from them -- including the inline SVG bar charts, which are
-built here with plain stdlib string formatting rather than any charting library.
+``activity.html`` from them. The charts themselves live in
+``nwn_wiki.htmlgen.charts`` -- the character and player pages draw the same
+ones, and they must be the same charts, not lookalikes.
 
 Only active when the build is given ``--log-dir``; ``bin/nwn-wiki-activity``
 drives the same functions to refresh the page without a full wiki rebuild.
@@ -11,17 +12,16 @@ drives the same functions to refresh the page without a full wiki rebuild.
 
 from __future__ import annotations
 
-import html
 import json
-import math
 import re
 import shutil
 import sys
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
+from nwn_wiki.htmlgen.charts import (svg_hbar_chart, svg_vbar_chart,
+                                     weekly_rollup)
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.htmlgen.escape import E
@@ -410,175 +410,57 @@ def parse_nwserver_logs(
 
 
 # =============================================================================
-# SVG chart helpers (pure stdlib — no third-party deps)
+# Session arithmetic (shared with the per-player charts)
 # =============================================================================
 
-def _nice_upper(val: float) -> float:
-    """Round val up to a visually nice axis maximum."""
-    if val <= 0:
-        return 1.0
-    exp = 10 ** math.floor(math.log10(val))
-    norm = val / exp
-    for nice in (1, 2, 2.5, 5, 10):
-        if nice >= norm:
-            return nice * exp
-    return float(val)
+DOW_ORDER = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+# Daily charts show at most this many of the most recent days; anything older
+# rolls up into the weekly chart underneath rather than being lost.
+DAILY_WINDOW = 35
+
+# Nothing before this date is charted daily. Session capture was patchy until
+# then, and a chart that shows a real day and a missing day the same way (as a
+# short bar) invites the reader to conclude nobody played.
+DAILY_CUTOFF = date(2026, 5, 17)
 
 
-def _fmt_num(val: float) -> str:
-    if val == int(val):
-        return str(int(val))
-    return f"{val:.1f}" if val < 10 else str(int(round(val)))
+def session_hours(sessions: list[dict]) -> tuple[dict, dict[int, float], dict[str, float]]:
+    """Roll sessions up three ways: by date, by clock hour, by weekday.
 
+    Returns ``(hours_by_date, hours_by_hour, hours_by_weekday_name)``.
 
-def _se(s: Any) -> str:
-    """html.escape shorthand for SVG text content."""
-    return html.escape(str(s))
-
-
-def svg_vbar_chart(
-    labels: list[str], values: list[float], title: str,
-    ylabel: str = "", bar_color: str = "#6b3a1c",
-    width: int = 700, height: int = 270,
-    rotate_labels: bool = False,
-) -> str:
-    """Vertical bar chart returned as an inline SVG string."""
-    mt, mb = 32, (72 if rotate_labels else 50)
-    ml, mr = 55, 20
-    pw, ph = width - ml - mr, height - mt - mb
-    n = len(labels)
-    if n == 0:
-        return f'<svg width="{width}" height="{height}"><text x="10" y="20">No data</text></svg>'
-    y_max = _nice_upper(max(values) if values else 1)
-    bar_w = max(2.0, pw / n * 0.65)
-    bar_gap = pw / n
-    out: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'style="font-family:Georgia,serif;background:#fff;'
-        f'border:1px solid #d6d2c4;border-radius:4px;display:block;">'
-    ]
-    out.append(
-        f'<text x="{width/2:.1f}" y="22" text-anchor="middle" '
-        f'font-size="13" fill="#6b3a1c">{_se(title)}</text>'
-    )
-    if ylabel:
-        cy = mt + ph / 2
-        out.append(
-            f'<text x="13" y="{cy:.1f}" text-anchor="middle" font-size="11" fill="#6b6b6b" '
-            f'transform="rotate(-90 13 {cy:.1f})">{_se(ylabel)}</text>'
-        )
-    for i in range(6):
-        tv = y_max * i / 5
-        y = mt + ph - (tv / y_max) * ph
-        out.append(
-            f'<line x1="{ml}" y1="{y:.1f}" x2="{ml+pw}" y2="{y:.1f}" '
-            f'stroke="#d6d2c4" stroke-width="1" stroke-dasharray="3,3"/>'
-        )
-        out.append(
-            f'<text x="{ml-6}" y="{y+4:.1f}" text-anchor="end" '
-            f'font-size="10" fill="#6b6b6b">{_fmt_num(tv)}</text>'
-        )
-    out.append(
-        f'<line x1="{ml}" y1="{mt}" x2="{ml}" y2="{mt+ph}" '
-        f'stroke="#9a9a9a" stroke-width="1.5"/>'
-    )
-    out.append(
-        f'<line x1="{ml}" y1="{mt+ph}" x2="{ml+pw}" y2="{mt+ph}" '
-        f'stroke="#9a9a9a" stroke-width="1.5"/>'
-    )
-    for i, (lbl, val) in enumerate(zip(labels, values)):
-        bx = ml + i * bar_gap + (bar_gap - bar_w) / 2
-        bh = (val / y_max) * ph
-        by = mt + ph - bh
-        out.append(
-            f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bar_w:.1f}" height="{bh:.1f}" '
-            f'fill="{bar_color}" opacity="0.82"/>'
-        )
-        if val > 0:
-            out.append(
-                f'<text x="{bx+bar_w/2:.1f}" y="{by-3:.1f}" text-anchor="middle" '
-                f'font-size="10" fill="{bar_color}">{_fmt_num(val)}</text>'
-            )
-        cx = bx + bar_w / 2
-        if rotate_labels:
-            out.append(
-                f'<text x="{cx:.1f}" y="{mt+ph+10}" text-anchor="end" font-size="10" '
-                f'fill="#6b6b6b" transform="rotate(-45 {cx:.1f} {mt+ph+10})">'
-                f'{_se(lbl)}</text>'
-            )
-        else:
-            out.append(
-                f'<text x="{cx:.1f}" y="{mt+ph+16}" text-anchor="middle" '
-                f'font-size="11" fill="#6b6b6b">{_se(lbl)}</text>'
-            )
-    out.append('</svg>')
-    return "\n".join(out)
-
-
-def svg_hbar_chart(
-    labels: list[str], values: list[float], title: str,
-    xlabel: str = "", bar_color: str = "#6b3a1c",
-) -> str:
-    """Horizontal bar chart returned as an inline SVG string."""
-    bar_h, bar_gap = 22, 30
-    n = len(labels)
-    width = 700
-    ml, mr, mt, mb = 130, 65, 34, 38
-    height = mt + n * bar_gap + mb
-    pw = width - ml - mr
-    x_max = _nice_upper(max(values) if values else 1)
-    y_bot = mt + n * bar_gap
-    out: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'style="font-family:Georgia,serif;background:#fff;'
-        f'border:1px solid #d6d2c4;border-radius:4px;display:block;">'
-    ]
-    out.append(
-        f'<text x="{width/2:.1f}" y="24" text-anchor="middle" '
-        f'font-size="13" fill="#6b3a1c">{_se(title)}</text>'
-    )
-    for i in range(6):
-        tv = x_max * i / 5
-        x = ml + (tv / x_max) * pw
-        out.append(
-            f'<line x1="{x:.1f}" y1="{mt}" x2="{x:.1f}" y2="{y_bot}" '
-            f'stroke="#d6d2c4" stroke-width="1" stroke-dasharray="3,3"/>'
-        )
-        out.append(
-            f'<text x="{x:.1f}" y="{y_bot+14}" text-anchor="middle" '
-            f'font-size="10" fill="#6b6b6b">{_fmt_num(tv)}</text>'
-        )
-    if xlabel:
-        out.append(
-            f'<text x="{ml+pw/2:.1f}" y="{y_bot+30}" text-anchor="middle" '
-            f'font-size="11" fill="#6b6b6b">{_se(xlabel)}</text>'
-        )
-    out.append(
-        f'<line x1="{ml}" y1="{mt}" x2="{ml}" y2="{y_bot}" '
-        f'stroke="#9a9a9a" stroke-width="1.5"/>'
-    )
-    out.append(
-        f'<line x1="{ml}" y1="{y_bot}" x2="{ml+pw}" y2="{y_bot}" '
-        f'stroke="#9a9a9a" stroke-width="1.5"/>'
-    )
-    for i, (lbl, val) in enumerate(zip(labels, values)):
-        by = mt + i * bar_gap + (bar_gap - bar_h) / 2
-        bw = (val / x_max) * pw
-        out.append(
-            f'<rect x="{ml}" y="{by:.1f}" width="{bw:.1f}" height="{bar_h}" '
-            f'fill="{bar_color}" opacity="0.82"/>'
-        )
-        if val > 0:
-            out.append(
-                f'<text x="{ml+bw+5:.1f}" y="{by+bar_h/2+4:.1f}" '
-                f'font-size="10" fill="{bar_color}">{_fmt_num(val)}</text>'
-            )
-        out.append(
-            f'<text x="{ml-8}" y="{by+bar_h/2+4:.1f}" text-anchor="end" '
-            f'font-size="11" fill="#1f1f1f">{_se(lbl)}</text>'
-        )
-    out.append('</svg>')
-    return "\n".join(out)
+    This is the whole of what the activity charts are: the page-level charts
+    pass every player's sessions, a player page passes one player's, and the
+    two are then guaranteed to be counting the same way. A session is credited
+    to the day it BEGAN -- the same rule ``sources.load_playtime_daily`` uses
+    for the per-character figures.
+    """
+    date_hours: dict = {}
+    hour_hours: dict[int, float] = {}
+    dow_hours: dict[str, float] = {}
+    for s in sessions:
+        if s.get("duration_min") is None or s.get("join") is None:
+            continue
+        d = s["join"].date()
+        day = s["join"].strftime("%a")
+        hrs = s["duration_min"] / 60.0
+        date_hours[d] = date_hours.get(d, 0.0) + hrs
+        dow_hours[day] = dow_hours.get(day, 0.0) + hrs
+        # Distribute play-hours across every clock hour the session spans,
+        # correctly handling sessions that cross midnight. Synthetic sessions
+        # (recovered from old chart snapshots — see bin/recover-activity-gap)
+        # carry a faithful daily total but a fabricated join time, so they are
+        # excluded here to keep the hour-of-day chart honest.
+        if not s.get("synthetic"):
+            cur = s["join"]
+            end = cur + timedelta(hours=hrs)
+            while cur < end:
+                next_hour = cur.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                seg_end = min(next_hour, end)
+                hour_hours[cur.hour] = hour_hours.get(cur.hour, 0.0) + (seg_end - cur).total_seconds() / 3600.0
+                cur = seg_end
+    return date_hours, hour_hours, dow_hours
 
 
 # =============================================================================
@@ -611,30 +493,8 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         ]
     else:
         date_range = []
-    date_hours: dict = {}
-    hour_hours: dict[int, float] = {}
-    dow_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    dow_hours: dict[str, float] = {}
-    for s in ps:
-        if s.get("duration_min") is not None:
-            d = s["join"].date()
-            day = s["join"].strftime("%a")
-            hrs = s["duration_min"] / 60.0
-            date_hours[d] = date_hours.get(d, 0.0) + hrs
-            dow_hours[day] = dow_hours.get(day, 0.0) + hrs
-            # Distribute play-hours across every clock hour the session spans,
-            # correctly handling sessions that cross midnight. Synthetic sessions
-            # (recovered from old chart snapshots — see bin/recover-activity-gap)
-            # carry a faithful daily total but a fabricated join time, so they are
-            # excluded here to keep the hour-of-day chart honest.
-            if not s.get("synthetic"):
-                cur = s["join"]
-                end = cur + timedelta(hours=hrs)
-                while cur < end:
-                    next_hour = cur.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-                    seg_end = min(next_hour, end)
-                    hour_hours[cur.hour] = hour_hours.get(cur.hour, 0.0) + (seg_end - cur).total_seconds() / 3600.0
-                    cur = seg_end
+    dow_order = list(DOW_ORDER)
+    date_hours, hour_hours, dow_hours = session_hours(ps)
 
     # Sweep-line: peak concurrent players per day and overall.
     # Leaves are sorted before joins at identical timestamps so a player
@@ -690,29 +550,8 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
         xlabel="hours",
         bar_color="#5a2b78",
     )
-    _daily_cutoff = date(2026, 5, 17)
+    _daily_cutoff = DAILY_CUTOFF
     _conc_cutoff = date(2026, 6, 1)
-
-    # Daily charts show at most the most recent DAILY_WINDOW days. Once the data
-    # runs longer than that, the days that fall off the daily chart aren't lost:
-    # a weekly roll-up of the *whole* range is rendered underneath it.
-    DAILY_WINDOW = 35
-
-    def _weekly(days: list, value_of, combine) -> tuple[list[str], list]:
-        """Roll a per-day series up into Mon-anchored weeks.
-
-        `value_of(day)` yields that day's value; `combine(list)` reduces a week's
-        worth of values (sum for hours, max for a peak). Returns (labels, values).
-        """
-        buckets: dict = {}
-        for d in days:
-            wk = d - timedelta(days=d.weekday())
-            buckets.setdefault(wk, []).append(value_of(d))
-        weeks = sorted(buckets)
-        return (
-            [w.strftime("%b %-d") for w in weeks],
-            [combine(buckets[w]) for w in weeks],
-        )
 
     date_range_daily_all = [d for d in date_range if d > _daily_cutoff]
     date_range_daily = date_range_daily_all[-DAILY_WINDOW:]
@@ -729,7 +568,7 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
     )
     chart_weekly_hours = ""
     if len(date_range_daily_all) > DAILY_WINDOW:
-        wk_labels, wk_values = _weekly(
+        wk_labels, wk_values = weekly_rollup(
             date_range_daily_all,
             lambda d: date_hours.get(d, 0.0),
             lambda vs: round(sum(vs), 2),
@@ -758,7 +597,7 @@ def render_activity_page(activity: dict, out: Path, tz_label: str = "GMT+0") -> 
     )
     chart_weekly_conc = ""
     if len(date_range_conc_all) > DAILY_WINDOW:
-        wk_labels, wk_values = _weekly(
+        wk_labels, wk_values = weekly_rollup(
             date_range_conc_all,
             lambda d: daily_peak_conc.get(d, 0),
             max,

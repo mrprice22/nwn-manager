@@ -76,6 +76,7 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
     from nwn_wiki.render.leaderboards import render_leaderboards
     from nwn_wiki.render.players import (render_player_pages,
                                          render_players_index)
+    from nwn_wiki.players import roadmap
 
     vault = Path(args.vault_dir).expanduser()
     if not vault.is_dir():
@@ -97,6 +98,7 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
 
     kills, catalogue, admin_cdkeys, dummy_runs = [], {}, set(), {}
     playtime: dict = {}
+    playtime_daily: dict = {}
     if args.db_dir:
         db_dir = Path(args.db_dir).resolve()
         bes = sources.open_ro(db_dir / "bestiarydb.sqlite3")
@@ -114,17 +116,31 @@ def _render_player_pages(wiki, args, activity: dict, out: "Path",
         ptm = sources.open_ro(db_dir / "playtimedb.sqlite3")
         if ptm is not None:
             playtime, state._PLAYTIME_SINCE = sources.load_playtime(ptm)
+            playtime_daily = sources.load_playtime_daily(ptm)
 
     sessions = activity["sessions"]
-    identity.configure()
+    identity.configure(roadmap_aliases=roadmap.load_aliases(args.player_aliases))
     roster = identity.build_roster(sessions, kills, chars)
     state._CHARACTERS = model.build_records(chars, kills, sessions, roster,
                                             catalogue,
                                             exclude_cdkeys=admin_cdkeys,
                                             dummy_runs=dummy_runs,
-                                            playtime=playtime)
+                                            playtime=playtime,
+                                            playtime_daily=playtime_daily)
     state._PLAYERS = model.build_players(state._CHARACTERS)
     state._PLAYER_SLUGS = {p["name"]: p["slug"] for p in state._PLAYERS}
+    state._PLAYER_SESSIONS = model.player_sessions(sessions, roster,
+                                                   exclude_cdkeys=admin_cdkeys)
+    state._TZ_LABEL = wiki._tz_label_from_env()
+    # Same idea credit the full build renders, so a page this pass rewrites
+    # does not silently lose its Ideas section between full rebuilds.
+    credits = roadmap.load_credits(args.roadmap_credits)
+    if credits:
+        state._ROADMAP = credits
+        state._PLAYER_IDEAS, unresolved = roadmap.attribute(credits, roster)
+        if unresolved:
+            print(f"[nwn-wiki-activity] warn: {len(unresolved)} roadmap name(s) "
+                  f"match no account: {', '.join(unresolved)}", file=sys.stderr)
     state._ACHIEVEMENTS = compute_achievements()
     state._PLAYER_ACHIEVEMENTS = achievement_counts(state._ACHIEVEMENTS)
     # This pass has no module database, so item pages cannot be enumerated from
@@ -189,6 +205,16 @@ def main() -> int:
              "alongside --db-dir, the character index, the per-character pages and "
              "the leaderboards are refreshed too, so they stay in step with the "
              "kill counts the same pass writes into Server Firsts.",
+    )
+    ap.add_argument(
+        "--roadmap-credits", default=None, dest="roadmap_credits", metavar="PATH",
+        help="JSON credit sidecar from the project's roadmap generator. Same "
+             "flag, same file and same effect as on the full build: without it "
+             "this pass rewrites the player pages with no Ideas section.",
+    )
+    ap.add_argument(
+        "--player-aliases", default=None, dest="player_aliases", metavar="PATH",
+        help="JSON map of roadmap `player:` label -> account name or CD key.",
     )
     ap.add_argument(
         "--vault-cache", default=None, dest="vault_cache", metavar="PATH",

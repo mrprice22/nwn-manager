@@ -1316,6 +1316,62 @@ nwnee-server ...
 kill "$SERVE_PID" 2>/dev/null
 ```
 
+#### Player and character pages
+
+Pass `--vault-dir` (with `--db-dir` and `--log-dir`) to generate the **Players**
+section: an account index, a page per player, a page per character, the
+leaderboards and the Hall of Fame. A player is an account; a character is one of
+their `.bic` files.
+
+Two play-time figures appear, and they are deliberately labelled differently
+because they answer different questions:
+
+- **per account** — from the server log, which records *who logged in* but never
+  which character they chose.
+- **per character** — from `playtimedb.sqlite3`, written by the module's
+  `ptm_db.nss`. A character page shows its total and a play-hours-per-day line
+  chart (the last 35 days, plus a weekly roll-up line once history outgrows
+  that). Both carry a `counted from <date>` note taken from the DB's
+  `tracking_started`, because tracking almost always starts long after the
+  season does and the figure is misleading without it. A character the DB has
+  never seen gets no chart rather than a flat line at zero.
+
+Each player page also carries its own copy of the activity charts — daily,
+hour-of-day and day-of-week — for that account alone. The concurrency charts
+stay on the Activity page, where they mean something.
+
+##### Player idea credit (`--roadmap-credits`)
+
+If the project publishes a development roadmap, `nwn-wiki` can credit the
+players who reported the bugs and asked for the features. It never parses the
+roadmap itself: the project's own generator writes a JSON sidecar, and this
+reads it.
+
+```bash
+nwn-manager wiki \
+  --vault-dir ~/.local/share/'Neverwinter Nights'/servervault \
+  --roadmap-credits ./roadmap-credits.json \
+  --player-aliases ./player-aliases.json
+```
+
+- `--roadmap-credits` adds **Bugs / Features / Exploits / Testing** columns to
+  the Players index (counting every idea submitted, whatever its status) and an
+  **Ideas & Testing** section to each player page: a type × lifecycle pivot,
+  then the ideas grouped by status, each linking back to the roadmap page's own
+  `#idea-<id>` anchor for the detail. Omit the flag and none of it exists.
+- `--player-aliases` is an optional JSON map of roadmap display name → account
+  name **or** CD key, for submitters whose hand-typed roadmap name cannot be
+  matched to a login.
+
+Names are matched exactly — the alias table first, then the parenthetical in
+`"Sync (Shync)"`, then the bare label — never by substring or edit distance,
+because two accounts one character apart are common and crediting the wrong
+player is worse than crediting nobody. Anything unmatched is **named on stderr**
+so it can be fixed with one alias entry, rather than silently dropped. A CD key
+in the alias table is only ever a lookup *into* the roster and never a name out
+of it, so an alias pointing at an account that has not played this season leaves
+the idea uncredited instead of putting a key on a page.
+
 #### Bestiary kill stats (live DB integration)
 
 When a module ships the bestiary kill-tracking system — detected by the presence
