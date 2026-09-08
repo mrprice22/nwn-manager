@@ -487,6 +487,37 @@ def _spell_failure_row(i: dict, _bi: int) -> list[str]:
     ]
 
 
+def _type_link(i: dict, display_name: str, *, is_broken: bool,
+               is_inaccessible: bool) -> str:
+    """The item's category, linked to its section on whichever index lists it.
+
+    Written relative to ``items/``, so only a page at that depth may use it --
+    the item detail page and Most Equipped both sit there.
+    """
+    cat = _item_category(i, nwn_text(display_name))
+    slug = cat.replace("_", "-")
+    if is_broken:
+        href = "index.html#broken"
+    elif is_inaccessible:
+        href = f"inaccessible/index.html#{slug}"
+    else:
+        href = f"index.html#{slug}"
+    return link(href, _item_category_label(cat))
+
+
+def item_type_cell(db: Db, resref: str, i: dict) -> str:
+    """:func:`_type_link` for an item the caller has only a resref for.
+
+    Resolves which index the item landed on through the same
+    :func:`_item_access_class` the indexes themselves are built from, so the
+    anchor can never point at a section the item was not written into.
+    """
+    cls = _item_access_class(db, resref)
+    return _type_link(i, nwn_text(db.item_name(resref)),
+                      is_broken=cls == "broken",
+                      is_inaccessible=cls == "inaccessible")
+
+
 def _item_meta_sections(i: dict, resref: str, display_name: str, _bi: int,
                         _carriers: list[dict], _any_droppable: bool, *,
                         is_broken: bool, is_inaccessible: bool,
@@ -509,13 +540,6 @@ def _item_meta_sections(i: dict, resref: str, display_name: str, _bi: int,
         _drop_label = "No"
         _drop_reason = " — not flagged droppable"
         _drop_tt = "title=\"No creature carrying this item has it flagged as droppable. It will not appear in any loot bag.\""
-    _cat_slug = _item_category(i, nwn_text(display_name)).replace("_", "-")
-    if is_broken:
-        _type_href = f"index.html#broken"
-    elif is_inaccessible:
-        _type_href = f"inaccessible/index.html#{_cat_slug}"
-    else:
-        _type_href = f"index.html#{_cat_slug}"
     _is_scroll = _bi in _SCROLL_BASEITEMS
     _scroll_spell_lvl, _scroll_spell_cls = (
         _spell_level_classes(_scroll_cast_spell_info(i, nwn_text(display_name))) if _is_scroll else ("", "")
@@ -532,7 +556,7 @@ def _item_meta_sections(i: dict, resref: str, display_name: str, _bi: int,
                     f"<dt>Caster Classes</dt><dd>{E(_scroll_spell_cls)}</dd>",
                 ] if _is_scroll and (_scroll_spell_lvl or _scroll_spell_cls) else []
             ),
-            f"<dt>Type</dt><dd>{link(_type_href, _item_category_label(_item_category(i, nwn_text(display_name))))}</dd>",
+            f"<dt>Type</dt><dd>{_type_link(i, display_name, is_broken=is_broken, is_inaccessible=is_inaccessible)}</dd>",
             *(
                 (lambda _ac: [
                     f"<dt>Base AC</dt><dd>{_ac}</dd>",
@@ -680,6 +704,56 @@ def _item_dialog_sections(db: Db, i: dict, resref: str, ctx: PageCtx) -> list[st
     return sections
 
 
+def itemprop_cells(f: dict) -> tuple[str, str, str, str]:
+    """(property, subtype, value, param) cells for one formatted item property.
+
+    ``f`` is an :func:`itemprop_format` result. The property and subtype cells
+    link into the Browse by Property index/detail pages -- property cell to the
+    index section heading, subtype cell to the detail page -- and fall back to
+    plain text when the property name is unresolved (e.g. "Property #7").
+
+    Hrefs are relative to ``items/``, so only a page at that depth may use this.
+    """
+    pname, subtype = f["property"], f["subtype"]
+    _pname_known = pname and not pname.startswith("Property #")
+    _subtype_real = subtype and not _is_raw_subtype(subtype)
+    cost_str = f["cost"]
+    if _pname_known:
+        _idx_anch = f"properties/index.html#pn-{_prop_slug(pname, '')}"
+        _detail_slug = _prop_slug(pname, subtype if _subtype_real else "")
+        _combined_page = _COMBINED_PROP_PAGES.get(pname)
+        if _combined_page:
+            _spell_frag = f"#{_detail_slug}" if _subtype_real else ""
+            _detail_href = f"properties/{_combined_page}.html{_spell_frag}"
+            # Cost links to the same spell section (no tier-based anchor).
+            cost_cell = link(_detail_href, cost_str) if cost_str else ""
+        else:
+            _detail_href = f"properties/{_detail_slug}.html"
+            if cost_str:
+                _cost_anch = _cost_anchor(cost_str)
+                _cost_href = f"{_detail_href}#{_cost_anch}" if _cost_anch else _detail_href
+                cost_cell = link(_cost_href, cost_str)
+            else:
+                cost_cell = ""
+        if _subtype_real:
+            pname_cell = colorize_damage_words(link(_idx_anch, pname))
+            subtype_cell = colorize_damage_words(link(_detail_href, subtype))
+        else:
+            pname_cell = colorize_damage_words(link(_detail_href, pname))
+            subtype_cell = colorize_damage_words(E(subtype))
+    else:
+        pname_cell = colorize_damage_words(E(pname))
+        subtype_cell = colorize_damage_words(E(subtype))
+        cost_cell = E(cost_str)
+    _param_raw = f["param"]
+    if pname == "Light" and _param_raw:
+        _pcls = f"nwn-light-color nwn-light-{_param_raw.lower()}"
+        param_cell = f'<span class="{_pcls}">{E(_param_raw)}</span>'
+    else:
+        param_cell = E(_param_raw)
+    return pname_cell, subtype_cell, cost_cell, param_cell
+
+
 def _item_property_sections(props: list[dict]) -> list[str]:
     """Item-properties table plus the collapsed raw-values table."""
     sections: list[str] = []
@@ -689,46 +763,7 @@ def _item_property_sections(props: list[dict]) -> list[str]:
         debug_rows = []
         for p in props:
             f = itemprop_format(p)
-            pname, subtype = f["property"], f["subtype"]
-            # Build links into the Browse by Property index/detail pages.
-            # Property cell → index section heading; subtype cell → detail page.
-            # Fall back to plain text when pname is unresolved (e.g. "Property #7").
-            _pname_known = pname and not pname.startswith("Property #")
-            _subtype_real = subtype and not _is_raw_subtype(subtype)
-            cost_str = f["cost"]
-            if _pname_known:
-                _idx_anch = f"properties/index.html#pn-{_prop_slug(pname, '')}"
-                _detail_slug = _prop_slug(pname, subtype if _subtype_real else "")
-                _combined_page = _COMBINED_PROP_PAGES.get(pname)
-                if _combined_page:
-                    _spell_frag = f"#{_detail_slug}" if _subtype_real else ""
-                    _detail_href = f"properties/{_combined_page}.html{_spell_frag}"
-                    # Cost links to the same spell section (no tier-based anchor).
-                    cost_cell = link(_detail_href, cost_str) if cost_str else ""
-                else:
-                    _detail_href = f"properties/{_detail_slug}.html"
-                    if cost_str:
-                        _cost_anch = _cost_anchor(cost_str)
-                        _cost_href = f"{_detail_href}#{_cost_anch}" if _cost_anch else _detail_href
-                        cost_cell = link(_cost_href, cost_str)
-                    else:
-                        cost_cell = ""
-                if _subtype_real:
-                    pname_cell = colorize_damage_words(link(_idx_anch, pname))
-                    subtype_cell = colorize_damage_words(link(_detail_href, subtype))
-                else:
-                    pname_cell = colorize_damage_words(link(_detail_href, pname))
-                    subtype_cell = colorize_damage_words(E(subtype))
-            else:
-                pname_cell = colorize_damage_words(E(pname))
-                subtype_cell = colorize_damage_words(E(subtype))
-                cost_cell = E(cost_str)
-            _param_raw = f["param"]
-            if f["property"] == "Light" and _param_raw:
-                _pcls = f"nwn-light-color nwn-light-{_param_raw.lower()}"
-                param_cell = f'<span class="{_pcls}">{E(_param_raw)}</span>'
-            else:
-                param_cell = E(_param_raw)
+            pname_cell, subtype_cell, cost_cell, param_cell = itemprop_cells(f)
             rows.append(
                 f"<tr><td>{pname_cell}</td>"
                 f"<td>{subtype_cell}</td>"

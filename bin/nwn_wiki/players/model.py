@@ -26,7 +26,7 @@ import unicodedata
 from collections import defaultdict
 from datetime import datetime
 
-from nwn_wiki.lookups import class_name, race_name
+from nwn_wiki.lookups import class_abbrev, class_name, race_name
 
 # How many recent combat-dummy trials the character page averages and lists.
 RECENT_DUMMY_RUNS = 5
@@ -111,6 +111,19 @@ def _class_line(classes: list) -> str:
     parts = [(class_name(cid), lvl) for cid, lvl in classes]
     parts.sort(key=lambda p: -p[1])
     return " / ".join(f"{n} {l}" for n, l in parts)
+
+
+def class_shorthand(classes: list) -> str:
+    """"10 Ftr 5 BG 5 AA" -- the compact build string, level before class.
+
+    Same highest-level-first ordering as :func:`_class_line`, which is how a
+    player reads their own build out loud. Kept as a render-time helper taking
+    ``rec["classes"]`` rather than a record field: the committed season snapshots
+    (:func:`save_snapshot`) were frozen without it and must keep rendering.
+    """
+    parts = sorted(((int(lvl), class_abbrev(cid)) for cid, lvl in classes),
+                   key=lambda p: -p[0])
+    return " ".join(f"{lvl} {abbr}" for lvl, abbr in parts)
 
 
 def _parse_ts(v):

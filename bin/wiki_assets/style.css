@@ -843,3 +843,14 @@ section[id] { scroll-margin-top: 4em; }
   padding: 0.05em 0.35em;
   border-radius: 3px;
 }
+
+/* Most Equipped items table (items/most-equipped.html).
+ * The gear rows are tall — a bulleted wearer list per row — so the table needs
+ * top-aligned cells and a compact, unmarked list rather than the page default. */
+table.data td.num { text-align: right; white-space: nowrap; vertical-align: top; }
+table.data ul.worn-by {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+table.data ul.worn-by li { margin: 0 0 0.15em 0; }

@@ -49,7 +49,8 @@ def _player_cell(rec: dict) -> str:
     return E(rec["player"]) if rec["player"] else '<span class="muted">—</span>'
 
 
-def _char_link(rec: dict, ctx: PageCtx) -> str:
+def char_link(rec: dict, ctx: PageCtx) -> str:
+    """Link to a character's page from anywhere in the site."""
     href = ctx.dir_url("characters") + f"{rec['slug']}.html"
     return f'<a href="{E(href)}">{E(rec["name"])}</a>'
 
@@ -69,7 +70,7 @@ def render_character_index(out) -> None:
     for r in recs:
         rows.append(
             "<tr>"
-            f"<td>{_char_link(r, ctx)}</td>"
+            f"<td>{char_link(r, ctx)}</td>"
             f"<td>{_player_cell(r)}</td>"
             f"<td>{r['level']}</td>"
             f"<td>{E(r['class_line'])}</td>"

@@ -415,6 +415,12 @@ def page(title: str, body: str, ctx: PageCtx, page_updated_at: str = "",
         "\n          " + _nav_link(ctx, "items/inaccessible/index.html",
                                    "Inaccessible")
         if chrome.has_inaccessible else "")
+    # Gated on the same fact render_most_equipped() early-returns on, so the
+    # menu never offers a page a vault-less build did not write.
+    most_equipped_nav = (
+        "\n          " + _nav_link(ctx, "items/most-equipped.html",
+                                   "Most Equipped")
+        if chrome.has_characters else "")
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -446,7 +452,7 @@ def page(title: str, body: str, ctx: PageCtx, page_updated_at: str = "",
         <div class="nav-dropdown-menu">
           {_nav_link(ctx, 'items/index.html', 'Accessible')}{inaccessible_nav}
           {_nav_link(ctx, 'items/properties/index.html', 'By Property')}
-          {_nav_link(ctx, 'items/search.html', 'Search')}
+          {_nav_link(ctx, 'items/search.html', 'Search')}{most_equipped_nav}
         </div>
       </div>
       {_nav_link(ctx, 'stores/index.html', 'Stores')}

@@ -50,6 +50,11 @@ BASEITEMS = _load_lookup("baseitems")
 # refuses every sale. Such a row is absent from this stock set. See _store_buy_summary.
 STOCK_BASEITEMS: frozenset[int] = frozenset(BASEITEMS)
 CLASSES = _load_lookup("classes")
+# Player-facing short forms ("Ftr", "AA", "RDD") keyed by the same 2DA row as
+# CLASSES. classes.2da's own Short column is a TLK StrRef that HAKs relabel
+# freely, so this is a curated map rather than an extraction; class_abbrev()
+# derives a fallback for any row it does not cover.
+CLASS_ABBREV = _load_lookup("class_abbrev")
 RACES = _load_lookup("racialtypes")
 APPEARANCE = _load_lookup("appearance")
 PLACEABLES: dict[int, str] = {}  # populated by overlays only — stock placeables.2da
@@ -338,6 +343,28 @@ def class_name(row: int | None) -> str:
         return CLASSES[r]
     _warn_once(f"classes.2da row {r} not found — add --2da-dir with an override to resolve")
     return f"Class #{r}"
+
+
+def class_abbrev(row: int | None) -> str:
+    """Short class form for the compact "10 Ftr 5 BG 5 AA" build strings.
+
+    Falls back to a derived abbreviation for a HAK/custom class the curated map
+    does not name -- initials for a multi-word name ("Arcane Archer" -> "AA"),
+    otherwise the first three letters. Deliberately silent: a derived form is a
+    correct answer here, not a lookup failure worth a warning.
+    """
+    if row is None:
+        return ""
+    r = int(row)
+    if r in CLASS_ABBREV:
+        return CLASS_ABBREV[r]
+    name = CLASSES.get(r, "")
+    if not name:
+        return f"Cls{r}"
+    words = name.split()
+    if len(words) > 1:
+        return "".join(w[0].upper() for w in words)
+    return name[:3].title()
 
 
 def race_name(row: int | None) -> str:

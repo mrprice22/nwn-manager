@@ -121,6 +121,7 @@ from nwn_wiki.render.items import (
     render_item_page,
     render_items_index,
 )
+from nwn_wiki.render.most_equipped import render_most_equipped
 from nwn_wiki.render.manual import render_manual_pages
 from nwn_wiki.render.map import render_map_page
 from nwn_wiki.render.quests import (
@@ -143,6 +144,7 @@ from nwn_wiki.reports.conflicts import (
     generate_store_tag_conflict_report,
     generate_tag_conflict_report,
 )
+from nwn_wiki.reports.equipped_items import write_equipped_items
 from nwn_wiki.reports.module_index import generate_module_index
 from nwn_wiki.twoda import detect_cep_haks, load_2da_overrides
 from nwn_wiki.util import (
@@ -1012,6 +1014,7 @@ def _render_pages(db: Db, src: Path, out: Path, title: str,
     state._current_context = ""
     render_items_search(db, out)
     state._current_context = ""
+    render_most_equipped(db, out)
     render_stores_index(db, out)
     for area_rr, inst_list in db.area_stores.items():
         if area_rr in db.hidden_areas:
@@ -1151,6 +1154,11 @@ def main() -> int:
 
     _render_pages(db, src, out, title, positions, sizes,
                   area_paths, path_from_name, args)
+
+    # After the pages, not with the other module-index reports: those run
+    # before _load_players, when the character records this is built from do
+    # not exist yet.
+    write_equipped_items(db, module_index_dir, title, out, args.base_url or "")
 
     warnings_path, warnings_out = _write_lookup_warnings(module_index_dir)
     _write_boss_registry(db, module_index_dir)
