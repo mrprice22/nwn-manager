@@ -854,3 +854,20 @@ table.data ul.worn-by {
   list-style: none;
 }
 table.data ul.worn-by li { margin: 0 0 0.15em 0; }
+
+/* One wearer per LINE. At the site's 1100px main the wearer column got roughly
+ * a quarter of the width and wrapped every "Name [Player]: 30 Mnk" onto three
+ * or four lines, which made the rows tall and the table hard to scan. Three
+ * things together fix that: this page opts out of the 1100px cap, the greedy
+ * properties column is capped so it stops eating the row, and each wearer is
+ * nowrap so it either fits on its line or the table scrolls — never wraps. */
+main:has(> .wide-page) { max-width: 1600px; }
+.table-scroll { overflow-x: auto; }
+.most-equipped { min-width: 900px; }
+.most-equipped .props-cell {
+  max-width: 34em;
+  display: inline-block;
+  vertical-align: top;
+}
+.most-equipped ul.worn-by li { white-space: nowrap; }
+.most-equipped td { vertical-align: top; }

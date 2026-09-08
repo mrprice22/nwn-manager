@@ -48,7 +48,7 @@ def _prop_sig(props: list) -> tuple[str, ...]:
     return tuple(sorted(itemprop_oneliner(p) for p in props or []))
 
 
-def collect_equipped(db) -> list[dict]:
+def collect_equipped(db) -> "tuple[list[dict], list[dict]]":
     """Worn items, most-worn first — the shared source for the page and the JSON.
 
     Returns one dict per blueprint resref::
@@ -56,9 +56,13 @@ def collect_equipped(db) -> list[dict]:
         {resref, name, item, copies, chars: [{rec, copies, modified}],
          modified_copies, has_page}
 
-    ``item`` is the blueprint struct, or ``None`` when the module has no
-    blueprint for a resref a character is wearing -- which is a module defect,
-    not a display case, and is reported as a build warning by the page renderer.
+    ``item`` is always a blueprint struct carrying at least one property.
+    Returns ``(rows, dropped)``: gear with no module blueprint, or with a
+    blueprint that grants nothing, is not equipment a player chose -- it is the
+    engine's starting outfit (nw_cloth001 and friends), which every new
+    character spawns wearing and which would otherwise top the ranking with an
+    unlinkable, propertyless row. Those are reported separately rather than
+    listed, so both the page and the JSON show only gear worth ranking.
     """
     rows: dict[str, dict] = {}
     for rec in dedupe(state._CHARACTERS):
@@ -90,15 +94,24 @@ def collect_equipped(db) -> list[dict]:
             slot["copies"] += 1
             slot["modified"] = slot["modified"] or modified
 
-    out = []
+    out, dropped = [], []
     for row in rows.values():
         row["chars"] = sorted(
             row.pop("_chars").values(),
             key=lambda c: (-c["copies"], c["rec"]["name"].lower()),
         )
-        out.append(row)
+        bp = row["item"]
+        if bp is None:
+            row["reason"] = "no blueprint in the module"
+            dropped.append(row)
+        elif not list_items(bp.get("PropertiesList")):
+            row["reason"] = "blueprint grants no properties"
+            dropped.append(row)
+        else:
+            out.append(row)
     out.sort(key=lambda r: (-r["copies"], r["name"].lower()))
-    return out
+    dropped.sort(key=lambda r: (-r["copies"], r["name"].lower()))
+    return out, dropped
 
 
 def _name_cell(row: dict) -> str:
@@ -122,22 +135,18 @@ def _type_cell(db, row: dict) -> str:
 
 def _props_cell(row: dict) -> str:
     """The blueprint's properties as one linked, comma-separated list."""
-    if row["item"] is None:
-        return '<span class="muted">—</span>'
     parts = []
     for p in list_items(row["item"].get("PropertiesList")):
         f = itemprop_format(p)
         pname_cell, subtype_cell, cost_cell, _param = itemprop_cells(f)
         bits = [b for b in (pname_cell, subtype_cell, cost_cell) if b]
         parts.append(" ".join(bits))
-    if not parts:
-        return '<span class="muted">no properties</span>'
     cell = ", ".join(parts)
     if row["modified_copies"]:
         cell += (' <span class="muted" title="Worn copies whose property set '
                  'differs from this blueprint — reworked at the forge.">&middot; '
                  f'{row["modified_copies"]} modified</span>')
-    return cell
+    return f'<div class="props-cell">{cell}</div>'
 
 
 def _worn_by_cell(row: dict, ctx: PageCtx) -> str:
@@ -169,8 +178,19 @@ def render_most_equipped(db, out: Path) -> None:
     if not state._CHARACTERS:
         return
     ctx = PageCtx(PAGE_REL)
-    rows = collect_equipped(db)
+    rows, dropped = collect_equipped(db)
 
+    # Not a warning: propertyless starting kit is expected on every character.
+    # Reported so the count stays visible if it ever grows into something else.
+    if dropped:
+        state._module_index_summary.append((
+            "info",
+            f"[nwn-wiki] most-equipped: {len(dropped)} worn item(s) not ranked "
+            f"(no properties, or no blueprint) — "
+            + ", ".join(r["resref"] for r in dropped[:8])
+            + (" …" if len(dropped) > 8 else ""),
+        ))
+    # A blueprint that IS ranked but has no item page is still a real defect.
     missing = [r["resref"] for r in rows if not r["has_page"]]
     if missing:
         state._module_index_summary.append((
@@ -211,16 +231,22 @@ def render_most_equipped(db, out: Path) -> None:
         '<small class="muted">Rows are keyed by item blueprint: an item reworked '
         "at the forge keeps its blueprint, so every variant is counted here and "
         "the properties shown are the blueprint's. Copies whose properties no "
-        'longer match are counted as <em>modified</em>.</small></p>'
+        'longer match are counted as <em>modified</em>. Starting kit is left '
+        "out: an item whose blueprint grants no properties is not gear a player "
+        'chose.</small></p>'
     )
     if not body_rows:
         body += '<p class="muted">No character is wearing anything.</p>'
     else:
         body += (
-            '<table class="data"><thead><tr>'
+            '<div class="table-scroll">'
+            '<table class="data most-equipped"><thead><tr>'
             "<th>Item</th><th>Type</th><th>Properties</th>"
             "<th>Equipped</th><th>Worn by</th>"
-            "</tr></thead><tbody>" + "\n".join(body_rows) + "</tbody></table>"
+            "</tr></thead><tbody>" + "\n".join(body_rows) + "</tbody></table></div>"
         )
 
-    write_page(out, ctx, "Most Equipped Items", items_layout(sidebar, body))
+    # .wide-page is what main:has(> .wide-page) keys the wider cap off, so the
+    # wearer column has room for one character per line.
+    write_page(out, ctx, "Most Equipped Items",
+               f'<div class="wide-page">{items_layout(sidebar, body)}</div>')

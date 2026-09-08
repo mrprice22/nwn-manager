@@ -34,19 +34,19 @@ def write_equipped_items(db, module_index_dir: Path, module_title: str,
     _iu = _module_index_url_helpers(module_index_dir, wiki_out, base_url)[1]
     now = datetime.now().isoformat(timespec="seconds")
 
+    rows, dropped = collect_equipped(db)
     items = []
-    for row in collect_equipped(db):
+    for row in rows:
         bp = row["item"]
-        bi_raw = fld(bp, "BaseItem", None) if bp is not None else None
+        bi_raw = fld(bp, "BaseItem", None)
         bi = -1 if bi_raw is None else _try_int(bi_raw, -1)
         items.append({
             "resref": row["resref"],
             "name": row["name"],
             "base_item": baseitem_name(bi) if bi >= 0 else "",
-            "category": _item_category(bp, row["name"]) if bp is not None else "",
+            "category": _item_category(bp, row["name"]),
             "properties": [itemprop_oneliner(p)
-                           for p in list_items(bp.get("PropertiesList"))]
-                          if bp is not None else [],
+                           for p in list_items(bp.get("PropertiesList"))],
             "equipped_copies": row["copies"],
             "equipped_by_characters": len(row["chars"]),
             "modified_copies": row["modified_copies"],
@@ -70,6 +70,11 @@ def write_equipped_items(db, module_index_dir: Path, module_title: str,
         "module": module_title,
         "count": len(items),
         "items": items,
+        # Worn but not ranked, and why -- the page leaves these out, so the
+        # export says plainly what it left out rather than silently shrinking.
+        "excluded": [{"resref": r["resref"], "name": r["name"],
+                      "equipped_copies": r["copies"], "reason": r["reason"]}
+                     for r in dropped],
     })
     state._module_index_summary.append((
         "info",
