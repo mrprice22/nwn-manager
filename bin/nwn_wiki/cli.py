@@ -1006,11 +1006,14 @@ def _render_pages(db: Db, src: Path, out: Path, title: str,
         render_creature_page(db, can_rr, out)
     state._current_context = ""
     render_items_index(db, out)
+    # BEFORE the item detail pages: it fills state._PROP_PAGES /
+    # _PROP_INDEX_SECTIONS, and an item page links a property only where one of
+    # those says the target was actually written.
+    render_items_by_property(db, out)
+    state._current_context = ""
     for resref in db.items:
         state._current_context = f"item:{resref} ({db.item_name(resref)})"
         render_item_page(db, resref, out)
-    state._current_context = ""
-    render_items_by_property(db, out)
     state._current_context = ""
     render_items_search(db, out)
     state._current_context = ""

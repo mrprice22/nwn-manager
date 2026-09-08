@@ -26,6 +26,7 @@ from nwn_wiki.itemprops import (
     _prop_group,
     _prop_slug,
     _prop_value_num,
+    cost_subtype_swap,
     itemprop_format,
 )
 from nwn_wiki.items import (
@@ -126,8 +127,7 @@ def _collect_item_properties(db: "Db") -> tuple[dict, dict, dict]:
             pname, subtype, cost_str = f["property"], f["subtype"], f["cost"]
             if not pname:
                 continue
-            if pname == "Immunity: Specific Spell" and not subtype and cost_str:
-                subtype, cost_str = cost_str, ""
+            subtype, cost_str = cost_subtype_swap(pname, subtype, cost_str)
             # Merge entries whose subtype is an unresolved numeric fallback
             # (e.g. "True Seeing: 1", "True Seeing: 2" → all under "True Seeing").
             key_subtype = "" if _is_raw_subtype(subtype) else _group_subtype(pname, subtype)
@@ -327,6 +327,8 @@ def _render_property_index_page(out: Path, prop_index: dict, unique_pnames: dict
                 )
 
     layout = items_layout(sidebar, body)
+    state._PROP_INDEX_SECTIONS.update(
+        pname for g in _PROP_GROUP_ORDER for pname in unique_pnames.get(g, []))
     write_page(out, PageCtx("items/properties/index.html"),
                "Browse by Property", layout)
 
@@ -521,6 +523,7 @@ def _render_property_detail_pages(db: "Db", out: Path, prop_index: dict,
         detail_sidebar = toc_sidebar([back, *toc_parts])
         layout = items_layout(detail_sidebar, body)
         write_page(out, PageCtx(f"items/properties/{slug}.html"), label, layout)
+        state._PROP_PAGES.add(slug)
 
 
 def _render_combined_property_pages(db: "Db", out: Path, prop_index: dict,
@@ -609,6 +612,7 @@ def _render_combined_property_pages(db: "Db", out: Path, prop_index: dict,
         layout = items_layout(combined_sidebar, body)
         write_page(out, PageCtx(f"items/properties/{combined_slug}.html"),
                    pname, layout)
+        state._PROP_PAGES.add(combined_slug)
 
 
 def render_items_by_property(db: "Db", out: Path) -> None:

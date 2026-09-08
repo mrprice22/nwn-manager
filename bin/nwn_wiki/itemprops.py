@@ -258,6 +258,22 @@ def itemprop_oneliner(prop: dict) -> str:
     return " ".join(b for b in bits if b)
 
 
+# "Immunity: Specific Spell" is the one property that names its subject in the
+# COST column rather than the subtype one: itemprop_format faithfully reports
+# subtype="" / cost="Meteor Swarm". Everything that keys a property page off
+# (name, subtype) has to undo that first, or it keys off a subtype-less slug --
+# which is how the item pages spent a long time linking at
+# properties/immunity-specific-spell.html, a page nothing ever writes.
+_COST_IS_SUBTYPE = ("Immunity: Specific Spell",)
+
+
+def cost_subtype_swap(pname: str, subtype: str, cost: str) -> tuple[str, str]:
+    """(subtype, cost) with a cost-borne subtype moved where callers expect it."""
+    if pname in _COST_IS_SUBTYPE and not subtype and cost:
+        return cost, ""
+    return subtype, cost
+
+
 def _prop_slug(prop_name: str, subtype: str) -> str:
     s = (prop_name + ("-" + subtype if subtype else "")).lower()
     return re.sub(r"[^a-z0-9]+", "-", s).strip("-")

@@ -82,6 +82,16 @@ _PLAYER_ACHIEVEMENTS: dict[str, int] = {}   # player name -> awards held
 # renamed gear can name a blueprint the wiki does not ship.
 _ITEM_PAGES: set[str] = set()
 
+# Property-page slugs (filename without .html) actually written under
+# items/properties/, and the property names that got a section on the property
+# index. Both indexes are built from the ACCESSIBLE items only, so a property
+# that occurs solely on an inaccessible item gets neither -- and an item page
+# linking to it blindly emits a 404. Same discipline as _ITEM_PAGES: link only
+# where the target exists. Populated by render_items_by_property(), which cli
+# therefore runs BEFORE the item detail pages.
+_PROP_PAGES: set[str] = set()
+_PROP_INDEX_SECTIONS: set[str] = set()
+
 # Blueprint resref -> display name, for gear whose .bic carries no
 # LocalizedName. A stock item's name lives in the TLK, not on the instance, so
 # without this a character's stock ring renders as "(unnamed item)". Written to

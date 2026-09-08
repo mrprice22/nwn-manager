@@ -24,6 +24,7 @@ from nwn_wiki.itemprops import (
     _is_raw_subtype,
     _prop_slug,
     _table_lookup,
+    cost_subtype_swap,
     itemprop_format,
 )
 from nwn_wiki.items import (
@@ -715,13 +716,31 @@ def itemprop_cells(f: dict) -> tuple[str, str, str, str]:
     Hrefs are relative to ``items/``, so only a page at that depth may use this.
     """
     pname, subtype = f["property"], f["subtype"]
-    _pname_known = pname and not pname.startswith("Property #")
-    _subtype_real = subtype and not _is_raw_subtype(subtype)
     cost_str = f["cost"]
+    # The detail pages are keyed by the subtype _collect_item_properties saw,
+    # which for a cost-borne subtype is the cost string -- so the hrefs have to
+    # be built from the same swap. Only the LINK TARGETS use it: the cells keep
+    # rendering the columns itemprop_format actually returned.
+    _link_subtype, _link_cost = cost_subtype_swap(pname, subtype, cost_str)
+    # The swap empties the cost it moved, which is exactly "the cost column is
+    # really this property's subtype".
+    _cost_is_subtype = bool(cost_str) and not _link_cost
+    _subtype_real = _link_subtype and not _is_raw_subtype(_link_subtype)
+    _detail_slug = _prop_slug(pname, _link_subtype if _subtype_real else "")
+    _combined_page = _COMBINED_PROP_PAGES.get(pname)
+    # Both property indexes are built from the ACCESSIBLE items only, so a
+    # property carried solely by inaccessible gear has neither a detail page nor
+    # an index section. Linking it anyway is how the item pages accumulated
+    # hundreds of 404s; render it as plain text instead, exactly as _item_cell
+    # does for gear whose blueprint the wiki does not ship.
+    _pname_known = (
+        pname
+        and not pname.startswith("Property #")
+        and (_combined_page or _detail_slug) in state._PROP_PAGES
+        and pname in state._PROP_INDEX_SECTIONS
+    )
     if _pname_known:
         _idx_anch = f"properties/index.html#pn-{_prop_slug(pname, '')}"
-        _detail_slug = _prop_slug(pname, subtype if _subtype_real else "")
-        _combined_page = _COMBINED_PROP_PAGES.get(pname)
         if _combined_page:
             _spell_frag = f"#{_detail_slug}" if _subtype_real else ""
             _detail_href = f"properties/{_combined_page}.html{_spell_frag}"
@@ -729,15 +748,22 @@ def itemprop_cells(f: dict) -> tuple[str, str, str, str]:
             cost_cell = link(_detail_href, cost_str) if cost_str else ""
         else:
             _detail_href = f"properties/{_detail_slug}.html"
-            if cost_str:
+            if not cost_str:
+                cost_cell = ""
+            elif _cost_is_subtype:
+                # The cost column IS the subtype: the page itself is the target,
+                # there is no per-value section under it to anchor into.
+                cost_cell = link(_detail_href, cost_str)
+            else:
                 _cost_anch = _cost_anchor(cost_str)
                 _cost_href = f"{_detail_href}#{_cost_anch}" if _cost_anch else _detail_href
                 cost_cell = link(_cost_href, cost_str)
-            else:
-                cost_cell = ""
         if _subtype_real:
             pname_cell = colorize_damage_words(link(_idx_anch, pname))
-            subtype_cell = colorize_damage_words(link(_detail_href, subtype))
+            # An empty subtype column stays empty -- linking "" renders an
+            # invisible anchor, and the cost cell already carries the link.
+            subtype_cell = (colorize_damage_words(link(_detail_href, subtype))
+                            if subtype else colorize_damage_words(E(subtype)))
         else:
             pname_cell = colorize_damage_words(link(_detail_href, pname))
             subtype_cell = colorize_damage_words(E(subtype))
