@@ -865,7 +865,12 @@ main:has(> .wide-page) { max-width: 1600px; }
 .table-scroll { overflow-x: auto; }
 .most-equipped { min-width: 900px; }
 .most-equipped .props-cell {
-  max-width: 34em;
+  /* 26em, not more: the wearer column needs ~540px for the longest
+     "Name [Player]: 40 CoT 10 RDD 9 Pal 1 Brd", and whatever this column takes
+     comes out of that. Properties wrap to more lines; wearers stay on one,
+     which is the priority — the properties are a reference dump, the wearer
+     list is what the page is for. */
+  max-width: 26em;
   display: inline-block;
   vertical-align: top;
 }
