@@ -29,6 +29,7 @@ from nwn_wiki.reports.counter_gear import (
     check_counter_gear_freshness,
     generate_counter_gear_index,
 )
+from nwn_wiki.reports.enums import write_enums
 from nwn_wiki.util import _try_int, _write_json
 
 
@@ -1037,6 +1038,8 @@ def generate_module_index(
       unspawned_creatures.json           — creature blueprints never placed or in an encounter
       instance_only_conversations.json   — creature instances with Conversation overrides not on the blueprint
       allegiance_gated_encounters.json   — encounters suppressed by a Well-of-Eru allegiance
+      enums.json                         — resolved int -> string lookup tables + NWScript constants
+      enums_names.json                   — the bulk name tables (feat, spells, appearance, placeables)
     """
     module_index_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now().isoformat(timespec="seconds")
@@ -1059,3 +1062,4 @@ def generate_module_index(
     _write_unspawned_creatures(db, module_index_dir, module_title, now, _cu)
     _write_allegiance_gated_encounters(db, module_index_dir, module_title, now, _cu, _au)
     _write_instance_only_conversations(db, module_index_dir, module_title, now, _cu, _au)
+    write_enums(module_index_dir, module_title, now)

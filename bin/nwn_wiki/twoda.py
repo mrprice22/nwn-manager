@@ -36,6 +36,7 @@ from nwn_wiki.lookups import (
     SPELLS,
     WEAPONS,
     _WEAPON_2DA_COLS,
+    mark_table_source,
 )
 
 
@@ -175,6 +176,8 @@ def load_2da_overrides(d: Path) -> None:
             if label:
                 target[ridx] = label
                 n_loaded += 1
+        if n_loaded:
+            mark_table_source(Path(fname).stem, "2da_override")
         print(f"  override: {fname} → {n_loaded} rows")
 
     # Equippable slots and weapon stats from a baseitems.2da override.
@@ -328,4 +331,5 @@ def load_2da_overrides(d: Path) -> None:
                 tbl[key] = display
                 n_updated += 1
         if n_updated:
+            mark_table_source(tbl_name, "2da_override")
             print(f"  override: {p.name} → {n_updated} row(s) updated → {tbl_name}")

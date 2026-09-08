@@ -267,6 +267,54 @@ IPROP_DEFS: dict[int, dict] = {int(k): v for k, v in ITEMPROPS.get("properties",
 IPROP_TABLES: dict[str, dict] = ITEMPROPS.get("tables", {})
 
 
+def _load_nwscript_consts() -> dict[str, dict[str, int]]:
+    """Load nwscript_consts.json — {family: {suffix: value}} from ovr/nwscript.nss.
+
+    Optional: the file is built by ``bin/refresh-nwn-script-consts`` against a
+    local NWN install and committed, but a checkout without it must still build
+    the wiki.  Missing → {} and the enum export omits its ``consts`` maps."""
+    p = DATA_DIR / "nwscript_consts.json"
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text())
+    except Exception as e:
+        print(f"warn: could not parse {p}: {e}", file=sys.stderr)
+        return {}
+    return {
+        k: {str(sk): int(sv) for sk, sv in v.items()}
+        for k, v in raw.items()
+        if not k.startswith("_") and isinstance(v, dict)
+    }
+
+
+NWSCRIPT_CONSTS: dict[str, dict[str, int]] = _load_nwscript_consts()
+
+
+# Provenance for the lookup tables above: table name -> "stock" | "cep_overlay"
+# | "2da_override", stamped by load_json_overlay() below and by
+# load_2da_overrides() in nwn_wiki.twoda as they patch a table in place.  A table
+# absent from this dict was never patched and is still the bundled stock data.
+#
+# Only the module-index enum export reads this; nothing in the rendering path
+# depends on it, so a writer that forgets to stamp degrades to "stock" rather
+# than breaking a page.
+TABLE_SOURCES: dict[str, str] = {}
+
+
+def mark_table_source(table: str, source: str) -> None:
+    """Record that `table` was patched from `source`.
+
+    A 2DA override wins over a CEP overlay in the reported provenance: the
+    overlay is applied first and the module's own 2DAs are the last word."""
+    if source == "2da_override" or table not in TABLE_SOURCES:
+        TABLE_SOURCES[table] = source
+
+
+def table_source(table: str) -> str:
+    return TABLE_SOURCES.get(table, "stock")
+
+
 _OVERLAY_TARGETS: dict[str, dict[int, str]] = {
     "baseitems":   BASEITEMS,
     "racialtypes": RACES,
@@ -306,6 +354,8 @@ def load_json_overlay(d: Path, label: str) -> int:
                 continue
             n += 1
         total += n
+        if n:
+            mark_table_source(name, "cep_overlay")
         print(f"  {label}: {name}.json → {n} rows")
     return total
 

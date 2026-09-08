@@ -900,6 +900,8 @@ without the generated content. The files are regenerated on the next wiki run.
 | `creature_index.json` | All canonical creatures with resolved names, CR, HP, race, appearance, faction, and a locations list (area + placement kind + count). Includes `appearance_id` and `appearance_name` for cross-referencing with `appearance_faction_report.json`. |
 | `appearance_faction_report.json` | Creatures grouped by `Appearance_Type` (visual model), showing which factions use each look. Entries where the same appearance spans multiple factions (`cross_faction: true`) are sorted first — useful for spotting NPCs that look like friendlies but are hostile, or vice versa. |
 | `item_index.json` | All named items with base item, gold cost, accessibility flag, and a `sources` list (sold at / in container / carried by / script reward). Excludes TLK-broken items whose names can't be resolved. |
+| `enums.json` | The int → string lookup tables themselves, resolved for this module: every `iprp_*` cost/subtype table, the base item / class / race / skill row spaces, the item-property → table map, and the equippable-slot bitmask. Each table records whether it came from stock data, the CEP overlay, or the module's own 2DAs (`_source`), and carries the matching NWScript constant names (`consts`) where the engine has them. Read this instead of re-deriving "`iprp_damagecost` row 6 = 1d4" from `hak_2da/*.2da`. |
+| `enums_names.json` | The bulk name tables split out of `enums.json` so it stays cheap to read: `feat`, `spells`, `appearance`, `placeables`, `iprp_feats`. Same shape. |
 
 The raw blueprint data (`db.creatures`, `db.items`, etc.) is already
 available in `unpacked/` as `.utc.json`, `.uti.json`, etc. The module-index

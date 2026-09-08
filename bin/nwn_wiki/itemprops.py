@@ -128,7 +128,8 @@ def itemprop_format(prop: dict) -> dict[str, str]:
             if cval is not None:
                 cost_str = cval
             elif ct_tbl == "iprp_chargecost":
-                # Standard table ends at row 12 (5/Day); extend the /Day pattern.
+                # Standard table ends at row 13 (Unlimited Use); a HAK that adds
+                # rows past it continues the /Day progression, so extrapolate.
                 n = int(cost_value)
                 cost_str = f"{n - 7}/Day" if n >= 8 else f"{n} charges"
             else:

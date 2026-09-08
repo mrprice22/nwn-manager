@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Rebuild bin/wiki_data/nwscript_consts.json from a local NWN install.
+#
+# Parses ovr/nwscript.nss for its integer constant declarations (BASE_ITEM_*,
+# IP_CONST_*, DAMAGE_TYPE_*, ...). The result is committed to git and feeds the
+# "consts" maps in module-index/enums.json, so the wiki build itself never needs
+# an NWN install.
+#
+# Re-run after any Beamdog EE patch that adds or renumbers constants.
+#
+# Usage:
+#   bin/refresh-nwn-script-consts [--nwn /path/to/nwn]
+#
+# All arguments are forwarded to build_nwscript_consts.py.
+# Default --nwn is the Steam install path.
+#
+# Unlike the other refresh-nwn-* scripts this reads one plain text file and
+# needs no neverwinter.nim tooling; it finishes in under a second.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+exec python3 "$SCRIPT_DIR/wiki_data/build_nwscript_consts.py" "$@"

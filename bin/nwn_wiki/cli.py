@@ -59,6 +59,7 @@ from nwn_wiki.lookups import (
     FEATS,
     IPROP_DEFS,
     IPRP_FEATS,
+    NWSCRIPT_CONSTS,
     PARTS_CHEST_AC,
     RACES,
     SKILLS,
@@ -425,27 +426,33 @@ def _load_tlks(args: argparse.Namespace) -> None:
 def _audit_wiki_data() -> bool:
     """wiki_data pre-flight.  Returns False (after printing) if a file is missing."""
     # --- wiki_data pre-flight: confirm all data files are present ---
-    _DATA_AUDIT: list[tuple[str, Any, str]] = [
-        ("baseitems.json",        lambda: len(BASEITEMS),                              "bin/wiki_data/_build_stock.py"),
-        ("classes.json",          lambda: len(CLASSES),                               "bin/wiki_data/_build_stock.py"),
-        ("racialtypes.json",      lambda: len(RACES),                                 "bin/wiki_data/_build_stock.py"),
-        ("appearance.json",       lambda: len(APPEARANCE),                            "bin/wiki_data/_build_stock.py"),
-        ("feat.json",             lambda: len(FEATS),                                 "bin/wiki_data/_build_stock.py"),
-        ("iprp_feats.json",       lambda: len(IPRP_FEATS),                            "bin/wiki_data/_build_stock.py"),
-        ("skills.json",           lambda: len(SKILLS),                                "bin/wiki_data/_build_stock.py"),
-        ("spells.json",           lambda: len(SPELLS),                                "bin/wiki_data/_build_stock.py"),
-        ("weapons.json",          lambda: len(WEAPONS),                               "bin/wiki_data/_build_stock.py"),
-        ("itemprops.json",        lambda: len(IPROP_DEFS),                            "committed — restore from git"),
-        ("parts_chest.2da",       lambda: len(PARTS_CHEST_AC),                        "committed — restore from git"),
-        ("armor.json",            lambda: len(ARMOR_ASF),                             "bin/wiki_data/_build_stock.py"),
-        ("stock_item_names.json", lambda: len(STOCK_ITEM_NAMES),                      "bin/refresh-nwn-stock-items"),
-        ("spell_info.json",       lambda: sum(len(v) for v in SPELL_INFO.values()),   "bin/refresh-nwn-spell-info"),
+    # (filename, count callable, how to rebuild, required)
+    # Optional entries report their absence and let the build continue: they add
+    # detail to the output rather than being load-bearing for it.
+    _DATA_AUDIT: list[tuple[str, Any, str, bool]] = [
+        ("baseitems.json",        lambda: len(BASEITEMS),                              "bin/wiki_data/_build_stock.py", True),
+        ("classes.json",          lambda: len(CLASSES),                               "bin/wiki_data/_build_stock.py", True),
+        ("racialtypes.json",      lambda: len(RACES),                                 "bin/wiki_data/_build_stock.py", True),
+        ("appearance.json",       lambda: len(APPEARANCE),                            "bin/wiki_data/_build_stock.py", True),
+        ("feat.json",             lambda: len(FEATS),                                 "bin/wiki_data/_build_stock.py", True),
+        ("iprp_feats.json",       lambda: len(IPRP_FEATS),                            "bin/wiki_data/_build_stock.py", True),
+        ("skills.json",           lambda: len(SKILLS),                                "bin/wiki_data/_build_stock.py", True),
+        ("spells.json",           lambda: len(SPELLS),                                "bin/wiki_data/_build_stock.py", True),
+        ("weapons.json",          lambda: len(WEAPONS),                               "bin/wiki_data/_build_stock.py", True),
+        ("itemprops.json",        lambda: len(IPROP_DEFS),                            "committed — restore from git", True),
+        ("parts_chest.2da",       lambda: len(PARTS_CHEST_AC),                        "committed — restore from git", True),
+        ("armor.json",            lambda: len(ARMOR_ASF),                             "bin/wiki_data/_build_stock.py", True),
+        ("stock_item_names.json", lambda: len(STOCK_ITEM_NAMES),                      "bin/refresh-nwn-stock-items", True),
+        ("spell_info.json",       lambda: sum(len(v) for v in SPELL_INFO.values()),   "bin/refresh-nwn-spell-info", True),
+        ("nwscript_consts.json",  lambda: sum(len(v) for v in NWSCRIPT_CONSTS.values()), "bin/refresh-nwn-script-consts", False),
     ]
     _missing_data: list[tuple[str, str]] = []
-    for _fname, _count_fn, _refresh in _DATA_AUDIT:
+    for _fname, _count_fn, _refresh, _required in _DATA_AUDIT:
         _p = DATA_DIR / _fname
         if _p.exists():
             print(f"[nwn-wiki] data: {_fname:<25} ok ({_count_fn()})")
+        elif not _required:
+            print(f"[nwn-wiki] data: {_fname:<25} absent — rebuild with {_refresh}")
         else:
             print(f"[nwn-wiki] data: {_fname:<25} MISSING", file=sys.stderr)
             _missing_data.append((_fname, _refresh))
