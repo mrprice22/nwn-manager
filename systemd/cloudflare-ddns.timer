@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodically refresh the Cloudflare DNS A record for this host
+Documentation=file:/var/home/james/GIT/nwn_manager/bin/cloudflare-ddns
+
+[Timer]
+# OnBootSec is the half that matters: the 2026-09-12 outage ended with the
+# router holding a new WAN IP and nothing on the box noticing. A run shortly
+# after every boot means an IP change now self-corrects in minutes, unattended.
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=cloudflare-ddns.service
+
+[Install]
+WantedBy=timers.target

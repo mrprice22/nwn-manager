@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# cloudflare-ddns — keep ONE Cloudflare A record pointed at this box's WAN IP.
+#
+#   cloudflare-ddns              # update the record if the IP changed
+#   cloudflare-ddns --status     # read-only: what the record says vs reality
+#   cloudflare-ddns --dry-run    # say what would change, write nothing
+#
+# WHY
+# ---
+# On 2026-09-12 a power cut took this box down for ~14h. The router came back
+# with a new WAN IP, and players on BOTH realms hit the NWN Downloader with
+# "couldn't resolve host homerslotr.ddns.net". The post-mortem found that
+# NOTHING on this host had ever updated DNS: no ddclient, no inadyn, no noip2,
+# no crontab. The record depended on an opaque DDNS client inside the router
+# PLUS a manual monthly no-ip captcha -- two unmonitored single points of
+# failure, and it took a human noticing to fix it.
+#
+# All three realms advertise their NWSync store on ONE hostname, differing only
+# by port (s1 8000 / s2 8001 / dev 8002), and the client fetches that URL on
+# EVERY connect before comparing anything. So one bad record breaks every realm
+# at once, even for a player whose content is already current. That is why this
+# tiny script guards something far more important than its size suggests.
+#
+# SHAPE
+# -----
+# Exactly one A record (CF_RECORD, default home.homerslotr.com) is updated;
+# play. and nwsync. are CNAMEs onto it, so an IP change is a single API write
+# and the two public names can never drift apart.
+#
+# The record is READ FROM THE API on every run, never from a local cache. That
+# is deliberate: it means an edit made in the dashboard (or by anything else)
+# is detected and corrected on the next tick, which a "compare against last
+# known IP" shortcut would silently miss.
+#
+# TWO SOURCES, AND IT REFUSES RATHER THAN GUESS
+# ---------------------------------------------
+# The WAN IP is read from Cloudflare's own trace endpoint and confirmed against
+# a second provider. If either lookup fails, or the two disagree, the script
+# writes NOTHING and exits non-zero. A wrong A record is far more damaging than
+# a late one -- it takes the whole server population offline until someone
+# notices, whereas a skipped run costs 5 minutes because the timer retries.
+#
+# SECRET
+# ------
+# The API token lives in ~/.config/cloudflare-ddns/env (mode 0600), NEVER in a
+# repo. Scope it to Zone -> DNS -> Edit on the one zone and nothing else. Per
+# CLAUDE.md: gitignoring a secret is not the same as keeping it out of a build,
+# and it must never reach the LAN Gemma box.
+#
+#   CF_API_TOKEN=...                  # required
+#   CF_ZONE=homerslotr.com            # required
+#   CF_RECORD=home.homerslotr.com     # optional, defaults to home.$CF_ZONE
+
+set -euo pipefail
+
+ENV_FILE="${CLOUDFLARE_DDNS_ENV:-$HOME/.config/cloudflare-ddns/env}"
+API="https://api.cloudflare.com/client/v4"
+MODE=update
+
+case "${1:-}" in
+  --status)  MODE=status ;;
+  --dry-run) MODE=dryrun ;;
+  --help|-h) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "")        ;;
+  *) echo "cloudflare-ddns: unknown option: $1 (see --help)" >&2; exit 2 ;;
+esac
+
+log() { printf '[cf-ddns] %s\n' "$*"; }
+die() { printf '[cf-ddns] error: %s\n' "$*" >&2; exit 1; }
+
+# --- config -----------------------------------------------------------------
+[[ -f $ENV_FILE ]] || die "missing $ENV_FILE (see --help for the keys it needs)"
+
+perms=$(stat -c '%a' "$ENV_FILE")
+[[ $perms == 600 ]] || log "warning: $ENV_FILE is mode $perms, expected 600"
+
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+: "${CF_API_TOKEN:?$ENV_FILE must define CF_API_TOKEN}"
+: "${CF_ZONE:?$ENV_FILE must define CF_ZONE}"
+CF_RECORD="${CF_RECORD:-home.$CF_ZONE}"
+
+is_ipv4() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+# --- what IS our WAN IP? ----------------------------------------------------
+# Cloudflare's trace is primary (same vendor as the record, no rate limits worth
+# worrying about); ipify is the independent confirmation.
+ip_primary=$(curl -fsS -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
+             | sed -n 's/^ip=//p' | tr -d '[:space:]') || ip_primary=""
+ip_second=$(curl -fsS -m 10 https://api.ipify.org 2>/dev/null \
+             | tr -d '[:space:]') || ip_second=""
+
+is_ipv4 "$ip_primary" || die "could not read WAN IP from cloudflare trace (got '${ip_primary}') -- not writing"
+is_ipv4 "$ip_second"  || die "could not read WAN IP from ipify (got '${ip_second}') -- not writing"
+
+if [[ $ip_primary != "$ip_second" ]]; then
+  die "WAN IP sources disagree (cloudflare=$ip_primary ipify=$ip_second) -- not writing"
+fi
+wan_ip=$ip_primary
+
+# --- what does the record SAY? ----------------------------------------------
+# NOTE: deliberately no -f. On a bad or expired token Cloudflare answers 400
+# with a JSON body naming the problem; -f would discard it and this script
+# would report "unreachable", sending you after the network instead of the
+# credential. Transport failures are caught by the empty-body check below.
+cf_get() { curl -sS -m 20 -H "Authorization: Bearer $CF_API_TOKEN" "$@"; }
+
+# Reports Cloudflare's own error text, or says plainly that nothing came back.
+cf_check() {
+  local json=$1 what=$2
+  [[ -n $json ]] || die "Cloudflare API unreachable ($what) -- empty response"
+  jq -e . <<<"$json" >/dev/null 2>&1 || die "Cloudflare API returned non-JSON ($what)"
+  jq -e '.success' <<<"$json" >/dev/null \
+    || die "$what rejected by Cloudflare: $(jq -rc '[.errors[]?.message] | join("; ")' <<<"$json")"
+}
+
+zone_json=$(cf_get "$API/zones?name=$CF_ZONE&status=active") || true
+cf_check "$zone_json" "zone lookup"
+
+zone_id=$(jq -r '.result[0].id // empty' <<<"$zone_json")
+[[ -n $zone_id ]] || die "no active zone named $CF_ZONE on this account"
+
+rec_json=$(cf_get "$API/zones/$zone_id/dns_records?type=A&name=$CF_RECORD") || true
+cf_check "$rec_json" "record lookup"
+
+rec_id=$(jq -r '.result[0].id // empty'      <<<"$rec_json")
+rec_ip=$(jq -r '.result[0].content // empty' <<<"$rec_json")
+rec_proxied=$(jq -r '.result[0].proxied // empty' <<<"$rec_json")
+
+[[ -n $rec_id ]] || die "no A record named $CF_RECORD in zone $CF_ZONE -- create it first (Phase 1)"
+
+# The game is UDP and NWSync runs on a non-proxiable port, so an orange cloud
+# here silently blackholes the whole server. Worth shouting about.
+[[ $rec_proxied == "true" ]] && log "WARNING: $CF_RECORD is PROXIED (orange cloud) -- NWN traffic cannot work through the proxy; set it to DNS-only"
+
+# --- act --------------------------------------------------------------------
+if [[ $rec_ip == "$wan_ip" ]]; then
+  log "ok: $CF_RECORD = $rec_ip (unchanged)"
+  exit 0
+fi
+
+if [[ $MODE == status ]]; then
+  log "STALE: $CF_RECORD = $rec_ip but WAN IP is $wan_ip"
+  exit 1
+fi
+
+if [[ $MODE == dryrun ]]; then
+  log "would update $CF_RECORD: $rec_ip -> $wan_ip"
+  exit 0
+fi
+
+patch=$(curl -sS -m 20 -X PATCH \
+          -H "Authorization: Bearer $CF_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          --data "$(jq -nc --arg ip "$wan_ip" '{content:$ip}')" \
+          "$API/zones/$zone_id/dns_records/$rec_id") || true
+cf_check "$patch" "record update"
+
+log "UPDATED $CF_RECORD: $rec_ip -> $wan_ip"

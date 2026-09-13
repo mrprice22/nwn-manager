@@ -1,0 +1,23 @@
+[Unit]
+# Keeps home.homerslotr.com pointed at this box's WAN IP. See
+# bin/cloudflare-ddns --help for why this exists (2026-09-12 power-cut outage).
+Description=Update Cloudflare DNS A record with this host's WAN IP
+Documentation=file:/var/home/james/GIT/nwn_manager/bin/cloudflare-ddns
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/home/james/GIT/nwn_manager/bin/cloudflare-ddns
+TimeoutStartSec=120
+
+# Shares the box with the live season; it is a couple of curls, but nothing
+# here outranks nwserver's single-threaded main loop.
+Slice=background.slice
+Nice=19
+
+# The token is the only secret involved and it is read from
+# ~/.config/cloudflare-ddns/env at runtime -- never passed on the command line,
+# so it stays out of `ps` and out of `systemctl show`.
+NoNewPrivileges=yes
+PrivateTmp=yes

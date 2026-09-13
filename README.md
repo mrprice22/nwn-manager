@@ -1738,6 +1738,59 @@ bin/repack-homers-lotr-clean [--verbose] [--force] [--no-prod]
 `--clean` to nasher before building, forcing a full recompile. Use it when the
 incremental repack produces stale or unexpected output.
 
+## Dynamic DNS (`bin/cloudflare-ddns`)
+
+Keeps **one** Cloudflare `A` record pointed at this box's WAN IP, so the public
+name the game server advertises survives an IP change.
+
+```bash
+bin/cloudflare-ddns            # update the record if the IP changed
+bin/cloudflare-ddns --status   # read-only; exit 1 if the record is stale
+bin/cloudflare-ddns --dry-run  # report what would change, write nothing
+```
+
+**Why it exists.** A power cut on 2026-09-12 took the host down for ~14h; the
+router came back on a new WAN IP and players on every realm hit the NWN
+Downloader with `couldn't resolve host`. Nothing on this host had ever updated
+DNS — no `ddclient`, no `inadyn`, no `noip2`, no crontab — so the record
+depended on an opaque DDNS client in the router plus a manual monthly no-ip
+captcha. All realms advertise their NWSync store on **one** hostname (differing
+only by port), and the client fetches that URL on *every* connect, so a single
+bad record takes every realm offline at once.
+
+**Shape.** Only `home.<zone>` is updated; the public names (`play.`, `nwsync.`)
+are CNAMEs onto it, so an IP change is a single API write and the names cannot
+drift apart. Those records must stay **DNS-only (grey cloud)** — the game is UDP
+and NWSync runs on a non-proxiable port, so an orange cloud blackholes the
+server. The script warns loudly if it finds the record proxied.
+
+The record is read from the API **every run**, never from a local cache, so an
+edit made anywhere else is detected and corrected on the next tick.
+
+**It refuses rather than guesses.** The WAN IP is read from Cloudflare's trace
+endpoint and confirmed against a second provider; if either fails or the two
+disagree, it writes nothing and exits non-zero. A wrong record takes the whole
+player base offline, whereas a skipped run costs 5 minutes because the timer
+retries.
+
+**Secret.** The token lives in `~/.config/cloudflare-ddns/env` (mode 0600),
+scoped to *Zone → DNS → Edit* on the one zone. See `env.example` there. Never
+commit it, never place it under a module's `unpacked/` (nasher packs every file
+on disk regardless of `.gitignore`), never send it to the LAN LLM box.
+
+**Install** (user units, like everything else here):
+
+```bash
+ln -sf ~/GIT/nwn_manager/systemd/cloudflare-ddns.service ~/.config/systemd/user/
+ln -sf ~/GIT/nwn_manager/systemd/cloudflare-ddns.timer   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cloudflare-ddns.timer
+```
+
+The timer runs `OnBootSec=1min` and every 5 minutes after. The boot trigger is
+the half that matters: it is what makes a post-outage IP change self-correct
+unattended.
+
 ## Out of scope (today)
 
 - Watch mode and auto-repack on save.
