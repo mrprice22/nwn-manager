@@ -1774,7 +1774,10 @@ player base offline, whereas a skipped run costs 5 minutes because the timer
 retries.
 
 **Secret.** The token lives in `~/.config/cloudflare-ddns/env` (mode 0600),
-scoped to *Zone → DNS → Edit* on the one zone. See `env.example` there. Never
+scoped to *Zone → DNS → Edit* on the one zone. Set `CF_ZONE_ID` as well (zone
+Overview page, right sidebar): with it the token needs nothing beyond DNS Edit,
+whereas looking the zone up by name additionally requires *Zone → Zone → Read*.
+See `env.example` there. Never
 commit it, never place it under a module's `unpacked/` (nasher packs every file
 on disk regardless of `.gitignore`), never send it to the LAN LLM box.
 

@@ -50,6 +50,12 @@
 #   CF_API_TOKEN=...                  # required
 #   CF_ZONE=homerslotr.com            # required
 #   CF_RECORD=home.homerslotr.com     # optional, defaults to home.$CF_ZONE
+#   CF_ZONE_ID=<32 hex>               # optional, but PREFER IT
+#
+# Set CF_ZONE_ID (zone Overview page, right sidebar) and the token needs only
+# Zone -> DNS -> Edit. Without it the script must look the zone up by name via
+# GET /zones, which additionally requires Zone -> Zone -> Read -- a broader
+# token for no benefit, plus an extra API call on every run.
 
 set -euo pipefail
 
@@ -115,11 +121,14 @@ cf_check() {
     || die "$what rejected by Cloudflare: $(jq -rc '[.errors[]?.message] | join("; ")' <<<"$json")"
 }
 
-zone_json=$(cf_get "$API/zones?name=$CF_ZONE&status=active") || true
-cf_check "$zone_json" "zone lookup"
-
-zone_id=$(jq -r '.result[0].id // empty' <<<"$zone_json")
-[[ -n $zone_id ]] || die "no active zone named $CF_ZONE on this account"
+if [[ -n ${CF_ZONE_ID:-} ]]; then
+  zone_id=$CF_ZONE_ID
+else
+  zone_json=$(cf_get "$API/zones?name=$CF_ZONE&status=active") || true
+  cf_check "$zone_json" "zone lookup"
+  zone_id=$(jq -r '.result[0].id // empty' <<<"$zone_json")
+  [[ -n $zone_id ]] || die "no active zone named $CF_ZONE on this account (set CF_ZONE_ID to skip this lookup, which also needs Zone:Read)"
+fi
 
 rec_json=$(cf_get "$API/zones/$zone_id/dns_records?type=A&name=$CF_RECORD") || true
 cf_check "$rec_json" "record lookup"
