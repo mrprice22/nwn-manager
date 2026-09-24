@@ -222,6 +222,10 @@ class DbCore:
     #     0 disables the cap. See README "Combat-stat configuration".
     #   max_ability_bonus: cap on the ability-score bonus an item may grant
     #     (NWN default +12; some modules raise it, e.g. +24).
+    #   max_skill_bonus: cap on the combined skill bonus from items/effects
+    #     (settings.tml ruleset.combat.max-skill-bonus, NWN default +50). A
+    #     literal SetSkillBonusLimit(N) in the module's scripts overrides it,
+    #     as it does at runtime — see _apply_script_skill_bonus_limit.
     #   max_player_level: the level cap a *player* can actually reach, used
     #     only to cap the counter-gear report's reference PC. Deliberately
     #     separate from max_character_level: a server can raise the player
@@ -230,6 +234,7 @@ class DbCore:
     #     would move published creature attack figures.
     max_character_level: int = 40
     max_ability_bonus: int = 12
+    max_skill_bonus: int = 50
     max_player_level: int = 40
     # Set from main(): the resolved --2da-dir (part of the counter-gear
     # staleness fingerprint) and whether --counter-gear asked for a re-run.
@@ -290,6 +295,8 @@ class DbCore:
     # script resref → retaliation analysis dict (see _analyze_retaliation) for
     # OnDamaged scripts that strike back at the attacker / nearby creatures.
     script_retaliation: dict[str, dict] = _new(dict)
+    # script resref → raw SetSkillBonusLimit() argument texts found in it.
+    script_skill_bonus_limits: dict[str, set[str]] = _index(set)
     # item resref → list of {kind, script, event, area(s), …} for script-based key checks
     item_script_checks: dict[str, list[dict]] = _index(list)
     # dialog resref → sorted list of item resrefs whose tags are checked in that dialog

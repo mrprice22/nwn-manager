@@ -12,6 +12,8 @@ Reads via `nwn_resman_extract`:
 Writes:
   - baseitems.json, racialtypes.json, classes.json, iprp_feats.json,
     appearance.json
+  - weapons.json, race_adjust.json, armor.json, armor_acp.json,
+    skill_info.json (numeric columns the creature page computes with)
 
 Usage:
   ./_build_stock.py [--nwn DIR]
@@ -33,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _2da_lib import (
     col_index, load_tlk_entries, parse_2da, require_tools, resolve_name,
+    skill_info_rows,
     tlk_to_json,
 )
 
@@ -264,6 +267,51 @@ def build(nwn_dir: Path, out_dir: Path) -> None:
                     encoding="utf-8",
                 )
                 print(f"    wrote {arpath.name}: {len(asf)} rows")
+
+            # Armour check penalty lives in the same table (ACCHECK, <= 0),
+            # keyed the same way. Shields carry theirs in baseitems.2da's
+            # ArmorCheckPen, already cached in weapons.json.
+            acp_i = col_index(headers, "ACCHECK")
+            if acp_i is None:
+                print("    warn: armor.2da has no ACCHECK column", file=sys.stderr)
+            else:
+                acp: dict[str, int] = {}
+                for row in rows:
+                    if not row or acp_i >= len(row):
+                        continue
+                    try:
+                        acp[str(int(row[0]))] = int(row[acp_i])
+                    except ValueError:
+                        continue
+                acpath = out_dir / "armor_acp.json"
+                acpath.write_text(
+                    json.dumps({"_source": "stock NWN :: armor.2da (ACCHECK)",
+                                **acp},
+                               indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                print(f"    wrote {acpath.name}: {len(acp)} rows")
+
+        # Per-skill rules the creature page needs to turn ranks into a total
+        # modifier: key ability, whether the skill works untrained, and
+        # whether armour check penalty applies.
+        try:
+            twoda = extract_stock_2da(nwn_dir, "skills.2da", tmp)
+        except Exception as e:
+            print(f"    warn: skill info: could not extract skills.2da: {e}",
+                  file=sys.stderr)
+        else:
+            headers, rows = parse_2da(twoda)
+            sinfo = skill_info_rows(headers, rows)
+            spath = out_dir / "skill_info.json"
+            spath.write_text(
+                json.dumps({"_source": "stock NWN :: skills.2da "
+                                       "(KeyAbility, Untrained, ArmorCheckPenalty)",
+                            **{str(k): v for k, v in sinfo.items()}},
+                           indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print(f"    wrote {spath.name}: {len(sinfo)} rows")
 
 
 def main() -> None:

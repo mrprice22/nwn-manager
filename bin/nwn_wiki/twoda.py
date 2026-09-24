@@ -32,6 +32,7 @@ from nwn_wiki.lookups import (
     PLACEABLES,
     RACE_ABILITY_ADJ,
     RACES,
+    SKILL_INFO,
     SKILLS,
     SPELLS,
     WEAPONS,
@@ -275,6 +276,45 @@ def load_2da_overrides(d: Path) -> None:
                         RACE_ABILITY_ADJ[ridx] = vals
         except Exception as e:
             print(f"  warn: could not parse {rp} adjusts: {e}", file=sys.stderr)
+
+    # Per-skill key ability / untrained / armour-check flags from a skills.2da
+    # override, so a module that re-keys a skill (or adds one) gets correct
+    # creature skill totals. Same rules as skill_info_rows() in
+    # bin/wiki_data/_2da_lib.py, which builds the stock skill_info.json.
+    sp = d / "skills.2da"
+    if sp.is_file():
+        try:
+            headers, rows = parse_2da(sp)
+            hl = [h.lower() for h in headers]
+
+            def _sk_col(name: str) -> int | None:
+                return hl.index(name) + 1 if name in hl else None
+
+            key_i = _sk_col("keyability")
+            untr_i = _sk_col("untrained")
+            acp_i = _sk_col("armorcheckpenalty")
+            if key_i is not None:
+                for row in rows:
+                    if not row:
+                        continue
+                    try:
+                        ridx = int(row[0])
+                    except ValueError:
+                        continue
+
+                    def _c(i: int | None) -> str:
+                        return row[i] if i is not None and i < len(row) else ""
+
+                    key = _c(key_i).strip().capitalize()
+                    if key not in ("Str", "Dex", "Con", "Int", "Wis", "Cha"):
+                        continue
+                    SKILL_INFO[ridx] = {
+                        "key": key,
+                        "untrained": 1 if _c(untr_i) == "1" else 0,
+                        "acp": 1 if _c(acp_i) == "1" else 0,
+                    }
+        except Exception as e:
+            print(f"  warn: could not parse {sp} skill columns: {e}", file=sys.stderr)
 
     # iprp cost/subtype tables: merge from any iprp_*.2da that matches a known
     # IPROP_TABLES key. Custom 2das fully override stock entries for existing

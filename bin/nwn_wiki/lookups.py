@@ -222,12 +222,9 @@ def _load_parts_chest() -> dict[int, int]:
 PARTS_CHEST_AC: dict[int, int] = _load_parts_chest()
 
 
-def _load_armor_asf() -> dict[int, int]:
-    """Load armor.json → {base_ac: arcane_spell_failure_pct}.
-    Stock armor.2da, whose row index *is* the armour's base AC (0-8). This is
-    where body armour's spell failure lives — baseitems.2da leaves the column
-    blank for row 16 and the engine looks it up here instead."""
-    p = DATA_DIR / "armor.json"
+def _load_int_map(name: str) -> dict[int, int]:
+    """Load a flat `{"<row>": <int>}` JSON from DATA_DIR ("_" keys skipped)."""
+    p = DATA_DIR / name
     if not p.exists():
         return {}
     raw = json.loads(p.read_text())
@@ -242,7 +239,27 @@ def _load_armor_asf() -> dict[int, int]:
     return out
 
 
-ARMOR_ASF: dict[int, int] = _load_armor_asf()
+# Stock armor.2da, whose row index *is* the armour's base AC (0-8). This is
+# where body armour's spell failure and armour check penalty live —
+# baseitems.2da leaves those columns blank for row 16 and the engine looks them
+# up here instead. Shields carry theirs in baseitems.2da (WEAPONS).
+ARMOR_ASF: dict[int, int] = _load_int_map("armor.json")
+ARMOR_ACP: dict[int, int] = _load_int_map("armor_acp.json")   # <= 0
+
+
+def _load_skill_info() -> dict[int, dict]:
+    """Load skill_info.json → {skill_id: {"key": "Con", "untrained": 0|1,
+    "acp": 0|1}} from stock skills.2da. A module skills.2da override is merged
+    on top in load_2da_overrides()."""
+    p = DATA_DIR / "skill_info.json"
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text())
+    return {int(k): v for k, v in raw.items()
+            if not k.startswith("_") and isinstance(v, dict)}
+
+
+SKILL_INFO: dict[int, dict] = _load_skill_info()
 
 
 def _torso_base_ac(item: dict | None) -> int:
@@ -289,6 +306,45 @@ def _load_nwscript_consts() -> dict[str, dict[str, int]]:
 
 
 NWSCRIPT_CONSTS: dict[str, dict[str, int]] = _load_nwscript_consts()
+
+
+def _build_skill_feats() -> dict[int, tuple[int, int]]:
+    """{feat_id: (skill_id, bonus)} for the feats that raise one skill.
+
+    Feat and skill ids are engine-fixed, so they are paired by NWScript
+    constant name (FEAT_SKILL_FOCUS_HIDE ↔ SKILL_HIDE) rather than hand-listed.
+    Underscores are ignored when matching because nwscript.nss spells a few
+    inconsistently (FEAT_SKILLFOCUS_APPRAISE, FEAT_EPIC_SKILL_FOCUS_DISABLETRAP).
+    Longest prefix first so EPIC_/PARTIAL_ aren't read as the plain feat."""
+    skills = {k.replace("_", ""): v
+              for k, v in NWSCRIPT_CONSTS.get("SKILL", {}).items()}
+    prefixes = (
+        ("EPICSKILLFOCUS", 10),
+        ("PARTIALSKILLAFFINITY", 1),
+        ("SKILLAFFINITY", 2),
+        ("SKILLFOCUS", 3),
+    )
+    out: dict[int, tuple[int, int]] = {}
+    for name, fid in NWSCRIPT_CONSTS.get("FEAT", {}).items():
+        flat = name.replace("_", "")
+        for pre, bonus in prefixes:
+            if flat.startswith(pre):
+                sid = skills.get(flat[len(pre):])
+                if sid is not None:
+                    out[fid] = (sid, bonus)
+                break
+    return out
+
+
+#: Feat → (skill id, bonus) for single-skill feats (Skill Focus +3, Epic Skill
+#: Focus +10, Skill Affinity +2, Partial Skill Affinity +1).
+SKILL_FEATS: dict[int, tuple[int, int]] = _build_skill_feats()
+
+#: Feats that raise several skills at once. Only ones whose effect is certain
+#: are listed — an omitted feat understates a total rather than inventing one.
+MULTI_SKILL_FEATS: dict[int, tuple[str, dict[int, int]]] = {
+    0: ("Alertness", {6: 2, 17: 2}),   # +2 Listen, +2 Spot
+}
 
 
 # Provenance for the lookup tables above: table name -> "stock" | "cep_overlay"

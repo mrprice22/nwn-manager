@@ -19,6 +19,7 @@ back from here for the boss registry.
 from __future__ import annotations
 
 import re
+import sys
 from typing import Iterable
 
 from nwn_wiki.gff import fld, list_items, loc
@@ -56,6 +57,11 @@ _RE_RET_HARM_EFFECT = re.compile(r'\bEffect(?:Death|Damage|DamageOverTime)\s*\('
 _RE_RET_DAMAGE_TYPE = re.compile(r'\bDAMAGE_TYPE_([A-Z]+)\b')
 _RE_RET_DICE = re.compile(r'\bd(\d+)\s*\(\s*(\d+)\s*\)')          # dX(Y) -> "YdX"
 _RE_RET_EFFECT_DAMAGE_ARG = re.compile(r'\bEffectDamage\s*\(\s*([A-Za-z_]\w*|\d+)')
+
+
+# SetSkillBonusLimit(<arg>): group 1 is the raw argument text (a literal int
+# or an expression); _apply_script_skill_bonus_limit decides what to do with it.
+_RE_SKILL_BONUS_LIMIT = re.compile(r'\bSetSkillBonusLimit\s*\(\s*([^)]*?)\s*\)')
 
 
 def _strip_nss_comments(text: str) -> str:
@@ -438,6 +444,11 @@ class DbScriptsMixin:
                      or self._RE_SELF_DMG_IMMUNITY.search(text))
             ):
                 self.script_mitigates_damage.add(resref)
+            # SetSkillBonusLimit(N): the module overriding the server's
+            # max-skill-bonus at runtime. Only a literal N is derivable.
+            if "SetSkillBonusLimit" in text:
+                for m in _RE_SKILL_BONUS_LIMIT.finditer(_strip_nss_comments(text)):
+                    self.script_skill_bonus_limits[resref].add(m.group(1))
             # Retaliation: strikes back at the attacker / nearby creatures on hit.
             _ret = _analyze_retaliation(text)
             if _ret is not None:
@@ -480,6 +491,36 @@ class DbScriptsMixin:
                             entry = {"creature_resref": crr, "waypoint_tag": actual_tag}
                             if entry not in self.script_creature_waypoint_spawns[resref]:
                                 self.script_creature_waypoint_spawns[resref].append(entry)
+
+        self._apply_script_skill_bonus_limit()
+
+    def _apply_script_skill_bonus_limit(self) -> None:
+        """Let a module's own SetSkillBonusLimit() call win over the
+        --max-skill-bonus server setting, as it does in the engine.
+
+        Several differing literal calls (e.g. a toggle) are ambiguous; the
+        largest is used and the choice logged. A non-literal argument can't be
+        resolved statically, so the configured value stands with a warning."""
+        literals: set[int] = set()
+        dynamic: list[str] = []
+        for resref, args in sorted(self.script_skill_bonus_limits.items()):
+            for a in args:
+                if a.isdigit():
+                    literals.add(min(int(a), 255))
+                else:
+                    dynamic.append(resref)
+        if dynamic:
+            print(f"[nwn-wiki] warn: SetSkillBonusLimit() with a non-literal "
+                  f"argument in {', '.join(sorted(set(dynamic)))}; skill totals "
+                  f"use max-skill-bonus=+{self.max_skill_bonus}", file=sys.stderr)
+        if literals:
+            limit = max(literals)
+            where = ", ".join(sorted(self.script_skill_bonus_limits))
+            extra = (f" (calls disagree: {sorted(literals)}; using the largest)"
+                     if len(literals) > 1 else "")
+            print(f"[nwn-wiki] max-skill-bonus: +{limit} from SetSkillBonusLimit() "
+                  f"in {where}{extra} — overrides +{self.max_skill_bonus}")
+            self.max_skill_bonus = limit
 
     def _build_tag_to_area(self) -> None:
         """Tag → area resref index spanning every placement (waypoints,

@@ -63,7 +63,11 @@ from nwn_wiki.items import (
     weapon_damage_string,
 )
 from nwn_wiki.lookups import (
+    ARMOR_ACP,
+    MULTI_SKILL_FEATS,
     RACE_ABILITY_ADJ,
+    SKILL_FEATS,
+    SKILL_INFO,
     WEAPONS,
     _torso_base_ac,
     appearance_name,
@@ -357,6 +361,9 @@ def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
         hp_display = _fmt_hp(_hp_raw)
     hp_value = (_base_hp + _et_hp) if _base_hp is not None else None
 
+    skills_out = _creature_skills(skills, ability_scores, cprop_by_pid, feat_ids,
+                                  armor_base_ac, shield_item, db.max_skill_bonus)
+
     # ----- Structured defenses (for analysis/export) ------------------------
     # The HTML "combined combat properties" table is built separately in
     # _creature_detail_sections from cprop_by_pid; these mirror the same
@@ -431,7 +438,86 @@ def extract_creature_defenses(db: Db, c: dict, bp: dict | None = None) -> dict:
         "spell_immunities": spell_immunities, "regen": regen, "vampiric": vampiric,
         "dmg_script": dmg_script, "hard_required_tags": hard_required_tags,
         "mitigates_damage": mitigates_damage, "retaliation": retaliation,
+        "skills": skills_out,
     }
+
+
+def _creature_skills(skills: list[dict], ability_scores: dict[str, int | None],
+                     cprop_by_pid: dict[int, list[tuple[dict, int]]],
+                     feat_ids: list[int], armor_base_ac: int,
+                     shield_item: dict | None, bonus_limit: int) -> list[dict]:
+    """Total skill modifier per skill: ranks + key-ability mod + skill feats +
+    equipped-item Skill Bonus / Decreased Skill + armour check penalty.
+
+    Returns one {id, name, ranks, total, parts} per skill worth showing: any
+    skill with ranks, plus untrained-usable skills whose total is non-zero (a
+    Con 30 creature has +10 Concentration with no ranks at all). Spells and
+    scripted effects are not modelled — this is the creature as built."""
+    ranks_by_id = {idx: int(fld(s, "Rank", 0) or 0) for idx, s in enumerate(skills)}
+
+    # Item Skill Bonus (52) / Decreased Skill (29): the property subtype is the
+    # skill's name. Bonuses from separate items stack; the engine then caps the
+    # combined bonus at the skill bonus limit (`bonus_limit`, db.max_skill_bonus).
+    item_up: dict[str, int] = defaultdict(int)
+    for _pf, _cv in cprop_by_pid.get(52, []):
+        item_up[_pf["subtype"]] += abs(_cv)
+    item_down: dict[str, int] = defaultdict(int)
+    for _pf, _cv in cprop_by_pid.get(29, []):
+        item_down[_pf["subtype"]] += abs(_cv)
+
+    feat_bonus: dict[int, list[tuple[str, int]]] = defaultdict(list)
+    for fid in feat_ids:
+        if fid in SKILL_FEATS:
+            sid, bonus = SKILL_FEATS[fid]
+            feat_bonus[sid].append((feat_name(fid), bonus))
+        if fid in MULTI_SKILL_FEATS:
+            label, per_skill = MULTI_SKILL_FEATS[fid]
+            for sid, bonus in per_skill.items():
+                feat_bonus[sid].append((label, bonus))
+
+    acp = ARMOR_ACP.get(min(max(armor_base_ac, 0), 8), 0)
+    if shield_item is not None:
+        _sstats = WEAPONS.get(int(fld(shield_item, "BaseItem", -1) or -1)) or {}
+        acp += _try_int(_sstats.get("ArmorCheckPen"), 0) or 0
+
+    out: list[dict] = []
+    for sid in sorted(set(ranks_by_id) | set(SKILL_INFO)):
+        info = SKILL_INFO.get(sid)
+        ranks = ranks_by_id.get(sid, 0)
+        if info is None:
+            # Unknown key ability (custom row with no override): ranks only.
+            if ranks > 0:
+                out.append({"id": sid, "name": skill_name(sid), "ranks": ranks,
+                            "total": None, "parts": []})
+            continue
+        if ranks <= 0 and not info["untrained"]:
+            continue  # trained-only skill with no ranks: unusable
+        name = skill_name(sid)
+        parts: list[str] = []
+        total = ranks
+        key = info["key"]
+        score = ability_scores.get(key)
+        amod = ability_mod(score) if score is not None else 0
+        total += amod
+        if amod:
+            parts.append(f"{amod:+d} {key}")
+        for flabel, bonus in feat_bonus.get(sid, []):
+            total += bonus
+            parts.append(f"+{bonus} {flabel}")
+        item_raw = item_up.get(name, 0) - item_down.get(name, 0)
+        item_net = min(item_raw, bonus_limit)
+        if item_net:
+            total += item_net
+            capped = f" (capped from {item_raw:+d})" if item_net != item_raw else ""
+            parts.append(f"{item_net:+d} items{capped}")
+        if info["acp"] and acp:
+            total += acp
+            parts.append(f"{acp:+d} armor check")
+        if ranks <= 0 and total == 0:
+            continue
+        out.append({"id": sid, "name": name, "ranks": ranks,
+                    "total": total, "parts": parts})
+    return out
 
 
 def extract_creature_offense(db: "Db", c: dict, bp: "dict | None", D: dict) -> dict:
@@ -788,13 +874,14 @@ def _section_combat_properties(D: dict) -> list[str]:
             _ab_parts = [f"{_sub} +{_val}" for _sub, _val in sorted(_ab_max.items())]
             cprop_rows.append(f"<tr><th>Ability Bonuses</th><td>{E(', '.join(_ab_parts))}</td></tr>")
 
-        # Skill Bonus (ID 52) — max per skill
+        # Skill Bonus (ID 52) — summed per skill across items (they stack);
+        # the engine cap is applied in the Skills table's totals.
         if 52 in cprop_by_pid:
-            _sk_max: dict[str, int] = {}
+            _sk_sum: dict[str, int] = {}
             for _pf, _cv in cprop_by_pid[52]:
                 _sub = _pf["subtype"] or "?"
-                _sk_max[_sub] = max(_sk_max.get(_sub, 0), _cv)
-            _sk_parts = [f"{_sub} +{_val}" for _sub, _val in sorted(_sk_max.items())]
+                _sk_sum[_sub] = _sk_sum.get(_sub, 0) + _cv
+            _sk_parts = [f"{_sub} +{_val}" for _sub, _val in sorted(_sk_sum.items())]
             cprop_rows.append(f"<tr><th>Skill Bonuses</th><td>{E(', '.join(_sk_parts))}</td></tr>")
 
         # Damage Resistance (ID 23) — max per damage type
@@ -1180,27 +1267,31 @@ def _section_feats(feats: list[dict], feat_ids: list) -> list[str]:
     return sections
 
 
-def _section_skills(skills: list[dict]) -> list[str]:
-    """Skill ranks table (zero-rank skills omitted)."""
-    sections: list[str] = []
-    # ----- Skills (skip zero ranks) -----------------------------------------
-    if skills:
-        skill_rows: list[str] = []
-        for idx, s in enumerate(skills):
-            rank = fld(s, "Rank", 0) or 0
-            if int(rank) <= 0:
-                continue
-            skill_rows.append(
-                f"<tr><td>{E(skill_name(idx))}</td><td>{E(rank)}</td></tr>"
-            )
-        if skill_rows:
-            sections.append(
-                "<h2>Skills</h2>"
-                '<table class="data"><thead><tr>'
-                "<th>Skill</th><th>Ranks</th>"
-                "</tr></thead><tbody>" + "\n".join(skill_rows) + "</tbody></table>"
-            )
-    return sections
+def _section_skills(D: dict) -> list[str]:
+    """Skills table: ranks, total modifier, and where the total comes from
+    (see _creature_skills for which skills are listed)."""
+    skill_rows: list[str] = []
+    for sk in D["skills"]:
+        total = "?" if sk["total"] is None else f"{sk['total']:+d}"
+        breakdown = f"{sk['ranks']} ranks"
+        if sk["parts"]:
+            breakdown += " " + " ".join(sk["parts"])
+        skill_rows.append(
+            f"<tr><td>{E(sk['name'])}</td><td>{sk['ranks']}</td>"
+            f"<td><strong>{E(total)}</strong></td>"
+            f'<td class="muted">{E(breakdown)}</td></tr>'
+        )
+    if not skill_rows:
+        return []
+    return [
+        "<h2>Skills</h2>"
+        '<table class="data"><thead><tr>'
+        "<th>Skill</th><th>Ranks</th><th>Total</th><th>Breakdown</th>"
+        "</tr></thead><tbody>" + "\n".join(skill_rows) + "</tbody></table>"
+        '<p class="muted">Total = ranks + key ability + skill feats + equipped '
+        "items + armor check penalty. Spells and scripted effects the creature "
+        "gains in play are not included.</p>"
+    ]
 
 
 def _section_scripts(_f) -> list[str]:
@@ -1252,7 +1343,6 @@ def _creature_detail_sections(
 
     classes = _list("ClassList")
     feats = _list("FeatList")
-    skills = _list("SkillList")
     equip = _list("Equip_ItemList")
     inv = list_items(c.get("ItemList"))
 
@@ -1285,7 +1375,7 @@ def _creature_detail_sections(
     sections.extend(_section_equipment(db, equip, items_dir, _equip_resref))
     sections.extend(_section_inventory(db, inv, items_dir))
     sections.extend(_section_feats(feats, D["feat_ids"]))
-    sections.extend(_section_skills(skills))
+    sections.extend(_section_skills(D))
     sections.extend(_section_scripts(_f))
     return sections
 

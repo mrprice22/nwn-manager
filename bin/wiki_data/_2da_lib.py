@@ -143,3 +143,39 @@ def tlk_to_json(tlk: Path, dest: Path) -> Path:
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     return out
+
+
+def skill_info_rows(headers: list[str],
+                    rows: list[list[str]]) -> dict[int, dict]:
+    """skills.2da → {row: {"key": "Con", "untrained": 1, "acp": 0}}.
+
+    `key` is the KeyAbility column title-cased to match the UTC ability field
+    names (Str/Dex/...). Rows with no KeyAbility (blanked-out skills) are
+    dropped. nwn_wiki.twoda.load_2da_overrides() applies the same rules to a
+    module's skills.2da override — keep the two in step."""
+    key_i = col_index(headers, "KeyAbility")
+    untr_i = col_index(headers, "Untrained")
+    acp_i = col_index(headers, "ArmorCheckPenalty")
+    if key_i is None:
+        return {}
+
+    def _cell(row: list[str], i: int | None) -> str:
+        return row[i] if i is not None and i < len(row) else ""
+
+    out: dict[int, dict] = {}
+    for row in rows:
+        if not row:
+            continue
+        try:
+            ridx = int(row[0])
+        except ValueError:
+            continue
+        key = _cell(row, key_i).strip().capitalize()
+        if key not in ("Str", "Dex", "Con", "Int", "Wis", "Cha"):
+            continue
+        out[ridx] = {
+            "key": key,
+            "untrained": 1 if _cell(row, untr_i) == "1" else 0,
+            "acp": 1 if _cell(row, acp_i) == "1" else 0,
+        }
+    return out

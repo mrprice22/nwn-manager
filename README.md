@@ -345,6 +345,11 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
     [Combat-stat configuration](#combat-stat-configuration)). Temporary
     spell buffs (Bull's Strength, etc.) can't be known statically and are
     not included.
+  - Skills show ranks and a **total**: ranks + key-ability mod + Skill
+    Focus / Epic Skill Focus / Skill Affinity / Alertness + equipped-item
+    Skill Bonus (stacked, capped by `--max-skill-bonus`) + armor check
+    penalty. Skills usable untrained are listed with no ranks when their
+    total isn't 0 (a high-Con boss's Concentration). Spells aren't included.
   - Saves shown = the UTC's stored bonus + ability mod + item save
     bonuses. The good-save class progression and feat bonuses (Great
     Fortitude, etc.) are added by the engine at load time, so the wiki
@@ -466,6 +471,7 @@ them to match your server:
 | --- | --- | --- |
 | `--max-character-level N` | `40` | Server level cap. A creature's total class levels are clamped to `N` (consumed in `ClassList` order) when deriving **base attack bonus**, so an over-HD boss doesn't accrue unbounded BAB. With `N=40`, a Fighter60/WeaponMaster10/ArcaneArcher60 is treated as Fighter40 → BAB 20. `0` disables the cap. |
 | `--max-ability-bonus N` | `12` | Cap on the ability-score bonus a single equipped item may grant when folded into a creature's effective Str/Dex/… (which drive AC, saves, and attack). NWN's default is `+12`; some modules raise it (e.g. `+24`). |
+| `--max-skill-bonus N` | `50` | Cap on the **combined** skill bonus from equipped items (bonuses from separate items stack, then cap) in the creature Skills table's totals. Matches `settings.tml`'s `ruleset.combat.max-skill-bonus`. A literal `SetSkillBonusLimit(N)` found in the module's own scripts overrides this, as it does in the engine; the build log says when that happens. |
 | `--max-player-level N` | follows `--max-character-level` | Level cap a **player** can actually reach, used only for the counter-gear report's reference PC. Deliberately separate from `--max-character-level`: a server running NWNX MaxLevel can let players past 40 (`NWN_MAXLEVEL=60`) while creature BAB still wants clamping at the engine's own 40 — raising the latter would move published creature attack figures. |
 
 ```sh

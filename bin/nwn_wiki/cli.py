@@ -53,6 +53,7 @@ from nwn_wiki.htmlgen.chrome import (
 from nwn_wiki.layout import layout_areas
 from nwn_wiki.lookups import (
     APPEARANCE,
+    ARMOR_ACP,
     ARMOR_ASF,
     BASEITEMS,
     CLASSES,
@@ -62,6 +63,7 @@ from nwn_wiki.lookups import (
     NWSCRIPT_CONSTS,
     PARTS_CHEST_AC,
     RACES,
+    SKILL_INFO,
     SKILLS,
     SPELL_INFO,
     SPELLS,
@@ -356,6 +358,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "applied when folding equipped-item ability bonuses into "
                          "a creature's effective scores. Default: 12 (NWN default; "
                          "some modules raise it, e.g. 24).")
+    ap.add_argument("--max-skill-bonus", type=int, default=50, metavar="N",
+                    dest="max_skill_bonus",
+                    help="Cap on the combined skill bonus from equipped items "
+                         "(the server's settings.tml ruleset.combat.max-skill-bonus). "
+                         "A literal SetSkillBonusLimit(N) found in the module's "
+                         "scripts overrides this, as it does in the engine. "
+                         "Default: 50 (NWN default).")
     ap.add_argument("--max-player-level", type=int, default=0, metavar="N",
                     dest="max_player_level",
                     help="Level cap a player character can actually reach, used "
@@ -442,6 +451,8 @@ def _audit_wiki_data() -> bool:
         ("itemprops.json",        lambda: len(IPROP_DEFS),                            "committed — restore from git", True),
         ("parts_chest.2da",       lambda: len(PARTS_CHEST_AC),                        "committed — restore from git", True),
         ("armor.json",            lambda: len(ARMOR_ASF),                             "bin/wiki_data/_build_stock.py", True),
+        ("armor_acp.json",        lambda: len(ARMOR_ACP),                             "bin/wiki_data/_build_stock.py", False),
+        ("skill_info.json",       lambda: len(SKILL_INFO),                            "bin/wiki_data/_build_stock.py", False),
         ("stock_item_names.json", lambda: len(STOCK_ITEM_NAMES),                      "bin/refresh-nwn-stock-items", True),
         ("spell_info.json",       lambda: sum(len(v) for v in SPELL_INFO.values()),   "bin/refresh-nwn-spell-info", True),
         ("nwscript_consts.json",  lambda: sum(len(v) for v in NWSCRIPT_CONSTS.values()), "bin/refresh-nwn-script-consts", False),
@@ -474,6 +485,7 @@ def _load_db(src: Path, args: argparse.Namespace) -> Db:
         src,
         max_character_level=args.max_character_level,
         max_ability_bonus=args.max_ability_bonus,
+        max_skill_bonus=args.max_skill_bonus,
         max_player_level=args.max_player_level or args.max_character_level or 40,
     )
     db.exclude_option_texts = list(args.exclude_conv_option or [])
@@ -483,6 +495,7 @@ def _load_db(src: Path, args: argparse.Namespace) -> Db:
     print(f"[nwn-wiki] combat dials: max-character-level="
           f"{db.max_character_level or 'uncapped'}, "
           f"max-ability-bonus=+{db.max_ability_bonus}, "
+          f"max-skill-bonus=+{db.max_skill_bonus}, "
           f"max-player-level={db.max_player_level}")
     db.load()
     db.index()

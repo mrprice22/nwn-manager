@@ -1,0 +1,143 @@
+{
+  "_source": "stock NWN :: skills.2da (KeyAbility, Untrained, ArmorCheckPenalty)",
+  "0": {
+    "key": "Cha",
+    "untrained": 0,
+    "acp": 0
+  },
+  "1": {
+    "key": "Con",
+    "untrained": 1,
+    "acp": 0
+  },
+  "2": {
+    "key": "Int",
+    "untrained": 0,
+    "acp": 0
+  },
+  "3": {
+    "key": "Str",
+    "untrained": 1,
+    "acp": 0
+  },
+  "4": {
+    "key": "Wis",
+    "untrained": 1,
+    "acp": 0
+  },
+  "5": {
+    "key": "Dex",
+    "untrained": 1,
+    "acp": 1
+  },
+  "6": {
+    "key": "Wis",
+    "untrained": 1,
+    "acp": 0
+  },
+  "7": {
+    "key": "Int",
+    "untrained": 1,
+    "acp": 0
+  },
+  "8": {
+    "key": "Dex",
+    "untrained": 1,
+    "acp": 1
+  },
+  "9": {
+    "key": "Dex",
+    "untrained": 0,
+    "acp": 0
+  },
+  "10": {
+    "key": "Dex",
+    "untrained": 1,
+    "acp": 1
+  },
+  "11": {
+    "key": "Cha",
+    "untrained": 1,
+    "acp": 0
+  },
+  "12": {
+    "key": "Cha",
+    "untrained": 1,
+    "acp": 0
+  },
+  "13": {
+    "key": "Dex",
+    "untrained": 0,
+    "acp": 1
+  },
+  "14": {
+    "key": "Int",
+    "untrained": 1,
+    "acp": 0
+  },
+  "15": {
+    "key": "Dex",
+    "untrained": 0,
+    "acp": 1
+  },
+  "16": {
+    "key": "Int",
+    "untrained": 0,
+    "acp": 0
+  },
+  "17": {
+    "key": "Wis",
+    "untrained": 1,
+    "acp": 0
+  },
+  "18": {
+    "key": "Cha",
+    "untrained": 1,
+    "acp": 0
+  },
+  "19": {
+    "key": "Cha",
+    "untrained": 0,
+    "acp": 0
+  },
+  "20": {
+    "key": "Int",
+    "untrained": 1,
+    "acp": 0
+  },
+  "21": {
+    "key": "Dex",
+    "untrained": 0,
+    "acp": 1
+  },
+  "22": {
+    "key": "Int",
+    "untrained": 1,
+    "acp": 0
+  },
+  "23": {
+    "key": "Cha",
+    "untrained": 1,
+    "acp": 0
+  },
+  "24": {
+    "key": "Cha",
+    "untrained": 1,
+    "acp": 0
+  },
+  "25": {
+    "key": "Int",
+    "untrained": 1,
+    "acp": 0
+  },
+  "26": {
+    "key": "Int",
+    "untrained": 1,
+    "acp": 0
+  },
+  "27": {
+    "key": "Dex",
+    "untrained": 1,
+    "acp": 0
+  }
+}
