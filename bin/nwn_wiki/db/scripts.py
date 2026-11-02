@@ -142,6 +142,19 @@ class DbScriptsMixin:
         r"\b(?:GetWaypointByTag|GetObjectByTag|GetNearestObjectByTag)"
         r"\s*\(\s*\"([A-Za-z0-9_]+)\"\s*\)"
     )
+    # Same lookups, but with a named string instead of a literal:
+    # GetWaypointByTag(WTOP_COURT_WP).  Resolved against _RE_STRING_CONST
+    # declarations in the SAME file only -- no include chasing, which is what
+    # keeps the heuristic's false-positive rate where it has always been.
+    # Without this, wtop_cave.nss (the hidden Weather Top court entrance) and
+    # six other teleport scripts look like they resolve no tag at all.
+    _RE_GET_TAG_VAR = re.compile(
+        r"\b(?:GetWaypointByTag|GetObjectByTag|GetNearestObjectByTag)"
+        r"\s*\(\s*([A-Za-z_]\w*)\s*\)"
+    )
+    _RE_STRING_CONST = re.compile(
+        r'\b(?:const\s+)?string\s+(\w+)\s*=\s*"([^"]*)"'
+    )
     _RE_JUMP = re.compile(
         r"\b(?:Action)?(?:JumpToLocation|JumpToObject)\s*\("
     )
@@ -297,6 +310,20 @@ class DbScriptsMixin:
 
         return dispatch
 
+    def _tags_resolved_in(self, text: str) -> set[str]:
+        """Every object tag a script body resolves by tag, literal or named.
+
+        Shared by the teleport and store-opener heuristics below: both ask the
+        same question ("which tags does this script look up?") and both used to
+        see only literal arguments.
+        """
+        tags = {m.group(1) for m in self._RE_GET_TAG.finditer(text)}
+        names = {m.group(1) for m in self._RE_GET_TAG_VAR.finditer(text)}
+        if names:
+            consts = dict(self._RE_STRING_CONST.findall(text))
+            tags |= {consts[n] for n in names if consts.get(n)}
+        return tags
+
     def _parse_scripts(self) -> None:
         """One-shot scan of every .nss file. Populates script_dialogs and
         script_teleport_tags. Cheap enough (~2300 files in well under 1s on
@@ -341,9 +368,13 @@ class DbScriptsMixin:
             # teleporting to that tag. Imperfect (a script may resolve a
             # tag for some other reason), but the false-positive rate on
             # real modules is low and the player-visible value is high.
+            # Computed at most once per file, and only for the minority that
+            # jump or open a store -- this loop runs over every .nss in the
+            # module.
+            _tags_in_text: set[str] | None = None
             if self._RE_JUMP.search(text):
-                for m in self._RE_GET_TAG.finditer(text):
-                    self.script_teleport_tags[resref].add(m.group(1))
+                _tags_in_text = self._tags_resolved_in(text)
+                self.script_teleport_tags[resref] |= _tags_in_text
             # Store-opening heuristic: a script that calls OpenStore (or the
             # HoMERs appraise variant) and resolves an object by tag is assumed
             # to be opening the store with that tag.  Scripts that call
@@ -351,10 +382,10 @@ class DbScriptsMixin:
             # Merchant System bdm_cnv_opn_stor, which uses a runtime local
             # object variable set by proximity) are recorded separately.
             if self._RE_OPEN_STORE.search(text):
-                tag_matches = list(self._RE_GET_TAG.finditer(text))
-                if tag_matches:
-                    for m in tag_matches:
-                        self.script_store_tags[resref].add(m.group(1))
+                if _tags_in_text is None:
+                    _tags_in_text = self._tags_resolved_in(text)
+                if _tags_in_text:
+                    self.script_store_tags[resref] |= _tags_in_text
                 else:
                     self.script_bdm_open.add(resref)
             # CreateItemOnObject with a literal resref string.
@@ -594,38 +625,58 @@ class DbScriptsMixin:
                     {"bp_rr": bp_rr, "can_rr": can_rr, "script": script_rr}
                 )
 
+    # World objects whose event script can teleport the PC without a dialog,
+    # and the edge kind each produces.  Placeables were the only source until
+    # the Weather Top hidden court turned up: area026's wtop_hiddencave trigger
+    # deliberately fakes an area transition in its OnEnter (so the destination
+    # stays off the TAB map), which left area028 looking unreachable.
+    # Event field order matters: the first one set wins.
+    _TELEPORT_SOURCES = (
+        ("area_placeables", "placeables", ("OnUsed",), "use"),
+        ("area_triggers", "triggers", ("ScriptOnEnter", "OnEnter"), "trigger"),
+        ("area_doors", "doors", ("OnOpen", "OnClick", "OnFailToOpen"), "door"),
+    )
+
     def _build_direct_teleport_transitions(self) -> None:
-        """Detect placeables whose OnUsed script directly calls ActionJumpToLocation
-        (not via a dialog) and populate self.script_transitions.
+        """Detect world objects whose event script directly calls
+        ActionJumpToLocation (not via a dialog) and populate
+        self.script_transitions.
 
         Must run after _parse_scripts (for script_teleport_tags) and
         _build_tag_to_area (for tag_to_area) are complete."""
-        for area_resref, placeables in self.area_placeables.items():
-            for p in placeables:
-                bp_rr = (fld(p, "TemplateResRef", "") or "").lower()
-                # Instance-level script takes priority; fall back to blueprint.
-                script = ((fld(p, "OnUsed", "") or "").lower()
-                          or (fld(self.placeables.get(bp_rr, {}), "OnUsed", "") or "").lower())
-                if not script:
-                    continue
-                # Skip dialog-launching scripts — those are in conv_transitions.
-                if self._script_dialog_targets(script):
-                    continue
-                tags = self.script_teleport_tags.get(script)
-                if not tags:
-                    continue
-                p_tag = fld(p, "Tag", "") or bp_rr
-                for tag in tags:
-                    area = self.tag_to_area.get(tag)
-                    if area and area != area_resref and area in self.areas:
-                        self.script_transitions.append({
-                            "src_area": area_resref,
-                            "dst_area": area,
-                            "dst_tag": tag,
-                            "kind": "use",
-                            "label": p_tag,
-                            "fallback": tag in self.fallback_tags,
-                        })
+        for inst_attr, bp_attr, fields, kind in self._TELEPORT_SOURCES:
+            blueprints = getattr(self, bp_attr)
+            for area_resref, objs in getattr(self, inst_attr).items():
+                for o in objs:
+                    bp_rr = (fld(o, "TemplateResRef", "") or "").lower()
+                    bp = blueprints.get(bp_rr, {})
+                    # Instance-level script takes priority; fall back to blueprint.
+                    script = ""
+                    for f in fields:
+                        script = ((fld(o, f, "") or "").lower()
+                                  or (fld(bp, f, "") or "").lower())
+                        if script:
+                            break
+                    if not script:
+                        continue
+                    # Skip dialog-launching scripts — those are in conv_transitions.
+                    if self._script_dialog_targets(script):
+                        continue
+                    tags = self.script_teleport_tags.get(script)
+                    if not tags:
+                        continue
+                    o_tag = fld(o, "Tag", "") or bp_rr
+                    for tag in tags:
+                        area = self.tag_to_area.get(tag)
+                        if area and area != area_resref and area in self.areas:
+                            self.script_transitions.append({
+                                "src_area": area_resref,
+                                "dst_area": area,
+                                "dst_tag": tag,
+                                "kind": kind,
+                                "label": o_tag,
+                                "fallback": tag in self.fallback_tags,
+                            })
 
     def _walk_dialog_nodes(self, dlg: dict) -> Iterable[tuple[str, int, dict]]:
         """Yield (kind, index, node) for every Entry and Reply in a dlg."""

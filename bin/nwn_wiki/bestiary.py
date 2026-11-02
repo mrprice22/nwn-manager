@@ -19,6 +19,7 @@ from pathlib import Path
 
 from nwn_wiki.gff import fld
 from nwn_wiki.htmlgen.escape import nwn_text
+from nwn_wiki.reachability import creature_is_reachable
 from nwn_wiki.util import _try_float
 
 from nwn_wiki import state
@@ -29,10 +30,13 @@ def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
     (<db_dir>/bestiarydb.sqlite3 — must match BST_DB in bst_db.nss, the file the
     in-game scripts use) so the in-game book can list creatures killed or not.
 
-    Seeds only PLAYER-ACCESSIBLE creatures — the same "present" set the creatures
-    index uses (has >=1 placement or encounter, i.e. canonical_locations count
-    > 0), including stock NWN/CEP creatures registered from encounter pools.
-    Blueprint-only creatures (e.g. DM avatars) are excluded. Rows are keyed by the
+    Seeds only PLAYER-ACCESSIBLE creatures — the same set the creatures index
+    lists: has >=1 placement or encounter (canonical_locations count > 0),
+    including stock NWN/CEP creatures registered from encounter pools, AND
+    standing somewhere a player can actually get to. Blueprint-only creatures
+    (e.g. DM avatars) are excluded, and so are creatures whose every spawn area
+    is cut off from the module's entry point — an entry no one can ever tick off
+    is worse than no entry. Rows are keyed by the
     runtime resref (the base blueprint, what GetResRef returns in-game), never the
     synthetic __v2/__orphan ids, so kills JOIN. The table is rebuilt each run so
     creatures that become inaccessible are pruned. Tolerant of the server holding
@@ -58,11 +62,12 @@ def seed_bestiary_catalogue(db: "Db", db_dir: Path) -> None:
         con.execute("CREATE TABLE IF NOT EXISTS catalogue "
                     "(resref TEXT PRIMARY KEY, name TEXT, cr REAL)")
         # Accessible = the base blueprint of any canonical that has a location
-        # (placement or encounter). A base counts if it OR any of its variants
-        # is placed/encountered.
+        # (placement or encounter) in a REACHABLE area. A base counts if it OR
+        # any of its variants is placed/encountered somewhere players can go.
         accessible_bases = set()
         for c_rr in db.canonical_creatures:
-            if sum(l["count"] for l in db.canonical_locations.get(c_rr, [])) > 0:
+            if (sum(l["count"] for l in db.canonical_locations.get(c_rr, [])) > 0
+                    and creature_is_reachable(db, c_rr)):
                 accessible_bases.add(db.canonical_bp_of.get(c_rr, c_rr))
         rows = []
         for can_rr, entry in db.canonical_creatures.items():

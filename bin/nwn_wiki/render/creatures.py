@@ -20,6 +20,8 @@ from nwn_wiki.htmlgen.escape import E, nwn_html, nwn_text
 from nwn_wiki.htmlgen.links import _area_link, link
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.lookups import class_name, race_name
+from nwn_wiki.reachability import (creature_is_reachable,
+                                  creature_unreachable_areas)
 from nwn_wiki.respawn import (boss_reset_seconds, boss_respawn_seconds,
                                format_respawn)
 from nwn_wiki.util import _try_float, _try_int
@@ -156,6 +158,8 @@ def render_creatures_index(db: Db, out: Path) -> None:
     rows_absent = []
     for can_rr in sorted(db.canonical_creatures.keys(),
                          key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        if not creature_is_reachable(db, can_rr):
+            continue  # listed on creatures/inaccessible/index.html instead
         entry = db.canonical_creatures[can_rr]
         c = entry["c"]
         bp_rr = entry["bp_rr"]
@@ -180,9 +184,9 @@ def render_creatures_index(db: Db, out: Path) -> None:
             rows_present.append(row)
         else:
             rows_absent.append(row)
-    n_unique = len(db.canonical_creatures)
-    n_variants = sum(1 for r in db.canonical_creatures
-                     if db.canonical_bp_of.get(r) != r)
+    listed = [r for r in db.canonical_creatures if creature_is_reachable(db, r)]
+    n_unique = len(listed)
+    n_variants = sum(1 for r in listed if db.canonical_bp_of.get(r) != r)
     variant_note_str = (
         f" ({n_variants} equipment/class/name variant{'s' if n_variants != 1 else ''})"
         if n_variants else ""
@@ -228,6 +232,96 @@ def render_creatures_index(db: Db, out: Path) -> None:
     body = items_layout(sidebar, "\n".join(sections))
     write_page(out, PageCtx("creatures/index.html"), "Creatures",
                body)
+
+
+def unreachable_creatures(db: Db) -> list[str]:
+    """Canonical creatures whose every spawn area is cut off from the anchor.
+
+    The single source for the Inaccessible page, its nav gate and the
+    module-index report, so all three agree on the count.
+    """
+    return sorted(
+        (r for r in db.canonical_creatures if not creature_is_reachable(db, r)),
+        key=lambda r: nwn_text(db.canonical_creature_name(r)).lower(),
+    )
+
+
+def has_inaccessible_creatures(db: Db) -> bool:
+    """The gate SiteChrome puts on the Creatures > Inaccessible nav entry, and
+    the early return of the page it links to — the same discipline as the item
+    pair (has_inaccessible_items / render_inaccessible_index)."""
+    return bool(unreachable_creatures(db))
+
+
+def render_creatures_inaccessible_index(db: Db, out: Path) -> None:
+    """creatures/inaccessible/index.html — creatures with nowhere to meet them.
+
+    Mirrors render_inaccessible_index() for items: a creature here still has its
+    own detail page (players link to those, and reviewing them is the point),
+    it is just kept out of the four browsing views because every area it spawns
+    in has no route from the module's entry point.
+    """
+    if not has_inaccessible_creatures(db):
+        return
+    ctx = PageCtx("creatures/inaccessible/index.html")
+    can_rrs = unreachable_creatures(db)
+
+    # area resref -> the creatures stranded there, for the sidebar and so the
+    # page reads as a per-area worklist rather than a flat list of names.
+    by_area: dict[str, list[str]] = defaultdict(list)
+    for can_rr in can_rrs:
+        for area_rr in creature_unreachable_areas(db, can_rr):
+            by_area[area_rr].append(can_rr)
+    ordered_areas = sorted(by_area, key=lambda r: db.area_name(r).lower())
+
+    toc_parts = [
+        *_views_toc("inaccessible/index.html", "../"),
+        '<div class="toc-group-heading">Areas</div>',
+    ]
+    for area_rr in ordered_areas:
+        toc_parts.append(
+            f'<div><a href="#area-{E(area_rr)}">{E(db.area_name(area_rr))}'
+            f' <span class="muted">({len(by_area[area_rr])})</span></a></div>'
+        )
+    sidebar = toc_sidebar(toc_parts)
+
+    TABLE_HEAD = (
+        '<table class="data"><thead><tr>'
+        "<th>Name</th><th>Count</th><th>Race</th><th>Class</th>"
+        "<th>HP</th><th>CR</th><th>Faction</th>"
+        f"{_kills_head()}"
+        "</tr></thead><tbody>"
+    )
+    sections = [
+        "<h1>Inaccessible Creatures</h1>",
+        f"<p>{len(can_rrs)} creature{'s' if len(can_rrs) != 1 else ''} across "
+        f"{len(ordered_areas)} area{'s' if len(ordered_areas) != 1 else ''}. "
+        '<small class="muted">These creatures are placed in the module, but no '
+        "route to the area they stand in could be traced from the module's entry "
+        "point — no door, trigger, conversation teleport or teleport script "
+        "leads there. Barring a DM warp, there is no way to meet them.</small></p>",
+    ]
+    for area_rr in ordered_areas:
+        rows = []
+        for can_rr in by_area[area_rr]:
+            entry = db.canonical_creatures[can_rr]
+            bp_rr = entry["bp_rr"]
+            bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+            total = sum(l["count"] for l in db.canonical_locations.get(can_rr, []))
+            rows.append(_creature_row(
+                link(ctx.url(f"creatures/{can_rr}.html"),
+                     db.canonical_creature_name(can_rr)),
+                entry["c"], bp,
+                after_name=f"<td>{total if total else '—'}</td>",
+                tail=_faction_cell(db, entry["c"], bp) + _kills_cells([can_rr]),
+            ))
+        sections.append(
+            f'<h2 id="area-{E(area_rr)}">{_area_link(db, area_rr, ctx)}'
+            f' <small class="muted">({len(rows)})</small></h2>'
+            + TABLE_HEAD + "\n".join(rows) + "</tbody></table>"
+        )
+    write_page(out, ctx, "Inaccessible Creatures",
+               items_layout(sidebar, "\n".join(sections)))
 
 
 # --- Boss respawn tracker ("Roll of the Fallen") ---------------------------
@@ -495,7 +589,9 @@ def render_creatures_by_area(db: Db, out: Path) -> None:
         for area_rr in areas:
             by_area[area_rr].append(can_rr)
 
-    visible_areas = [a for a in by_area if a not in db.hidden_areas]
+    visible_areas = [a for a in by_area
+                     if a not in db.hidden_areas
+                     and a not in state.UNREACHABLE_AREAS]
 
     # Build sidebar TOC
     toc_parts = [
@@ -583,6 +679,8 @@ def render_creatures_by_cr(db: Db, out: Path, *, cr_bucket_size: int = 10) -> No
     known: list[tuple[float, str]] = []
     unknown: list[str] = []
     for can_rr in db.canonical_creatures:
+        if not creature_is_reachable(db, can_rr):
+            continue
         cr = _cr_val(can_rr)
         if cr is None:
             unknown.append(can_rr)
@@ -692,6 +790,8 @@ def render_creatures_by_race(db: Db, out: Path) -> None:
 
     by_race: dict = defaultdict(list)
     for can_rr in db.canonical_creatures:
+        if not creature_is_reachable(db, can_rr):
+            continue
         by_race[_race_id(can_rr)].append(can_rr)
 
     sorted_races = sorted(

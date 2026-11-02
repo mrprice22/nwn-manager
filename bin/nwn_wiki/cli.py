@@ -71,6 +71,7 @@ from nwn_wiki.lookups import (
     load_json_overlay,
 )
 from nwn_wiki.paths import ASSETS_DIR, DATA_DIR, SCRIPT_DIR
+from nwn_wiki.reachability import unreachable_areas
 from nwn_wiki.render.activity import (
     _load_activity_cache,   # re-export: poked as wiki._load_activity_cache
     _save_activity_cache,   # re-export: poked as wiki._save_activity_cache
@@ -104,6 +105,7 @@ from nwn_wiki.render.creature_page import (
 )
 from nwn_wiki.render.leaderboards import render_leaderboards
 from nwn_wiki.render.creatures import (
+    has_inaccessible_creatures,
     load_boss_registry,
     load_boss_registry_from_src,  # re-export: poked as wiki.load_boss_registry_from_src
     render_bosses_index,
@@ -111,7 +113,9 @@ from nwn_wiki.render.creatures import (
     render_creatures_by_area,
     render_creatures_by_cr,
     render_creatures_by_race,
+    render_creatures_inaccessible_index,
     render_creatures_index,
+    unreachable_creatures,
 )
 from nwn_wiki.render.factions import render_factions
 from nwn_wiki.render.index import render_index
@@ -922,17 +926,12 @@ def _load_roadmap_credits(args: argparse.Namespace, roster) -> None:
 
 
 def _freeze_site_chrome(db: Db, src: Path, out: Path) -> None:
-    """Load the boss registry, render the manual, then freeze ``state.CHROME``.
+    """Render the manual, then freeze ``state.CHROME``.
 
-    ORDER IS LOAD-BEARING (see the two comments below): the boss registry must
-    be loaded before ANY page renders, and the chrome can only be frozen once
-    every loader the page shell depends on has run.
+    ORDER IS LOAD-BEARING (see the comment below): the chrome can only be
+    frozen once every loader the page shell depends on has run — the boss
+    registry among them, loaded back in main() before the reports.
     """
-    # Boss respawn tracker registry — must load before ANY page renders (manual
-    # pages here, the activity subprocess below, and the main pages) so the
-    # conditional "Bosses" nav link appears consistently on every page.
-    load_boss_registry(db)
-
     render_manual_pages(src.parent, out)
 
     # Every loader that the page shell depends on has now run (theme, creature
@@ -943,6 +942,7 @@ def _freeze_site_chrome(db: Db, src: Path, out: Path) -> None:
     # subprocess can no longer emit a nav bar that disagrees with this build.
     state.CHROME = SiteChrome.from_state(
         has_inaccessible=has_inaccessible_items(db),
+        has_inaccessible_creatures=has_inaccessible_creatures(db),
     )
     state.CHROME.save(out)
 
@@ -997,6 +997,7 @@ def _render_pages(db: Db, src: Path, out: Path, title: str,
     render_creatures_by_area(db, out)
     render_creatures_by_cr(db, out, cr_bucket_size=args.cr_bucket_size)
     render_creatures_by_race(db, out)
+    render_creatures_inaccessible_index(db, out)
     render_creatures_search(db, out)
     state._ITEM_PAGES = set(db.items)
     # Shared with the nwn-wiki-activity subprocess, which has no module DB of
@@ -1157,12 +1158,24 @@ def main() -> int:
     # Area graph is always built (used for module-index and, conditionally, shortest paths).
     graph = build_area_graph(db)
     area_paths, path_from_name = _compute_area_paths(db, args, graph)
+    # Must be set before any renderer or report runs: every creature-level
+    # "is this findable?" question reads it through nwn_wiki.reachability.
+    state.UNREACHABLE_AREAS = unreachable_areas(db, area_paths,
+                                               args.path_from or "")
+    if state.UNREACHABLE_AREAS:
+        print(f"[nwn-wiki] {len(state.UNREACHABLE_AREAS)} visible area(s) have "
+              f"no path from {args.path_from!r}")
 
     _apply_2da_overrides(db, src, args)
     _prepare_out_dir(out)
     _load_theme_and_pics(db, src, out)
 
     title = _module_title(db, args)
+    # Boss respawn tracker registry — must load before the module-index reports
+    # (unreachable_creatures.json flags which stranded creatures are on the
+    # board) and before ANY page renders (manual pages, the activity subprocess
+    # and the main pages) so the conditional "Bosses" nav link is consistent.
+    load_boss_registry(db)
     module_index_dir = _prepare_module_index_dir(src)
     _generate_reports(db, module_index_dir, title, graph, area_paths,
                       path_from_name, out, args)

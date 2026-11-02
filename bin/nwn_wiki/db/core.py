@@ -248,6 +248,11 @@ class DbCore:
     # These areas, their stores, and their creature placements are omitted
     # from all wiki output (map, index pages, cross-references).
     hidden_areas: set[str] = _new(set)
+    # Areas whose Comments carry WIKI_REACHABLE: the builder asserts players can
+    # get there even though no static route resolves (a runtime-only entrance,
+    # e.g. a plot item that teleports).  Reachability reporting treats them as
+    # reachable; they are otherwise ordinary, visible areas.
+    forced_reachable: set[str] = _new(set)
     # Item source cross-references (built in index())
     # item resref → stores that sell it: [{"area_rr", "slug", "name"}]
     item_sold_at: dict[str, list[dict]] = _index(list)

@@ -22,6 +22,7 @@ from nwn_wiki.gff import fld, list_items
 from nwn_wiki.htmlgen.escape import nwn_text
 from nwn_wiki.items import item_gp_value
 from nwn_wiki.lookups import appearance_name, baseitem_name, race_name
+from nwn_wiki.reachability import creature_unreachable_areas
 from nwn_wiki.render.creature_page import _retaliation_sentence
 from nwn_wiki.render.creatures import creature_max_hp
 from nwn_wiki.reports.counter_gear import (
@@ -30,7 +31,7 @@ from nwn_wiki.reports.counter_gear import (
     generate_counter_gear_index,
 )
 from nwn_wiki.reports.enums import write_enums
-from nwn_wiki.util import _try_int, _write_json
+from nwn_wiki.util import _try_float, _try_int, _write_json
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +792,66 @@ def _write_inaccessible_items(
     state._module_index_summary.append(("warn", f"[nwn-wiki] module-index: inaccessible_items.json ({len(inac_items)} item(s))"))
 
 
+# ------------------------------------------------------------ unreachable_creatures.json
+def _write_unreachable_creatures(
+    db: "Db",
+    module_index_dir: Path,
+    module_title: str,
+    now: str,
+    _cu,
+    _au,
+) -> None:
+    """Creatures placed somewhere no route leads to.
+
+    Distinct from unspawned_creatures.json (blueprints never placed at all):
+    these ARE placed, the area they stand in just has no inbound transition
+    from the module's entry point. Written only when the build was given
+    --path-from, since without an anchor there is nothing to be cut off from.
+    Grouped per-area because the fix is per-area — build an entrance, or accept
+    the area as DM-event-only.
+    """
+    rows: list[dict] = []
+    boss_rrs = {b["resref"] for b in state._BOSS_REGISTRY}
+    for can_rr in sorted(db.canonical_creatures,
+                         key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        areas = creature_unreachable_areas(db, can_rr)
+        if not areas:
+            continue
+        entry = db.canonical_creatures[can_rr]
+        bp_rr = entry["bp_rr"]
+        bp = db.creatures.get(bp_rr) if bp_rr != can_rr else None
+        cr_raw = fld(entry["c"], "ChallengeRating")
+        if cr_raw is None and bp is not None:
+            cr_raw = fld(bp, "ChallengeRating")
+        rows.append({
+            "canonical_resref": can_rr,
+            "blueprint_resref": bp_rr,
+            "name": nwn_text(db.canonical_creature_name(can_rr)),
+            "cr": _try_float(cr_raw or 0, 0.0),
+            "is_registry_boss": can_rr in boss_rrs or bp_rr in boss_rrs,
+            "wiki_url": _cu(can_rr),
+            "areas": [{"resref": a, "name": nwn_text(db.area_name(a)),
+                       "wiki_url": _au(a)} for a in areas],
+        })
+    areas_hit = sorted({a["resref"] for r in rows for a in r["areas"]})
+    _write_json(module_index_dir / "unreachable_creatures.json", {
+        "generated_at": now,
+        "module": module_title,
+        "count": len(rows),
+        "area_count": len(areas_hit),
+        "areas": areas_hit,
+        "summary": (
+            f"{len(rows)} creature(s) across {len(areas_hit)} area(s) that no "
+            f"route reaches from the module's entry point."
+            if rows else "No unreachable creatures found."
+        ),
+        "creatures": rows,
+    })
+    state._module_index_summary.append(
+        ("warn", f"[nwn-wiki] module-index: unreachable_creatures.json "
+                 f"({len(rows)} creature(s) in {len(areas_hit)} area(s))"))
+
+
 # ------------------------------------------------------------------ unspawned_creatures.json
 def _write_unspawned_creatures(
     db: "Db",
@@ -1035,6 +1096,7 @@ def generate_module_index(
       cross_faction_creatures.json       — blueprints appearing in multiple factions
       faction_bp_instance_discrepancies.json — placed instances whose FactionID differs from their blueprint
       inaccessible_items.json            — items not reachable by players
+      unreachable_creatures.json         — creatures placed only in areas no route reaches
       unspawned_creatures.json           — creature blueprints never placed or in an encounter
       instance_only_conversations.json   — creature instances with Conversation overrides not on the blueprint
       allegiance_gated_encounters.json   — encounters suppressed by a Well-of-Eru allegiance
@@ -1059,6 +1121,7 @@ def generate_module_index(
     _write_cross_faction_creatures(db, module_index_dir, module_title, now, _cu)
     _write_faction_bp_instance_discrepancies(db, module_index_dir, module_title, now, _cu, _au)
     _write_inaccessible_items(db, module_index_dir, module_title, now, _cu, _iu)
+    _write_unreachable_creatures(db, module_index_dir, module_title, now, _cu, _au)
     _write_unspawned_creatures(db, module_index_dir, module_title, now, _cu)
     _write_allegiance_gated_encounters(db, module_index_dir, module_title, now, _cu, _au)
     _write_instance_only_conversations(db, module_index_dir, module_title, now, _cu, _au)

@@ -50,6 +50,7 @@ class DbIndexMixin:
         self._index_containers()
         self._index_encounter_spawns()
         self._index_hidden_areas()
+        self._index_forced_reachable()
         self._index_canonical_creatures()
         self._index_canonical_locations()
         self._index_item_sources()
@@ -57,6 +58,8 @@ class DbIndexMixin:
 
         hidden_msg = (f", {len(self.hidden_areas)} area(s) marked WIKI_HIDDEN"
                       if self.hidden_areas else "")
+        hidden_msg += (f", {len(self.forced_reachable)} marked WIKI_REACHABLE"
+                       if self.forced_reachable else "")
         print(f"  indexed in {time.time()-t0:.1f}s — {len(self.areas)} areas, "
               f"{len(self.transitions)} transitions, "
               f"{len(self.creatures)} creatures, {len(self.items)} items{hidden_msg}")
@@ -297,6 +300,19 @@ class DbIndexMixin:
         self.hidden_areas = {
             rr for rr, a in self.areas.items()
             if "WIKI_HIDDEN" in (fld(a, "Comments") or "").upper()
+        }
+
+    def _index_forced_reachable(self) -> None:
+        """Areas the builder has declared reachable despite the area graph.
+
+        Escape hatch for entrances static analysis cannot resolve — a runtime
+        object lookup, a plot item that teleports, a destination computed from
+        a local variable.  Same convention as WIKI_HIDDEN so there is one place
+        in the toolset to say either thing.
+        """
+        self.forced_reachable = {
+            rr for rr, a in self.areas.items()
+            if "WIKI_REACHABLE" in (fld(a, "Comments") or "").upper()
         }
 
     def _index_canonical_creatures(self) -> None:

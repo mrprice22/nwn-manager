@@ -164,3 +164,11 @@ _current_context: str = ""
 # generation and printed as a grouped, colour-coded block at the end of the run.
 # severity ∈ {"info", "warn", "issue"}
 _module_index_summary: list[tuple[str, str]] = []
+
+# Visible areas with no route from the --path-from anchor (the Well of Eru on
+# HoMERs), computed once in main() right after the shortest-path pass. A build
+# without --path-from leaves it empty, so every reader degrades to the
+# pre-reachability behaviour rather than hiding content it cannot justify.
+# Read it through nwn_wiki.reachability, never directly -- the creature-level
+# question ("is this thing findable?") is one rule and lives in one place.
+UNREACHABLE_AREAS: frozenset[str] = frozenset()

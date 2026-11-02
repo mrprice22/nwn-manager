@@ -36,7 +36,7 @@ from nwn_wiki.util import _try_float
 from nwn_wiki import state
 
 CHROME_FILE = ".chrome.json"
-_CHROME_FORMAT = 2
+_CHROME_FORMAT = 3
 
 
 def has_creature_pics_page() -> bool:
@@ -60,10 +60,12 @@ class SiteChrome:
     guaranteed to render the same chrome as every other consumer, including the
     ``nwn-wiki-activity`` subprocess running in its own interpreter.
 
-    ``has_inaccessible`` / ``has_creature_pics`` gate the Items > Inaccessible
-    and Creatures > Pictures nav entries.  Each is fed by the *same* predicate
-    its renderer early-returns on -- ``has_inaccessible_items()`` for
-    render_inaccessible_index, ``has_creature_pics()`` for
+    ``has_inaccessible`` / ``has_inaccessible_creatures`` / ``has_creature_pics``
+    gate the Items > Inaccessible, Creatures > Inaccessible and
+    Creatures > Pictures nav entries.  Each is fed by the *same* predicate its
+    renderer early-returns on -- ``has_inaccessible_items()`` for
+    render_inaccessible_index, ``has_inaccessible_creatures()`` for
+    render_creatures_inaccessible_index, ``has_creature_pics()`` for
     render_creature_pictures -- so the nav cannot offer a page that was never
     written.
     """
@@ -83,10 +85,15 @@ class SiteChrome:
     # entries mean today; a build that knows better passes the real value.
     has_inaccessible: bool = True
     has_creature_pics: bool = True
+    # Unlike the two above, defaults False: a build with no --path-from cannot
+    # know any creature is unreachable, and "assume present" would advertise a
+    # page that is never written.
+    has_inaccessible_creatures: bool = False
 
     @classmethod
     def from_state(cls, has_inaccessible: bool = True,
-                   has_creature_pics: bool | None = None) -> "SiteChrome":
+                   has_creature_pics: bool | None = None,
+                   has_inaccessible_creatures: bool = False) -> "SiteChrome":
         """Snapshot the current :mod:`nwn_wiki.state` nav globals."""
         if has_creature_pics is None:
             has_creature_pics = has_creature_pics_page()
@@ -104,6 +111,7 @@ class SiteChrome:
             theme_extra_css=state._THEME_EXTRA_CSS,
             has_inaccessible=bool(has_inaccessible),
             has_creature_pics=bool(has_creature_pics),
+            has_inaccessible_creatures=bool(has_inaccessible_creatures),
         )
 
     def to_dict(self) -> dict:
@@ -123,6 +131,7 @@ class SiteChrome:
             "theme_extra_css": self.theme_extra_css,
             "has_inaccessible": self.has_inaccessible,
             "has_creature_pics": self.has_creature_pics,
+            "has_inaccessible_creatures": self.has_inaccessible_creatures,
         }
 
     @classmethod
@@ -142,6 +151,8 @@ class SiteChrome:
             theme_extra_css=d.get("theme_extra_css") or "",
             has_inaccessible=bool(d.get("has_inaccessible", True)),
             has_creature_pics=bool(d.get("has_creature_pics", True)),
+            has_inaccessible_creatures=bool(
+                d.get("has_inaccessible_creatures", False)),
         )
 
     def save(self, out: Path) -> Path:
@@ -415,6 +426,10 @@ def page(title: str, body: str, ctx: PageCtx, page_updated_at: str = "",
         "\n          " + _nav_link(ctx, "items/inaccessible/index.html",
                                    "Inaccessible")
         if chrome.has_inaccessible else "")
+    inaccessible_creatures_nav = (
+        "\n          " + _nav_link(ctx, "creatures/inaccessible/index.html",
+                                   "Inaccessible")
+        if chrome.has_inaccessible_creatures else "")
     # Gated on the same fact render_most_equipped() early-returns on, so the
     # menu never offers a page a vault-less build did not write.
     most_equipped_nav = (
@@ -444,7 +459,7 @@ def page(title: str, body: str, ctx: PageCtx, page_updated_at: str = "",
           {_nav_link(ctx, 'creatures/by-cr/index.html', 'By Challenge Rating')}
           {_nav_link(ctx, 'creatures/by-race/index.html', 'By Race')}
           {_nav_link(ctx, 'creatures/search.html', 'Search')}
-          {_nav_link(ctx, 'creatures/bosses.html', 'Bosses') if chrome.has_bosses else ''}{pictures_nav}
+          {_nav_link(ctx, 'creatures/bosses.html', 'Bosses') if chrome.has_bosses else ''}{pictures_nav}{inaccessible_creatures_nav}
         </div>
       </div>
       <div class="nav-dropdown">

@@ -78,6 +78,7 @@ from nwn_wiki.lookups import (
     skill_name,
     spell_name,
 )
+from nwn_wiki.reachability import creature_unreachable_areas
 from nwn_wiki.render.creatures import _bp_field, _pic_figures, creature_max_hp
 from nwn_wiki.render.stores import _creature_store_section
 from nwn_wiki.respawn import (NONE, STANDARD, encounter_respawn_label,
@@ -1778,6 +1779,18 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
             )
 
     # "Where to find" section
+    # Lead with the bad news when there is any: every area below is cut off from
+    # the module's entry point, so the table that follows is not a route.
+    cut_off = creature_unreachable_areas(db, canonical_rr)
+    if cut_off:
+        where = ", ".join(_area_link(db, a, ctx) for a in cut_off)
+        sections.append(
+            '<p class="muted"><strong>Not currently reachable.</strong> '
+            f'This creature is only placed in {where}, and no route there could '
+            "be traced from the module's entry point — no door, trigger, "
+            "conversation teleport or teleport script leads to it. Barring a DM "
+            "warp, there is no way to meet it.</p>"
+        )
     locs = db.canonical_locations.get(canonical_rr, [])
     placed_locs  = [l for l in locs if l["kind"] == "placed"]
     enc_locs     = [l for l in locs if l["kind"] == "encounter"]
@@ -1896,6 +1909,8 @@ def render_creatures_search(db: Db, out: Path) -> None:
 
     for can_rr in sorted(db.canonical_creatures,
                          key=lambda r: nwn_text(db.canonical_creature_name(r)).lower()):
+        if creature_unreachable_areas(db, can_rr):
+            continue  # listed on creatures/inaccessible/index.html instead
         entry = db.canonical_creatures[can_rr]
         c = entry["c"]
         bp_rr = entry["bp_rr"]
