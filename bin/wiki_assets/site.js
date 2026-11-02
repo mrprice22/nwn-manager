@@ -35,10 +35,251 @@ function releaseNav() {
 document.addEventListener("DOMContentLoaded", () => {
   const nav = document.querySelector('header.site-header nav');
   if (nav) initNav(nav);
+  initPage();
+  initRadio();
+  if (RADIO.src) initSoftNav();
+});
+
+/* Everything that belongs to one page's <main> / <footer>. Runs on the first
+ * load and again after every in-place page swap (see initSoftNav), so each of
+ * these must find its own elements and tolerate being called more than once. */
+function initPage() {
   initMap();
   initFooterTimestamp();
   initOnlineStatus();
-});
+  syncRadioOptOut();
+}
+
+/* ── Radio ─────────────────────────────────────────────────────────────────
+ * An optional web-radio player, as an iframe docked along the bottom of every
+ * page or sitting in the header nav. The player remembers each visitor's
+ * station by itself; the site only places it, and lets the visitor minimise
+ * it to a single music-note button (remembered in localStorage).
+ *
+ * RADIO is written into the copied assets/site.js by nwn-wiki from
+ * --radio-url / --radio-default-station / --radio-placement:
+ *   {src: player URL, placement: 'bottom' | 'header'}
+ * Empty, as here in the source, means no radio and no in-place navigation:
+ * every build without the flag ships this line untouched. The marker comment
+ * is what the generator matches on. */
+const RADIO = {};  // @nwn-wiki:radio
+
+const RADIO_COLLAPSED_KEY = 'radio-collapsed';
+let radioDock = null;
+
+function initRadio() {
+  if (!RADIO.src) return;
+  const placement = RADIO.placement === 'header' ? 'header' : 'bottom';
+  const nav = document.querySelector('header.site-header nav');
+  const host = placement === 'header' ? nav : document.body;
+  if (!host) return;
+
+  const dock = document.createElement(placement === 'header' ? 'span' : 'div');
+  dock.className = 'radio-dock';
+  dock.dataset.placement = placement;
+
+  const f = document.createElement('iframe');
+  f.className = 'radio-frame';
+  f.title = 'Radio';
+  // Required: lets the player start sound without a click of its own when it
+  // carries playback over a full page load (the fallback when the in-place
+  // swap below can't be used). No loading="lazy": it would only delay it.
+  f.allow = 'autoplay; encrypted-media';
+  f.src = RADIO.src;
+
+  const collapse = document.createElement('button');
+  collapse.type = 'button';
+  collapse.className = 'radio-collapse';
+  collapse.title = 'Minimise radio';
+  collapse.setAttribute('aria-label', 'Minimise radio');
+  collapse.innerHTML = '<span aria-hidden="true">&#x2013;</span>';
+
+  const expand = document.createElement('button');
+  expand.type = 'button';
+  expand.className = 'radio-expand';
+  expand.title = 'Show radio';
+  expand.setAttribute('aria-label', 'Show radio');
+  expand.innerHTML = '<span aria-hidden="true">&#x266B;</span>';
+
+  dock.append(f, collapse, expand);
+  host.appendChild(dock);
+  radioDock = dock;
+
+  const root = document.documentElement;
+  root.classList.add('has-radio', 'radio-' + placement);
+  let collapsed = false;
+  try { collapsed = localStorage.getItem(RADIO_COLLAPSED_KEY) === '1'; } catch (e) {}
+  const setCollapsed = (c) => {
+    root.classList.toggle('radio-collapsed', c);
+    try {
+      if (c) localStorage.setItem(RADIO_COLLAPSED_KEY, '1');
+      else localStorage.removeItem(RADIO_COLLAPSED_KEY);
+    } catch (e) {}
+  };
+  setCollapsed(collapsed);
+  collapse.addEventListener('click', () => { setCollapsed(true); expand.focus(); });
+  expand.addEventListener('click', () => { setCollapsed(false); collapse.focus(); });
+
+  // The player posts its playback state, so the minimised note can glow while
+  // music is on. Only messages from our own iframe count.
+  window.addEventListener('message', (e) => {
+    if (e.source !== f.contentWindow || !e.data || e.data.type !== 'slightly-epic-radio:state') return;
+    dock.dataset.state = String(e.data.state || '');
+  });
+  syncRadioOptOut();
+}
+
+/* Per-page opt-out: <main data-no-radio>. Hidden, not removed, so music that
+ * is already playing carries on underneath an opted-out page. */
+function syncRadioOptOut() {
+  document.documentElement.classList.toggle(
+    'radio-off', !!document.querySelector('main[data-no-radio]'));
+}
+
+/* ── In-place navigation ───────────────────────────────────────────────────
+ * Any full page load reloads the radio iframe, and Firefox / Safari will not
+ * let the new copy start sound without a click. So while a radio is
+ * configured, same-site links swap the page in place instead: fetch the page,
+ * replace <main>, <footer> and the title, push the URL, re-run initPage().
+ * The header (and the radio in it, or docked below) is never touched, so
+ * playback never stops.
+ *
+ * Anything unusual falls back to an ordinary navigation: other origins, new
+ * tabs, downloads, non-HTML files, a fetch or parse failure, or a page that is
+ * not one of ours. The fallback is always safe, just not gap-free. */
+let softNavSeq = 0;
+let softNavPath = '';
+
+function initSoftNav() {
+  if (!window.fetch || !window.DOMParser || !history.pushState) return;
+  // Header links are relative to the page they were written for; once the URL
+  // starts changing underneath them they would point at the wrong depth.
+  document.querySelectorAll('header.site-header a[href]').forEach(a => {
+    a.setAttribute('href', a.href);
+  });
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+  softNavPath = pathKey(location.href);
+  history.replaceState({ softnav: 1, y: window.scrollY }, '', location.href);
+
+  // Remember where each entry was scrolled to, for back / forward.
+  let saveTimer = 0;
+  window.addEventListener('scroll', () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      const st = history.state;
+      if (st && st.softnav) history.replaceState({ softnav: 1, y: window.scrollY }, '', location.href);
+    }, 150);
+  }, { passive: true });
+
+  document.addEventListener('click', (e) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest && e.target.closest('a[href]');
+    if (!a || a.hasAttribute('download')) return;
+    if (a.target && a.target !== '_self') return;
+    const url = new URL(a.href, location.href);
+    if (!softNavTarget(url)) return;
+    // Same page, different #anchor: the browser's own jump is right.
+    if (pathKey(url.href) === softNavPath && url.hash) return;
+    e.preventDefault();
+    softNavigate(url.href, { push: true });
+  });
+
+  window.addEventListener('popstate', (e) => {
+    // A hash-only history entry on the same page: nothing to load.
+    if (pathKey(location.href) === softNavPath) return;
+    softNavigate(location.href, { push: false, y: e.state && e.state.y });
+  });
+}
+
+function pathKey(href) {
+  const u = new URL(href, location.href);
+  return u.origin + u.pathname + u.search;
+}
+
+function softNavTarget(url) {
+  if (url.origin !== location.origin) return false;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  // Directory URLs and .html pages only; .json, .png, .zip ... load normally.
+  const last = url.pathname.split('/').pop();
+  return !last.includes('.') || /\.html?$/i.test(last);
+}
+
+async function softNavigate(href, opts) {
+  const seq = ++softNavSeq;
+  const full = () => { if (seq === softNavSeq) location.assign(href); };
+  let doc, finalUrl;
+  try {
+    const res = await fetch(href, { headers: { Accept: 'text/html' } });
+    const type = res.headers.get('content-type') || '';
+    if (!res.ok || !/text\/html/i.test(type)) return full();
+    const text = await res.text();
+    if (seq !== softNavSeq) return;            // a newer click won
+    doc = new DOMParser().parseFromString(text, 'text/html');
+    // Only our own pages: same shell, same site.js.
+    if (!doc.querySelector('main') || !doc.querySelector('script[src$="assets/site.js"]')) return full();
+    const hash = new URL(href, location.href).hash;
+    finalUrl = res.url ? res.url.replace(/#.*$/, '') + hash : href;
+  } catch (err) {
+    return full();
+  }
+
+  try {
+    // URL first: relative src/href inside the new content resolve against it.
+    if (opts.push) history.pushState({ softnav: 1, y: 0 }, '', finalUrl);
+    softNavPath = pathKey(location.href);
+
+    document.title = doc.title;
+    const main = document.querySelector('main');
+    const newMain = document.adoptNode(doc.querySelector('main'));
+    main.replaceWith(newMain);
+    const footer = document.querySelector('body > footer');
+    const newFooter = doc.querySelector('body > footer');
+    if (footer && newFooter) footer.replaceWith(document.adoptNode(newFooter));
+
+    runPageScripts(newMain);
+    initPage();
+
+    const id = decodeURIComponent(location.hash.slice(1));
+    const target = id && document.getElementById(id);
+    if (typeof opts.y === 'number') window.scrollTo(0, opts.y);
+    else if (target) target.scrollIntoView();
+    else window.scrollTo(0, 0);
+  } catch (err) {
+    // Half-swapped is worse than a reload: start this page over properly.
+    console.error('[nwn-wiki] in-place navigation failed; reloading', err);
+    location.reload();
+  }
+}
+
+/* Scripts inserted by innerHTML / adoptNode never run, so each page script in
+ * the new <main> is re-created to execute it. Page scripts are written for a
+ * fresh load and wait for DOMContentLoaded, which has long since fired, so
+ * those listeners are collected while the scripts run and called right after.
+ * Data blocks (type="application/json") are left alone. */
+function runPageScripts(root) {
+  const ready = [];
+  const add = document.addEventListener;
+  document.addEventListener = function (type, fn, o) {
+    if (type === 'DOMContentLoaded') { ready.push(fn); return; }
+    return add.call(this, type, fn, o);
+  };
+  try {
+    root.querySelectorAll('script').forEach(old => {
+      const type = (old.getAttribute('type') || '').trim().toLowerCase();
+      if (type && !/^(text|application)\/(java|ecma)script$|^module$/.test(type)) return;
+      const s = document.createElement('script');
+      for (const at of old.attributes) s.setAttribute(at.name, at.value);
+      s.textContent = old.textContent;
+      old.replaceWith(s);
+    });
+  } finally {
+    document.addEventListener = add;
+  }
+  ready.forEach(fn => {
+    try { fn.call(document, new Event('DOMContentLoaded')); }
+    catch (err) { console.error(err); }
+  });
+}
 
 function graceMs() {
   const raw = getComputedStyle(document.documentElement)
@@ -307,7 +548,12 @@ function initMap() {
  * already in the element is left exactly as it is. */
 const ONLINE_POLL_MS = 60000;
 
+/* One poll for the whole visit: initPage() re-runs this after an in-place page
+ * swap, which must replace the previous page's timer, not add a second one. */
+let onlineTimer = 0;
+
 function initOnlineStatus() {
+  clearInterval(onlineTimer);
   const roster = document.querySelector('[data-online-roster]');
   const badges = document.querySelectorAll('[data-online-count]');
   if (!roster && !badges.length) return;
@@ -381,7 +627,7 @@ function initOnlineStatus() {
   }
 
   tick();
-  setInterval(tick, ONLINE_POLL_MS);
+  onlineTimer = setInterval(tick, ONLINE_POLL_MS);
 }
 
 function initFooterTimestamp() {

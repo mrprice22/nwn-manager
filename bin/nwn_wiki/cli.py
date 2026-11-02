@@ -27,6 +27,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from nwn_wiki.bestiary import (
     backfill_server_first_player_names,
@@ -334,6 +335,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "serves that route; without it the page and its nav "
                          "entry are not rendered at all, which is how archived "
                          "seasons and the forks stay fully static.")
+    ap.add_argument("--radio-url", default="", dest="radio_url", metavar="URL",
+                    help="Web-radio player to embed on every page as an iframe "
+                         "(assets/site.js initRadio). Any query the player takes "
+                         "for this site's look rides in the URL (e.g. "
+                         "...?size=slim&theme=dark&accent=c8a045). Setting it also "
+                         "turns on in-place page navigation, so playback is never "
+                         "interrupted by a page load. Empty (the default) means "
+                         "neither.")
+    ap.add_argument("--radio-default-station", default="",
+                    dest="radio_default_station", metavar="SLUG",
+                    help="Station first-time visitors start on, added to "
+                         "--radio-url as default=SLUG. Visitors who have picked "
+                         "a station keep theirs. Empty = the player's own first "
+                         "station.")
+    ap.add_argument("--radio-placement", default="bottom", dest="radio_placement",
+                    choices=("bottom", "header"),
+                    help="Where the radio sits: a bar docked along the bottom of "
+                         "the window (default), or a compact player in the header "
+                         "nav row.")
     ap.add_argument("--activity-cache", default=None, dest="activity_cache",
                     metavar="PATH",
                     help="JSON file for persisting player-session data across log "
@@ -572,8 +592,71 @@ def _apply_2da_overrides(db: Db, src: Path, args: argparse.Namespace) -> None:
                   file=sys.stderr)
 
 
-def _prepare_out_dir(out: Path) -> None:
-    """Wipe and re-seed the output tree (.nojekyll, assets/, assets/meta.json)."""
+#: The line in wiki_assets/site.js that _prepare_out_dir() rewrites to carry the
+#: radio config. Matched exactly, so editing it in site.js means editing it here.
+_RADIO_SENTINEL = "const RADIO = {};  // @nwn-wiki:radio"
+
+
+def _radio_config(args: argparse.Namespace) -> dict:
+    """site.js's RADIO object: ``{"src": url, "placement": ...}``, or ``{}``."""
+    src = _radio_src(args)
+    return {"src": src, "placement": args.radio_placement} if src else {}
+
+
+def _radio_src(args: argparse.Namespace) -> str:
+    """The radio's iframe URL from --radio-url / --radio-default-station.
+
+    Empty means no radio. The URL is the site's own business (size, theme and
+    accent ride in its query string); the generator only adds ``default=`` for
+    first-time visitors, replacing any default already in the URL.
+    """
+    url = (args.radio_url or "").strip()
+    station = (args.radio_default_station or "").strip()
+    if not url:
+        if station:
+            print("warn: --radio-default-station given without --radio-url; "
+                  "no radio bar", file=sys.stderr)
+        return ""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.netloc:
+        print(f"warn: --radio-url must be an absolute https:// URL, got {url!r}; "
+              "no radio bar", file=sys.stderr)
+        return ""
+    if station:
+        query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                 if k != "default"]
+        query.append(("default", station))
+        parts = parts._replace(query=urlencode(query))
+    return urlunsplit(parts)
+
+
+def _write_site_js(src: Path, dst: Path, radio: dict) -> None:
+    """Copy site.js, baking the radio config into its RADIO line."""
+    if not radio:
+        shutil.copy2(src, dst)
+        return
+    text = src.read_text(encoding="utf-8")
+    if text.count(_RADIO_SENTINEL) != 1:
+        # Loud on purpose: a silently unmatched sentinel would ship a wiki with
+        # no radio bar and nothing in the log to say why.
+        raise SystemExit(f"error: {src} must contain exactly one line "
+                         f"{_RADIO_SENTINEL!r} for --radio-url to fill in")
+    # JSON is a valid JS object literal; '</' is escaped in case the file is
+    # ever inlined into a <script> block.
+    literal = json.dumps(radio, sort_keys=True).replace("</", "<\\/")
+    dst.write_text(text.replace(
+        _RADIO_SENTINEL,
+        f"const RADIO = {literal};  // @nwn-wiki:radio (filled by nwn-wiki)"),
+        encoding="utf-8")
+    print(f"[nwn-wiki] radio ({radio['placement']}): {radio['src']}")
+
+
+def _prepare_out_dir(out: Path, radio: dict | None = None) -> None:
+    """Wipe and re-seed the output tree (.nojekyll, assets/, assets/meta.json).
+
+    ``radio`` (from :func:`_radio_config`) is written into assets/site.js;
+    empty leaves site.js a byte-for-byte copy of the source.
+    """
     # Wipe stale generated content so deleted resources don't linger in the
     # wiki. We only nuke the contents — keeping the directory itself preserves
     # any user-created tooling (CNAME, custom workflow files) co-located in
@@ -596,7 +679,9 @@ def _prepare_out_dir(out: Path) -> None:
     if ASSETS_DIR.is_dir():
         (out / "assets").mkdir(parents=True, exist_ok=True)
         for f in ASSETS_DIR.iterdir():
-            if f.is_file():
+            if f.name == "site.js":
+                _write_site_js(f, out / "assets" / f.name, radio or {})
+            elif f.is_file():
                 shutil.copy2(f, out / "assets" / f.name)
     (out / "assets" / "meta.json").write_text(
         json.dumps({"generated_at": state._GENERATED_AT}, ensure_ascii=False)
@@ -1167,7 +1252,7 @@ def main() -> int:
               f"no path from {args.path_from!r}")
 
     _apply_2da_overrides(db, src, args)
-    _prepare_out_dir(out)
+    _prepare_out_dir(out, radio=_radio_config(args))
     _load_theme_and_pics(db, src, out)
 
     title = _module_title(db, args)
