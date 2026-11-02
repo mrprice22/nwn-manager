@@ -159,7 +159,13 @@ html.radio-collapsed .radio-dock[data-placement="bottom"] .radio-expand { width:
 .radio-dock[data-placement="header"] .radio-frame { width: 300px; max-width: calc(100vw - 60px); height: var(--radio-h); }
 .radio-dock[data-placement="header"] .radio-collapse { width: 24px; height: 32px; font-size: 18px; }
 html.radio-collapsed .radio-dock[data-placement="header"] { border-color: transparent; background: transparent; padding: 0; }
-html.radio-collapsed .radio-dock[data-placement="header"] .radio-expand { width: 32px; height: 32px; }
+html.radio-collapsed .radio-dock[data-placement="header"] .radio-expand {
+  width: 32px; height: 32px;
+  color: inherit;   /* same as the nav links, so first-time visitors spot it */
+}
+html.radio-collapsed .radio-dock[data-placement="header"] .radio-expand:hover,
+html.radio-collapsed .radio-dock[data-placement="header"][data-state="playing"] .radio-expand,
+html.radio-collapsed .radio-dock[data-placement="header"][data-state="loading"] .radio-expand { color: var(--accent); }
 .muted { color: var(--muted); font-size: 0.85em; }
 
 main {

@@ -57,8 +57,9 @@ function initPage() {
  * it to a single music-note button (remembered in localStorage).
  *
  * RADIO is written into the copied assets/site.js by nwn-wiki from
- * --radio-url / --radio-default-station / --radio-placement:
- *   {src: player URL, placement: 'bottom' | 'header'}
+ * --radio-url / --radio-default-station / --radio-placement / --radio-start:
+ *   {src: player URL, placement: 'bottom' | 'header',
+ *    start: 'open' | 'minimised'  (how a visitor who never chose sees it)}
  * Empty, as here in the source, means no radio and no in-place navigation:
  * every build without the flag ships this line untouched. The marker comment
  * is what the generator matches on. */
@@ -107,18 +108,19 @@ function initRadio() {
 
   const root = document.documentElement;
   root.classList.add('has-radio', 'radio-' + placement);
-  let collapsed = false;
-  try { collapsed = localStorage.getItem(RADIO_COLLAPSED_KEY) === '1'; } catch (e) {}
-  const setCollapsed = (c) => {
-    root.classList.toggle('radio-collapsed', c);
-    try {
-      if (c) localStorage.setItem(RADIO_COLLAPSED_KEY, '1');
-      else localStorage.removeItem(RADIO_COLLAPSED_KEY);
-    } catch (e) {}
+  // A visitor's own choice ('1' / '0') wins; until they make one, the site's
+  // RADIO.start decides. That first state is deliberately not stored, so a
+  // later change of the site default still reaches everyone who never chose.
+  let stored = null;
+  try { stored = localStorage.getItem(RADIO_COLLAPSED_KEY); } catch (e) {}
+  const apply = (c) => root.classList.toggle('radio-collapsed', c);
+  apply(stored === null ? RADIO.start === 'minimised' : stored === '1');
+  const choose = (c) => {
+    apply(c);
+    try { localStorage.setItem(RADIO_COLLAPSED_KEY, c ? '1' : '0'); } catch (e) {}
   };
-  setCollapsed(collapsed);
-  collapse.addEventListener('click', () => { setCollapsed(true); expand.focus(); });
-  expand.addEventListener('click', () => { setCollapsed(false); collapse.focus(); });
+  collapse.addEventListener('click', () => { choose(true); expand.focus(); });
+  expand.addEventListener('click', () => { choose(false); collapse.focus(); });
 
   // The player posts its playback state, so the minimised note can glow while
   // music is on. Only messages from our own iframe count.

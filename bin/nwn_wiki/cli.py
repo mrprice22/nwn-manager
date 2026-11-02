@@ -354,6 +354,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="Where the radio sits: a bar docked along the bottom of "
                          "the window (default), or a compact player in the header "
                          "nav row.")
+    ap.add_argument("--radio-start", default="open", dest="radio_start",
+                    choices=("open", "minimised"),
+                    help="How the radio first appears to a visitor who has never "
+                         "opened or minimised it: the full player (default), or "
+                         "just the music-note button. Each visitor's own choice "
+                         "is remembered and wins.")
     ap.add_argument("--activity-cache", default=None, dest="activity_cache",
                     metavar="PATH",
                     help="JSON file for persisting player-session data across log "
@@ -600,7 +606,10 @@ _RADIO_SENTINEL = "const RADIO = {};  // @nwn-wiki:radio"
 def _radio_config(args: argparse.Namespace) -> dict:
     """site.js's RADIO object: ``{"src": url, "placement": ...}``, or ``{}``."""
     src = _radio_src(args)
-    return {"src": src, "placement": args.radio_placement} if src else {}
+    if not src:
+        return {}
+    return {"src": src, "placement": args.radio_placement,
+            "start": args.radio_start}
 
 
 def _radio_src(args: argparse.Namespace) -> str:
@@ -648,7 +657,8 @@ def _write_site_js(src: Path, dst: Path, radio: dict) -> None:
         _RADIO_SENTINEL,
         f"const RADIO = {literal};  // @nwn-wiki:radio (filled by nwn-wiki)"),
         encoding="utf-8")
-    print(f"[nwn-wiki] radio ({radio['placement']}): {radio['src']}")
+    print(f"[nwn-wiki] radio ({radio['placement']}, starts {radio['start']}): "
+          f"{radio['src']}")
 
 
 def _prepare_out_dir(out: Path, radio: dict | None = None) -> None:
