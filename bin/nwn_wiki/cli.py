@@ -131,7 +131,8 @@ from nwn_wiki.render.items import (
 )
 from nwn_wiki.render.most_equipped import render_most_equipped
 from nwn_wiki.render.manual import render_manual_pages
-from nwn_wiki.render.map import render_map_page
+from nwn_wiki.render.map import CONNECTION_DIAGRAM, render_map_page
+from nwn_wiki.render.overland import build_overland
 from nwn_wiki.render.quests import (
     _quest_categories,
     _quest_slugs,
@@ -764,6 +765,17 @@ def _generate_reports(db: Db, module_index_dir: Path, title: str, graph: dict,
     )
 
 
+def _compute_overland(db: Db, args: argparse.Namespace) -> dict | None:
+    """World model for the graphical overland map (render/overland.py)."""
+    print("[nwn-wiki] building overland map")
+    t0 = time.time()
+    model = build_overland(db, seed=args.seed)
+    if model:
+        print(f"  overland {model['w']}×{model['h']} cells, "
+              f"{len(model['sites'])} sites, in {time.time() - t0:.1f}s")
+    return model
+
+
 def _compute_layout(db: Db, args: argparse.Namespace) -> tuple[dict, dict]:
     """Force-directed placement of the visible areas.  Returns (positions, sizes)."""
     # Layout
@@ -1064,13 +1076,14 @@ def _run_activity_subprocess(db: Db, src: Path, out: Path,
 def _render_pages(db: Db, src: Path, out: Path, title: str,
                   positions: dict, sizes: dict,
                   area_paths: dict[str, list | None], path_from_name: str,
-                  args: argparse.Namespace) -> None:
+                  args: argparse.Namespace, overland: dict | None = None) -> None:
     """Render every wiki page.  Runs after every loader stage above."""
     print("[nwn-wiki] rendering pages")
     t0 = time.time()
     render_index(db, out, title, positions, sizes, base_url=args.base_url,
-                 project_root=src.parent)
-    render_map_page(db, out, positions, sizes, base_url=args.base_url)
+                 project_root=src.parent, overland=overland)
+    render_map_page(db, out, positions, sizes, base_url=args.base_url,
+                    overland=overland)
     render_areas_index(db, out,
                        area_paths=area_paths if args.path_from else None,
                        path_from_resref=args.path_from or "",
@@ -1275,7 +1288,9 @@ def main() -> int:
     _generate_reports(db, module_index_dir, title, graph, area_paths,
                       path_from_name, out, args)
 
-    positions, sizes = _compute_layout(db, args)
+    # The layout only feeds the connection diagram; skip it while that's off.
+    positions, sizes = _compute_layout(db, args) if CONNECTION_DIAGRAM else ({}, {})
+    overland = _compute_overland(db, args)
 
     activity = _parse_activity_logs(args)
     _load_bestiary(db, args, activity)
@@ -1284,7 +1299,7 @@ def main() -> int:
     _run_activity_subprocess(db, src, out, args)
 
     _render_pages(db, src, out, title, positions, sizes,
-                  area_paths, path_from_name, args)
+                  area_paths, path_from_name, args, overland=overland)
 
     # After the pages, not with the other module-index reports: those run
     # before _load_players, when the character records this is built from do

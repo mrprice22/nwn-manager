@@ -17,7 +17,8 @@ from nwn_wiki.htmlgen.escape import E, nwn_html
 from nwn_wiki.htmlgen.links import link
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.render.manual import _manual_doc_body
-from nwn_wiki.render.map import _MAP_HINT_HTML, render_map_svg
+from nwn_wiki.render.map import CONNECTION_DIAGRAM, connection_diagram_html
+from nwn_wiki.render.overland import render_overland_html
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +28,8 @@ from nwn_wiki.render.map import _MAP_HINT_HTML, render_map_svg
 def render_index(db: Db, out: Path, module_title: str,
                  positions: dict[str, tuple[float, float]],
                  sizes: dict[str, tuple[float, float]],
-                 base_url: str = "", project_root: Path | None = None) -> None:
+                 base_url: str = "", project_root: Path | None = None,
+                 overland: dict | None = None) -> None:
     ctx = PageCtx("index.html")
     # Author-supplied landing page replaces the generated overview/map index.
     # .html takes precedence over .md. Body fragment only (same handling as
@@ -116,8 +118,11 @@ def render_index(db: Db, out: Path, module_title: str,
         )
 
     overview.append('<h2>Area map</h2>')
-    overview.append(_MAP_HINT_HTML)
-    overview.append(render_map_svg(db, positions, sizes, base_url=base_url))
+    overview.append(render_overland_html(db, overland, ctx,
+                                         diagram_below=CONNECTION_DIAGRAM))
+    diagram = connection_diagram_html(db, positions, sizes, base_url=base_url)
+    if diagram:
+        overview.append(diagram)
 
     body = "\n".join(overview)
     write_page(out, ctx, module_title, body)

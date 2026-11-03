@@ -1,7 +1,9 @@
 """Area map rendering for the wiki.
 
-The force-directed area-map SVG shared by the home index and the dedicated
-``/map`` page, plus the legend hint that keeps the two in sync.
+The force-directed area-map SVG (the "connection diagram") shared by the home
+index and the dedicated ``/map`` page, plus the legend hint that keeps the two
+in sync. Both pages show the graphical overland map (``render/overland.py``)
+above it.
 """
 
 from __future__ import annotations
@@ -12,6 +14,28 @@ from pathlib import Path
 from nwn_wiki.htmlgen.chrome import write_page
 from nwn_wiki.htmlgen.pagectx import PageCtx
 from nwn_wiki.htmlgen.escape import E, nwn_first_color, nwn_text
+from nwn_wiki.render.overland import render_overland_html
+
+
+#: The force-directed "connection diagram" below the overland map. Switched
+#: off 2026-11-02 now that the overland map (render/overland.py) covers the
+#: same ground; the code is kept so it can come back by flipping this. While
+#: off, cli.py also skips the layout pass that only this diagram uses.
+CONNECTION_DIAGRAM = False
+
+
+def connection_diagram_html(db: Db, positions: dict[str, tuple[float, float]],
+                            sizes: dict[str, tuple[float, float]],
+                            base_url: str = "") -> str:
+    """Heading + legend + SVG for the connection diagram, or "" while it is
+    switched off (CONNECTION_DIAGRAM)."""
+    if not CONNECTION_DIAGRAM:
+        return ""
+    return "\n".join([
+        '<h2>Connection diagram</h2>',
+        _MAP_HINT_HTML,
+        render_map_svg(db, positions, sizes, base_url=base_url),
+    ])
 
 
 # Shared between the home index and the dedicated /map page so the legend stays
@@ -29,16 +53,18 @@ _MAP_HINT_HTML = (
 def render_map_page(db: Db, out: Path,
                     positions: dict[str, tuple[float, float]],
                     sizes: dict[str, tuple[float, float]],
-                    base_url: str = "") -> None:
-    """Dedicated Map page (map/index.html) rendering the same area-map SVG as the
-    home index. Targeted by the header 'Map' nav link so the map remains reachable
-    even when the index is replaced by an author-supplied override."""
-    body = "\n".join([
+                    base_url: str = "", overland: dict | None = None) -> None:
+    """Dedicated Map page (map/index.html): the graphical overland map, then the
+    same connection-diagram SVG as the home index. Targeted by the header 'Map'
+    nav link so the maps remain reachable even when the index is replaced by an
+    author-supplied override."""
+    ctx = PageCtx("map/index.html")
+    body = "\n".join(part for part in [
         '<h1>Area map</h1>',
-        _MAP_HINT_HTML,
-        render_map_svg(db, positions, sizes, base_url=base_url),
-    ])
-    write_page(out, PageCtx("map/index.html"), "Map", body)
+        render_overland_html(db, overland, ctx, diagram_below=CONNECTION_DIAGRAM),
+        connection_diagram_html(db, positions, sizes, base_url=base_url),
+    ] if part)
+    write_page(out, ctx, "Map", body)
 
 
 def render_map_svg(db: Db, positions: dict[str, tuple[float, float]],

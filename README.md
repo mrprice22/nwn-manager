@@ -295,12 +295,33 @@ and open `http://localhost:8000/` in that case.
 
 Builds a static, multi-page HTML wiki from `unpacked/`:
 
-- `index.html` — module overview and a directional SVG map of every
-  area. Box dimensions are scaled to each area's tile size (Width ×
-  Height); transition X/Y is used to bias each connected area to the
-  correct N/E/S/W of its neighbour, so the resulting map respects
-  in-game orientation rather than producing a force-directed blob. Click
-  any area to open its page.
+- `index.html` — module overview, then the area map (also on
+  `map/index.html`):
+  - **Overland map** — a pixel-art world in the style of a 90s 4X
+    overland view, drawn on a canvas by `assets/overland.js`. Exterior
+    areas (ARE `Flags` interior bit clear) become patches of terrain
+    painted from their tileset — rural → grassland with copses and hills,
+    forest → forest, winter → tundra, desert → sand, underground → rock —
+    joined into continents along their connections, with coastlines,
+    lakes and roads. Interior areas are drawn as icons (house, castle,
+    tower, crypt, mine, cave, dungeon, sewer) on the land you enter them
+    from; interiors only reachable by teleport get an island of their
+    own. Drag to pan, scroll or `+`/`−` to zoom, click an area or icon to
+    open its page; the minimap in the corner jumps around. **Find** opens a
+    panel listing every place, filtered as you type (name, resref or icon
+    kind such as `crypt` or `teleport`; accents ignored) — click a result,
+    or Enter, to fly the map there. `map/#find=<words>` links straight to
+    a place. All art is procedural and original. Built by
+    `nwn_wiki/render/overland.py`.
+  - **Connection diagram** — *switched off* since 2026-11-02 (set
+    `CONNECTION_DIAGRAM = True` in `bin/nwn_wiki/render/map.py` to bring
+    it back below the overland map; the layout pass it needs is skipped
+    while it is off). A directional SVG map of every area. Box
+    dimensions are scaled to each area's tile size (Width × Height);
+    transition X/Y is used to bias each connected area to the correct
+    N/E/S/W of its neighbour, so the resulting map respects in-game
+    orientation rather than producing a force-directed blob. Click any
+    area to open its page.
 - `areas/<resref>.html` — per-area page listing NPCs (friendly /
   hostile), encounter spawn pools, store inventories, in/out
   transitions, and a **Containers** table (placeables with non-empty
@@ -439,6 +460,24 @@ Builds a static, multi-page HTML wiki from `unpacked/`:
   The Comments field is a free-text notes field — any other content in it
   is unaffected. Adding `WIKI_HIDDEN` to an area leaves the module itself
   completely unchanged; it only signals the wiki generator.
+
+  **Overland map overrides** — the overland map guesses each area's look
+  from its tileset and name, which is only a rough guide. Two directives
+  in the same **Comments** field correct it:
+
+  - `@overland-terrain <kind>` — paint an exterior area as `grass`,
+    `forest`, `hills`, `mountain`, `desert`, `tundra` (or `snow`),
+    `swamp` or `rock`.
+  - `@overland-icon <icon>` — draw an interior with a different icon:
+    `town`, `castle`, `house`, `tower`, `crypt`, `mine`, `cave`,
+    `dungeon` or `sewer`. On an exterior area it adds that icon in the
+    middle of the area (city tilesets get a town or castle by default).
+  - `@overland-hub` — for a teleport hub (a chamber whose conversation
+    sends you to many places): leave the area off the overland map and
+    instead call out every area its conversations teleport to, with a
+    glowing marker and a ✦ name banner. Areas reachable *only* by walking
+    through the hub become teleport-only islands. The connection diagram
+    is unaffected.
 
 - `assets/style.css` — bundled stylesheet.
 - `manual/` — rendered hand-written documentation pages (see below).
@@ -1641,7 +1680,8 @@ creature spawn points.
 
 ### Tuning the area map
 
-The index page renders a force-directed SVG of every area. The default
+These knobs apply to the connection diagram, which is currently switched
+off (`CONNECTION_DIAGRAM` in `bin/nwn_wiki/render/map.py`). The index page renders a force-directed SVG of every area. The default
 layout fits most modules; tweak it in three places when it doesn't.
 
 **Viewport** — `bin/wiki_assets/style.css`, the `.map-wrap` rule
