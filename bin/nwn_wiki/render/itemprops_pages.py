@@ -32,6 +32,7 @@ from nwn_wiki.itemprops import (
 from nwn_wiki.items import (
     _item_category,
     _item_category_label,
+    item_accessible,
     item_gp_value,
 )
 from nwn_wiki.lookups import (
@@ -114,9 +115,11 @@ def _collect_item_properties(db: "Db") -> tuple[dict, dict, dict]:
     _light_param: dict[tuple[str, str], str] = {}
 
     for resref, i in db.items.items():
-        if not (resref in db.item_sold_at or resref in db.item_in_container
-                or any(e.get("dropable") for e in db.item_carried_by.get(resref, []))
-                or resref in db.item_from_script):
+        # TODO: this index has always ignored pickpocket-only carriers, unlike
+        # every other page.  Kept as-is so the item_accessible() refactor is a
+        # zero-diff change; dropping pickpocket=False is a separate, declared
+        # wiki-golden diff.
+        if not item_accessible(db, resref, pickpocket=False):
             continue
         name = db.item_name(resref)
         if name.startswith("[TLK#") or name == resref:
@@ -800,12 +803,7 @@ def render_items_search(db: "Db", out: Path) -> None:
                             key=lambda kv: nwn_text(db.item_name(kv[0])).lower()):
         carriers = db.item_carried_by.get(resref, [])
         pickpocketable = any(e.get("pickpocketable") for e in carriers)
-        accessible = (
-            resref in db.item_sold_at
-            or resref in db.item_in_container
-            or any(e.get("dropable") or e.get("pickpocketable") for e in carriers)
-            or resref in db.item_from_script
-        )
+        accessible = item_accessible(db, resref)
         if not accessible and not carriers:
             continue
         name = db.item_name(resref)

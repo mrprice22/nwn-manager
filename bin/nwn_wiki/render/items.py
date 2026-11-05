@@ -36,6 +36,7 @@ from nwn_wiki.items import (
     _TOC_GROUPS,
     _item_category,
     _item_category_label,
+    item_accessible,
     item_gp_value,
     item_spell_failure,
 )
@@ -286,15 +287,10 @@ def render_inaccessible_index(db: Db, inaccessible: list[tuple[str, dict]], out:
 
 
 def item_is_accessible(db: Db, rr: str) -> bool:
-    """True when players can reach item ``rr`` (store, container, droppable
-    carrier or script reward). Everything else lands on the Inaccessible page."""
-    return (
-        rr in db.item_sold_at
-        or rr in db.item_in_container
-        or any(e.get("dropable") or e.get("pickpocketable")
-               for e in db.item_carried_by.get(rr, []))
-        or rr in db.item_from_script
-    )
+    """True when players can reach item ``rr``; everything else lands on the
+    Inaccessible page.  Thin alias of :func:`nwn_wiki.items.item_accessible`,
+    the one definition of the rule."""
+    return item_accessible(db, rr)
 
 
 def _item_access_class(db: Db, rr: str) -> str:
@@ -1086,13 +1082,7 @@ def render_item_page(db: Db, resref: str, out: Path) -> None:
     is_resref_named  = (not is_tlk_broken) and (name == resref)
     is_broken        = is_tlk_broken or is_resref_named
     display_name     = resref if is_broken else name
-    accessible = (
-        resref in db.item_sold_at
-        or resref in db.item_in_container
-        or any(e.get("dropable") or e.get("pickpocketable")
-               for e in db.item_carried_by.get(resref, []))
-        or resref in db.item_from_script
-    )
+    accessible = item_accessible(db, resref)
     is_inaccessible = not is_broken and not accessible
     props = list_items(i.get("PropertiesList"))
     is_cursed = bool(int(fld(i, "Cursed", 0) or 0))

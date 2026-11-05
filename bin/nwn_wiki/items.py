@@ -535,17 +535,29 @@ def item_gp_value(item: dict | None) -> int:
     return total
 
 
-def _item_accessible(db: "Db", rr: str) -> bool:
+def item_accessible(db: "Db", rr: str, *, pickpocket: bool = True) -> bool:
     """True when players can obtain this item: sold in a store, found in a
     container, dropped/pickpocketed off a creature, or granted by a script.
-    Mirrors the item_index.json accessibility rule."""
+
+    THE single definition of "obtainable" -- every page and report that splits
+    items into accessible / inaccessible calls this, so a new item source (e.g. a
+    loot table) is added here once and reaches all of them.
+
+    ``pickpocket=False`` ignores pickpocket-only carriers.  Only the
+    Browse-by-Property pages use it, and only to stay byte-identical with the
+    rule they always had (see the TODO there) -- do not use it anywhere new.
+    """
     return (
         rr in db.item_sold_at
         or rr in db.item_in_container
-        or any(e.get("dropable") or e.get("pickpocketable")
+        or any(e.get("dropable") or (pickpocket and e.get("pickpocketable"))
                for e in db.item_carried_by.get(rr, []))
         or rr in db.item_from_script
     )
+
+
+# Historical name; counter_gear and sim import it.
+_item_accessible = item_accessible
 
 
 _ABIL_NAME_KEY = {"Strength": "Str", "Dexterity": "Dex", "Constitution": "Con",

@@ -20,7 +20,7 @@ from typing import Any
 from nwn_wiki import state
 from nwn_wiki.gff import fld, list_items
 from nwn_wiki.htmlgen.escape import nwn_text
-from nwn_wiki.items import item_gp_value
+from nwn_wiki.items import item_accessible, item_gp_value
 from nwn_wiki.lookups import appearance_name, baseitem_name, race_name
 from nwn_wiki.reachability import creature_unreachable_areas
 from nwn_wiki.render.creature_page import _retaliation_sentence
@@ -586,12 +586,7 @@ def _write_item_index(
         bi = -1 if bi_raw is None else _try_int(bi_raw, -1)
         cost = item_gp_value(i)
         carriers = db.item_carried_by.get(rr, [])
-        accessible = (
-            rr in db.item_sold_at
-            or rr in db.item_in_container
-            or any(e.get("dropable") or e.get("pickpocketable") for e in carriers)
-            or rr in db.item_from_script
-        )
+        accessible = item_accessible(db, rr)
         item_index.append({
             "resref": rr,
             "name": name,
@@ -748,12 +743,7 @@ def _write_inaccessible_items(
         if name.startswith("[TLK#") or name == rr:
             continue
         carriers = db.item_carried_by.get(rr, [])
-        accessible = (
-            rr in db.item_sold_at
-            or rr in db.item_in_container
-            or any(e.get("dropable") or e.get("pickpocketable") for e in carriers)
-            or rr in db.item_from_script
-        )
+        accessible = item_accessible(db, rr)
         if accessible:
             continue
         bi_raw = fld(i, "BaseItem", None)
