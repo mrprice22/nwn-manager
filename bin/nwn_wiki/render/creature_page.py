@@ -1730,12 +1730,19 @@ def render_creature_page(db: Db, canonical_rr: str, out: Path) -> None:
             )
         k = state._BESTIARY_KILLS.get(canonical_rr)
         if k:
+            champ = k.get("champ", 0)
             sections.append(
                 "<h2>Kills</h2>"
                 '<table class="data"><thead><tr>'
-                "<th>Total</th><th>Solo</th><th>Party</th></tr></thead><tbody>"
+                "<th>Total</th><th>Solo</th><th>Party</th>"
+                + ("<th>Champions</th>" if champ else "")
+                + "</tr></thead><tbody>"
                 f"<tr><td>{k['total']}</td><td>{k['solo']}</td>"
-                f"<td>{k['party']}</td></tr></tbody></table>"
+                f"<td>{k['party']}</td>"
+                + (f"<td>{champ}</td>" if champ else "")
+                + "</tr></tbody></table>"
+                + ('<p class="note">Champions are counted in the totals too: a champion '
+                   "is this creature spawned stronger.</p>" if champ else "")
             )
         else:
             sections.append("<h2>Kills</h2><p>Not yet slain by any adventurer.</p>")

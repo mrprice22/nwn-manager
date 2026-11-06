@@ -129,9 +129,21 @@ def load_bestiary_stats(db_dir: Path, sessions: list | None = None) -> None:
         ).fetchall():
             state._BESTIARY_KILLS[resref] = {"total": int(total or 0),
                                        "solo": int(solo or 0),
-                                       "party": int(party or 0)}
+                                       "party": int(party or 0),
+                                       "champ": 0}
     except sqlite3.Error:
         pass  # kills table not created yet (no kills recorded)
+    # Champions (a module that spawns them - Homer's LOTR Loot Overhaul - tallies
+    # them in kills.champ_kills; they are ALSO in solo/party, under the base
+    # creature). Older DBs have no such column: leave "champ" at 0.
+    try:
+        for resref, champ in con.execute(
+            "SELECT resref, SUM(champ_kills) FROM kills GROUP BY resref"
+        ).fetchall():
+            if resref in state._BESTIARY_KILLS:
+                state._BESTIARY_KILLS[resref]["champ"] = int(champ or 0)
+    except sqlite3.Error:
+        pass
     # Per-character rows for the "Top Killers" tables on creature pages.
     # Loaded once here (never per-page SQL). Fold variant resrefs through the
     # DB's resref_alias table so a character's kills of a variant blueprint
