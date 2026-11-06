@@ -13,7 +13,7 @@ by the race's ``CRModifier`` (racialtypes.2da):
 
     HD * 0.15
     NaturalAC * 0.1
-    item value / (HD * 20000 + 100000) * 0.2 * HD        items NOT in creature slots
+    item value / (HD * 20000 + 100000) * 0.2 * HD        EQUIPPED items, creature slots excluded
     base HP / average HP * 0.2 * HD * walk / PC walk     base HP = ``HitPoints`` (no Con, no feats)
     ability total / (HD + 50) * 0.1 * HD                  the raw Str..Cha fields
     special-ability innate levels / (HD + 6) * 0.15
@@ -34,12 +34,15 @@ wiki leaves three things out:
   * WalkRate 7 ("Default") takes the walk rate of the appearance's
     ``MOVERATE`` (appearance.2da -> creaturespeed.2da ``2DAName``).
 
-Item value is ``Cost + AddCost`` (items.item_gp_value) counted ONCE per item,
-whatever its stack size: module ``.uti`` files first, then the bundled stock
-item costs.  Multiplying by StackSize made a 99-arrow quiver worth 99 items
-and fitted worse (580 vs 614 of 825 blueprints within 10%); Legolas computed
-to CR 180,363 on his arrows alone.  An item found in neither (a hak-only blueprint)
-is counted as unresolved; such a creature's result is a lower bound.
+Item value counts EQUIPPED gear only (``Equip_ItemList`` outside the creature
+slots), each item ``Cost + AddCost`` (items.item_gp_value) ONCE whatever its
+stack size - a creature fires one arrow at a time - from module ``.uti`` files
+first, then the bundled stock item costs.  Measured on Homer's LOTR (within 10%
+of the stored CR, of 825-828 blueprints): equipped + inventory, x stack 580;
+equipped + inventory, stack once 614; equipped only 675.  Counting the pack
+made Legolas CR 180,363 on his spare arrows; equipped-only gives 1,428
+against a stored 1,418.  An item found in neither source (a hak-only
+blueprint) is counted as unresolved; that creature's result is a lower bound.
 
 Data: ``wiki_data/cr_info.json`` (stock tables, ``build_cr_info.py``) with a
 module's own 2DAs (``--2da-dir``) layered over them row by row.
@@ -250,8 +253,6 @@ def creature_cr(utc: dict, tables: Tables, item_value: ItemValues) -> CRResult:
         if int(e.get("__struct_id", 0)) >= CREATURE_SLOT_MIN:
             continue
         count(fld(e, "EquippedRes", ""))
-    for e in fld(utc, "ItemList", []) or []:
-        count(fld(e, "InventoryRes", "") or fld(e, "TemplateResRef", ""))
 
     abil = sum(int(fld(utc, k, 0) or 0) for k in ("Str", "Dex", "Con", "Int", "Wis", "Cha"))
 

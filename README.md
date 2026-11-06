@@ -982,15 +982,15 @@ nwn-cr --project ~/GIT/my_module --resync a,b,@list.txt [--apply]
 encounter creature-list entry naming it. It is a dry run without `--apply`.
 `--2da-dir` (default `<project>/hak_2da`) layers the module's own 2DAs over the
 bundled stock numbers in `wiki_data/cr_info.json`. Rebuild that file after an NWN
-patch with `bin/wiki_data/build_cr_info.py`. Item values are `Cost + AddCost`, counted
-once per item whatever its stack size (multiplying by the stack fits worse), from the
-module's `.uti` files, then `wiki_data/stock_item_names.json`; a creature
+patch with `bin/wiki_data/build_cr_info.py`. The item term counts **equipped gear
+only**, each item's `Cost + AddCost` once whatever its stack size (counting the pack, or
+every arrow in a stack, fits measurably worse), from the module's `.uti` files, then
+`wiki_data/stock_item_names.json`; a creature
 holding a hak-only item gets a lower-bound result and is flagged.
 
-Measured on Homer's LOTR (830 blueprints): 43% exact, 74% within 10% of the
+Measured on Homer's LOTR (830 blueprints): 44% exact, 82% within 10% of the
 stored CR. The misses are mostly real drift, which is the point of the tool.
-The item term dominates for creatures carrying very expensive gear, so check a
-resync's XP impact before applying it.
+Kill XP reads the stored CR, so check a resync's XP impact before applying it.
 
 ### Compare module forks
 
