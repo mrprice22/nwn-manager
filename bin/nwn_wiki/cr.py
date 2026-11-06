@@ -34,9 +34,11 @@ wiki leaves three things out:
   * WalkRate 7 ("Default") takes the walk rate of the appearance's
     ``MOVERATE`` (appearance.2da -> creaturespeed.2da ``2DAName``).
 
-Item value is ``Cost + AddCost`` (what ``GetGoldPieceValue`` returns, see
-items.item_gp_value) times the stack size: module ``.uti`` files first, then
-the bundled stock item costs.  An item found in neither (a hak-only blueprint)
+Item value is ``Cost + AddCost`` (items.item_gp_value) counted ONCE per item,
+whatever its stack size: module ``.uti`` files first, then the bundled stock
+item costs.  Multiplying by StackSize made a 99-arrow quiver worth 99 items
+and fitted worse (580 vs 614 of 825 blueprints within 10%); Legolas computed
+to CR 180,363 on his arrows alone.  An item found in neither (a hak-only blueprint)
 is counted as unresolved; such a creature's result is a lower bound.
 
 Data: ``wiki_data/cr_info.json`` (stock tables, ``build_cr_info.py``) with a
@@ -164,7 +166,8 @@ def load_tables(two_da_dir: Path | None = None) -> Tables:
 
 
 class ItemValues:
-    """resref -> gold value of one stack: module .uti first, then stock."""
+    """resref -> Cost + AddCost of one item (a stack counts once): module .uti
+    first, then stock."""
 
     def __init__(self, unpacked: Path):
         self.unpacked = Path(unpacked)
@@ -182,7 +185,7 @@ class ItemValues:
             p = self.unpacked / f"{rr}.uti.json"
             if p.exists():
                 d = json.loads(p.read_text(encoding="utf-8"))
-                self._cache[rr] = item_gp_value(d) * max(1, int(fld(d, "StackSize", 1) or 1))
+                self._cache[rr] = item_gp_value(d)
             elif rr in self._stock:
                 self._cache[rr] = int(self._stock[rr].get("cost", 0) or 0)
             else:
