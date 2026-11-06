@@ -988,7 +988,7 @@ every arrow in a stack, fits measurably worse), from the module's `.uti` files, 
 `wiki_data/stock_item_names.json`; a creature
 holding a hak-only item gets a lower-bound result and is flagged.
 
-Measured on Homer's LOTR (830 blueprints): 44% exact, 82% within 10% of the
+Measured on Homer's LOTR (830 blueprints): 47% exact, 86% within 10% of the
 stored CR. The misses are mostly real drift, which is the point of the tool.
 Kill XP reads the stored CR, so check a resync's XP impact before applying it.
 

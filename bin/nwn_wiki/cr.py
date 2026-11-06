@@ -34,7 +34,9 @@ wiki leaves three things out:
   * WalkRate 7 ("Default") takes the walk rate of the appearance's
     ``MOVERATE`` (appearance.2da -> creaturespeed.2da ``2DAName``).
 
-Item value counts EQUIPPED gear only (``Equip_ItemList`` outside the creature
+An equipment entry is either a resref (``EquippedRes``, an ordinary blueprint)
+or a whole embedded item struct with its own Cost (a placed instance, or a
+blueprint baked from one); both count.  Item value counts EQUIPPED gear only (``Equip_ItemList`` outside the creature
 slots), each item ``Cost + AddCost`` (items.item_gp_value) ONCE whatever its
 stack size - a creature fires one arrow at a time - from module ``.uti`` files
 first, then the bundled stock item costs.  Measured on Homer's LOTR (within 10%
@@ -239,9 +241,19 @@ def creature_cr(utc: dict, tables: Tables, item_value: ItemValues) -> CRResult:
 
     value, unresolved, top = 0, [], None
 
-    def count(rr):
+    def count(entry):
+        # A blueprint's equipment entry names the item (EquippedRes); a placed
+        # instance's - and a blueprint baked from one - embeds the whole item
+        # struct, Cost and AddCost included, and has no EquippedRes.
         nonlocal value, top
-        v = item_value(rr)
+        rr = fld(entry, "EquippedRes", "") or ""
+        if rr:
+            v = item_value(rr)
+        elif "Cost" in entry:
+            rr = fld(entry, "TemplateResRef", "") or fld(entry, "Tag", "") or "(embedded)"
+            v = item_gp_value(entry)
+        else:
+            return
         if v is None:
             unresolved.append(rr)
             return
@@ -252,7 +264,7 @@ def creature_cr(utc: dict, tables: Tables, item_value: ItemValues) -> CRResult:
     for e in fld(utc, "Equip_ItemList", []) or []:
         if int(e.get("__struct_id", 0)) >= CREATURE_SLOT_MIN:
             continue
-        count(fld(e, "EquippedRes", ""))
+        count(e)
 
     abil = sum(int(fld(utc, k, 0) or 0) for k in ("Str", "Dex", "Con", "Int", "Wis", "Cha"))
 
