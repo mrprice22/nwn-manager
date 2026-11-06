@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""nwn-cr - compute creature challenge ratings the way the NWN toolset does,
+measure how far a module's stored CRs have drifted, and resync them.
+
+The toolset recomputes a creature's ChallengeRating only when its Properties
+dialog is OK'd, so any edit made outside the toolset leaves the stored CR stale.
+The formula and its calibration are documented in bin/nwn_wiki/cr.py.
+
+  nwn-cr --project ~/GIT/my_module                    fit summary
+  nwn-cr --project ~/GIT/my_module gntfrost003 ...    term breakdown per creature
+  nwn-cr --project ~/GIT/my_module --json out.json    every blueprint, machine-readable
+  nwn-cr --project ~/GIT/my_module --resync a,b,@list.txt          dry run
+  nwn-cr --project ~/GIT/my_module --resync a,b --apply             write
+
+--resync writes the computed CR into the blueprint (<resref>.utc.json), into
+every placed instance (computed from the INSTANCE's own fields, since an
+instance can differ from its blueprint), and into the cached CR of every
+encounter creature-list entry naming it (*.git.json instances and *.ute.json
+blueprints) - the engine budgets encounter spawns on that cache.  JSON is
+re-serialised the way nwn_gff writes it (indent 2, UTF-8, trailing newline).
+
+--2da-dir defaults to <project>/hak_2da when that exists; point it at any
+directory of the module's extracted 2DAs (classes, racialtypes, feat, spells,
+creaturespeed, appearance, cls_savthr_*).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from nwn_wiki import cr  # noqa: E402
+from nwn_wiki.gff import fld  # noqa: E402
+
+
+def _dump(obj) -> str:
+    return json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+
+
+def _set_cr(struct: dict, key: str, value: float) -> bool:
+    cell = struct.get(key)
+    if isinstance(cell, dict) and "value" in cell:
+        if float(cell["value"]) == float(value):
+            return False
+        cell["value"] = float(value)
+        return True
+    return False
+
+
+def blueprints(unpacked: Path):
+    for p in sorted(unpacked.glob("*.utc.json")):
+        yield p.name[:-len(".utc.json")], p
+
+
+def fit(rows) -> str:
+    def line(label, rs):
+        rel = [abs(r["calc"] - r["stored"]) / max(1.0, r["stored"]) for r in rs]
+        n = len(rs) or 1
+        return ("%-22s %4d   exact %4d (%3.0f%%)   <=2%% %4d   <=10%% %4d (%3.0f%%)   <=25%% %4d"
+                % (label, len(rs), sum(x == 0 for x in rel), 100.0 * sum(x == 0 for x in rel) / n,
+                   sum(x <= .02 for x in rel), sum(x <= .10 for x in rel),
+                   100.0 * sum(x <= .10 for x in rel) / n, sum(x <= .25 for x in rel)))
+    ok = [r for r in rows if not r["unresolved_items"]]
+    out = ["blueprints %d, %d with every item resolved (the others are lower bounds)"
+           % (len(rows), len(ok)),
+           line("all resolved", ok),
+           line("  CRAdjust == 0", [r for r in ok if r["cr_adjust"] == 0]),
+           line("  CRAdjust != 0", [r for r in ok if r["cr_adjust"] != 0])]
+    return "\n".join(out)
+
+
+def row_for(resref: str, utc: dict, res: cr.CRResult) -> dict:
+    return {"resref": resref, "stored": float(fld(utc, "ChallengeRating", 0) or 0),
+            "calc": res.cr, "additive": round(res.additive, 4), "cr_adjust": res.cr_adjust,
+            "race_mod": res.race_mod, "hd": res.hd, "item_value": res.item_value,
+            "top_item": list(res.top_item) if res.top_item else None,
+            "dominant": res.dominant,
+            "terms": {k: round(v, 4) for k, v in res.terms.items()},
+            "unresolved_items": res.unresolved_items}
+
+
+def resync(unpacked: Path, tables, values, targets: set[str], apply: bool) -> int:
+    new_cr: dict[str, float] = {}
+    changes = 0
+    for rr in sorted(targets):
+        p = unpacked / f"{rr}.utc.json"
+        if not p.exists():
+            print(f"  skip {rr}: no blueprint")
+            continue
+        d = json.loads(p.read_text(encoding="utf-8"))
+        res = cr.creature_cr(d, tables, values)
+        new_cr[rr] = res.cr
+        old = float(fld(d, "ChallengeRating", 0) or 0)
+        if _set_cr(d, "ChallengeRating", res.cr):
+            changes += 1
+            print(f"  {rr}.utc: {old:g} -> {res.cr:g}")
+            if apply:
+                p.write_text(_dump(d), encoding="utf-8")
+    for p in sorted(unpacked.glob("*.git.json")) + sorted(unpacked.glob("*.ute.json")):
+        d = json.loads(p.read_text(encoding="utf-8"))
+        touched = False
+        for c in fld(d, "Creature List", []) or []:
+            rr = (fld(c, "TemplateResRef", "") or "").lower()
+            if rr in new_cr:
+                res = cr.creature_cr(c, tables, values)
+                old = float(fld(c, "ChallengeRating", 0) or 0)
+                if _set_cr(c, "ChallengeRating", res.cr):
+                    touched = True
+                    changes += 1
+                    print(f"  {p.name}: placed {rr} {old:g} -> {res.cr:g}")
+        encs = fld(d, "Encounter List", []) or []
+        if p.name.endswith(".ute.json"):
+            encs = [d]
+        for e in encs:
+            for c in fld(e, "CreatureList", []) or []:
+                rr = (fld(c, "ResRef", "") or "").lower()
+                if rr in new_cr:
+                    old = float(fld(c, "CR", 0) or 0)
+                    if _set_cr(c, "CR", new_cr[rr]):
+                        touched = True
+                        changes += 1
+                        print(f"  {p.name}: encounter cache {rr} {old:g} -> {new_cr[rr]:g}")
+        if touched and apply:
+            p.write_text(_dump(d), encoding="utf-8")
+    print(f"{changes} field(s) {'written' if apply else 'would change (dry run; --apply writes)'}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("resrefs", nargs="*", help="print the term breakdown for these creatures")
+    ap.add_argument("--project", type=Path, help="module project folder (reads <project>/unpacked)")
+    ap.add_argument("--unpacked", type=Path, help="unpacked tree (overrides --project)")
+    ap.add_argument("--2da-dir", dest="two_da_dir", type=Path,
+                    help="module 2DA overrides (default <project>/hak_2da if present)")
+    ap.add_argument("--json", type=Path, help="write every blueprint's result here")
+    ap.add_argument("--resync", help="comma list of resrefs, @file entries allowed")
+    ap.add_argument("--apply", action="store_true", help="with --resync: write the files")
+    a = ap.parse_args()
+
+    unpacked = a.unpacked or (a.project / "unpacked" if a.project else None)
+    if not unpacked or not unpacked.is_dir():
+        ap.error("need --project or --unpacked pointing at an unpacked module")
+    two_da = a.two_da_dir
+    if two_da is None and a.project and (a.project / "hak_2da").is_dir():
+        two_da = a.project / "hak_2da"
+    tables = cr.load_tables(two_da)
+    values = cr.ItemValues(unpacked)
+
+    if a.resync:
+        targets = set()
+        for tok in a.resync.split(","):
+            tok = tok.strip()
+            if tok.startswith("@"):
+                targets |= {ln.split("#")[0].strip().lower()
+                            for ln in Path(tok[1:]).read_text().splitlines() if ln.split("#")[0].strip()}
+            elif tok:
+                targets.add(tok.lower())
+        return resync(unpacked, tables, values, targets, a.apply)
+
+    rows = []
+    for rr, p in blueprints(unpacked):
+        d = json.loads(p.read_text(encoding="utf-8"))
+        rows.append(row_for(rr, d, cr.creature_cr(d, tables, values)))
+
+    if a.json:
+        a.json.write_text(json.dumps({"_source": "nwn-cr (nwn_manager/bin/nwn_wiki/cr.py)",
+                                      "creatures": rows}, indent=1, sort_keys=True) + "\n",
+                          encoding="utf-8")
+        print(f"wrote {a.json} ({len(rows)} blueprints)")
+    if a.resrefs:
+        by = {r["resref"]: r for r in rows}
+        for rr in a.resrefs:
+            r = by.get(rr.lower())
+            if not r:
+                print(f"{rr}: no blueprint")
+                continue
+            print(f"{rr}: stored {r['stored']:g}  computed {r['calc']:g}  (sum x{r['race_mod']:g} "
+                  f"= {r['additive']:.2f}, CRAdjust {r['cr_adjust']:+d}, HD {r['hd']})")
+            for k in cr.TERMS:
+                print(f"    {k:<18} {r['terms'][k]:10.2f}")
+            if r["top_item"]:
+                print(f"    item value {r['item_value']:,} gp (top: {r['top_item'][0]} "
+                      f"{r['top_item'][1]:,})")
+            if r["unresolved_items"]:
+                print(f"    unresolved items: {', '.join(r['unresolved_items'])}")
+    if not a.json and not a.resrefs:
+        print(fit(rows))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

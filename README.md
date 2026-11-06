@@ -28,6 +28,8 @@ nwn_manager/
   bin/nwn-wiki           the wiki generator (Python 3, stdlib only)
   bin/nwn-fork-diff      cross-module comparison of ancestor forks against a
                          baseline module (see "Compare module forks")
+  bin/nwn-cr             the toolset's creature challenge-rating formula: measure
+                         stored-CR drift and resync it (see "Creature challenge ratings")
   bin/wiki_data/         bundled 2DA → name lookups (classes, baseitems,
                          item properties, …)
   bin/wiki_assets/       bundled wiki stylesheet
@@ -954,6 +956,40 @@ files add what the raw files don't have: resolved string names, built
 cross-references, and pre-aggregated views that let an LLM or script answer
 questions like "where is this item found?" or "which NPCs share this
 appearance?" without re-parsing the full GFF tree.
+
+### Creature challenge ratings (`nwn-cr`)
+
+The toolset stores a creature's CR in its blueprint and recomputes it **only** when
+the creature's Properties dialog is OK'd. A module save, a repack and the server
+never refresh it, so any edit made outside the toolset (a script, a hand edit of
+the unpacked JSON, an item revalued by a 2DA cost change) leaves the stored CR
+stale, and the stale number keeps driving kill XP and encounter spawn budgets.
+
+`bin/nwn-cr` reproduces the formula (`bin/nwn_wiki/cr.py`; the terms are the ones
+on nwn.fandom.com's *Challenge rating* page, plus three things calibrated against a
+real module: `CRAdjust` is added after the racial multiplier, a result of 1 or
+more is rounded, and below 1 the toolset stores a fraction).
+
+```
+nwn-cr --project ~/GIT/my_module                    # how well it fits the stored CRs
+nwn-cr --project ~/GIT/my_module gntfrost003        # term-by-term breakdown
+nwn-cr --project ~/GIT/my_module --json cr.json     # every blueprint
+nwn-cr --project ~/GIT/my_module --resync a,b,@list.txt [--apply]
+```
+
+`--resync` writes the computed CR into the blueprint, into every placed instance
+(computed from the instance's own fields) and into the cached `CR` of every
+encounter creature-list entry naming it. It is a dry run without `--apply`.
+`--2da-dir` (default `<project>/hak_2da`) layers the module's own 2DAs over the
+bundled stock numbers in `wiki_data/cr_info.json`. Rebuild that file after an NWN
+patch with `bin/wiki_data/build_cr_info.py`. Item values are `Cost + AddCost`
+from the module's `.uti` files, then `wiki_data/stock_item_names.json`; a creature
+holding a hak-only item gets a lower-bound result and is flagged.
+
+Measured on Homer's LOTR (830 blueprints): 42% exact, 70% within 10% of the
+stored CR. The misses are mostly real drift, which is the point of the tool.
+The item term dominates for creatures carrying very expensive gear, so check a
+resync's XP impact before applying it.
 
 ### Compare module forks
 
